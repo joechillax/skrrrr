@@ -37,6 +37,7 @@ local ConfigTab = Window:CreateTab("Configuration", nil)
 -- ======================================================================
 -- FEATURE VARIABLES
 -- ======================================================================
+local autoNextStageEnabled = false
 local autoRebirthEnabled = false
 local targetRebirthStage = 0
 local autoBuyNodesEnabled = false
@@ -44,6 +45,17 @@ local autoBuyNodesEnabled = false
 -- ======================================================================
 -- AUTOMATION UI
 -- ======================================================================
+MainTab:CreateSection("Stage Progression")
+
+local AutoNextToggle = MainTab:CreateToggle({
+    Name = "Enable Auto Next Stage",
+    CurrentValue = false,
+    Flag = "AutoNextToggle",
+    Callback = function(value)
+        autoNextStageEnabled = value
+    end,
+})
+
 MainTab:CreateSection("Auto Rebirth")
 
 MainTab:CreateInput({
@@ -78,6 +90,55 @@ local AutoBuyToggle = MainTab:CreateToggle({
 -- ======================================================================
 -- AUTOMATION LOOPS
 -- ======================================================================
+
+-- Auto Next Stage Loop (UI Clicker)
+task.spawn(function()
+    while task.wait(1) do
+        if autoNextStageEnabled then
+            local PlayerGui = LocalPlayer:FindFirstChild("PlayerGui")
+            if not PlayerGui then continue end
+            
+            local GameUI = PlayerGui:FindFirstChild("GameUI")
+            if not (GameUI and GameUI.Enabled) then continue end
+            
+            local VictoryEndScreen = GameUI:FindFirstChild("VictoryEndScreen")
+            if not (VictoryEndScreen and VictoryEndScreen.Visible) then continue end
+            
+            local Buttons = VictoryEndScreen:FindFirstChild("Buttons")
+            local NextStageBtn = Buttons and Buttons:FindFirstChild("NextStage")
+            
+            if NextStageBtn and NextStageBtn.Visible then
+                task.wait(1.5) -- Brief delay to allow the server to register victory
+                
+                local clicked = false
+                
+                if type(firesignal) == "function" then
+                    pcall(function()
+                        firesignal(NextStageBtn.Activated)
+                        firesignal(NextStageBtn.MouseButton1Click)
+                        clicked = true
+                    end)
+                end
+                
+                if not clicked and type(getconnections) == "function" then
+                    pcall(function()
+                        for _, conn in ipairs(getconnections(NextStageBtn.Activated)) do
+                            conn.Function()
+                        end
+                        for _, conn in ipairs(getconnections(NextStageBtn.MouseButton1Click)) do
+                            conn.Function()
+                        end
+                        clicked = true
+                    end)
+                end
+                
+                -- Wait a few seconds to let the next stage load
+                task.wait(4)
+            end
+        end
+    end
+end)
+
 -- Auto Rebirth Loop
 task.spawn(function()
     while task.wait(REBIRTH_CHECK_COOLDOWN) do
@@ -85,7 +146,6 @@ task.spawn(function()
             local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
             if leaderstats then
                 local stageVal = leaderstats:FindFirstChild("Stage")
-                -- Check if the current stage meets or exceeds the target
                 if stageVal and tonumber(stageVal.Value) and tonumber(stageVal.Value) >= targetRebirthStage then
                     pcall(function()
                         local event = Workspace:FindFirstChild("Network") and Workspace.Network:FindFirstChild("AttemptRebirth-RemoteFunction")
@@ -172,6 +232,7 @@ local function saveConfig(name)
 
     pcall(function()
         writefile(fName .. "/" .. name .. ".json", HttpS:JSONEncode({
+            NextStage = autoNextStageEnabled,
             Stage = targetRebirthStage,
             Rebirth = autoRebirthEnabled,
             BuyNodes = autoBuyNodesEnabled,
@@ -188,11 +249,12 @@ local function loadConfig(name)
 
         local data = HttpS:JSONDecode(readfile(path))
 
-        -- Apply settings to variables and UI
+        if data.NextStage ~= nil then
+            AutoNextToggle:Set(data.NextStage)
+        end
+
         if data.Stage ~= nil then
             targetRebirthStage = data.Stage
-            -- Rayfield doesn't natively support setting Input text after creation,
-            -- but the variable is updated for the loop to use.
         end
 
         if data.Rebirth ~= nil then
