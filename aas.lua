@@ -1,4 +1,4 @@
--- Anime Suite 2.6 | standalone source | September 2026
+-- Anime Suite 2.7 | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload and automatic start are opt-in.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -1517,7 +1517,7 @@ return function(A)
             return
         end
         if currentGuild()~=request.guildId then pending=nil; previous=nil; return end
-        pending=nil; local now=os.time(); local s=A.guildSession; local changed=false
+        pending=nil; local now=os.time(); local s=A.guildSession
         if request.kind=='start' then
             local guid
             local ok,value=pcall(function() return A.S.HTTP:GenerateGUID(false) end)
@@ -1525,7 +1525,7 @@ return function(A)
             local fresh=G.new(rows,request.guildId,A.player.UserId,game.GameId,now,guid,(s and s.generation or 0)+1)
             local first=G.sample(fresh,rows,now,nil)
             if not A.guildSave(fresh) then A.status['Guild tracker']='New session could not be fully saved; inspect Guild storage'; return end
-            A.guildSession=fresh; previous=first; s=fresh; changed=true
+            A.guildSession=fresh; previous=first; s=fresh
             A.status['Guild tracker']='Tracking started; existing contribution stored as the baseline'
         elseif request.kind=='stop' then
             if not s or s.active then return end
@@ -1533,10 +1533,9 @@ return function(A)
             local saved=A.guildSave()
             A.status['Guild tracker']=saved and 'Tracking stopped; final snapshot saved' or 'Tracking stopped; final save failed (see Guild storage)'
         elseif s and s.active and G.id(s.guildId)==request.guildId then
-            previous,changed=G.sample(s,rows,now,previous); A.guildSave()
+            previous=G.sample(s,rows,now,previous); A.guildSave()
             A.status['Guild tracker']='Tracking '..s.trackedMemberCount..' members; presence is sampled'
         end
-        if changed and A.refreshUI then A.refreshUI() end
     end)
     function A.guildCheckpoint()
         if A.guildSession and A.guildSession.active then
@@ -1571,27 +1570,22 @@ return function(A)
             end
         end
     else A.status['Guild tracker']='No valid saved session; press Start Tracking when ready' end
-    A.guildSelected=''
     local function duration(seconds) return string.format('%dh %dm',math.floor(seconds/3600),math.floor(seconds/60)%60) end
     function A.guildSummary()
-        local s=A.guildSession; if not s then return 'No tracking session. JSON: '..A.guildFile end
-        local elapsed=math.max(0,(s.active and os.time() or s.endedAt)-s.startedAt)
-        return (s.active and 'ACTIVE' or 'STOPPED')..' | '..tostring(s.trackedMemberCount)..' members\n'
-            ..'Started: '..s.startedAtISO..'\nTotal tracking time: '..duration(elapsed)
-            ..'\nObserved: '..duration(s.observedSeconds)
-            ..' | Unobserved: '..duration(math.max(0,elapsed-s.observedSeconds))
-            ..'\nFile: '..A.guildFile
-    end
-    function A.guildMemberText()
-        local s=A.guildSession; local m=s and s.members[A.guildSelected]
-        if not m then return 'Choose a member to inspect their recorded progress.' end
-        return m.displayName..' (@'..m.username..') | UserId '..tostring(m.userId)
-            ..'\n'..(m.inGuild and 'In guild' or 'Left guild')..' | Last observed status: '..m.onlineStatus
-            ..'\nObserved online: '..duration(m.onlineSeconds)..' | Starting: '..tostring(m.startingContribution)
-            ..'\nLatest: '..tostring(m.finalContribution)..' | Gained: '..tostring(m.contributionGained)
-            ..'\nPer observed online hour: '..(m.contributionPerHour and string.format('%.2f',m.contributionPerHour) or 'N/A')
-            ..(not m.contributionComparable and '\nWARNING: weekly counter decreased/reset; raw difference spans incompatible counters.' or '')
-            ..(m.unobservedSeconds>0 and '\nObservation gaps: efficiency is not a reliable comparison.' or '')
+        local s=A.guildSession
+        local text=s and s.active and 'TRACKING IS ON' or 'TRACKING IS OFF'
+        if s then
+            local elapsed=math.max(0,(s.active and os.time() or s.endedAt)-s.startedAt)
+            text=text..'\nTotal tracking time: '..duration(elapsed)
+        end
+        local storage=A.status['Guild storage'] or ''
+        local tracker=A.status['Guild tracker'] or ''
+        if storage:find('FAILED',1,true) or storage:find('copy update failed',1,true) then
+            text=text..'\nSave problem: '..storage
+        elseif tracker:find('Cannot start:',1,true) then text=text..'\n'..tracker
+        elseif not s and pending then text=text..'\nStarting...'
+        elseif not s and tracker:find('timed out',1,true) then text=text..'\nCould not start. Press Start Tracking to retry.' end
+        return text
     end
 end
 
@@ -1616,7 +1610,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='2.6',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='Anime Suite',SubTitle='2.7',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1954,25 +1948,10 @@ return function(A)
         toggle('Rewards',row[1],row[2])
     end
     note('Rewards','Chests','Visits ready chests in their world and claims within range. Group chest requires existing membership.')
-    note('Guild Tracker','Persistent weekly session','Start Tracking resets the previous session after a fresh roster arrives. Stop Tracking preserves the finished file. An active saved session resumes when this script is run again, even with Automation off.')
     button('Guild Tracker','Start Tracking',A.guildStart)
     button('Guild Tracker','Stop Tracking',A.guildStop)
-    button('Guild Tracker','Save tracking JSON now',function() A.guildSave() end)
-    button('Guild Tracker','Refresh guild roster',A.guildRefresh)
-    local guildSummary=note('Guild Tracker','Session',A.guildSummary())
+    local guildSummary=note('Guild Tracker','Tracking status',A.guildSummary())
     statuses[#statuses+1]=function() guildSummary:SetDesc(A.guildSummary()) end
-    status('Guild Tracker','Guild tracker'); status('Guild Tracker','Guild storage')
-    dropdown('Guild Tracker','Member','guildMember',function()
-        local out={}
-        for id,m in pairs(A.guildSession and A.guildSession.members or {}) do
-            out[#out+1]={key=id,label=m.username..' ['..id..']'..(m.inGuild and '' or ' (left)')}
-        end
-        table.sort(out,function(a,b) return a.label<b.label end); return out
-    end,function(id) return A.guildSelected==id end,function(id) A.guildSelected=id end)
-    local guildMember=note('Guild Tracker','Member progress',A.guildMemberText())
-    statuses[#statuses+1]=function() guildMember:SetDesc(A.guildMemberText()) end
-    note('Guild Tracker','Observation limits','Online time is estimated from roster samples, not exact playtime. Phone-off/crash/rejoin gaps are unobserved and never added as online hours. Contribution changes across gaps can make per-hour efficiency misleading. Weekly counter decreases are flagged; baselines never change.')
-    note('Guild Tracker','JSON location','In your executor workspace: '..A.guildFile..'. Keep the .bak and .tmp recovery copies too. Closing Roblox cannot force a final save; the last successful snapshot is retained.')
 
     input('Webhook','Webhook URL','webhookURL'); input('Webhook','Discord user ID','pingId')
     toggle('Webhook','Enable webhook','webhook'); toggle('Webhook','Send disconnect notification','sendDisconnect')
