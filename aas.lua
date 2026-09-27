@@ -1,6 +1,6 @@
--- Anime Suite 2.7 | standalone source | September 2026
+-- Anime Suite 2.8 | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
--- Fluent UI from dawid-scripts/Fluent. Autoload and automatic start are opt-in.
+-- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 local previous = environment.AnimeSuite
 if previous and type(previous.stop) == "function" then pcall(previous.stop) end
@@ -310,7 +310,7 @@ return function(A)
         gacha=false,gachaKey='',eggs=false,eggKey='',
         webhook=false,webhookURL='',pingId='',ping=false,sendDisconnect=true,
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
-        pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},blackScreen=false,startOnLoad=false,
+        pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},blackScreen=false,
         moveStyle='Walk',distance=5,saveSecrets=false}
     A.folder='AnimeSuite_'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.file=A.folder..'/settings.json'
@@ -386,7 +386,7 @@ return function(A)
         return ok
     end
     function A.finishStartup()
-        if A.autoloadApplied and A.settings.startOnLoad then A.setRunning(true) end
+        A.setRunning(true)
     end
     function A.save()
         if type(writefile)~='function' or type(readfile)~='function' or type(makefolder)~='function' then
@@ -418,7 +418,8 @@ return function(A)
         A.setRunning(false); A.settings=A.validate(saved)
         if A.render then A.render(false) end
         if A.refreshUI then A.refreshUI() end
-        A.status.Settings='Loaded settings; enable Automation to resume.'; A.log('Settings',A.status.Settings)
+        A.setRunning(true)
+        A.status.Settings='Loaded settings; enabled features are active.'; A.log('Settings',A.status.Settings)
     end
     function A.module(kind,name)
         local key=kind..':'..name
@@ -520,7 +521,6 @@ return function(A)
     end
     function A.setRunning(value)
         A.running=value; A.epoch=A.epoch+1
-        if A.syncRunningUI then A.syncRunningUI() end
         if not value then
             if A.watchTarget then A.watchTarget(nil) end
             local h=A.player.Character and A.player.Character:FindFirstChildOfClass('Humanoid')
@@ -1119,7 +1119,7 @@ return function(A)
     end
     function A.join(mode,key)
         if mode~='Tower' and mode~='TimeTrial' then return false end
-        if not A.running then A.status.Mode='Automation paused; enable the Automation toggle'; return false end
+        if not A.running then A.status.Mode='Script stopped or disconnected'; return false end
         if A.pendingMode or A.inMode() then A.status.Mode='Waiting for the current mode or entry request'; return false end
         local available,reason=A.modeAvailable(mode,key)
         if not available then A.status.Mode=reason; return false end
@@ -1610,7 +1610,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='2.7',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='Anime Suite',SubTitle='2.8',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1837,22 +1837,6 @@ return function(A)
             end)
         end
     end
-    local masters={}; local syncingRun=false
-    for _,tab in ipairs({'Farm','Quests','Modes','Upgrades','Pets','Rewards','Webhook','Settings'}) do
-        local master=tabs[tab]:AddToggle('Automation_'..tab,{Title='Automation',
-            Description='On: run enabled features. Off: pause them.',Default=A.running})
-        master:OnChanged(guard(function(value)
-            if not syncingRun and value~=A.running then A.setRunning(value==true) end
-        end))
-        masters[#masters+1]=master
-    end
-    function A.syncRunningUI()
-        syncingRun=true
-        for _,master in ipairs(masters) do if master.Value~=A.running then master:SetValue(A.running) end end
-        syncingRun=false
-
-    end
-    bindings[#bindings+1]=A.syncRunningUI
     choose('Farm','World','world',function()
         local out={}
         for id,w in pairs(A.catalog.worlds) do
@@ -1969,14 +1953,13 @@ return function(A)
     bindings[#bindings+1]=function()
         if auto.Value~=A.autoloadEnabled then auto:SetValue(A.autoloadEnabled) end
     end
-    toggle('Settings','Start automation after autoload','startOnLoad')
-    note('Settings','Save / Load / Autoload','Save writes the current configuration. Autoload restores that saved configuration next launch. Save again after changing options. Automatic start is optional; manual Load always pauses automation.')
+    note('Settings','Save / Load / Autoload','Save writes the current configuration. Autoload restores that saved configuration next launch. Save again after changing options. Loaded or autoloaded ON features run immediately. Each feature uses its own toggle.')
     local savedStatus=note('Settings','Configuration','Ready')
     statuses[#statuses+1]=function()
-        savedStatus:SetDesc('Autoload: '..(A.autoloadEnabled and 'enabled' or 'disabled')..' | '..(A.running and 'running' or 'paused'))
+        savedStatus:SetDesc('Autoload: '..(A.autoloadEnabled and 'enabled' or 'disabled'))
     end
     toggle('Settings','Black screen / disable 3D rendering','blackScreen',function(value) if A.render then A.render(value) end end)
-    note('Settings','Controls',touch and 'Tap SUITE to hide/show; drag it to reposition. Automation is controlled inside the GUI. RESTORE enables rendering. Landscape gives the menus more room.'
+    note('Settings','Controls',touch and 'Tap SUITE to hide/show; drag it to reposition. Use each feature’s own toggle. RESTORE enables rendering. Landscape gives the menus more room.'
         or 'Right Shift: minimize/show Fluent. F8: restore rendering. Rendering starts enabled.')
     note('Settings','Executor capabilities',
         'Save/load: '..((type(writefile)=='function' and type(readfile)=='function' and type(makefolder)=='function') and 'available' or 'file APIs missing')
@@ -2020,7 +2003,6 @@ return function(A)
     sync=false; A.refreshUI(); window:SelectTab(1)
     A.job('UI status',1,function()
         if F.Unloaded or not A.gui.Parent then A.stop(); return end
-        A.syncRunningUI()
         for _,update in ipairs(statuses) do update() end
     end,true)
 end
