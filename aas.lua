@@ -1,4 +1,4 @@
--- Anime Suite 2.9 | standalone source | September 2026
+-- Anime Suite 3.0 | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -133,7 +133,7 @@ return Core
 
 end)()
 A.GuildCore = (function()
-local G={pollSeconds=30,maxObservedInterval=45,autosaveSeconds=90,heartbeatSeconds=20,historyLimit=128}
+local G={pollSeconds=30,maxObservedInterval=45,autosaveSeconds=90,heartbeatSeconds=20,historyLimit=128,cphSettlingSeconds=120}
 local function finite(v) return type(v)=='number' and v==v and math.abs(v)<math.huge end
 local function iso(t) return os.date('!%Y-%m-%dT%H:%M:%SZ',t) end
 function G.append(owner,key,event)
@@ -147,6 +147,15 @@ function G.migrate(s)
         s.activeTrackingSeconds=s.observedSeconds
         s.runtimeMigration='Legacy file had no runtime clock; retained observed seconds as a conservative active-runtime baseline.'
         s.schemaVersion=2
+    end
+    if s.schemaVersion==2 then
+        for _,m in pairs(s.members) do
+            m.cphContribution=0; m.cphOnlineSeconds=0; m.cphReadyAt=false; m.cphMeasurementStartedAt=false
+        end
+        s.cphMigration='Original totals retained. Matched CpH measurements start after upgrading; old gains cannot be assigned to live intervals.'
+        s.cphMethod='cphContribution / (cphOnlineSeconds / 3600); excluded contribution remains included in Gained.'
+        s.efficiencyCaveat='CpH is a sampled live estimate after 120-second settling periods; delayed server updates may still affect attribution.'
+        s.schemaVersion=3
     end
     s.recoveries=s.recoveries or {}
     for _,key in ipairs({'gaps','recoveries'}) do
@@ -187,13 +196,14 @@ local function member(row,t)
     return {userId=row.userId,username=row.username,displayName=row.displayName,displayNameSource=row.displayNameSource,
         firstDetectedAt=t,firstDetectedAtISO=iso(t),lastDetectedAt=t,lastContributionAt=t,
         startingContribution=row.contribution,finalContribution=row.contribution,contributionGained=0,
+        cphContribution=0,cphOnlineSeconds=0,cphReadyAt=t+G.cphSettlingSeconds,cphMeasurementStartedAt=t,
         onlineSeconds=0,onlineMinutes=0,onlineHours=0,observedSeconds=0,
         onlineStatus='unknown',lastKnownOnline=false,lastSeenOnlineAt=false,serverLastSeen=row.serverLastSeen,
         inGuild=true,departedAt=false,membershipEvents={{at=t,event='firstDetected'}},
         counterDecreases={},contributionComparable=true,contributionPerHour=false}
 end
 function G.new(rows,guildId,ownerId,gameId,t,sessionId,generation)
-    local s={schemaVersion=2,sessionId=sessionId,generation=generation or 1,revision=0,
+    local s={schemaVersion=3,sessionId=sessionId,generation=generation or 1,revision=0,
         activeTrackingSeconds=0,lastSessionStartedAt=t,lastHeartbeatAt=false,recoveries={},
         ownerUserId=ownerId,gameId=gameId,guildId=tonumber(guildId),active=true,
         startedAt=t,startedAtISO=iso(t),endedAt=false,endedAtISO=false,lastSavedAt=false,
@@ -201,7 +211,8 @@ function G.new(rows,guildId,ownerId,gameId,t,sessionId,generation)
         trackedMemberCount=0,members={},gaps={},finalSnapshotStatus='notStopped',
         contributionSource='Guild roster Members[].Week',
         onlineTimeMethod='Sampled presence: credit only intervals <=45 seconds with online at both endpoints; never bridge a reload or observation gap.',
-        efficiencyCaveat='Contribution may include unobserved periods. Online time is a sampling estimate, not exact session history.'}
+        efficiencyCaveat='Gained includes the full period. CpH uses only matched live online intervals after a 120-second settling period. Server batching can still affect attribution.',
+        cphMethod='cphContribution / (cphOnlineSeconds / 3600); gap, settling, unknown/offline presence and final-snapshot deltas are excluded only from CpH, never from Gained.'}
     for id,row in pairs(rows) do s.members[id]=member(row,t) end
     return s
 end
@@ -221,11 +232,16 @@ function G.metrics(s,t)
         count=count+1
         m.onlineMinutes=m.onlineSeconds/60; m.onlineHours=m.onlineSeconds/3600
         m.contributionGained=m.finalContribution-m.startingContribution
-        m.contributionPerHour=m.onlineHours>0 and m.contributionGained/m.onlineHours or false
+        m.cphOnlineHours=m.cphOnlineSeconds/3600
+        m.contributionPerHour=m.cphOnlineSeconds>0 and m.contributionComparable
+            and m.cphContribution/m.cphOnlineHours or false
+        m.contributionExcludedFromCph=m.contributionGained-m.cphContribution
+        m.cphCoverageOfOnlineTime=m.onlineSeconds>0 and math.min(1,m.cphOnlineSeconds/m.onlineSeconds) or 0
+        m.cphSampleSufficient=m.cphOnlineSeconds>=300
         local memberEnd=m.inGuild and (tonumber(ending) or t) or (tonumber(m.departedAt) or m.lastDetectedAt)
         m.observationSpanSeconds=math.max(0,memberEnd-m.firstDetectedAt)
         m.unobservedSeconds=math.max(0,m.observationSpanSeconds-m.observedSeconds)
-        m.efficiencyReliable=m.onlineHours>0 and m.contributionComparable and m.unobservedSeconds==0
+        m.efficiencyReliable=m.cphSampleSufficient and m.contributionComparable and m.unobservedSeconds==0
     end
     s.trackedMemberCount=count
 end
@@ -247,6 +263,16 @@ function G.sample(s,rows,t,previous)
         if m.finalContribution~=row.contribution or m.onlineStatus~=(row.presenceKnown and (row.online and 'online' or 'offline') or 'unknown') then changedMembers=true end
         m.username=row.username; m.displayName=row.displayName; m.displayNameSource=row.displayNameSource
         local prior=continuous and previous.rows[id]
+        local matched=prior and interval>0 and prior.presenceKnown and row.presenceKnown and prior.online and row.online
+        local delta=row.contribution-m.finalContribution
+        if not m.cphMeasurementStartedAt then m.cphMeasurementStartedAt=t end
+        if not matched or delta<0 then
+            m.cphReadyAt=t+G.cphSettlingSeconds
+        elseif m.contributionComparable and prior.contribution==m.finalContribution
+            and previous.at>=(tonumber(m.cphReadyAt) or (t+G.cphSettlingSeconds)) then
+            m.cphContribution=m.cphContribution+delta
+            m.cphOnlineSeconds=m.cphOnlineSeconds+interval
+        end
         if prior then
             if prior.presenceKnown and row.presenceKnown then m.observedSeconds=m.observedSeconds+interval end
             if prior.presenceKnown and row.presenceKnown and prior.online and row.online then m.onlineSeconds=m.onlineSeconds+interval end
@@ -291,7 +317,7 @@ function G.finalSnapshot(s,rows,receivedAt)
     G.metrics(s,s.endedAt)
 end
 function G.valid(s,ownerId,gameId)
-    if type(s)~='table' or (s.schemaVersion~=1 and s.schemaVersion~=2) or s.ownerUserId~=ownerId or s.gameId~=gameId
+    if type(s)~='table' or (s.schemaVersion~=1 and s.schemaVersion~=2 and s.schemaVersion~=3) or s.ownerUserId~=ownerId or s.gameId~=gameId
         or not G.id(s.guildId) or type(s.sessionId)~='string' or type(s.active)~='boolean'
         or not finite(s.startedAt) or type(s.startedAtISO)~='string'
         or not finite(s.generation) or s.generation<1 or not finite(s.revision) or s.revision<0
@@ -299,7 +325,7 @@ function G.valid(s,ownerId,gameId)
         or s.observedSeconds<0 or (s.lastObservedAt~=false and not finite(s.lastObservedAt))
         or (s.lastSavedAt~=false and not finite(s.lastSavedAt))
         or (not s.active and not finite(s.endedAt)) then return false end
-    if s.schemaVersion==2 and (not finite(s.activeTrackingSeconds) or s.activeTrackingSeconds<0
+    if s.schemaVersion>=2 and (not finite(s.activeTrackingSeconds) or s.activeTrackingSeconds<0
         or type(s.recoveries)~='table') then return false end
     for id,m in pairs(s.members) do
         if type(m)~='table' or G.id(m.userId)~=id or type(m.username)~='string' or type(m.displayName)~='string'
@@ -308,6 +334,10 @@ function G.valid(s,ownerId,gameId)
             or not finite(m.onlineSeconds) or m.onlineSeconds<0 or not finite(m.observedSeconds) or m.observedSeconds<0
             or not finite(m.firstDetectedAt) or not finite(m.lastDetectedAt)
             or type(m.membershipEvents)~='table' or type(m.counterDecreases)~='table' then return false end
+        if s.schemaVersion==3 and (not finite(m.cphContribution) or m.cphContribution<0
+            or not finite(m.cphOnlineSeconds) or m.cphOnlineSeconds<0
+            or (m.cphReadyAt~=false and not finite(m.cphReadyAt))
+            or (m.cphMeasurementStartedAt~=false and not finite(m.cphMeasurementStartedAt))) then return false end
     end
     return true
 end
@@ -1834,7 +1864,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='2.9',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.0',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
