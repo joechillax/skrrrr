@@ -1,4 +1,4 @@
--- Anime Suite 2.8 | standalone source | September 2026
+-- Anime Suite 2.9 | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -133,9 +133,32 @@ return Core
 
 end)()
 A.GuildCore = (function()
-local G={pollSeconds=30,maxObservedInterval=75}
+local G={pollSeconds=30,maxObservedInterval=45,autosaveSeconds=90,heartbeatSeconds=20,historyLimit=128}
 local function finite(v) return type(v)=='number' and v==v and math.abs(v)<math.huge end
 local function iso(t) return os.date('!%Y-%m-%dT%H:%M:%SZ',t) end
+function G.append(owner,key,event)
+    local list=owner[key] or {}; owner[key]=list
+    if #list>=G.historyLimit then table.remove(list,1); owner[key..'Dropped']=(owner[key..'Dropped'] or 0)+1 end
+    list[#list+1]=event
+end
+function G.migrate(s)
+    if s.schemaVersion==1 then
+        s.legacyWallElapsedSeconds=s.totalElapsedSeconds
+        s.activeTrackingSeconds=s.observedSeconds
+        s.runtimeMigration='Legacy file had no runtime clock; retained observed seconds as a conservative active-runtime baseline.'
+        s.schemaVersion=2
+    end
+    s.recoveries=s.recoveries or {}
+    for _,key in ipairs({'gaps','recoveries'}) do
+        while #s[key]>G.historyLimit do table.remove(s[key],1); s[key..'Dropped']=(s[key..'Dropped'] or 0)+1 end
+    end
+    for _,m in pairs(s.members) do
+        for _,key in ipairs({'membershipEvents','counterDecreases'}) do
+            while #m[key]>G.historyLimit do table.remove(m[key],1); m[key..'Dropped']=(m[key..'Dropped'] or 0)+1 end
+        end
+    end
+    return s
+end
 function G.id(v)
     local n=tonumber(v)
     if not n or not finite(n) or n<=0 or n%1~=0 then return nil end
@@ -170,24 +193,28 @@ local function member(row,t)
         counterDecreases={},contributionComparable=true,contributionPerHour=false}
 end
 function G.new(rows,guildId,ownerId,gameId,t,sessionId,generation)
-    local s={schemaVersion=1,sessionId=sessionId,generation=generation or 1,revision=0,
+    local s={schemaVersion=2,sessionId=sessionId,generation=generation or 1,revision=0,
+        activeTrackingSeconds=0,lastSessionStartedAt=t,lastHeartbeatAt=false,recoveries={},
         ownerUserId=ownerId,gameId=gameId,guildId=tonumber(guildId),active=true,
         startedAt=t,startedAtISO=iso(t),endedAt=false,endedAtISO=false,lastSavedAt=false,
         lastObservedAt=false,totalElapsedSeconds=0,observedSeconds=0,unobservedSeconds=0,
         trackedMemberCount=0,members={},gaps={},finalSnapshotStatus='notStopped',
         contributionSource='Guild roster Members[].Week',
-        onlineTimeMethod='Sampled presence: credit only intervals <=75 seconds with online at both endpoints; never bridge a reload or observation gap.',
+        onlineTimeMethod='Sampled presence: credit only intervals <=45 seconds with online at both endpoints; never bridge a reload or observation gap.',
         efficiencyCaveat='Contribution may include unobserved periods. Online time is a sampling estimate, not exact session history.'}
     for id,row in pairs(rows) do s.members[id]=member(row,t) end
     return s
 end
 function G.metrics(s,t)
     local ending=s.active and t or s.endedAt
-    s.totalElapsedSeconds=math.max(0,(tonumber(ending) or t)-s.startedAt)
+    s.wallElapsedSeconds=math.max(0,(tonumber(ending) or t)-s.startedAt)
+    s.totalElapsedSeconds=s.activeTrackingSeconds or s.observedSeconds
+    s.activeTrackingHours=s.totalElapsedSeconds/3600
     s.totalElapsedHours=s.totalElapsedSeconds/3600
     s.totalElapsedMinutes=s.totalElapsedSeconds/60
     s.observedHours=s.observedSeconds/3600
-    s.unobservedSeconds=math.max(0,s.totalElapsedSeconds-s.observedSeconds)
+    s.unobservedSeconds=math.max(0,s.wallElapsedSeconds-s.observedSeconds)
+    s.unobservedActiveSeconds=math.max(0,s.totalElapsedSeconds-s.observedSeconds)
     s.unobservedHours=s.unobservedSeconds/3600
     local count=0
     for _,m in pairs(s.members) do
@@ -207,16 +234,17 @@ function G.sample(s,rows,t,previous)
     local continuous=previous~=nil and interval>=0 and interval<=G.maxObservedInterval
     if continuous then s.observedSeconds=s.observedSeconds+interval
     elseif s.lastObservedAt and t>s.lastObservedAt then
-        s.gaps[#s.gaps+1]={from=s.lastObservedAt,to=t,seconds=t-s.lastObservedAt,reason='No continuous observation'}
+        G.append(s,'gaps',{from=s.lastObservedAt,to=t,seconds=t-s.lastObservedAt,reason='No continuous observation'})
     end
     local changedMembers=false
     for id,row in pairs(rows) do
         local m=s.members[id]
         if not m then m=member(row,t); s.members[id]=m; changedMembers=true end
         if not m.inGuild then
-            m.membershipEvents[#m.membershipEvents+1]={at=t,event='returned'}; changedMembers=true
+            G.append(m,'membershipEvents',{at=t,event='returned'}); changedMembers=true
         end
         if m.username~=row.username or m.displayName~=row.displayName then changedMembers=true end
+        if m.finalContribution~=row.contribution or m.onlineStatus~=(row.presenceKnown and (row.online and 'online' or 'offline') or 'unknown') then changedMembers=true end
         m.username=row.username; m.displayName=row.displayName; m.displayNameSource=row.displayNameSource
         local prior=continuous and previous.rows[id]
         if prior then
@@ -224,8 +252,8 @@ function G.sample(s,rows,t,previous)
             if prior.presenceKnown and row.presenceKnown and prior.online and row.online then m.onlineSeconds=m.onlineSeconds+interval end
         end
         if row.contribution<m.finalContribution then
-            m.counterDecreases[#m.counterDecreases+1]={at=t,before=m.finalContribution,after=row.contribution,
-                possibleWeeklyReset=true}
+            G.append(m,'counterDecreases',{at=t,before=m.finalContribution,after=row.contribution,
+                possibleWeeklyReset=true})
             m.contributionComparable=false
         end
         m.finalContribution=row.contribution; m.lastContributionAt=t
@@ -237,7 +265,7 @@ function G.sample(s,rows,t,previous)
     for id,m in pairs(s.members) do
         if not rows[id] and m.inGuild then
             m.inGuild=false; m.departedAt=t; m.onlineStatus='unknown'
-            m.membershipEvents[#m.membershipEvents+1]={at=t,event='noLongerInRoster'}; changedMembers=true
+            G.append(m,'membershipEvents',{at=t,event='noLongerInRoster'}); changedMembers=true
         end
     end
     s.lastObservedAt=t; G.metrics(s,t)
@@ -253,7 +281,7 @@ function G.finalSnapshot(s,rows,receivedAt)
         local row=rows[id]
         if row then
             if row.contribution<m.finalContribution then
-                m.counterDecreases[#m.counterDecreases+1]={at=receivedAt,before=m.finalContribution,after=row.contribution,possibleWeeklyReset=true}
+                G.append(m,'counterDecreases',{at=receivedAt,before=m.finalContribution,after=row.contribution,possibleWeeklyReset=true})
                 m.contributionComparable=false
             end
             m.finalContribution=row.contribution; m.lastContributionAt=receivedAt
@@ -263,7 +291,7 @@ function G.finalSnapshot(s,rows,receivedAt)
     G.metrics(s,s.endedAt)
 end
 function G.valid(s,ownerId,gameId)
-    if type(s)~='table' or s.schemaVersion~=1 or s.ownerUserId~=ownerId or s.gameId~=gameId
+    if type(s)~='table' or (s.schemaVersion~=1 and s.schemaVersion~=2) or s.ownerUserId~=ownerId or s.gameId~=gameId
         or not G.id(s.guildId) or type(s.sessionId)~='string' or type(s.active)~='boolean'
         or not finite(s.startedAt) or type(s.startedAtISO)~='string'
         or not finite(s.generation) or s.generation<1 or not finite(s.revision) or s.revision<0
@@ -271,6 +299,8 @@ function G.valid(s,ownerId,gameId)
         or s.observedSeconds<0 or (s.lastObservedAt~=false and not finite(s.lastObservedAt))
         or (s.lastSavedAt~=false and not finite(s.lastSavedAt))
         or (not s.active and not finite(s.endedAt)) then return false end
+    if s.schemaVersion==2 and (not finite(s.activeTrackingSeconds) or s.activeTrackingSeconds<0
+        or type(s.recoveries)~='table') then return false end
     for id,m in pairs(s.members) do
         if type(m)~='table' or G.id(m.userId)~=id or type(m.username)~='string' or type(m.displayName)~='string'
             or type(m.onlineStatus)~='string' or type(m.inGuild)~='boolean' or type(m.contributionComparable)~='boolean'
@@ -531,7 +561,7 @@ return function(A)
     end
     function A.stop()
         if not A.alive then return end
-        if A.guildCheckpoint then A.guildCheckpoint() end
+        if A.guildCheckpoint then A.guildCheckpoint('unload') end
         A.setRunning(false); if A.render then A.render(false) end
         A.alive=false
         for _,c in ipairs(A.connections) do pcall(function() c:Disconnect() end) end
@@ -595,26 +625,32 @@ return function(A)
     A.httpRequest=(type(request)=='function' and request) or (type(http_request)=='function' and http_request)
         or (type(syn)=='table' and syn.request)
     A.webhookNext=0
+    local env=(type(getgenv)=='function' and getgenv()) or _G
+    env.AnimeSuiteHTTP=env.AnimeSuiteHTTP or {busy=false}
+    local transport=env.AnimeSuiteHTTP
     local function fingerprint(url)
         local n=0; for i=1,#url do n=(n*31+url:byte(i))%2147483647 end; return tostring(n)
     end
     local function persist()
         if type(writefile)=='function' and type(makefolder)=='function' then
-            pcall(function() pcall(makefolder,A.folder); writefile(A.folder..'/outbox.json',A.S.HTTP:JSONEncode(A.outbox)) end)
+            local ok,err=pcall(function() pcall(makefolder,A.folder); writefile(A.folder..'/outbox.json',A.S.HTTP:JSONEncode(A.outbox)) end)
+            if not ok then A.status.Webhook='Outbox save failed: '..tostring(err); A.log('Webhook',A.status.Webhook) end
+            return ok
         end
+        return false
     end
     function A.http(options)
         if not A.httpRequest then return false,'HTTP request API unavailable' end
-        if A.httpBusy then return false,'HTTP already in flight' end
+        if transport.busy then return false,'HTTP already in flight' end
         options.Timeout=15
-        A.httpBusy=true; local response
-        task.spawn(function() response=table.pack(pcall(A.httpRequest,options)); A.httpBusy=false end)
+        A.httpBusy=true; transport.busy=true; local response
+        task.spawn(function() response=table.pack(pcall(A.httpRequest,options)); A.httpBusy=false; transport.busy=false end)
         local deadline=os.clock()+15
         while A.alive and not response and os.clock()<deadline do task.wait(0.05) end
         if not response then return false,'HTTP timed out; waiting for transport to recover' end
         return table.unpack(response,1,response.n)
     end
-    function A.notify(kind,message,force)
+    function A.notify(kind,message,force,attachment)
         local s=A.settings
         if not s.webhook or (not force and s.webhookEvents[kind]==false) then return end
         if kind=='Disconnect' and not s.sendDisconnect then return end
@@ -622,14 +658,29 @@ return function(A)
             and not s.webhookURL:match('^https://discordapp%.com/api/webhooks/%d+/[%w_%-]+') then
             A.status.Webhook='Enter a Discord webhook URL'; return
         end
-        if #A.outbox>=50 then table.remove(A.outbox,1) end
+        if attachment then
+            for _,entry in ipairs(A.outbox) do
+                if entry.attachment and entry.attachment.key==attachment.key then
+                    if persist() then return entry end
+                    return
+                end
+            end
+        end
+        if #A.outbox>=50 then
+            local discard
+            for i,entry in ipairs(A.outbox) do if not entry.attachment then discard=i; break end end
+            if not discard then A.status.Webhook='Upload queue full; local exports retained'; return end
+            table.remove(A.outbox,discard)
+        end
         local ping=s.ping and kind~='Test' and s.pingEvents[kind]~=false and s.pingId:match('^%d+$') and s.pingId or nil
         A.outbox[#A.outbox+1]={kind=kind,message=tostring(message):sub(1,1500),time=os.time(),attempt=0,
-            target=fingerprint(s.webhookURL),ping=ping}
-        persist(); A.webhookNext=kind=='Disconnect' and 0 or A.webhookNext
+            target=fingerprint(s.webhookURL),ping=ping,attachment=attachment}
+        local saved=persist(); A.webhookNext=kind=='Disconnect' and 0 or A.webhookNext
+        if attachment and not saved then return end
+        return A.outbox[#A.outbox]
     end
     A.job('Webhook delivery',1,function()
-        if not A.settings.webhook or #A.outbox==0 or os.clock()<A.webhookNext or A.httpBusy then return end
+        if not A.alive or not A.settings.webhook or #A.outbox==0 or os.clock()<A.webhookNext or transport.busy then return end
         local entry=A.outbox[1]
         if type(entry)~='table' or type(entry.message)~='string' or entry.target~=fingerprint(A.settings.webhookURL) then
             table.remove(A.outbox,1); persist(); return
@@ -638,8 +689,29 @@ return function(A)
             allowed_mentions={parse={},users=entry.ping and {entry.ping} or {}},
             embeds={{title='Anime Suite / '..tostring(entry.kind),description=entry.message,
                 footer={text='Place '..tostring(game.PlaceId)..' | event '..tostring(entry.time)}}}}
-        local ok,response=A.http({Url=A.settings.webhookURL,Method='POST',
-            Headers={['Content-Type']='application/json'},Body=A.S.HTTP:JSONEncode(payload)})
+        local contentType='application/json'; local data=A.S.HTTP:JSONEncode(payload)
+        if entry.attachment then
+            local file=entry.attachment
+            local valid=type(file.path)=='string' and file.path:sub(1,#A.folder+14)==A.folder..'/guild-export-'
+                and not file.path:find('..',1,true) and type(file.name)=='string' and file.name:match('^[%w_%-%.]+%.json$')
+            local readOK,bytes=false,nil
+            if valid and type(readfile)=='function' then readOK,bytes=pcall(readfile,file.path) end
+            if not readOK or type(bytes)~='string' then
+                A.status['Guild upload']='Upload failed: saved attachment unavailable; main JSON retained'
+                if A.guildExportFailed then A.guildExportFailed(file.key) end
+                A.log('Webhook',A.status['Guild upload']); table.remove(A.outbox,1); persist(); return
+            end
+            local boundary='AnimeSuite'..tostring(os.time())..tostring(math.random(100000,999999))
+            while bytes:find(boundary,1,true) do boundary=boundary..'x' end
+            contentType='multipart/form-data; boundary='..boundary
+            data='--'..boundary..'\r\nContent-Disposition: form-data; name="payload_json"\r\nContent-Type: application/json\r\n\r\n'
+                ..data..'\r\n--'..boundary..'\r\nContent-Disposition: form-data; name="files[0]"; filename="'..file.name
+                ..'"\r\nContent-Type: application/json\r\n\r\n'..bytes..'\r\n--'..boundary..'--\r\n'
+        end
+        local url=A.settings.webhookURL:gsub('([?&])wait=[^&]*','%1wait=true')
+        if not url:find('wait=',1,true) then url=url..(url:find('?',1,true) and '&' or '?')..'wait=true' end
+        local ok,response=A.http({Url=url,Method='POST',Headers={['Content-Type']=contentType},Body=data})
+        if not A.alive then return end
         local status=ok and type(response)=='table' and tonumber(response.StatusCode or response.Status) or 0
         local body; if ok and type(response)=='table' then
             local parsed,value=pcall(A.S.HTTP.JSONDecode,A.S.HTTP,response.Body or '')
@@ -657,13 +729,22 @@ return function(A)
         else
             A.webhookNext=os.clock()+delay; A.status.Webhook='Retry in '..math.ceil(delay)..'s (HTTP '..tostring(status)..')'
         end
+        if action~='done' then
+            local detail=type(response)=='table' and tostring(response.Body or ''):sub(1,500) or tostring(response):sub(1,500)
+            A.status.Webhook=A.status.Webhook..' | '..detail
+            A.log('Webhook',A.status.Webhook)
+        end
+        if entry.attachment then A.status['Guild upload']=A.status.Webhook..' (local JSON retained)' end
+        if entry.attachment and (action=='stop' or (action~='done' and entry.attempt>=8 and status~=429)) then
+            if A.guildExportFailed then A.guildExportFailed(entry.attachment.key) end
+        end
         persist()
     end,true)
     local sent=false
     local function disconnected(message)
         if not sent and tostring(message)~='' then
             sent=true; A.notify('Disconnect','Client connection/error message: '..tostring(message))
-            if A.guildCheckpoint then A.guildCheckpoint() end
+            if A.guildCheckpoint then A.guildCheckpoint('disconnect') end
             A.setRunning(false)
         end
     end
@@ -681,7 +762,7 @@ return function(A)
     end
     A.status.Disconnect=connected and 'Error-message listener connected' or 'Error-message signals unavailable in this executor'
     A.job('Disconnect fallback',2,function()
-        if not sent and A.settings.webhook and A.settings.sendDisconnect then
+        if not sent and ((A.settings.webhook and A.settings.sendDisconnect) or (A.guildSession and A.guildSession.active)) then
             local readOK,message=pcall(function() return A.S.Gui:GetErrorMessage() end)
             if readOK and type(message)=='string' and message~='' then disconnected(message) end
         end
@@ -1421,6 +1502,95 @@ end
 
 end)()(A);
 
+-- ===== guild_clock =====
+(function()
+return function(A)
+    local G=A.GuildCore
+    local lastClock,lastBeat=nil,0
+    local suspended=false
+    A.guildHeartbeatFile=A.folder..'/guild-heartbeat.json'
+    local function finite(n) return type(n)=='number' and n==n and n>=0 and n<math.huge end
+    function A.guildAccrue()
+        local now=os.clock(); local s=A.guildSession
+        if s and s.active and not suspended and lastClock then
+            local delta=now-lastClock
+            if delta>=0 and delta<=G.maxObservedInterval then
+                s.activeTrackingSeconds=s.activeTrackingSeconds+delta
+            elseif delta>G.maxObservedInterval then
+                s.runtimeStallSeconds=(s.runtimeStallSeconds or 0)+delta
+                if A.guildBreakObservation then A.guildBreakObservation() end
+            end
+        end
+        lastClock=now
+    end
+    function A.guildRuntimeSeconds()
+        local s=A.guildSession; if not s then return 0 end
+        local delta=lastClock and os.clock()-lastClock or 0
+        if not s.active or suspended or delta<0 or delta>G.maxObservedInterval then delta=0 end
+        return s.activeTrackingSeconds+delta
+    end
+    function A.guildIsSuspended() return suspended end
+    function A.guildHeartbeat(force,reason)
+        local s=A.guildSession
+        if not s or not s.active or (suspended and not force) then return end
+        if not force and os.clock()-lastBeat<G.heartbeatSeconds then return end
+        A.guildAccrue(); lastBeat=os.clock()
+        local h={schemaVersion=1,sessionId=s.sessionId,generation=s.generation,ownerUserId=s.ownerUserId,
+            gameId=s.gameId,active=true,activeTrackingSeconds=s.activeTrackingSeconds,
+            lastHeartbeatAt=os.time(),lastFullSaveAt=s.lastSavedAt,exitReason=reason or false}
+        local ok,err=pcall(function()
+            local encoded=A.S.HTTP:JSONEncode(h)
+            for _,suffix in ipairs({'','.bak'}) do
+                writefile(A.guildHeartbeatFile..suffix,encoded)
+                local check=A.safeLoad(A.guildHeartbeatFile..suffix)
+                assert(check and check.sessionId==h.sessionId and check.lastHeartbeatAt==h.lastHeartbeatAt,'Heartbeat read-back failed')
+            end
+        end)
+        if ok then s.lastHeartbeatAt=h.lastHeartbeatAt
+        else A.status['Guild storage']='HEARTBEAT SAVE FAILED: '..tostring(err); A.log('Guild',A.status['Guild storage']) end
+    end
+    function A.guildAttachClock(restored)
+        local s=A.guildSession; if not s then return end
+        G.migrate(s); lastClock=os.clock(); lastBeat=0; suspended=false
+        if restored and s.active then
+            local best
+            for _,suffix in ipairs({'','.bak'}) do
+                local h=A.safeLoad(A.guildHeartbeatFile..suffix)
+                if type(h)=='table' and h.schemaVersion==1 and h.sessionId==s.sessionId and h.generation==s.generation
+                    and h.ownerUserId==s.ownerUserId and h.gameId==s.gameId and h.active==true
+                    and finite(h.lastHeartbeatAt) and finite(h.activeTrackingSeconds)
+                    and (not best or h.lastHeartbeatAt>best.lastHeartbeatAt) then best=h end
+            end
+            local prior=tonumber(s.lastHeartbeatAt) or tonumber(s.lastSavedAt)
+            if best and best.lastHeartbeatAt>=(tonumber(s.lastSavedAt) or 0) then
+                s.activeTrackingSeconds=math.max(s.activeTrackingSeconds,best.activeTrackingSeconds)
+                prior=best.lastHeartbeatAt
+            end
+            if prior then
+                local r={lastHeartbeatAt=prior,resumedAt=os.time(),gapSeconds=math.max(0,os.time()-prior),
+                    previousLastSavedAt=s.lastSavedAt,exitReason=best and best.exitReason or false,
+                    note='Gap after last recorded heartbeat excluded; this does not establish an exact crash time.'}
+                G.append(s,'recoveries',r); s.pendingRecoveryNotice=r
+                A.log('Guild','Restored active runtime; gap after '..os.date('!%Y-%m-%d %H:%M:%S UTC',prior)..' excluded.')
+            end
+        end
+        if s.active then s.lastSessionStartedAt=os.time() end
+        G.metrics(s,os.time())
+    end
+    function A.guildSuspend(reason)
+        local s=A.guildSession; if not s or not s.active or suspended then return end
+        A.guildAccrue(); suspended=true
+        if A.guildBreakObservation then A.guildBreakObservation() end
+        A.guildHeartbeat(true,reason); A.guildSave()
+    end
+    function A.guildResumeClock()
+        suspended=false; lastClock=os.clock()
+        if A.guildBreakObservation then A.guildBreakObservation() end
+    end
+end
+
+end)()(A);
+
 -- ===== guild =====
 (function()
 return function(A)
@@ -1439,12 +1609,15 @@ return function(A)
         return best
     end
     A.guildSession=loadSession()
+    function A.guildBreakObservation() previous=nil; pending=nil end
+    A.guildAttachClock(true)
     function A.guildSave(candidate)
         if saving then return false end
         if type(writefile)~='function' or type(readfile)~='function' or type(makefolder)~='function' then
             A.status['Guild storage']='File APIs required; tracking cannot be persisted'; return false
         end
         local s=candidate or A.guildSession; if not s then return false end
+        if not candidate then A.guildAccrue() end
         saving=true
         local snapshot=C.copy(s); G.metrics(snapshot,os.time())
         snapshot.revision=snapshot.revision+1; snapshot.lastSavedAt=os.time()
@@ -1471,6 +1644,32 @@ return function(A)
             A.status['Guild storage']='Saved '..s.lastSavedAtISO
         else A.status['Guild storage']=(durable and 'RECOVERY COPY SAVED; copy update failed: ' or 'SAVE FAILED: ')..tostring(err); A.log('Guild',A.status['Guild storage']) end
         return durable
+    end
+    function A.guildQueueExport()
+        local s=A.guildSession
+        if not s or s.active or s.finalSnapshotStatus=='pending' then return end
+        if s.exportQueued then return end
+        local name='GuildTracking_'..os.date('!%Y-%m-%d',s.startedAt)..'.json'
+        local path=A.folder..'/guild-export-'..s.sessionId:gsub('[^%w%-_]','_')..'-'..s.generation..'.json'
+        local ok,err=pcall(function()
+            local snapshot=C.copy(s); G.metrics(snapshot,s.endedAt)
+            local encoded=A.S.HTTP:JSONEncode(snapshot)
+            writefile(path,encoded)
+            assert(readfile(path)==encoded,'Export read-back failed')
+        end)
+        if not ok then A.status['Guild upload']='Export failed: '..tostring(err); A.log('Guild',A.status['Guild upload']); return end
+        local message='Started: '..s.startedAtISO..'\nStopped: '..s.endedAtISO
+            ..'\nACTIVE tracking: '..string.format('%.2f hours',s.activeTrackingSeconds/3600)
+            ..'\nMembers: '..s.trackedMemberCount..'\nLast save: '..tostring(s.lastSavedAtISO)
+        local entry=A.notify('GuildExport',message,true,{path=path,name=name,key=s.sessionId..':'..s.generation})
+        if entry then s.exportQueued=true; A.guildSave(); A.status['Guild upload']='JSON upload queued'
+        else A.status['Guild upload']='JSON kept locally. Enable webhook and enter its URL, then press Stop Tracking to retry.' end
+    end
+    function A.guildExportFailed(key)
+        local s=A.guildSession
+        if s and not s.active and key==s.sessionId..':'..s.generation then
+            s.exportQueued=false; s.exportRequested=false; A.guildSave()
+        end
     end
     local function currentGuild() return G.id((A.data() or {}).GuildId) end
     local function sendRoster(kind)
@@ -1499,10 +1698,13 @@ return function(A)
     end
     function A.guildStop()
         local s=A.guildSession
-        if not s or not s.active then A.status['Guild tracker']='No active tracking session'; return end
+        if not s then return end
+        if not s.active then s.exportRequested=true; A.guildQueueExport(); return end
+        A.guildAccrue()
+        s.exportRequested=true
         pending=nil; G.stop(s,os.time()); previous=nil
         A.guildSave(); A.status['Guild tracker']='Stopped; requesting final contribution snapshot'
-        if not sendRoster('stop') then s.finalSnapshotStatus='unavailable'; A.guildSave() end
+        if not sendRoster('stop') then s.finalSnapshotStatus='unavailable'; A.guildSave(); A.guildQueueExport() end
     end
     function A.guildRefresh()
         if A.guildSession and A.guildSession.active then sendRoster('poll')
@@ -1517,6 +1719,8 @@ return function(A)
             return
         end
         if currentGuild()~=request.guildId then pending=nil; previous=nil; return end
+        if A.guildIsSuspended() and request.kind=='poll' then pending=nil; return end
+        A.guildAccrue()
         pending=nil; local now=os.time(); local s=A.guildSession
         if request.kind=='start' then
             local guid
@@ -1526,37 +1730,56 @@ return function(A)
             local first=G.sample(fresh,rows,now,nil)
             if not A.guildSave(fresh) then A.status['Guild tracker']='New session could not be fully saved; inspect Guild storage'; return end
             A.guildSession=fresh; previous=first; s=fresh
+            A.guildAttachClock(false); A.guildHeartbeat(true)
             A.status['Guild tracker']='Tracking started; existing contribution stored as the baseline'
         elseif request.kind=='stop' then
             if not s or s.active then return end
             G.finalSnapshot(s,rows,now)
             local saved=A.guildSave()
             A.status['Guild tracker']=saved and 'Tracking stopped; final snapshot saved' or 'Tracking stopped; final save failed (see Guild storage)'
+            A.guildQueueExport()
         elseif s and s.active and G.id(s.guildId)==request.guildId then
-            previous=G.sample(s,rows,now,previous); A.guildSave()
+            local changed
+            previous,changed=G.sample(s,rows,now,previous)
+            if changed then A.guildSave() end
             A.status['Guild tracker']='Tracking '..s.trackedMemberCount..' members; presence is sampled'
         end
     end)
-    function A.guildCheckpoint()
+    function A.guildCheckpoint(reason)
+        if reason then A.guildSuspend(reason); return end
         if A.guildSession and A.guildSession.active then
             previous=nil; pending=nil
-            A.guildSave()
+            A.guildHeartbeat(true); A.guildSave()
         end
     end
-    A.connect(A.player.OnTeleport,function() A.guildCheckpoint() end)
-    A.connect(A.S.Players.PlayerRemoving,function(player) if player==A.player then A.guildCheckpoint() end end)
-    A.job('Guild tracker',2,function()
+    A.connect(A.player.OnTeleport,function(state)
+        if state==Enum.TeleportState.Started then A.guildSuspend('teleport')
+        elseif state==Enum.TeleportState.Failed then A.guildResumeClock() end
+    end)
+    A.connect(A.S.Players.PlayerRemoving,function(player) if player==A.player then A.guildSuspend('departure') end end)
+    A.job('Guild tracker',5,function()
         local s=A.guildSession
+        if not A.alive then return end
+        A.guildAccrue()
         if pending and os.clock()>pending.deadline then
             local kind=pending.kind; pending=nil; previous=nil
             A.status['Guild tracker']='Roster response timed out; no online time added for the gap'
-            if kind=='stop' and s then s.finalSnapshotStatus='unavailable'; A.guildSave() end
+            if kind=='stop' and s then s.finalSnapshotStatus='unavailable'; A.guildSave(); A.guildQueueExport() end
         end
-        if not s or not s.active then return end
+        if not s or not s.active or A.guildIsSuspended() then return end
+        if s.pendingRecoveryNotice then
+            local r=s.pendingRecoveryNotice
+            local entry=A.notify('Disconnect','Previous tracker last recorded heartbeat: '
+                ..os.date('!%Y-%m-%d %H:%M:%S UTC',r.lastHeartbeatAt)..'\nResumed: '
+                ..os.date('!%Y-%m-%d %H:%M:%S UTC',r.resumedAt)..'\nGap: '..r.gapSeconds
+                ..' seconds (not counted). Exact crash time/cause is unknown.',true)
+            if entry then s.pendingRecoveryNotice=false; A.guildSave() end
+        end
         if s.lastObservedAt and os.time()-s.lastObservedAt>G.maxObservedInterval then
             for _,m in pairs(s.members) do if m.inGuild then m.onlineStatus='unknown' end end
         end
-        if not s.lastSavedAt or os.time()-s.lastSavedAt>=30 then A.guildSave() end
+        A.guildHeartbeat(false)
+        if not s.lastSavedAt or os.time()-s.lastSavedAt>=G.autosaveSeconds then A.guildSave() end
         sendRoster('poll')
     end,true)
     if A.guildSession then
@@ -1568,6 +1791,7 @@ return function(A)
             if A.guildSession.finalSnapshotStatus=='pending' then
                 A.guildSession.finalSnapshotStatus='unavailableAfterRestart'; A.guildSave()
             end
+            if A.guildSession.exportRequested and not A.guildSession.exportQueued then A.guildQueueExport() end
         end
     else A.status['Guild tracker']='No valid saved session; press Start Tracking when ready' end
     local function duration(seconds) return string.format('%dh %dm',math.floor(seconds/3600),math.floor(seconds/60)%60) end
@@ -1575,8 +1799,7 @@ return function(A)
         local s=A.guildSession
         local text=s and s.active and 'TRACKING IS ON' or 'TRACKING IS OFF'
         if s then
-            local elapsed=math.max(0,(s.active and os.time() or s.endedAt)-s.startedAt)
-            text=text..'\nTotal tracking time: '..duration(elapsed)
+            text=text..'\nTotal tracking time (active): '..duration(A.guildRuntimeSeconds())
         end
         local storage=A.status['Guild storage'] or ''
         local tracker=A.status['Guild tracker'] or ''
@@ -1585,6 +1808,7 @@ return function(A)
         elseif tracker:find('Cannot start:',1,true) then text=text..'\n'..tracker
         elseif not s and pending then text=text..'\nStarting...'
         elseif not s and tracker:find('timed out',1,true) then text=text..'\nCould not start. Press Start Tracking to retry.' end
+        if A.status['Guild upload'] then text=text..'\n'..A.status['Guild upload'] end
         return text
     end
 end
@@ -1610,7 +1834,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='2.8',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='Anime Suite',SubTitle='2.9',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1944,7 +2168,7 @@ return function(A)
     multi('Webhook','Events to ping','pingEvents',choices({'Disconnect','Mode','Progress','Error','Inventory'}))
     toggle('Webhook','Save webhook URL locally with settings','saveSecrets')
     button('Webhook','Send test notification',function() A.notify('Test','Webhook test from Anime Suite',true) end)
-    note('Webhook','Disconnect alerts only','This in-game sender cannot report a Roblox process crash: its code stops with Roblox. Crash alerts require a separate companion outside the game. The URL is excluded from saved settings unless enabled above.')
+    note('Webhook','Disconnect / recovery','A hard crash stops the sender. Guild tracking records a local heartbeat and reports the interruption after you rerun the script. Stop Tracking sends its JSON attachment here. Save the URL with settings and enable autoload to restore it after rejoining.')
     status('Webhook','Webhook'); status('Webhook','Disconnect')
     button('Settings','Save settings',function() A.save() end)
     button('Settings','Load settings',function() A.load() end)
