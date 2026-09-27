@@ -1,4 +1,4 @@
--- Anime Suite 2.3 | standalone source | September 2026
+-- Anime Suite 2.4 | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload and automatic start are opt-in.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -266,7 +266,7 @@ return function(A)
         A.setRunning(false); A.settings=A.validate(saved)
         if A.render then A.render(false) end
         if A.refreshUI then A.refreshUI() end
-        A.status.Settings='Loaded settings; press Start to resume.'; A.log('Settings',A.status.Settings)
+        A.status.Settings='Loaded settings; enable Automation to resume.'; A.log('Settings',A.status.Settings)
     end
     function A.module(kind,name)
         local key=kind..':'..name
@@ -368,6 +368,7 @@ return function(A)
     end
     function A.setRunning(value)
         A.running=value; A.epoch=A.epoch+1
+        if A.syncRunningUI then A.syncRunningUI() end
         if not value then
             if A.watchTarget then A.watchTarget(nil) end
             local h=A.player.Character and A.player.Character:FindFirstChildOfClass('Humanoid')
@@ -964,7 +965,7 @@ return function(A)
     end
     function A.join(mode,key)
         if mode~='Tower' and mode~='TimeTrial' then return false end
-        if not A.running then A.status.Mode='Automation paused; press Start / Pause'; return false end
+        if not A.running then A.status.Mode='Automation paused; enable the Automation toggle'; return false end
         if A.pendingMode or A.inMode() then A.status.Mode='Waiting for the current mode or entry request'; return false end
         local available,reason=A.modeAvailable(mode,key)
         if not available then A.status.Mode=reason; return false end
@@ -1285,7 +1286,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='2.3',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='Anime Suite',SubTitle='2.4',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1325,7 +1326,18 @@ return function(A)
             A.connect(b.Activated,callback); A.touchControls[name]=b; return b
         end
         touchButton('SUITE',-168,function() window:Minimize() end)
-        touchButton('START',-84,function() A.setRunning(not A.running) end)
+        local auto=touchButton('Automation',-84,function() A.setRunning(not A.running) end)
+        auto.Text=''; auto.AutoButtonColor=false
+        local label=Instance.new('TextLabel'); label.BackgroundTransparency=1
+        label.Size=UDim2.new(1,0,0,17); label.Text='AUTO OFF'; label.TextSize=11
+        label.TextColor3=Color3.new(1,1,1); label.Parent=auto
+        local track=Instance.new('Frame'); track.Size=UDim2.fromOffset(42,22)
+        track.Position=UDim2.fromOffset(18,19); track.BackgroundColor3=Color3.fromRGB(80,84,94); track.Parent=auto
+        local rounded=Instance.new('UICorner'); rounded.CornerRadius=UDim.new(1,0); rounded.Parent=track
+        local knob=Instance.new('Frame'); knob.Size=UDim2.fromOffset(18,18); knob.Position=UDim2.fromOffset(2,2)
+        knob.BackgroundColor3=Color3.new(1,1,1); knob.Parent=track
+        local knobRound=Instance.new('UICorner'); knobRound.CornerRadius=UDim.new(1,0); knobRound.Parent=knob
+        A.touchControls.autoLabel=label; A.touchControls.autoTrack=track; A.touchControls.autoKnob=knob
         local restore=touchButton('RESTORE',-252,function() if A.render then A.render(false) end end)
         restore.Visible=false
     end
@@ -1455,16 +1467,27 @@ return function(A)
             end)
         end
     end
-    local run=note('Farm','Automation','Paused')
-    button('Farm','Start / Pause',function() A.setRunning(not A.running) end)
-    for _,tab in ipairs({'Quests','Modes','Upgrades','Pets','Rewards','Webhook','Settings'}) do
-        local banner=note(tab,'Automation','Paused')
-        button(tab,'Start / Pause automation',function() A.setRunning(not A.running) end)
-        statuses[#statuses+1]=function()
-            banner:SetDesc(A.running and (A.spendPaused and 'Running; spending paused - see Upgrades' or 'Running')
-                or 'PAUSED - feature toggles take effect after Start / Pause')
+    local masters={}; local syncingRun=false; local lastTouchRun
+    for _,tab in ipairs({'Farm','Quests','Modes','Upgrades','Pets','Rewards','Webhook','Settings'}) do
+        local master=tabs[tab]:AddToggle('Automation_'..tab,{Title='Automation',
+            Description='On: run enabled features. Off: pause them.',Default=A.running})
+        master:OnChanged(guard(function(value)
+            if not syncingRun and value~=A.running then A.setRunning(value==true) end
+        end))
+        masters[#masters+1]=master
+    end
+    function A.syncRunningUI()
+        syncingRun=true
+        for _,master in ipairs(masters) do if master.Value~=A.running then master:SetValue(A.running) end end
+        syncingRun=false
+        if A.touchControls and lastTouchRun~=A.running then
+            lastTouchRun=A.running
+            A.touchControls.autoLabel.Text=A.running and 'AUTO ON' or 'AUTO OFF'
+            A.touchControls.autoTrack.BackgroundColor3=A.running and Color3.fromRGB(60,180,220) or Color3.fromRGB(80,84,94)
+            A.touchControls.autoKnob.Position=UDim2.fromOffset(A.running and 22 or 2,2)
         end
     end
+    bindings[#bindings+1]=A.syncRunningUI
     choose('Farm','World','world',function()
         local out={}
         for id,w in pairs(A.catalog.worlds) do
@@ -1583,7 +1606,7 @@ return function(A)
         savedStatus:SetDesc('Autoload: '..(A.autoloadEnabled and 'enabled' or 'disabled')..' | '..(A.running and 'running' or 'paused'))
     end
     toggle('Settings','Black screen / disable 3D rendering','blackScreen',function(value) if A.render then A.render(value) end end)
-    note('Settings','Controls',touch and 'Touch SUITE to hide/show, START/PAUSE to control automation, and RESTORE to enable rendering. Landscape gives the menus more room.'
+    note('Settings','Controls',touch and 'Touch SUITE to hide/show, the AUTO switch to toggle automation, and RESTORE to enable rendering. Landscape gives the menus more room.'
         or 'Right Shift: minimize/show Fluent. F8: restore rendering. Rendering starts enabled.')
     note('Settings','Executor capabilities',
         'Save/load: '..((type(writefile)=='function' and type(readfile)=='function' and type(makefolder)=='function') and 'available' or 'file APIs missing')
@@ -1627,11 +1650,7 @@ return function(A)
     sync=false; A.refreshUI(); window:SelectTab(1)
     A.job('UI status',1,function()
         if F.Unloaded or not A.gui.Parent then A.stop(); return end
-        run:SetDesc((A.running and 'Running' or 'Paused')..(A.spendPaused and ' - spending paused; see Upgrades' or ''))
-        if A.touchControls then
-            local label=A.running and 'PAUSE' or 'START'
-            if A.touchControls.START.Text~=label then A.touchControls.START.Text=label end
-        end
+        A.syncRunningUI()
         for _,update in ipairs(statuses) do update() end
     end,true)
 end
