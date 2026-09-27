@@ -1,4 +1,4 @@
--- Anime Suite 2.4 | standalone source | September 2026
+-- Anime Suite 2.6 | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload and automatic start are opt-in.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -130,6 +130,158 @@ function Core.webhookRetry(status,headers,body,attempt)
     return 'stop',0
 end
 return Core
+
+end)()
+A.GuildCore = (function()
+local G={pollSeconds=30,maxObservedInterval=75}
+local function finite(v) return type(v)=='number' and v==v and math.abs(v)<math.huge end
+local function iso(t) return os.date('!%Y-%m-%dT%H:%M:%SZ',t) end
+function G.id(v)
+    local n=tonumber(v)
+    if not n or not finite(n) or n<=0 or n%1~=0 then return nil end
+    return string.format('%.0f',n)
+end
+function G.roster(payload,guildId,selfId)
+    if type(payload)~='table' or payload.Live==true or G.id(payload.Id)~=G.id(guildId)
+        or type(payload.Members)~='table' then return nil,'Waiting for a complete roster for your guild' end
+    local out={}; local count=0
+    for _,row in pairs(payload.Members) do
+        if type(row)~='table' then return nil,'Invalid roster member' end
+        local id=G.id(row.Id); local week=tonumber(row.Week)
+        if not id or out[id] or not finite(week) or week<0 then return nil,'Incomplete or duplicate roster data' end
+        local username=type(row.Name)=='string' and row.Name or ('User '..id)
+        out[id]={userId=tonumber(id),username=username,
+            displayName=type(row.DisplayName)=='string' and row.DisplayName or username,
+            displayNameSource=type(row.DisplayName)=='string' and 'roster' or 'usernameFallback',
+            contribution=week,online=row.Online==true,
+            presenceKnown=type(row.Online)=='boolean',serverLastSeen=tonumber(row.Seen) or 0}
+        count=count+1
+    end
+    if count==0 or not out[G.id(selfId)] then return nil,'Roster does not include this account; session preserved' end
+    return out
+end
+local function member(row,t)
+    return {userId=row.userId,username=row.username,displayName=row.displayName,displayNameSource=row.displayNameSource,
+        firstDetectedAt=t,firstDetectedAtISO=iso(t),lastDetectedAt=t,lastContributionAt=t,
+        startingContribution=row.contribution,finalContribution=row.contribution,contributionGained=0,
+        onlineSeconds=0,onlineMinutes=0,onlineHours=0,observedSeconds=0,
+        onlineStatus='unknown',lastKnownOnline=false,lastSeenOnlineAt=false,serverLastSeen=row.serverLastSeen,
+        inGuild=true,departedAt=false,membershipEvents={{at=t,event='firstDetected'}},
+        counterDecreases={},contributionComparable=true,contributionPerHour=false}
+end
+function G.new(rows,guildId,ownerId,gameId,t,sessionId,generation)
+    local s={schemaVersion=1,sessionId=sessionId,generation=generation or 1,revision=0,
+        ownerUserId=ownerId,gameId=gameId,guildId=tonumber(guildId),active=true,
+        startedAt=t,startedAtISO=iso(t),endedAt=false,endedAtISO=false,lastSavedAt=false,
+        lastObservedAt=false,totalElapsedSeconds=0,observedSeconds=0,unobservedSeconds=0,
+        trackedMemberCount=0,members={},gaps={},finalSnapshotStatus='notStopped',
+        contributionSource='Guild roster Members[].Week',
+        onlineTimeMethod='Sampled presence: credit only intervals <=75 seconds with online at both endpoints; never bridge a reload or observation gap.',
+        efficiencyCaveat='Contribution may include unobserved periods. Online time is a sampling estimate, not exact session history.'}
+    for id,row in pairs(rows) do s.members[id]=member(row,t) end
+    return s
+end
+function G.metrics(s,t)
+    local ending=s.active and t or s.endedAt
+    s.totalElapsedSeconds=math.max(0,(tonumber(ending) or t)-s.startedAt)
+    s.totalElapsedHours=s.totalElapsedSeconds/3600
+    s.totalElapsedMinutes=s.totalElapsedSeconds/60
+    s.observedHours=s.observedSeconds/3600
+    s.unobservedSeconds=math.max(0,s.totalElapsedSeconds-s.observedSeconds)
+    s.unobservedHours=s.unobservedSeconds/3600
+    local count=0
+    for _,m in pairs(s.members) do
+        count=count+1
+        m.onlineMinutes=m.onlineSeconds/60; m.onlineHours=m.onlineSeconds/3600
+        m.contributionGained=m.finalContribution-m.startingContribution
+        m.contributionPerHour=m.onlineHours>0 and m.contributionGained/m.onlineHours or false
+        local memberEnd=m.inGuild and (tonumber(ending) or t) or (tonumber(m.departedAt) or m.lastDetectedAt)
+        m.observationSpanSeconds=math.max(0,memberEnd-m.firstDetectedAt)
+        m.unobservedSeconds=math.max(0,m.observationSpanSeconds-m.observedSeconds)
+        m.efficiencyReliable=m.onlineHours>0 and m.contributionComparable and m.unobservedSeconds==0
+    end
+    s.trackedMemberCount=count
+end
+function G.sample(s,rows,t,previous)
+    local interval=previous and t-previous.at or 0
+    local continuous=previous~=nil and interval>=0 and interval<=G.maxObservedInterval
+    if continuous then s.observedSeconds=s.observedSeconds+interval
+    elseif s.lastObservedAt and t>s.lastObservedAt then
+        s.gaps[#s.gaps+1]={from=s.lastObservedAt,to=t,seconds=t-s.lastObservedAt,reason='No continuous observation'}
+    end
+    local changedMembers=false
+    for id,row in pairs(rows) do
+        local m=s.members[id]
+        if not m then m=member(row,t); s.members[id]=m; changedMembers=true end
+        if not m.inGuild then
+            m.membershipEvents[#m.membershipEvents+1]={at=t,event='returned'}; changedMembers=true
+        end
+        if m.username~=row.username or m.displayName~=row.displayName then changedMembers=true end
+        m.username=row.username; m.displayName=row.displayName; m.displayNameSource=row.displayNameSource
+        local prior=continuous and previous.rows[id]
+        if prior then
+            if prior.presenceKnown and row.presenceKnown then m.observedSeconds=m.observedSeconds+interval end
+            if prior.presenceKnown and row.presenceKnown and prior.online and row.online then m.onlineSeconds=m.onlineSeconds+interval end
+        end
+        if row.contribution<m.finalContribution then
+            m.counterDecreases[#m.counterDecreases+1]={at=t,before=m.finalContribution,after=row.contribution,
+                possibleWeeklyReset=true}
+            m.contributionComparable=false
+        end
+        m.finalContribution=row.contribution; m.lastContributionAt=t
+        m.lastDetectedAt=t; m.inGuild=true; m.departedAt=false
+        m.onlineStatus=row.presenceKnown and (row.online and 'online' or 'offline') or 'unknown'
+        m.lastKnownOnline=row.online; m.serverLastSeen=row.serverLastSeen
+        if row.presenceKnown and row.online then m.lastSeenOnlineAt=t end
+    end
+    for id,m in pairs(s.members) do
+        if not rows[id] and m.inGuild then
+            m.inGuild=false; m.departedAt=t; m.onlineStatus='unknown'
+            m.membershipEvents[#m.membershipEvents+1]={at=t,event='noLongerInRoster'}; changedMembers=true
+        end
+    end
+    s.lastObservedAt=t; G.metrics(s,t)
+    return {at=t,rows=rows},changedMembers
+end
+function G.stop(s,t)
+    s.active=false; s.endedAt=t; s.endedAtISO=iso(t)
+    s.finalSnapshotStatus='pending'; G.metrics(s,t)
+end
+function G.finalSnapshot(s,rows,receivedAt)
+    -- Stopping freezes time/membership. Only existing members get a fresh final counter.
+    for id,m in pairs(s.members) do
+        local row=rows[id]
+        if row then
+            if row.contribution<m.finalContribution then
+                m.counterDecreases[#m.counterDecreases+1]={at=receivedAt,before=m.finalContribution,after=row.contribution,possibleWeeklyReset=true}
+                m.contributionComparable=false
+            end
+            m.finalContribution=row.contribution; m.lastContributionAt=receivedAt
+        end
+    end
+    s.finalSnapshotStatus='received'; s.finalSnapshotReceivedAt=receivedAt
+    G.metrics(s,s.endedAt)
+end
+function G.valid(s,ownerId,gameId)
+    if type(s)~='table' or s.schemaVersion~=1 or s.ownerUserId~=ownerId or s.gameId~=gameId
+        or not G.id(s.guildId) or type(s.sessionId)~='string' or type(s.active)~='boolean'
+        or not finite(s.startedAt) or type(s.startedAtISO)~='string'
+        or not finite(s.generation) or s.generation<1 or not finite(s.revision) or s.revision<0
+        or type(s.members)~='table' or type(s.gaps)~='table' or not finite(s.observedSeconds)
+        or s.observedSeconds<0 or (s.lastObservedAt~=false and not finite(s.lastObservedAt))
+        or (s.lastSavedAt~=false and not finite(s.lastSavedAt))
+        or (not s.active and not finite(s.endedAt)) then return false end
+    for id,m in pairs(s.members) do
+        if type(m)~='table' or G.id(m.userId)~=id or type(m.username)~='string' or type(m.displayName)~='string'
+            or type(m.onlineStatus)~='string' or type(m.inGuild)~='boolean' or type(m.contributionComparable)~='boolean'
+            or not finite(m.startingContribution) or not finite(m.finalContribution)
+            or not finite(m.onlineSeconds) or m.onlineSeconds<0 or not finite(m.observedSeconds) or m.observedSeconds<0
+            or not finite(m.firstDetectedAt) or not finite(m.lastDetectedAt)
+            or type(m.membershipEvents)~='table' or type(m.counterDecreases)~='table' then return false end
+    end
+    return true
+end
+return G
 
 end)()
 local bootOK, bootError = pcall(function()
@@ -379,6 +531,7 @@ return function(A)
     end
     function A.stop()
         if not A.alive then return end
+        if A.guildCheckpoint then A.guildCheckpoint() end
         A.setRunning(false); if A.render then A.render(false) end
         A.alive=false
         for _,c in ipairs(A.connections) do pcall(function() c:Disconnect() end) end
@@ -510,6 +663,7 @@ return function(A)
     local function disconnected(message)
         if not sent and tostring(message)~='' then
             sent=true; A.notify('Disconnect','Client connection/error message: '..tostring(message))
+            if A.guildCheckpoint then A.guildCheckpoint() end
             A.setRunning(false)
         end
     end
@@ -1267,6 +1421,182 @@ end
 
 end)()(A);
 
+-- ===== guild =====
+(function()
+return function(A)
+    local G,C=A.GuildCore,A.Core
+    A.guildFile=A.folder..'/guild-weekly-tracking.json'
+    local paths={A.guildFile,A.guildFile..'.bak',A.guildFile..'.tmp'}
+    local previous,pending,nextPoll=nil,nil,0
+    local saving=false
+    local function loadSession()
+        local best
+        for _,path in ipairs(paths) do
+            local s=A.safeLoad(path)
+            if G.valid(s,A.player.UserId,game.GameId) and (not best or s.generation>best.generation
+                or (s.generation==best.generation and s.revision>best.revision)) then best=s end
+        end
+        return best
+    end
+    A.guildSession=loadSession()
+    function A.guildSave(candidate)
+        if saving then return false end
+        if type(writefile)~='function' or type(readfile)~='function' or type(makefolder)~='function' then
+            A.status['Guild storage']='File APIs required; tracking cannot be persisted'; return false
+        end
+        local s=candidate or A.guildSession; if not s then return false end
+        saving=true
+        local snapshot=C.copy(s); G.metrics(snapshot,os.time())
+        snapshot.revision=snapshot.revision+1; snapshot.lastSavedAt=os.time()
+        snapshot.lastSavedAtISO=os.date('!%Y-%m-%dT%H:%M:%SZ',snapshot.lastSavedAt)
+        local durable=false
+        local ok,err=pcall(function()
+            pcall(makefolder,A.folder)
+            local encoded=A.S.HTTP:JSONEncode(snapshot)
+            assert(G.valid(A.S.HTTP:JSONDecode(encoded),A.player.UserId,game.GameId),'Invalid tracking snapshot')
+            -- Stage and verify before replacing the primary; both backups retain recoverable data.
+            for _,path in ipairs({paths[3],paths[1],paths[2]}) do
+                writefile(path,encoded)
+                local saved=A.safeLoad(path)
+                assert(G.valid(saved,A.player.UserId,game.GameId) and saved.sessionId==snapshot.sessionId
+                    and saved.revision==snapshot.revision,'Read-back failed')
+                durable=true
+            end
+        end)
+        saving=false
+        if durable then
+            s.revision=snapshot.revision; s.lastSavedAt=snapshot.lastSavedAt; s.lastSavedAtISO=snapshot.lastSavedAtISO
+        end
+        if ok then
+            A.status['Guild storage']='Saved '..s.lastSavedAtISO
+        else A.status['Guild storage']=(durable and 'RECOVERY COPY SAVED; copy update failed: ' or 'SAVE FAILED: ')..tostring(err); A.log('Guild',A.status['Guild storage']) end
+        return durable
+    end
+    local function currentGuild() return G.id((A.data() or {}).GuildId) end
+    local function sendRoster(kind)
+        local id=currentGuild()
+        if not id then A.status['Guild tracker']='Waiting for your guild/player data'; return false end
+        if kind~='start' and A.guildSession and id~=G.id(A.guildSession.guildId) then
+            previous=nil; A.status['Guild tracker']='Different guild detected; original session preserved'; return false
+        end
+        if pending then return false end
+        if os.clock()<nextPoll and kind=='poll' then return false end
+        pending={kind=kind,guildId=id,deadline=os.clock()+12,requestedAt=os.time()}
+        nextPoll=os.clock()+G.pollSeconds
+        local bridge=A.bridge('GuildRosterRequest')
+        -- A read-only request; intentionally independent of the gameplay Automation toggle.
+        local ok=bridge and pcall(bridge.Fire,bridge)
+        if not ok then pending=nil; A.status['Guild tracker']='Guild roster request unavailable'; return false end
+        return true
+    end
+    function A.guildStart()
+        if pending then A.status['Guild tracker']='Waiting for the current roster request'; return end
+        if type(writefile)~='function' or type(readfile)~='function' or type(makefolder)~='function' then
+            A.status['Guild tracker']='Cannot start: persistent file APIs are missing'; return
+        end
+        A.status['Guild tracker']='Fetching a fresh baseline for the new session'
+        sendRoster('start')
+    end
+    function A.guildStop()
+        local s=A.guildSession
+        if not s or not s.active then A.status['Guild tracker']='No active tracking session'; return end
+        pending=nil; G.stop(s,os.time()); previous=nil
+        A.guildSave(); A.status['Guild tracker']='Stopped; requesting final contribution snapshot'
+        if not sendRoster('stop') then s.finalSnapshotStatus='unavailable'; A.guildSave() end
+    end
+    function A.guildRefresh()
+        if A.guildSession and A.guildSession.active then sendRoster('poll')
+        else A.status['Guild tracker']='Finished results are frozen. Start Tracking begins a new session.' end
+    end
+    A.on('GuildRosterResult',function(payload)
+        local request=pending
+        if not request then return end
+        local rows,err=G.roster(payload,request.guildId,A.player.UserId)
+        if not rows then
+            if type(payload)=='table' and payload.Live~=true then A.status['Guild tracker']=err end
+            return
+        end
+        if currentGuild()~=request.guildId then pending=nil; previous=nil; return end
+        pending=nil; local now=os.time(); local s=A.guildSession; local changed=false
+        if request.kind=='start' then
+            local guid
+            local ok,value=pcall(function() return A.S.HTTP:GenerateGUID(false) end)
+            guid=ok and value or (tostring(now)..'-'..tostring(math.random(100000,999999)))
+            local fresh=G.new(rows,request.guildId,A.player.UserId,game.GameId,now,guid,(s and s.generation or 0)+1)
+            local first=G.sample(fresh,rows,now,nil)
+            if not A.guildSave(fresh) then A.status['Guild tracker']='New session could not be fully saved; inspect Guild storage'; return end
+            A.guildSession=fresh; previous=first; s=fresh; changed=true
+            A.status['Guild tracker']='Tracking started; existing contribution stored as the baseline'
+        elseif request.kind=='stop' then
+            if not s or s.active then return end
+            G.finalSnapshot(s,rows,now)
+            local saved=A.guildSave()
+            A.status['Guild tracker']=saved and 'Tracking stopped; final snapshot saved' or 'Tracking stopped; final save failed (see Guild storage)'
+        elseif s and s.active and G.id(s.guildId)==request.guildId then
+            previous,changed=G.sample(s,rows,now,previous); A.guildSave()
+            A.status['Guild tracker']='Tracking '..s.trackedMemberCount..' members; presence is sampled'
+        end
+        if changed and A.refreshUI then A.refreshUI() end
+    end)
+    function A.guildCheckpoint()
+        if A.guildSession and A.guildSession.active then
+            previous=nil; pending=nil
+            A.guildSave()
+        end
+    end
+    A.connect(A.player.OnTeleport,function() A.guildCheckpoint() end)
+    A.connect(A.S.Players.PlayerRemoving,function(player) if player==A.player then A.guildCheckpoint() end end)
+    A.job('Guild tracker',2,function()
+        local s=A.guildSession
+        if pending and os.clock()>pending.deadline then
+            local kind=pending.kind; pending=nil; previous=nil
+            A.status['Guild tracker']='Roster response timed out; no online time added for the gap'
+            if kind=='stop' and s then s.finalSnapshotStatus='unavailable'; A.guildSave() end
+        end
+        if not s or not s.active then return end
+        if s.lastObservedAt and os.time()-s.lastObservedAt>G.maxObservedInterval then
+            for _,m in pairs(s.members) do if m.inGuild then m.onlineStatus='unknown' end end
+        end
+        if not s.lastSavedAt or os.time()-s.lastSavedAt>=30 then A.guildSave() end
+        sendRoster('poll')
+    end,true)
+    if A.guildSession then
+        if A.guildSession.active then
+            for _,m in pairs(A.guildSession.members) do m.onlineStatus='unknown' end
+            A.status['Guild tracker']='Active saved session restored; waiting for a fresh roster'
+        else
+            A.status['Guild tracker']='Finished session loaded; statistics remain frozen'
+            if A.guildSession.finalSnapshotStatus=='pending' then
+                A.guildSession.finalSnapshotStatus='unavailableAfterRestart'; A.guildSave()
+            end
+        end
+    else A.status['Guild tracker']='No valid saved session; press Start Tracking when ready' end
+    A.guildSelected=''
+    local function duration(seconds) return string.format('%dh %dm',math.floor(seconds/3600),math.floor(seconds/60)%60) end
+    function A.guildSummary()
+        local s=A.guildSession; if not s then return 'No tracking session. JSON: '..A.guildFile end
+        local elapsed=math.max(0,(s.active and os.time() or s.endedAt)-s.startedAt)
+        return (s.active and 'ACTIVE' or 'STOPPED')..' | '..tostring(s.trackedMemberCount)..' members\n'
+            ..'Started: '..s.startedAtISO..'\nTotal tracking time: '..duration(elapsed)
+            ..'\nObserved: '..duration(s.observedSeconds)
+            ..' | Unobserved: '..duration(math.max(0,elapsed-s.observedSeconds))
+            ..'\nFile: '..A.guildFile
+    end
+    function A.guildMemberText()
+        local s=A.guildSession; local m=s and s.members[A.guildSelected]
+        if not m then return 'Choose a member to inspect their recorded progress.' end
+        return m.displayName..' (@'..m.username..') | UserId '..tostring(m.userId)
+            ..'\n'..(m.inGuild and 'In guild' or 'Left guild')..' | Last observed status: '..m.onlineStatus
+            ..'\nObserved online: '..duration(m.onlineSeconds)..' | Starting: '..tostring(m.startingContribution)
+            ..'\nLatest: '..tostring(m.finalContribution)..' | Gained: '..tostring(m.contributionGained)
+            ..'\nPer observed online hour: '..(m.contributionPerHour and string.format('%.2f',m.contributionPerHour) or 'N/A')
+            ..(not m.contributionComparable and '\nWARNING: weekly counter decreased/reset; raw difference spans incompatible counters.' or '')
+            ..(m.unobservedSeconds>0 and '\nObservation gaps: efficiency is not a reliable comparison.' or '')
+    end
+end
+
+end)()(A);
+
 -- ===== ui =====
 (function()
 return function(A)
@@ -1286,7 +1616,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='2.4',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='Anime Suite',SubTitle='2.6',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1298,6 +1628,7 @@ return function(A)
             window.Position=UDim2.fromOffset((viewport.X-w)/2,(viewport.Y-h)/2)
             window.Root.Size=window.Size; window.Root.Position=window.Position
         end
+        if A.clampTouchButton then A.clampTouchButton() end
         if touch then
             for _,limit in ipairs(popupLimits) do limit.MaxSize=Vector2.new(w,h) end
         end
@@ -1325,24 +1656,69 @@ return function(A)
             b.Parent=A.touchGui; local corner=Instance.new('UICorner'); corner.CornerRadius=UDim.new(0,8); corner.Parent=b
             A.connect(b.Activated,callback); A.touchControls[name]=b; return b
         end
-        touchButton('SUITE',-168,function() window:Minimize() end)
-        local auto=touchButton('Automation',-84,function() A.setRunning(not A.running) end)
-        auto.Text=''; auto.AutoButtonColor=false
-        local label=Instance.new('TextLabel'); label.BackgroundTransparency=1
-        label.Size=UDim2.new(1,0,0,17); label.Text='AUTO OFF'; label.TextSize=11
-        label.TextColor3=Color3.new(1,1,1); label.Parent=auto
-        local track=Instance.new('Frame'); track.Size=UDim2.fromOffset(42,22)
-        track.Position=UDim2.fromOffset(18,19); track.BackgroundColor3=Color3.fromRGB(80,84,94); track.Parent=auto
-        local rounded=Instance.new('UICorner'); rounded.CornerRadius=UDim.new(1,0); rounded.Parent=track
-        local knob=Instance.new('Frame'); knob.Size=UDim2.fromOffset(18,18); knob.Position=UDim2.fromOffset(2,2)
-        knob.BackgroundColor3=Color3.new(1,1,1); knob.Parent=track
-        local knobRound=Instance.new('UICorner'); knobRound.CornerRadius=UDim.new(1,0); knobRound.Parent=knob
-        A.touchControls.autoLabel=label; A.touchControls.autoTrack=track; A.touchControls.autoKnob=knob
-        local restore=touchButton('RESTORE',-252,function() if A.render then A.render(false) end end)
+        local dragging,suppressTap=nil,false
+        local suite=touchButton('SUITE',-122,function()
+            if not suppressTap then window:Minimize() end
+        end)
+        suite.Size=UDim2.fromOffset(110,46); suite.Text='SUITE'; suite.TextSize=15
+        suite.Font=Enum.Font.GothamBold; suite.AutoButtonColor=false
+        suite.BackgroundColor3=Color3.fromRGB(18,24,34); suite.TextColor3=Color3.fromRGB(230,245,255)
+        local shape=suite:FindFirstChildOfClass('UICorner'); if shape then shape.CornerRadius=UDim.new(0,16) end
+        local outline=Instance.new('UIStroke'); outline.Color=Color3.fromRGB(77,197,232)
+        outline.Thickness=1.3; outline.Transparency=0.2; outline.ApplyStrokeMode=Enum.ApplyStrokeMode.Border; outline.Parent=suite
+        local accent=Instance.new('Frame'); accent.Size=UDim2.fromOffset(5,18)
+        accent.Position=UDim2.fromOffset(9,14); accent.BorderSizePixel=0
+        accent.BackgroundColor3=Color3.fromRGB(77,197,232); accent.Parent=suite
+        local accentRound=Instance.new('UICorner'); accentRound.CornerRadius=UDim.new(1,0); accentRound.Parent=accent
+        for x=0,1 do for y=0,2 do
+            local dot=Instance.new('Frame'); dot.Size=UDim2.fromOffset(2,2)
+            dot.Position=UDim2.fromOffset(96+x*4,17+y*5); dot.BorderSizePixel=0
+            dot.BackgroundColor3=Color3.fromRGB(122,147,166); dot.Parent=suite
+        end end
+        local area=Instance.new('Frame'); area.Name='TouchBounds'; area.Size=UDim2.fromScale(1,1)
+        area.BackgroundTransparency=1; area.Parent=A.touchGui; suite.Parent=area
+        local function bounds()
+            local size=area.AbsoluteSize
+            if size and size.X>0 and size.Y>0 then return size.X,size.Y end
+            local v=camera and camera.ViewportSize or Vector2.new(720,600)
+            return v.X,math.max(46,v.Y-60)
+        end
+        local function place(x,y)
+            local w,h=bounds()
+            suite.Position=UDim2.fromOffset(math.clamp(x,4,math.max(4,w-114)),math.clamp(y,4,math.max(4,h-50)))
+        end
+        function A.clampTouchButton()
+            local w,h=bounds(); local pos=suite.Position
+            place(pos.X.Scale*w+pos.X.Offset,pos.Y.Scale*h+pos.Y.Offset)
+        end
+        A.connect(area:GetPropertyChangedSignal('AbsoluteSize'),A.clampTouchButton)
+        A.clampTouchButton()
+        A.connect(suite.InputBegan,function(input)
+            if dragging then return end
+            if input.UserInputType==Enum.UserInputType.Touch or input.UserInputType==Enum.UserInputType.MouseButton1 then
+                suppressTap=false
+                dragging={input=input,start=input.Position,x=suite.Position.X.Offset,y=suite.Position.Y.Offset}
+            end
+        end)
+        A.connect(A.S.UIS.InputChanged,function(input)
+            if not dragging then return end
+            if input==dragging.input or (dragging.input.UserInputType==Enum.UserInputType.MouseButton1
+                and input.UserInputType==Enum.UserInputType.MouseMovement) then
+                local delta=input.Position-dragging.start
+                if delta.Magnitude>=6 then suppressTap=true end
+                if suppressTap then place(dragging.x+delta.X,dragging.y+delta.Y) end
+            end
+        end)
+        A.connect(A.S.UIS.InputEnded,function(input)
+            if dragging and (input==dragging.input or (dragging.input.UserInputType==Enum.UserInputType.MouseButton1
+                and input.UserInputType==Enum.UserInputType.MouseButton1)) then dragging=nil end
+        end)
+        local restore=touchButton('RESTORE',-84,function() if A.render then A.render(false) end end)
+        restore.Size=UDim2.fromOffset(130,44); restore.Position=UDim2.new(.5,-65,1,-58)
         restore.Visible=false
     end
     local tabs={}
-    for _,name in ipairs({'Farm','Quests','Modes','Upgrades','Pets','Rewards','Webhook','Settings'}) do
+    for _,name in ipairs({'Farm','Quests','Modes','Upgrades','Pets','Rewards','Guild Tracker','Webhook','Settings'}) do
         tabs[name]=window:AddTab({Title=name,Icon=''})
     end
     local sync=true; local bindings={}; local statuses={}
@@ -1467,7 +1843,7 @@ return function(A)
             end)
         end
     end
-    local masters={}; local syncingRun=false; local lastTouchRun
+    local masters={}; local syncingRun=false
     for _,tab in ipairs({'Farm','Quests','Modes','Upgrades','Pets','Rewards','Webhook','Settings'}) do
         local master=tabs[tab]:AddToggle('Automation_'..tab,{Title='Automation',
             Description='On: run enabled features. Off: pause them.',Default=A.running})
@@ -1480,12 +1856,7 @@ return function(A)
         syncingRun=true
         for _,master in ipairs(masters) do if master.Value~=A.running then master:SetValue(A.running) end end
         syncingRun=false
-        if A.touchControls and lastTouchRun~=A.running then
-            lastTouchRun=A.running
-            A.touchControls.autoLabel.Text=A.running and 'AUTO ON' or 'AUTO OFF'
-            A.touchControls.autoTrack.BackgroundColor3=A.running and Color3.fromRGB(60,180,220) or Color3.fromRGB(80,84,94)
-            A.touchControls.autoKnob.Position=UDim2.fromOffset(A.running and 22 or 2,2)
-        end
+
     end
     bindings[#bindings+1]=A.syncRunningUI
     choose('Farm','World','world',function()
@@ -1583,6 +1954,26 @@ return function(A)
         toggle('Rewards',row[1],row[2])
     end
     note('Rewards','Chests','Visits ready chests in their world and claims within range. Group chest requires existing membership.')
+    note('Guild Tracker','Persistent weekly session','Start Tracking resets the previous session after a fresh roster arrives. Stop Tracking preserves the finished file. An active saved session resumes when this script is run again, even with Automation off.')
+    button('Guild Tracker','Start Tracking',A.guildStart)
+    button('Guild Tracker','Stop Tracking',A.guildStop)
+    button('Guild Tracker','Save tracking JSON now',function() A.guildSave() end)
+    button('Guild Tracker','Refresh guild roster',A.guildRefresh)
+    local guildSummary=note('Guild Tracker','Session',A.guildSummary())
+    statuses[#statuses+1]=function() guildSummary:SetDesc(A.guildSummary()) end
+    status('Guild Tracker','Guild tracker'); status('Guild Tracker','Guild storage')
+    dropdown('Guild Tracker','Member','guildMember',function()
+        local out={}
+        for id,m in pairs(A.guildSession and A.guildSession.members or {}) do
+            out[#out+1]={key=id,label=m.username..' ['..id..']'..(m.inGuild and '' or ' (left)')}
+        end
+        table.sort(out,function(a,b) return a.label<b.label end); return out
+    end,function(id) return A.guildSelected==id end,function(id) A.guildSelected=id end)
+    local guildMember=note('Guild Tracker','Member progress',A.guildMemberText())
+    statuses[#statuses+1]=function() guildMember:SetDesc(A.guildMemberText()) end
+    note('Guild Tracker','Observation limits','Online time is estimated from roster samples, not exact playtime. Phone-off/crash/rejoin gaps are unobserved and never added as online hours. Contribution changes across gaps can make per-hour efficiency misleading. Weekly counter decreases are flagged; baselines never change.')
+    note('Guild Tracker','JSON location','In your executor workspace: '..A.guildFile..'. Keep the .bak and .tmp recovery copies too. Closing Roblox cannot force a final save; the last successful snapshot is retained.')
+
     input('Webhook','Webhook URL','webhookURL'); input('Webhook','Discord user ID','pingId')
     toggle('Webhook','Enable webhook','webhook'); toggle('Webhook','Send disconnect notification','sendDisconnect')
     toggle('Webhook','Ping selected user','ping')
@@ -1606,7 +1997,7 @@ return function(A)
         savedStatus:SetDesc('Autoload: '..(A.autoloadEnabled and 'enabled' or 'disabled')..' | '..(A.running and 'running' or 'paused'))
     end
     toggle('Settings','Black screen / disable 3D rendering','blackScreen',function(value) if A.render then A.render(value) end end)
-    note('Settings','Controls',touch and 'Touch SUITE to hide/show, the AUTO switch to toggle automation, and RESTORE to enable rendering. Landscape gives the menus more room.'
+    note('Settings','Controls',touch and 'Tap SUITE to hide/show; drag it to reposition. Automation is controlled inside the GUI. RESTORE enables rendering. Landscape gives the menus more room.'
         or 'Right Shift: minimize/show Fluent. F8: restore rendering. Rendering starts enabled.')
     note('Settings','Executor capabilities',
         'Save/load: '..((type(writefile)=='function' and type(readfile)=='function' and type(makefolder)=='function') and 'available' or 'file APIs missing')
