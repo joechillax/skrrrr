@@ -1,4 +1,4 @@
--- Anime Suite 3.0 | standalone source | September 2026
+-- Anime Suite 3.1 | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -581,6 +581,7 @@ return function(A)
     end
     function A.setRunning(value)
         A.running=value; A.epoch=A.epoch+1
+        A.status.Gameplay=value and 'Ready: each feature uses its own toggle' or 'Stopped or disconnected; rerun after reconnecting'
         if not value then
             if A.watchTarget then A.watchTarget(nil) end
             local h=A.player.Character and A.player.Character:FindFirstChildOfClass('Humanoid')
@@ -771,9 +772,17 @@ return function(A)
         persist()
     end,true)
     local sent=false
+    function A.isDisconnectMessage(message)
+        local text=tostring(message or ''):lower()
+        for _,phrase in ipairs({'disconnected','lost connection','connection lost','kicked from','shut down','shutdown','reconnect','same account launched','internet connection'}) do
+            if text:find(phrase,1,true) then return true end
+        end
+        return false
+    end
     local function disconnected(message)
-        if not sent and tostring(message)~='' then
+        if not sent and A.isDisconnectMessage(message) then
             sent=true; A.notify('Disconnect','Client connection/error message: '..tostring(message))
+            A.status.Gameplay='Disconnected: rerun the script after reconnecting'
             if A.guildCheckpoint then A.guildCheckpoint('disconnect') end
             A.setRunning(false)
         end
@@ -1059,12 +1068,30 @@ return function(A)
         A.fire('OpenEgg',key,{}); A.status.Eggs='Requested egg '..key; return true
     end
     local workers={treeStep,evolveStep,specStep,renameStep,worldStep,progressionStep,gachaStep,eggStep}
+    local names={'Trees','Evolution','Specializations','Rename','World unlock','Progression','Gacha','Eggs'}
+    local retryAt={}
     A.job('Spending',2,function()
-        if not A.data() or A.spendPaused or A.pendingMode then return end
+        local blocked=not A.data() and 'Waiting for player data'
+            or A.spendPaused and 'A request timed out. Check its result, then use Upgrades: Resume spending after a timeout'
+            or A.pendingMode and 'Waiting for mode entry to finish'
+        if blocked then
+            A.status.Spending=blocked
+            if A.settings.rename then A.status.Rename=blocked end
+            return
+        end
         -- All spenders share this single non-overlapping worker.
         for offset=0,#workers-1 do
             local i=(A.spendCursor+offset-1)%#workers+1
-            if workers[i]() then A.spendCursor=i%#workers+1; return end
+            if (retryAt[i] or 0)<=os.clock() then
+                local ok,worked=pcall(workers[i])
+                if not ok then
+                    retryAt[i]=os.clock()+30
+                    A.status[names[i]]='Error: '..tostring(worked)
+                    A.log(names[i],worked)
+                elseif worked then A.spendCursor=i%#workers+1; return end
+                -- An uncertain purchase still blocks further spending until explicitly resumed.
+                if A.spendPaused or not A.alive or not A.running then return end
+            end
         end
     end)
 end
@@ -1864,7 +1891,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.0',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.1',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2220,11 +2247,15 @@ return function(A)
         ..' | Webhook HTTP: '..(A.httpRequest and 'available' or 'request API missing')
         ..'. Rendering availability is checked when you use it.')
     status('Settings','Settings')
+    status('Settings','Gameplay')
     button('Settings','Refresh catalogs',function() A.discover(); A.refreshUI() end)
     button('Settings','Write diagnostics',function()
         assert(type(writefile)=='function','File API unavailable')
         pcall(makefolder,A.folder)
-        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version=2,status=A.status,logs=A.logs,
+        local jobs,enabled={},{}
+        for name,job in pairs(A.tasks) do jobs[name]={busy=job.busy,failures=job.failures,nextIn=math.max(0,job.next-os.clock())} end
+        for key,value in pairs(A.settings) do if type(value)=='boolean' then enabled[key]=value end end
+        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='3.1',status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
             running=A.running,activeMode=A.activeMode,spendingPaused=A.spendPaused,
             worlds=#C.keys(A.catalog.worlds),enemies=#C.keys(A.catalog.enemies),trees=C.keys(A.catalog.trees)}))
         A.log('Diagnostics','Saved '..A.folder..'/diagnostics.json')
