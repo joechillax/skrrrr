@@ -2270,11 +2270,14 @@ function state.skip()
     assert(readValue(values,"Vote")==true,"Skip voting is closed by the game")
     assert(readValue(LocalPlayer,"Voted")==false,"Already voted or vote state unavailable")
     if state.skipBusy then return end
-    local wave=readValue(values,"LocalWave");state.skipBusy=true
+    local wave=readValue(values,"LocalWave")
+    local character=LocalPlayer.Character;local map=child(Workspace,"Map");local epoch=state.epoch
+    state.skipBusy=true;state.skipStartedAt=os.clock()
     local ok,result=pcall(remote,"RemoteFunctions","VoteSkip","InvokeServer")
-    state.skipBusy=false
+    state.skipBusy=false;state.skipStartedAt=nil
     if not ok then error(result) end
-    if not runtime.active or readValue(values,"LocalWave")~=wave or readValue(values,"Vote")~=true then return end
+    if not runtime.active or state.epoch~=epoch or LocalPlayer.Character~=character or child(Workspace,"Map")~=map
+        or readValue(values,"LocalWave")~=wave or readValue(values,"Vote")~=true then return end
     if type(result)=="boolean" then
         local voted=child(LocalPlayer,"Voted");if voted then voted.Value=result end
     end
@@ -2380,7 +2383,8 @@ connect(RunService.RenderStepped,function()
 end)
 function state.automation()
     if state.farm and (e.Autofarm or state.farm.active) then
-        state.farm.step()
+        local ok,err=pcall(state.farm.step)
+        if not ok then state.farm.lastError=tostring(err);state.farm.status("Autofarm error: "..tostring(err)) else state.farm.lastError=nil end
         if e.Autofarm and state.farm.supported() and state.farm.stage>=3 and not state.farm.inFlight and not runtime.action and not state.farm.moving then
             runtime.refillStep()
             if state.farm.unlimitedOwned() then state.spending(true) end
@@ -3222,12 +3226,22 @@ function farm.request(object,cost,event,...)
     if state.spendingBusy then farm.waitStatus("support purchase/repair response");return false end
     if not farm.confirmed() or os.clock()<(farm.requestAt or 0) then return false end
     if type(cost)~="number" or cost<0 or cost>=math.huge or cost~=cost then farm.status("Unknown price; purchase withheld.");return false end
-    if cost>availableMoney() then farm.status("Saving for "..object.Name..": "..math.ceil(cost));return false end
-    local _,humanoid=alive();if not humanoid or runtime.consumableBusy or runtime.refillBusy or reloadState.key then return false end
-    local args={...};local character=LocalPlayer.Character;local epoch=farm.epoch
+    local cash=readValue(LocalPlayer,"ReplicatedMoney")
+    if not finite(cash) then farm.status("Waiting for numeric ReplicatedMoney; balance unavailable.");return false end
+    local budget=availableMoney()
+    farm.purchaseBudget={item=object.Name,cost=cost,cash=cash,reserve=e.MoneyReserve,available=budget,at=os.clock()}
+    if cost>budget then
+        farm.status("Saving for "..object.Name..": cost "..math.ceil(cost)..", cash "..math.floor(cash)..", reserve "..tostring(e.MoneyReserve)..", available "..math.floor(budget));return false
+    end
+    local _,humanoid=alive()
+    if not humanoid then farm.waitStatus("living character before purchase");return false end
+    if runtime.consumableBusy or runtime.refillBusy or reloadState.key then
+        farm.waitStatus("item use/refill/reload before "..object.Name.." purchase (available "..math.floor(budget)..", cost "..math.ceil(cost)..")");return false
+    end
+    local args={...};local character=LocalPlayer.Character;local run=farm.runId
     farm.inFlight=true;farm.requestAt=os.clock()+math.max(.5,e.ActionInterval)
     task.spawn(function()
-        if not runtime.active or LocalPlayer.Character~=character or farm.epoch~=epoch or not (e.Autofarm or e.AutoC96) then farm.inFlight=false;return end
+        if not runtime.active or LocalPlayer.Character~=character or farm.runId~=run or not (e.Autofarm or e.AutoC96) then farm.inFlight=false;return end
         local ok,result=pcall(function()
             if event=="UpgradeWeapon" then return state.upgradeTool(args[1],args[2],true) end
             if event=="UpgradeStructurePlayer" then
@@ -3237,6 +3251,7 @@ function farm.request(object,cost,event,...)
             return state.purchase(args[1],true,true)
         end)
         farm.inFlight=false
+        if farm.runId~=run or LocalPlayer.Character~=character then return end
         if not ok then farm.fault="Native purchase failed: "..tostring(result);farm.status(farm.fault)
         elseif result then farm.status("Native purchase sent: "..object.Name..". Server acceptance unverified.")
         else farm.status("Purchase waiting for native prerequisites: "..object.Name) end
@@ -3290,6 +3305,9 @@ function farm.buy(name)
     return farm.request(flag,cost,structure and "BuyStructure" or "BuyPlayerUpgrade",name)
 end
 function farm.upgrades(name,selected,firstLevelOnly)
+    if state.shopUpgradeFaults and state.shopUpgradeFaults[name] then
+        farm.status("Native upgrade failed for "..name.."; purchase paused to avoid repeating partial changes. Movement and ready-up continue.");return false
+    end
     if not farm.confirmed() or not farm.buy(name) then return false end
     local _,owned,structure=farm.shopData(name);local folder=child(owned,"Upgrades")
     if not folder then farm.status("Upgrade list unavailable: "..name);return false end
@@ -3636,6 +3654,7 @@ function farm.begin()
     farm.ledgeSince=nil;farm.ledgeBlocked=nil;farm.ledgeJumpAt=0
     farm.waitReason=nil;farm.waitSince=nil
     farm.earlyDone=false
+    farm.roofReached=false;farm.recovering=nil;farm.lastWave=nil;farm.purchaseBudget=nil
     farm.forwardDone=false;farm.forwardGoal=nil;farm.forwardScanAt=0
     farm.roofScanAt=0;farm.roofGoal=nil;farm.pathAt=0;farm.ladder=nil;farm.fault=nil;farm.exitTransit=nil;farm.exitWalking=nil
     farm.savedTrigger=config.Triggerbot;triggerToggle:SetValue(false)
@@ -3658,12 +3677,43 @@ function farm.equipC96()
     if tool.Parent~=character then if not releaseHeld() then return false end;humanoid:EquipTool(tool) end
     return true
 end
+function farm.resumeCharacter()
+    farm.runId=(farm.runId or 0)+1
+    farm.cancelWalk()
+    if runtime.cancelRefill then runtime.cancelRefill() end
+    if runtime.cancelAction then runtime.cancelAction() end
+    farm.character=LocalPlayer.Character;farm.recovering=1
+    farm.exitTransit=nil;farm.exitWalking=nil;farm.ladder=nil;farm.pathAt=0
+    farm.ledgeSince=nil;farm.ledgeBlocked=nil;farm.ledgeJumpAt=0
+    farm.forwardDone=true;farm.next=0
+    triggerToggle:SetValue(false);releaseHeld()
+end
+function farm.ongoingSkip()
+    local values=child(storage(),"Values")
+    if not e.Autofarm or not farm.roofReached or farm.recovering then return end
+    if (readValue(values,"LocalLives") or 1)<=0 or (readValue(values,"VotingTime") or 0)>0 then return end
+    if readValue(values,"Vote")~=true or readValue(LocalPlayer,"Voted")~=false then return end
+    local run,character,map,wave=farm.runId,LocalPlayer.Character,child(Workspace,"Map"),readValue(values,"LocalWave")
+    job("Farm skip",3,function()
+        if e.Autofarm and farm.active and farm.roofReached and not farm.recovering and farm.runId==run
+            and LocalPlayer.Character==character and child(Workspace,"Map")==map
+            and readValue(values,"LocalWave")==wave and (readValue(values,"LocalLives") or 1)>0
+            and (readValue(values,"VotingTime") or 0)<=0 and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==false then state.skip() end
+    end)
+end
 function farm.step()
     if not e.Autofarm then if farm.active then farm.stop() end;return end
     if not farm.active then farm.begin() end
-    if farm.character~=LocalPlayer.Character or farm.map~=child(Workspace,"Map") or farm.mapId~=farm.mapName() then
+    local values=child(storage(),"Values")
+    local wave=readValue(values,"LocalWave")
+    local newRound=type(wave)=="number" and type(farm.lastWave)=="number" and wave<farm.lastWave
+    if farm.map~=child(Workspace,"Map") or farm.mapId~=farm.mapName() or newRound then
         farm.stop();farm.begin()
+    elseif farm.character~=LocalPlayer.Character then
+        if farm.roofReached or farm.stage>=7 then farm.roofReached=true;farm.resumeCharacter()
+        else farm.stop();farm.begin() end
     end
+    farm.lastWave=wave;farm.lastTick=os.clock()
     for _,key in ipairs(conflicts) do if e[key] then e[key]=false;if ui[key] then ui[key]:SetValue(false) end end end
     if farm.voteMap() then triggerToggle:SetValue(false);releaseHeld();farm.cancelWalk();return end
     if not farm.supported() then
@@ -3673,18 +3723,34 @@ function farm.step()
         farm.status("Unsupported map: staying put, skipping when allowed. Shop lives: "..tostring(readValue(values,"LocalLives") or "unknown")..". Waiting for game over.")
         return
     end
-    if runtime.action then farm.waitStatus("active item action");return end
-    if farm.fault then farm.status(farm.fault);return end
+    if (readValue(values,"LocalLives") or 1)<=0 then farm.cancelWalk();triggerToggle:SetValue(false);farm.status("Run lost; waiting for map voting.");return end
+    local _,humanoid=alive()
+    if not humanoid then
+        if farm.roofReached or farm.stage>=7 then farm.roofReached=true;farm.recovering=1 end
+        farm.cancelWalk();farm.status("Waiting for respawn.");return
+    end
+    if farm.stage>=7 then farm.roofReached=true end
+    -- Recovery holds ready-up until the character is safely back on the ledge.
+    if farm.recovering then
+        if farm.recovering<=2 then
+            if farm.leave(farm.recovering) then farm.recovering=farm.recovering+1 end
+        else
+            if farm.equipC96() and not config.Triggerbot then triggerToggle:SetValue(true) end
+            if farm.roof() then farm.recovering=nil;farm.status("Respawn recovery complete; resuming upgrades and ready-up.") end
+        end
+        return
+    end
+    farm.ongoingSkip()
+    if runtime.action then farm.waitStatus("active item action; rooftop ready-up remains independent");return end
     if os.clock()<farm.next then return end;farm.next=os.clock()+.1
-    local values=child(storage(),"Values")
     if farm.stage>=3 and not farm.forwardDone then
         if not farm.forwardPosition() then return end
         farm.forwardDone=true
     end
     if farm.stage>=3 then
-        if not farm.equipC96() then farm.status("Waiting to equip C96.");return end
-        if not config.Triggerbot then triggerToggle:SetValue(true) end
-        if farm.stage>=7 and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==false then job("Farm skip",3,state.skip) end
+        if farm.equipC96() then
+            if not config.Triggerbot then triggerToggle:SetValue(true) end
+        elseif farm.stage<7 then farm.status("Waiting to equip C96.");return end
     end
     if farm.stage>=7 and farm.stage~=8 and farm.stage~=11 and not farm.roof() then return end
     local done=false
@@ -3715,7 +3781,11 @@ function farm.step()
         if done then farm.status("All available ordered upgrades complete. Holding roof, C96 and skip.") end
         return
     end
-    if done then farm.stage=farm.stage+1;farm.status("Autofarm stage "..farm.stage) end
+    if done then
+        farm.stage=farm.stage+1
+        if farm.stage==7 then farm.roofReached=true end
+        farm.status("Autofarm stage "..farm.stage)
+    end
 end
 function farm.applyJump(humanoid)
     if farm.moving and farm.jumpUntil and os.clock()<farm.jumpUntil then humanoid.Jump=true end
