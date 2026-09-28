@@ -3192,7 +3192,17 @@ function farm.voteMap()
     end
     farm.status((ballot[index]=="Default" and "Forest" or (ballot[index]=="Winter" and "Arctic" or "Lakeside")).." vote submitted; waiting for map result.");return true
 end
-function farm.status(message) farm.message=message;if farm.label then farm.label:SetText(message) end end
+function farm.status(message)
+    farm.message=message
+    if farm.displayed==message or not farm.label or os.clock()<(farm.displayRetryAt or 0) then return end
+    farm.displayRetryAt=os.clock()+.5
+    local ok,err=pcall(function() farm.label:SetText(message) end)
+    if ok then farm.displayed=message;farm.displayError=nil else farm.displayError=tostring(err) end
+end
+function farm.waitStatus(reason)
+    if farm.waitReason~=reason then farm.waitReason=reason;farm.waitSince=os.clock() end
+    farm.status("Waiting: "..reason.." ("..math.floor(os.clock()-(farm.waitSince or os.clock())).."s). Stage "..tostring(farm.stage)..", live wave "..tostring(readValue(child(storage(),"Values"),"LocalWave")))
+end
 function farm.unlimited()
     local folder=toolUpgrades("C96")
     if not folder then return nil end
@@ -3205,9 +3215,11 @@ function farm.unlimitedOwned()
 end
 function farm.confirmed()
     if farm.fault then farm.status(farm.fault);return false end
-    return not farm.inFlight
+    if farm.inFlight then farm.waitStatus("native farm purchase response");return false end
+    return true
 end
 function farm.request(object,cost,event,...)
+    if state.spendingBusy then farm.waitStatus("support purchase/repair response");return false end
     if not farm.confirmed() or os.clock()<(farm.requestAt or 0) then return false end
     if type(cost)~="number" or cost<0 or cost>=math.huge or cost~=cost then farm.status("Unknown price; purchase withheld.");return false end
     if cost>availableMoney() then farm.status("Saving for "..object.Name..": "..math.ceil(cost));return false end
@@ -3304,7 +3316,7 @@ end
 function farm.cancelWalk()
     if farm.route and farm.route.blocked then farm.route.blocked:Disconnect() end
     farm.epoch=farm.epoch+1;farm.route=nil;farm.pathBusy=false;farm.climbDirection=nil
-    farm.walkPoint=nil
+    farm.walkPoint=nil;farm.jumpUntil=nil
     local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
     if humanoid and root and farm.moving then humanoid:MoveTo(root.Position) end
     farm.moving=false
@@ -3329,7 +3341,7 @@ function farm.walk(goal,message,tolerance)
             farm.cancelWalk();farm.pathAt=os.clock()+.25
             farm.status("Route obstructed or stalled; recalculating around obstacles.");return false
         end
-        if point.Action==Enum.PathWaypointAction.Jump then humanoid.Jump=true end
+        if point.Action==Enum.PathWaypointAction.Jump then humanoid.Jump=true;farm.jumpUntil=os.clock()+.25 end
         farm.walkPoint=point.Position
         if route.sentIndex~=route.index then humanoid:MoveTo(point.Position);route.sentIndex=route.index end
         return false
@@ -3404,27 +3416,35 @@ function farm.forwardPosition()
     if not goal then farm.status("No firing position configured for this map.");return false end
     return farm.walk(goal,"Walking to map firing position",1.5)
 end
+function farm.priorityUpgrades()
+    if not farm.upgradeC96(false) then return false end
+    return farm.upgrades("Shop",{MoneyUpgrade=true})
+end
 function farm.earlyWaves()
     local values=child(storage(),"Values")
     local wave=readValue(values,"LocalWave")
     if type(wave)~="number" or wave<1 then farm.status("Waiting for valid wave state before early-wave voting.");return false end
     local time=game:GetService("Lighting"):GetMinutesAfterMidnight()
     local daytime=time>=360 and time<1080
-    if wave>=5 or (wave==4 and daytime and readValue(values,"Vote")==true) then
+    if wave>=5 then
         farm.status("Holding wave-5 vote; moving to rooftop position.")
         return true
     end
-    if wave<4 and daytime and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==false then
-        local epoch=farm.epoch
+    if wave<5 and daytime and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==false then
+        local run=farm.runId
+        local character=LocalPlayer.Character
+        local map=child(Workspace,"Map")
         job("Farm early waves",3,function()
             local current=readValue(values,"LocalWave")
             local t=game:GetService("Lighting"):GetMinutesAfterMidnight()
-            if e.Autofarm and farm.stage==6 and farm.epoch==epoch and type(current)=="number" and current<4 and t>=360 and t<1080 then state.skip() end
+            if e.Autofarm and farm.stage==6 and farm.runId==run and LocalPlayer.Character==character and child(Workspace,"Map")==map and type(current)=="number" and current<5 and t>=360 and t<1080 then state.skip() end
         end)
     end
     if not farm.forwardPosition() then return false end
-    if wave>=2 and wave<=4 then farm.upgradeC96(false) end
-    farm.status("Early-wave farming: "..wave..". C96 upgrades before rooftop; no vote to start wave 5.")
+    if wave>=2 and wave<=4 then farm.priorityUpgrades() end
+    if farm.inFlight then farm.waitStatus("native priority purchase response; early-wave voting still active")
+    elseif state.spendingBusy then farm.waitStatus("support purchase/repair response; early-wave voting still active")
+    else farm.status("Early-wave farming: "..wave..". Ready "..tostring(readValue(values,"Vote"))..", voted "..tostring(readValue(LocalPlayer,"Voted"))..". C96 then Shop Money; climb on day 5 before voting.") end
     return false
 end
 function farm.ladderStep(base,roof,identity)
@@ -3440,19 +3460,22 @@ function farm.ladderStep(base,roof,identity)
         farm.ladder=l
     end
     local function phase(name)
+        if name=="blocked" then l.blockedFrom=l.phase end
         farm.cancelWalk();farm.pathAt=0;l.phase=name;l.at=os.clock();l.progressAt=os.clock();l.high=root.Position.Y
     end
     local function retry()
         if l.attempt>=3 then phase("blocked") else phase("backoff") end
     end
-    if l.phase=="blocked" then farm.status("Ladder failed after 3 attempts. Need live ladder Position/Size/CFrame from Dex.");return false end
+    if l.phase=="blocked" then farm.status("Ladder blocked during "..tostring(l.blockedFrom or "unknown phase")..", attempt "..tostring(l.attempt).."/3. Need live route geometry.");return false end
     if l.phase=="backoff" then
         local retreat=l.base-l.toward*7
         if farm.walk(retreat,"Backing away from ladder before retry",1) then l.attempt=l.attempt+1;phase("approach")
-        elseif os.clock()-l.at>10 then phase("blocked") end
+        elseif os.clock()-l.at>10 then
+            if l.attempt<3 then l.attempt=l.attempt+1;phase("approach") else phase("blocked") end
+        end
         return false
     end
-    local offset=({0,-1.5,1.5})[l.attempt]
+    local offset=({0,-.35,.35})[l.attempt]
     local approach=l.base-l.toward*4+l.side*offset
     if l.phase=="approach" then
         if farm.walk(approach,"Approaching ladder: attempt "..l.attempt.."/3",.9) then phase("engage")
@@ -3539,56 +3562,79 @@ function farm.holdFrontLedge(perkActive)
     farm.moving=true;farm.walkPoint=goal
     humanoid:MoveTo(goal)
     if height>.65 and os.clock()>=(farm.ledgeJumpAt or 0) then
-        humanoid.Jump=true;farm.ledgeJumpAt=os.clock()+1
+        humanoid.Jump=true;farm.jumpUntil=os.clock()+.25;farm.ledgeJumpAt=os.clock()+1
     end
     farm.status("Stepping onto raised front ledge center")
     return false
 end
+function farm.ladderDestination(region,surface)
+    local map=child(Workspace,"Map");local upgrades=child(map,"Upgrades")
+    local parts=child(upgrades,"LaddersMetal") or child(upgrades,"Ladders")
+    if not parts then return nil end
+    local lowest
+    for _,p in ipairs(parts:GetDescendants()) do
+        if p:IsA("BasePart") and p.CanCollide and math.abs(p.Position.X-region.Position.X)<1
+            and math.abs(p.Position.Z-region.Position.Z)<5 then
+            if not lowest or p.Position.Y<lowest.Position.Y then lowest=p end
+        end
+    end
+    if not lowest then return nil end
+    -- Use the rungs' centerline, not the distant upper roof's center.
+    local base=Vector3.new(lowest.Position.X,region.Position.Y-region.Size.Y/2+3,lowest.Position.Z)
+    local landing=Vector3.new(lowest.Position.X,surface.Y+3,surface.Z)
+    return base,landing
+end
 function farm.roof()
     local perks=child(child(LocalPlayer,"PlayerValues"),"PerkValues")
-    if readValue(perks,"RoofCamp")==true then
-        if farm.ladder then farm.cancelWalk();farm.ladder=nil end
-        return farm.holdFrontLedge(true)
-    end
+    local active=readValue(perks,"RoofCamp")==true
+    local root=child(LocalPlayer.Character,"HumanoidRootPart")
+    if not root then return false end
     if not child(child(LocalPlayer,"PlayerPerks"),"RoofCamp") then farm.status("Rooftop Camper perk is required for this route.");return false end
-    if not farm.leave(2) then return false end
-    local map=child(Workspace,"Map")
-    if os.clock()>=(farm.roofScanAt or 0) or farm.roofMap~=map then
-        farm.roofScanAt=os.clock()+5;farm.roofMap=map;farm.roofGoal=nil
-        local root=child(LocalPlayer.Character,"HumanoidRootPart");local distance
-        if map and root then for _,part in ipairs(map:GetDescendants()) do
-            if part.Name=="TopRoof" and part:IsA("BasePart") then
-                local goal=part.Position+Vector3.new(0,part.Size.Y/2+3,0);local d=(root.Position-goal).Magnitude
-                if not distance or d<distance then farm.roofGoal=goal;distance=d end
-            end
-        end end
+    local ledge,surface=farm.frontLedge()
+    if not ledge then farm.status("Shared front balcony ledge is unavailable.");return false end
+    -- A perk can activate before clearing the ladder. Clear its top first.
+    if active and root.Position.Y>=surface.Y-1 then
+        local _,humanoid=alive()
+        if humanoid and humanoid:GetState()~=Enum.HumanoidStateType.Climbing then
+            if farm.ladder then farm.cancelWalk();farm.ladder=nil end
+            return farm.holdFrontLedge(true)
+        end
     end
-    if farm.roofGoal then
-        local root=child(LocalPlayer.Character,"HumanoidRootPart")
-        local regions=child(storage(),"ShopRegions");local ladder;local distance
+    -- Check the exit only on entry into this route. Re-running it on each
+    -- ladder tick can compete with an approach/backoff path.
+    if not farm.ladder then
+        local exit=child(child(storage(),"ShopRegions"),"ShopExit")
+        if exit and root.Position.Y<exit.Position.Y+exit.Size.Y/2 and root.Position.Z<=exit.Position.Z+exit.Size.Z/2+.5 then
+            if not farm.leave(2) then return false end
+        end
+    end
+    local regions=child(storage(),"ShopRegions");local ladder=farm.ladder and farm.ladder.identity
+    local base,landing,distance
+    if ladder then base,landing=farm.ladderDestination(ladder,surface)
+    else
         for _,name in ipairs({"LadderRegionL","LadderRegionR"}) do
             local region=child(regions,name)
-            if region and root then
-                local d=(root.Position-region.Position).Magnitude
-                if not distance or d<distance then ladder=region;distance=d end
+            if region then
+                local candidate,top=farm.ladderDestination(region,surface)
+                if candidate then
+                    local d=(root.Position-candidate).Magnitude
+                    if not distance or d<distance then ladder=region;base=candidate;landing=top;distance=d end
+                end
             end
         end
-        if farm.ladder and (farm.ladder.identity==child(regions,"LadderRegionL") or farm.ladder.identity==child(regions,"LadderRegionR")) then ladder=farm.ladder.identity end
-        if ladder and root and (farm.ladder or root.Position.Y<farm.roofGoal.Y-1.5) then
-            local upgrades=child(map,"Upgrades")
-            if not (child(upgrades,"Ladders") or child(upgrades,"LaddersMetal")) then farm.status("Waiting for physical ladders to appear.");return false end
-            local base=Vector3.new(ladder.Position.X,ladder.Position.Y-ladder.Size.Y/2+3,ladder.Position.Z)
-            return farm.ladderStep(base,farm.roofGoal,ladder)
-        else farm.walk(farm.roofGoal,"Walking to roof; waiting for RoofCamp effect") end
-    else farm.status("No supported TopRoof landmark on this map; roof route needs verification.") end
-    return false
+    end
+    if not base then farm.status("Waiting for matching physical ladder rungs.");return false end
+    farm.roofGoal=landing
+    return farm.ladderStep(base,landing,ladder)
 end
 local conflicts={"AutoVote","AutoSkip","AutoEquip","AutoUpgrade1","AutoUpgrade2","AutoUpgrade3","AutoPurchase","AutoDonate","AutoC96","AutoLeaveSpawn","MeleeAura"}
 function farm.begin()
+    farm.runId=(farm.runId or 0)+1
     if runtime.cancelRefill then runtime.cancelRefill() end
     if runtime.cancelAction then runtime.cancelAction() end
     farm.stage=1;farm.character=LocalPlayer.Character;farm.map=child(Workspace,"Map");farm.mapId=farm.mapName();farm.requestAt=farm.requestAt or 0;farm.active=true
     farm.ledgeSince=nil;farm.ledgeBlocked=nil;farm.ledgeJumpAt=0
+    farm.waitReason=nil;farm.waitSince=nil
     farm.earlyDone=false
     farm.forwardDone=false;farm.forwardGoal=nil;farm.forwardScanAt=0
     farm.roofScanAt=0;farm.roofGoal=nil;farm.pathAt=0;farm.ladder=nil;farm.fault=nil;farm.exitTransit=nil;farm.exitWalking=nil
@@ -3597,6 +3643,7 @@ function farm.begin()
     farm.status("Starting ordered C96 autofarm.")
 end
 function farm.stop()
+    farm.runId=(farm.runId or 0)+1
     farm.cancelWalk()
     farm.exitTransit=nil;farm.exitWalking=nil
     farm.ladder=nil
@@ -3605,7 +3652,9 @@ function farm.stop()
 end
 function farm.equipC96()
     local character,humanoid=alive();local tool=child(character,"C96") or child(child(LocalPlayer,"Backpack"),"C96")
-    if not humanoid or not tool or runtime.consumableBusy or runtime.refillBusy or reloadState.key then return false end
+    if not humanoid or not tool then return false end
+    if tool.Parent==character then return true end
+    if runtime.consumableBusy or runtime.refillBusy or reloadState.key then farm.waitStatus("item use/refill/reload before C96 equip");return false end
     if tool.Parent~=character then if not releaseHeld() then return false end;humanoid:EquipTool(tool) end
     return true
 end
@@ -3624,7 +3673,8 @@ function farm.step()
         farm.status("Unsupported map: staying put, skipping when allowed. Shop lives: "..tostring(readValue(values,"LocalLives") or "unknown")..". Waiting for game over.")
         return
     end
-    if state.spendingBusy or runtime.action or runtime.consumableBusy or runtime.refillBusy or not farm.confirmed() then return end
+    if runtime.action then farm.waitStatus("active item action");return end
+    if farm.fault then farm.status(farm.fault);return end
     if os.clock()<farm.next then return end;farm.next=os.clock()+.1
     local values=child(storage(),"Values")
     if farm.stage>=3 and not farm.forwardDone then
@@ -3636,7 +3686,7 @@ function farm.step()
         if not config.Triggerbot then triggerToggle:SetValue(true) end
         if farm.stage>=7 and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==false then job("Farm skip",3,state.skip) end
     end
-    if farm.stage>=7 and farm.stage~=9 and farm.stage~=12 and not farm.roof() then return end
+    if farm.stage>=7 and farm.stage~=8 and farm.stage~=11 and not farm.roof() then return end
     local done=false
     if farm.stage==1 then done=farm.leave(1)
     elseif farm.stage==2 then done=farm.leave(2)
@@ -3652,14 +3702,13 @@ function farm.step()
             farm.earlyDone=true
         end
         done=farm.roof()
-    elseif farm.stage==7 then done=farm.upgradeC96(false)
-    elseif farm.stage==8 then done=farm.upgrades("Shop",{MoneyUpgrade=true})
-    elseif farm.stage==9 then done=farm.upgrades("Armour",{ArmourDurability=true,Absorption=true})
-    elseif farm.stage==10 then done=farm.upgrades("Barricade")
-    elseif farm.stage==11 then done=farm.upgrades("Shop")
-    elseif farm.stage==12 then done=farm.upgrades("NightVision",{CriticalChance=true})
-    elseif farm.stage==13 then done=farm.upgrades("Sniper")
-    elseif farm.stage==14 then done=farm.upgrades("MortarSquad")
+    elseif farm.stage==7 then done=farm.priorityUpgrades()
+    elseif farm.stage==8 then done=farm.upgrades("Armour",{ArmourDurability=true,Absorption=true})
+    elseif farm.stage==9 then done=farm.upgrades("Barricade")
+    elseif farm.stage==10 then done=farm.upgrades("Shop")
+    elseif farm.stage==11 then done=farm.upgrades("NightVision",{CriticalChance=true})
+    elseif farm.stage==12 then done=farm.upgrades("Sniper")
+    elseif farm.stage==13 then done=farm.upgrades("MortarSquad")
     else
         if not farm.roof() then return end
         done=farm.upgrades("AmmoBox",{AmmoDamage=true})
@@ -3667,6 +3716,9 @@ function farm.step()
         return
     end
     if done then farm.stage=farm.stage+1;farm.status("Autofarm stage "..farm.stage) end
+end
+function farm.applyJump(humanoid)
+    if farm.moving and farm.jumpUntil and os.clock()<farm.jumpUntil then humanoid.Jump=true end
 end
 if RunService.BindToRenderStep then
     local binding="CombatAssistantFarmMovement"
@@ -3680,6 +3732,7 @@ if RunService.BindToRenderStep then
                     direction=offset.Magnitude>.5 and offset.Unit or Vector3.new(0,0,0)
                 end
                 if direction then humanoid:Move(direction,false) end
+                farm.applyJump(humanoid)
             end
         end
     end)
