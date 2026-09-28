@@ -1,15 +1,16 @@
--- Anime Suite 3.8 Lite | standalone source | September 2026
+-- JoesAAS 3.9.1 | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
-local previous = environment.AnimeSuite
+local previous = environment.JoesAAS or environment.AnimeSuite
 if previous and type(previous.stop) == "function" then pcall(previous.stop) end
 if game.GameId ~= 10502841145 then
-    warn("Anime Suite: this build targets the exported game's universe, not this experience.")
+    warn("JoesAAS: this build targets the exported game's universe, not this experience.")
     return
 end
 local A = {}
-environment.AnimeSuite = A
+environment.JoesAAS = A
+environment.AnimeSuite = A -- Compatibility with older running versions.
 A.Core = (function()
 local Core = {}
 function Core.copy(t)
@@ -40,8 +41,7 @@ function Core.renameEligible(id,pet,named,target,petStats)
     if petStats.GetRarity(pet)~='Astral' then return false,'not Astral' end
     -- Match NamedStateUtil.IsNamed: only a table is a naming record.
     if type(named)=='table' and type(named[id])=='table' then return false,'existing named record' end
-    if (type(pet.CustomName)=='string' and pet.CustomName:match('%S')) or pet.Renamed==true then return false,'already renamed' end
-    if pet.Name==target then return false,'name already matches' end
+    -- Pet.Name is catalog data; the game stores custom names in NamedPets.
     if petStats and petStats.IsDynamicById and petStats.IsDynamicById(pet.PetId) then return false,'percentage pet' end
     return true,'eligible'
 end
@@ -292,13 +292,16 @@ return function(A)
         UIS=game:GetService('UserInputService'),Gui=game:GetService('GuiService')}
     A.player=A.S.Players.LocalPlayer
     A.logs={}; A.status={}; A.connections={}; A.tasks={}; A.cache={}; A.cooldowns={}
-    A.alive=true; A.running=false; A.epoch=0; A.started=os.clock(); A.spendPaused=false
+    A.alive=true; A.running=false; A.epoch=0; A.started=os.clock()
     A.defaults={version=3,world='0',mobsByWorld={},target='Nearest',farm=false,trialFollow=false,trialAutoJoin=false,trialJoinSelection={},
+        towerAutoJoin=false,towerSelection={},raidAutoJoin=false,raidSelection={},defenseAutoJoin=false,defenseSelection={},
+        dungeonAutoJoin=false,dungeonSelection={},bossRushAutoJoin=false,bossRushSelection={},
         rename=false,petName='',webhook=false,webhookURL='',pingId='',ping=false,sendDisconnect=true,
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
         blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false}
-    A.folder='AnimeSuite_'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
+    A.legacyFolder='AnimeSuite_'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
+    A.folder='JoesAAS/'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.file=A.folder..'/settings.json'
     function A.log(kind,text)
         text=tostring(text)
@@ -307,7 +310,7 @@ return function(A)
         end
         local line=os.date('%H:%M:%S')..' ['..kind..'] '..text
         A.logs[#A.logs+1]=line; if #A.logs>150 then table.remove(A.logs,1) end
-        print('[Anime Suite] '..line)
+        print('[JoesAAS] '..line)
     end
     function A.connect(signal,fn)
         local c=signal:Connect(function(...)
@@ -329,7 +332,7 @@ return function(A)
         s.distance=math.clamp(s.distance,2,20)
         if not Core.contains({'Nearest','Highest HP','Lowest HP'},s.target) then s.target='Nearest' end
         if not Core.contains({'Walk','Teleport'},s.moveStyle) then s.moveStyle='Walk' end
-        for _,k in ipairs({'webhookEvents','pingEvents','trialJoinSelection'}) do
+        for _,k in ipairs({'webhookEvents','pingEvents','trialJoinSelection','towerSelection','raidSelection','defenseSelection','dungeonSelection','bossRushSelection'}) do
             for id,v in pairs(s[k]) do if type(id)~='string' or type(v)~='boolean' then s[k][id]=nil end end
         end
         for world,selection in pairs(s.mobsByWorld) do
@@ -338,6 +341,42 @@ return function(A)
             end
         end
         s.version=3; return s
+    end
+    -- Copy once before reading settings/session state; never overwrite a new-folder file.
+    if type(makefolder)=='function' and type(readfile)=='function' and type(writefile)=='function' then
+        pcall(makefolder,'JoesAAS'); pcall(makefolder,A.folder)
+        if not A.safeLoad(A.folder..'/migration.json') then
+            local function copyLegacy(name,transform)
+                local destination=A.folder..'/'..name
+                if pcall(readfile,destination) then return end
+                local ok,bytes=pcall(readfile,A.legacyFolder..'/'..name)
+                if not ok then return end
+                if transform then bytes=transform(bytes) end
+                writefile(destination,bytes)
+                assert(readfile(destination)==bytes,'Migration read-back failed: '..name)
+            end
+            local ok,err=pcall(function()
+                for _,name in ipairs({'autoload.json','settings.json','settings.json.bak',
+                    'guild-weekly-tracking.json','guild-weekly-tracking.json.bak','guild-weekly-tracking.json.tmp',
+                    'guild-heartbeat.json','guild-heartbeat.json.bak'}) do copyLegacy(name) end
+                copyLegacy('outbox.json',function(bytes)
+                    local queue=A.S.HTTP:JSONDecode(bytes)
+                    for _,entry in ipairs(queue) do
+                        local file=entry.attachment
+                        if type(file)=='table' and type(file.path)=='string' then
+                            local name=file.path:sub(#A.legacyFolder+2)
+                            if file.path:sub(1,#A.legacyFolder+1)==A.legacyFolder..'/'
+                                and name:match('^guild%-export%-[%w%-]+%.json$') then
+                                copyLegacy(name); file.path=A.folder..'/'..name
+                            end
+                        end
+                    end
+                    return A.S.HTTP:JSONEncode(queue)
+                end)
+                writefile(A.folder..'/migration.json',A.S.HTTP:JSONEncode({complete=true}))
+            end)
+            assert(ok,'Could not preserve previous saves: '..tostring(err)..'. Old files are untouched; rerun to retry.')
+        end
     end
     A.autoloadFile=A.folder..'/autoload.json'
     A.autoloadEnabled=(A.safeLoad(A.autoloadFile) or {}).enabled==true
@@ -446,28 +485,6 @@ return function(A)
     end
     function A.on(name,fn)
         local b=A.bridge(name); if b then return A.connect(b,fn) end
-    end
-    A.inflight={}
-    function A.request(event,resultEvent,...)
-        local b=A.bridge(resultEvent); if not b then return false,'Missing response '..resultEvent end
-        local sentArgs=table.pack(...)
-        local response; local connection=b:Connect(function(accepted,reason,payload,...)
-            if accepted==true and type(payload)=='table' then
-                if event=='NameRenameRequest' and payload.UniqueId~=sentArgs[1].UniqueId then return end
-            end
-            response=table.pack(accepted,reason,payload,...)
-        end)
-        A.connections[#A.connections+1]=connection
-        local ok=A.fire(event,...); local deadline=os.clock()+(event=='NameRenameRequest' and 20 or 10)
-        while ok and A.alive and not response and os.clock()<deadline do task.wait(0.05) end
-        connection:Disconnect()
-        for i=#A.connections,1,-1 do if A.connections[i]==connection then table.remove(A.connections,i); break end end
-        if not ok then return false,'Send failed' end
-        if not response then
-            A.spendPaused=true
-            return false,'Response timeout' 
-        end
-        return true,table.unpack(response,1,response.n)
     end
     function A.job(name,interval,fn,always)
         A.tasks[name]={name=name,interval=interval,fn=fn,always=always,next=0,busy=false,failures=0}
@@ -615,7 +632,7 @@ return function(A)
             table.remove(A.outbox,1); persist(); return
         end
         local payload={content=entry.ping and ('<@'..entry.ping..'>') or '',
-            embeds={{title='Anime Suite / '..tostring(entry.kind),description=entry.message,
+            embeds={{title='JoesAAS / '..tostring(entry.kind),description=entry.message,
                 footer={text='Place '..tostring(game.PlaceId)..' | event '..tostring(entry.time)}}}}
         local contentType='application/json'; local data=A.S.HTTP:JSONEncode(payload)
         -- Empty Lua tables may encode as objects. Discord requires arrays here.
@@ -757,7 +774,7 @@ return function(A)
     A.sessionNamed={}
     function A.renameDiagnostics()
         local d=A.data() or {}; local stats=A.util('PetStatsUtil')
-        local report={version='3.8',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={}}
+        local report={version='3.9',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={}}
         local named=type(d.NamedPets)=='table' and d.NamedPets or {}
         local sampled={}
         for _,id in ipairs(C.keys(type(d.Pets)=='table' and d.Pets or {})) do
@@ -791,65 +808,96 @@ return function(A)
         A.status['Rename report']=ok and ('Saved '..A.folder..'/rename-diagnostics.json')
             or ('Could not save rename report: '..tostring(err))
     end
+    local pending,retries={},{}
+    A.renamePending=nil
+    local function isConfirmed(id)
+        local d=A.data()
+        return d and type(d.NamedPets)=='table' and type(d.NamedPets[id])=='table'
+    end
+    local function finish(id,success,reason)
+        if success then
+            A.sessionNamed[id]=true; retries[id]=nil
+            A.status.Rename='Named Astral: '..id
+        else
+            A.status.Rename='Rename failed for '..id..': '..tostring(reason)
+            A.log('Rename',A.status.Rename)
+        end
+        pending[id]=nil; A.renamePending=nil
+    end
+    A.on('NameRenameResult',function(accepted,reason,payload)
+        local id=A.renamePending
+        if not id then return end
+        if type(payload)=='table' and ((payload.UniqueId and payload.UniqueId~=id)
+            or (payload.Kind and payload.Kind~='Pet')) then return end
+        -- An uncorrelated rejection may belong to another script or the game's UI.
+        if accepted==true and type(payload)=='table' and (payload.Kind==nil or payload.Kind=='Pet')
+            and payload.UniqueId==id then finish(id,true)
+        elseif type(payload)=='table' and payload.UniqueId==id then
+            finish(id,false,reason)
+        end
+    end)
     local function renameStep()
-        if not A.settings.rename then return false end
-        if A.S.UIS:GetFocusedTextBox() then A.status.Rename='Finish editing before naming pets'; return false end
-        local cfg=A.config('NamedConfig'); local stats=A.util('PetStatsUtil'); local d=A.data()
-        if type(d.Pets)~='table' then A.status.Rename='Pet inventory unavailable'; return false end
+        local d=A.data()
+        if not d then A.status.Rename='Waiting for player data'; return end
+        local id=A.renamePending
+        if id then
+            if isConfirmed(id) then finish(id,true)
+            elseif os.clock()-pending[id]>=20 then finish(id,false,'No confirmation; will retry, up to 3 attempts per pet')
+            else A.status.Rename='Waiting for confirmation: '..id; return end
+        end
+        if not A.settings.rename then return end
+        if A.S.UIS:GetFocusedTextBox() then A.status.Rename='Finish editing before naming pets'; return end
+        local cfg=A.config('NamedConfig'); local stats=A.util('PetStatsUtil')
+        if type(d.Pets)~='table' then A.status.Rename='Pet inventory unavailable'; return end
         if not cfg or not stats or type(stats.GetRarity)~='function' then
-            A.status.Rename='Naming configuration unavailable'; return false
+            A.status.Rename='Naming configuration unavailable'; return
         end
         if cfg.WorldId and not A.unlocked(cfg.WorldId) then
-            A.status.Rename='Unlock naming world '..tostring(cfg.WorldId)..' first'; return false
+            A.status.Rename='Unlock naming world '..tostring(cfg.WorldId)..' first'; return
         end
         local name=cfg:Normalize(A.settings.petName)
         local valid,reason=cfg:Validate(name)
-        if not valid then A.status.Rename=cfg:GetErrorMessage(reason); return false end
-        local eligible=0; local skipped={}; local total=0
-        for _,id in ipairs(C.keys(d.Pets)) do
-            local pet=d.Pets[id]
+        if not valid then A.status.Rename=cfg:GetErrorMessage(reason); return end
+        local skipped,total={},0
+        for _,petId in ipairs(C.keys(d.Pets)) do
             total=total+1
-            local canRename,skip=C.renameEligible(id,pet,d.NamedPets or {},name,stats)
-            if A.sessionNamed[id] then canRename=false; skip='renamed this session' end
-            if not canRename then skipped[skip]=(skipped[skip] or 0)+1 end
+            local canRename,skip=C.renameEligible(petId,d.Pets[petId],d.NamedPets or {},name,stats)
+            if A.sessionNamed[petId] then canRename=false; skip='renamed this session' end
+            if (retries[petId] or 0)>=3 then canRename=false; skip='3 unconfirmed attempts; use Retry' end
             if canRename then
-                eligible=eligible+1
-                local cost=cfg:GetCost('Pet','Astral')
-                local balance=A.balance(cfg.ItemId)
-                if type(cost)~='number' or cost<0 then A.status.Rename='Naming cost unavailable'; return false end
+                local cost=cfg:GetCost('Pet','Astral'); local balance=A.balance(cfg.ItemId)
+                if type(cost)~='number' or cost<0 then A.status.Rename='Naming cost unavailable'; return end
                 if balance<cost then
-                    A.status.Rename=string.format('Need %s %s per Astral; have %s',tostring(cost),cfg.ItemId,tostring(balance))
-                    return false
+                    A.status.Rename=string.format('Need %s %s per Astral; have %s',tostring(cost),cfg.ItemId,tostring(balance)); return
                 end
-                if A.ready('rename:'..id,20) then
-                    local ok,accepted,why,payload=A.request('NameRenameRequest','NameRenameResult',{Kind='Pet',UniqueId=id,Name=name})
-                    if ok and accepted==true and type(payload)=='table' and payload.UniqueId==id then
-                        A.sessionNamed[id]=true
-                        A.status.Rename='Named Astral: '..tostring(payload.Name or name)
-                    else
-                        A.status.Rename='Rename failed: '..tostring((not ok and accepted) or why or 'unconfirmed response')
-                        A.log('Rename',A.status.Rename)
+                if A.ready('rename:'..petId,25) then
+                    -- Set pending before Fire: responses may arrive synchronously.
+                    retries[petId]=(retries[petId] or 0)+1
+                    pending[petId]=os.clock(); A.renamePending=petId
+                    A.status.Rename='Requesting Astral rename: '..petId
+                    if not A.fire('NameRenameRequest',{Kind='Pet',UniqueId=petId,Name=name}) then
+                        finish(petId,false,'Bridge send failed')
                     end
-                    return true
+                    return
                 end
+                skip='retry cooling down'
             end
+            skipped[skip]=(skipped[skip] or 0)+1
         end
         local details={}
         for _,reason in ipairs(C.keys(skipped)) do details[#details+1]=skipped[reason]..' '..reason end
-        A.status.Rename=eligible>0 and 'Waiting for Astral rename retry cooldown'
-            or ('Scanned '..total..' pets; none eligible. '..table.concat(details,', '))
-        return false
+        A.status.Rename='Scanned '..total..' pets. '..table.concat(details,', ')
     end
-    A.job('Renaming',2,function()
-        if not A.settings.rename then return end
-        if not A.data() then A.status.Rename='Waiting for player data'; return end
-        if A.spendPaused then A.status.Rename='Request timed out: check the pet, then Resume renaming after timeout'; return end
+    function A.retryRenaming()
+        if A.renamePending then return end
+        retries={}
+        A.status.Rename='Retry enabled; checking unnamed Astral pets'
+    end
+    A.job('Renaming',1,function()
+        if not A.settings.rename and not A.renamePending then return end
         local ok,err=pcall(renameStep)
-        if not ok then
-            A.status.Rename='Rename error: '..tostring(err)
-            A.log('Rename',A.status.Rename)
-        end
-        if not tostring(A.status.Rename):find('^Named Astral:') then saveDiagnostic() end
+        if not ok then A.status.Rename='Rename error: '..tostring(err); A.log('Rename',A.status.Rename) end
+        if not A.renamePending and not tostring(A.status.Rename):find('^Named Astral:') then saveDiagnostic() end
     end)
 end
 
@@ -935,7 +983,7 @@ return function(A)
         local char=A.player.Character; local hrp=char and char:FindFirstChild('HumanoidRootPart')
         local hum=char and char:FindFirstChildOfClass('Humanoid')
         if not hrp or not hum or hum.Health<=0 then A.status.Farm='Waiting for respawn'; return end
-        if not A.settings.farm or A.inMode() or (A.trialContext and A.trialContext()) then
+        if not A.settings.farm or (A.activityBlocksFarm and A.activityBlocksFarm()) or A.inMode() or (A.trialContext and A.trialContext()) then
             A.watchTarget(nil)
             if A.rangeOwned then A.fire('RangeToggle',false); A.rangeOwned=false; hum:Move(Vector3.zero) end
             return
@@ -1008,61 +1056,154 @@ end
 
 end)()(A);
 
--- ===== trial_join =====
+-- ===== activities =====
 (function()
 return function(A)
-    local open,nextTry={},0
-    function A.trialChoices()
-        local cfg=A.config('TimeTrialConfig')
-        return cfg and cfg:GetAllTrials() or {}
+    local definitions={
+        Tower={rank=400,config='TowerConfig',method='GetAllTowers',toggle='towerAutoJoin',selection='towerSelection'},
+        TimeTrial={rank=300,config='TimeTrialConfig',method='GetAllTrials',toggle='trialAutoJoin',selection='trialJoinSelection'},
+        Raid={rank=200,config='RaidConfig',method='GetAllRaids',toggle='raidAutoJoin',selection='raidSelection'},
+        Defense={rank=200,config='DefenseConfig',method='GetAllDefenses',toggle='defenseAutoJoin',selection='defenseSelection'},
+        Dungeon={rank=100,config='DungeonConfig',method='GetAllDungeons',toggle='dungeonAutoJoin',selection='dungeonSelection'},
+        BossRush={rank=100,config='BossRushConfig',method='GetAllRushes',toggle='bossRushAutoJoin',selection='bossRushSelection'}
+    }
+    local order={'Tower','TimeTrial','Raid','Defense','Dungeon','BossRush'}
+    local available,backoff={},{}
+    local pending,leaving,locked,returning
+    for _,mode in ipairs(order) do available[mode]={} end
+    function A.activityChoices(mode)
+        local def=definitions[mode]; if not def then return {} end
+        local cfg=A.config(def.config)
+        return cfg and type(cfg[def.method])=='function' and cfg[def.method](cfg) or {}
     end
-    function A.tryTrialJoin()
-        if not A.alive or not A.running or not A.settings.trialAutoJoin then return end
-        if os.clock()<nextTry or A.trialContext() or A.inMode() then return end
-        local ctrl=A.client('TeleportController')
-        if ctrl and ctrl:IsLoading() then return end
-        local trials=A.trialChoices()
-        for _,key in ipairs(A.Core.keys(open)) do
-            if open[key]<=os.clock() then open[key]=nil
-            elseif A.settings.trialJoinSelection[key]==true and trials[key] then
-                nextTry=os.clock()+15
-                if A.fire('TimeTrialJoin','Join',key) then
-                    A.status['Trial join']='Requested '..tostring(trials[key].Name or key)
-                else A.status['Trial join']='Trial join request unavailable' end
-                return
+    function A.trialChoices() return A.activityChoices('TimeTrial') end
+    local function context()
+        local raw=A.player:GetAttribute('VisibilityContext')
+        local mode=type(raw)=='string' and raw:match('^([^:]+):') or nil
+        if mode=='Trial' then mode='TimeTrial' end
+        return mode~='World' and mode or nil,raw
+    end
+    local function enabled(mode,key)
+        local def=definitions[mode]
+        return A.settings[def.toggle] and A.settings[def.selection][key]==true
+    end
+    local function selectCandidate()
+        for _,mode in ipairs(order) do
+            local choices=A.settings[definitions[mode].toggle] and A.activityChoices(mode) or {}
+            for _,key in ipairs(A.Core.keys(choices)) do
+                if enabled(mode,key) and (backoff[mode..':'..key] or 0)<=os.clock() then
+                    local entry=available[mode][key]
+                    if mode=='Tower' then
+                        local cfg=A.config('TowerConfig'); local util=A.util('TowerStateUtil'); local d=A.data()
+                        local tower=choices[key]
+                        if cfg and cfg.Enabled~=false and util and d and A.unlocked(tower.WorldId)
+                            and util.GetCooldownRemaining(d,tower)<=0 then return mode,key,{} end
+                    elseif entry and entry.deadline>os.clock() then return mode,key,entry end
+                end
             end
         end
     end
-    A.on('TimeTrialAnnouncement',function(p)
-        if type(p)~='table' or p.NotifyKind~='GamemodeOpen' or p.GamemodeType~='TimeTrial'
-            or type(p.Key)~='string' then return end
-        local lifetime=tonumber(p.ExpiresIn) or 10
-        if lifetime<=0 or lifetime~=lifetime then return end
-        open[p.Key]=os.clock()+math.min(lifetime,120)
-        A.tryTrialJoin()
+    local function status(text) A.status.Activities=text; A.status['Trial join']=text end
+    local function suspendFarm()
+        A.watchTarget(nil)
+        local c=A.player.Character; local h=c and c:FindFirstChildOfClass('Humanoid')
+        if h then h:Move(Vector3.zero) end
+    end
+    function A.activityBlocksFarm()
+        local mode=context()
+        return mode~=nil or pending~=nil or leaving~=nil or locked~=nil or returning~=nil
+    end
+    function A.coordinateActivities()
+        if not A.alive or not A.running then return end
+        local current,raw=context()
+        local ctrl=A.client('TeleportController')
+        local loading=ctrl and ctrl:IsLoading()
+        if current=='Tower' or current=='TimeTrial' then
+            if returning~=current then locked=current end
+        end
+        -- A world context plus cleared controller flags confirms an actual exit, including manual exits.
+        if type(raw)=='string' and raw:match('^World:') and not A.inMode() and not loading then
+            locked=nil; returning=nil; leaving=nil
+        end
+        if pending then
+            if current==pending.mode then pending=nil
+            elseif os.clock()-pending.at>20 and not loading and not A.inMode() and not current then
+                backoff[pending.mode..':'..pending.key]=os.clock()+5
+                status('Join not confirmed: '..pending.mode..'; retrying after backoff'); pending=nil
+            else status('Waiting for '..pending.mode..' entry confirmation'); return end
+        end
+        if locked then status(locked..' locked until the run ends'); return end
+        if returning then status('Waiting for '..returning..' return teleport'); return end
+        if leaving then status('Waiting for '..leaving..' exit confirmation'); return end
+        if loading then return end
+        local mode,key,entry=selectCandidate()
+        if not mode then status(current and ('In '..current) or 'Waiting for a selected activity'); return end
+        if current then
+            -- Only these two modes may be interrupted. Equal priority never interrupts a run.
+            if (current=='Raid' or current=='Defense') and definitions[mode].rank>200 then
+                leaving=current; suspendFarm(); status('Leaving '..current..' for '..mode)
+                if not A.fire(current..'Leave') then leaving=nil; status('Could not send leave request') end
+            end
+            return
+        end
+        if A.inMode() then status('Waiting for current mode to finish'); return end
+        pending={mode=mode,key=key,at=os.clock()}; suspendFarm()
+        status('Joining '..mode..': '..key)
+        local ok
+        if mode=='Tower' then ok=A.fire('TowerJoin',{TowerKey=key})
+        elseif mode=='BossRush' then ok=A.fire('BossRushJoin','Join',key,entry.modeId or 'V1',true)
+        else ok=A.fire(mode..'Join','Join',key) end
+        if not ok then backoff[mode..':'..key]=os.clock()+5; pending=nil; status('Join bridge unavailable: '..mode) end
+    end
+    A.tryTrialJoin=A.coordinateActivities
+    for _,name in ipairs(order) do
+        local mode=name
+        A.on(mode..'Announcement',function(p)
+            if type(p)~='table' or p.NotifyKind~='GamemodeOpen' or p.GamemodeType~=mode or type(p.Key)~='string' then return end
+            -- A raid gate announcement is a world gate teleport, not a joinable raid.
+            if p.GateTeleport then return end
+            local duration=tonumber(p.ExpiresIn) or 10
+            if duration<=0 or duration~=duration then return end
+            available[mode][p.Key]={deadline=os.clock()+math.min(duration,600),modeId=p.ModeId}
+            A.coordinateActivities()
+        end)
+        A.on(mode..'Ended',function()
+            local current=context()
+            if current==mode or locked==mode then locked=nil; returning=mode end
+            if pending and pending.mode==mode then pending=nil end
+            A.coordinateActivities()
+        end)
+        if mode~='Tower' then
+            A.on(mode..'Join',function(accepted,reason)
+                if not pending or pending.mode~=mode then return end
+                if accepted==false then
+                    backoff[mode..':'..pending.key]=os.clock()+5; pending=nil
+                    A.status['Activity error']=mode..' refused: '..tostring(reason)
+                    status(A.status['Activity error'])
+                end
+            end)
+        end
+    end
+    A.on('TowerState',function(p)
+        if type(p)=='table' and p.Refused and pending and pending.mode=='Tower' then
+            backoff['Tower:'..pending.key]=os.clock()+10; pending=nil
+            A.status['Activity error']='Tower refused: '..tostring(p.Refused)
+            status(A.status['Activity error'])
+        end
     end)
     A.on('TimeTrialActiveStatus',function(_,p)
         if type(p)~='table' then return end
-        open={}
+        available.TimeTrial={}
         if p.IsOpen==true then
-            if type(p.OpenTrialKeys)=='table' then
-                for key,value in pairs(p.OpenTrialKeys) do
-                    if type(key)=='string' and value==true then open[key]=os.clock()+15 end
-                end
-            elseif type(p.OpenTrialKey)=='string' then open[p.OpenTrialKey]=os.clock()+15 end
+            local keys=p.OpenTrialKeys or {[p.OpenTrialKey or '']=true}
+            for key,value in pairs(keys) do
+                if type(key)=='string' and value==true then available.TimeTrial[key]={deadline=os.clock()+15} end
+            end
         end
-        A.tryTrialJoin()
+        A.coordinateActivities()
     end)
-    A.on('TimeTrialJoin',function(accepted,reason,key)
-        if not A.settings.trialAutoJoin then return end
-        if accepted then
-            nextTry=os.clock()+30; A.status['Trial join']='Accepted; waiting for trial loading'
-        else
-            nextTry=os.clock()+10; A.status['Trial join']='Join response: '..tostring(reason)
-            if type(key)=='string' then open[key]=nil end
-        end
-    end)
-    A.job('Trial join',1,A.tryTrialJoin)
+    A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),A.coordinateActivities)
+    A.job('Activities',0.2,A.coordinateActivities)
 end
 
 end)()(A);
@@ -1427,7 +1568,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.8 Lite',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.1',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1456,7 +1597,7 @@ return function(A)
         function window:Minimize()
             self.Minimized=not self.Minimized; self.Root.Visible=not self.Minimized
         end
-        A.touchGui=Instance.new('ScreenGui'); A.touchGui.Name='AnimeSuiteTouchControls'
+        A.touchGui=Instance.new('ScreenGui'); A.touchGui.Name='JoesAASTouchControls'
         A.touchGui.ResetOnSpawn=false; A.touchGui.DisplayOrder=100002
         A.touchGui.Parent=A.player:WaitForChild('PlayerGui')
         A.touchControls={}
@@ -1468,10 +1609,10 @@ return function(A)
             A.connect(b.Activated,callback); A.touchControls[name]=b; return b
         end
         local dragging,suppressTap=nil,false
-        local suite=touchButton('SUITE',-122,function()
+        local suite=touchButton('JoesAAS',-122,function()
             if not suppressTap then window:Minimize() end
         end)
-        suite.Size=UDim2.fromOffset(110,46); suite.Text='SUITE'; suite.TextSize=15
+        suite.Size=UDim2.fromOffset(110,46); suite.Text='JoesAAS'; suite.TextSize=15
         suite.Font=Enum.Font.GothamBold; suite.AutoButtonColor=false
         suite.BackgroundColor3=Color3.fromRGB(18,24,34); suite.TextColor3=Color3.fromRGB(230,245,255)
         local shape=suite:FindFirstChildOfClass('UICorner'); if shape then shape.CornerRadius=UDim.new(0,16) end
@@ -1529,7 +1670,7 @@ return function(A)
         restore.Visible=false
     end
     local tabs={}
-    for _,name in ipairs({'Farm','Pets','Guild Tracker','Webhook','Settings'}) do
+    for _,name in ipairs({'Farm','Modes','Pets','Guild Tracker','Webhook','Settings'}) do
         tabs[name]=window:AddTab({Title=name,Icon=''})
     end
     local sync=true; local bindings={}; local statuses={}
@@ -1537,7 +1678,7 @@ return function(A)
         return function(...)
             if sync or not A.alive then return end
             local ok,why=pcall(fn,...)
-            if not ok then A.log('UI',why); F:Notify({Title='Anime Suite',Content=tostring(why),Duration=6}) end
+            if not ok then A.log('UI',why); F:Notify({Title='JoesAAS',Content=tostring(why),Duration=6}) end
         end
     end
     local function button(tab,title,fn) return tabs[tab]:AddButton({Title=title,Callback=guard(fn)}) end
@@ -1677,14 +1818,28 @@ return function(A)
     function(selected) A.settings.trialJoinSelection=selected end,true)
     toggle('Farm','Auto join selected trials when open','trialAutoJoin',function() A.tryTrialJoin() end)
     status('Farm','Trial join')
+    note('Modes','Activity priority','Tower > Time Trials > Raid / Defense > other modes > mob farming. Active Tower and Trial runs are never interrupted. Raid wins a tie with Defense; an active run keeps its place.')
+    note('Modes','Movement','Only Time Trials move toward mobs. Tower opens your own tower. Turn off competing auto-join / movement in your other script to let this coordinator control switching.')
+    for _,entry in ipairs({{'Tower','towerAutoJoin','towerSelection'},{'Raid','raidAutoJoin','raidSelection'},
+        {'Defense','defenseAutoJoin','defenseSelection'},{'Dungeon','dungeonAutoJoin','dungeonSelection'},
+        {'BossRush','bossRushAutoJoin','bossRushSelection'}}) do
+        local mode,toggleKey,selectionKey=entry[1],entry[2],entry[3]
+        dropdown('Modes',mode..' selection',selectionKey,function()
+            local rows={}
+            for key,config in pairs(A.activityChoices(mode)) do rows[#rows+1]={key=key,label=config.Name or key} end
+            table.sort(rows,function(a,b) return a.label<b.label end); return rows
+        end,function(key) return A.settings[selectionKey][key]==true end,
+        function(selected) A.settings[selectionKey]=selected; A.coordinateActivities() end,true)
+        toggle('Modes','Auto join '..mode,toggleKey,A.coordinateActivities)
+    end
+    status('Modes','Activities')
+    status('Modes','Activity error')
     input('Pets','Name for unnamed Astral pets','petName')
     toggle('Pets','Auto rename Astral pets ONLY','rename')
-    note('Pets','Astral naming','Only verified Astral rarity is eligible. Existing names, matching names and percentage pets are skipped. Uses the normal Magicule cost. Check the status below for blockers.')
+    note('Pets','Astral naming','Only verified Astral rarity is eligible. Already named and percentage pets are skipped. Uses the normal Magicule cost. Check the status below for blockers.')
     status('Pets','Rename')
     status('Pets','Rename report')
-    button('Pets','Resume renaming after timeout',function()
-        if not next(A.inflight) then A.spendPaused=false end
-    end)
+    button('Pets','Retry unconfirmed renames',A.retryRenaming)
     button('Guild Tracker','Start Tracking',A.guildStart)
     button('Guild Tracker','Stop Tracking',A.guildStop)
     button('Guild Tracker','Send current JSON',A.guildSendSnapshot)
@@ -1697,7 +1852,7 @@ return function(A)
     multi('Webhook','Events to send','webhookEvents',choices({'Disconnect','Mode','Progress','Error','Inventory'}))
     multi('Webhook','Events to ping','pingEvents',choices({'Disconnect','Mode','Progress','Error','Inventory'}))
     toggle('Webhook','Save webhook URL locally with settings','saveSecrets')
-    button('Webhook','Send test notification',function() A.notify('Test','Webhook test from Anime Suite',true) end)
+    button('Webhook','Send test notification',function() A.notify('Test','Webhook test from JoesAAS',true) end)
     note('Webhook','Disconnect / recovery','A hard crash stops the sender. Guild tracking records a local heartbeat and reports the interruption after you rerun the script. Stop Tracking sends its JSON attachment here. Save the URL with settings and enable autoload to restore it after rejoining.')
     status('Webhook','Webhook'); status('Webhook','Disconnect')
     button('Settings','Save settings',function() A.save() end)
@@ -1713,7 +1868,7 @@ return function(A)
         savedStatus:SetDesc('Autoload: '..(A.autoloadEnabled and 'enabled' or 'disabled'))
     end
     toggle('Settings','Black screen / disable 3D rendering','blackScreen',function(value) if A.render then A.render(value) end end)
-    note('Settings','Controls',touch and 'Tap SUITE to hide/show; drag it to reposition. Use each feature’s own toggle. RESTORE enables rendering. Landscape gives the menus more room.'
+    note('Settings','Controls',touch and 'Tap JoesAAS to hide/show; drag it to reposition. Use each feature’s own toggle. RESTORE enables rendering. Landscape gives the menus more room.'
         or 'Right Shift: minimize/show Fluent. F8: restore rendering. Rendering starts enabled.')
     note('Settings','Executor capabilities',
         'Save/load: '..((type(writefile)=='function' and type(readfile)=='function' and type(makefolder)=='function') and 'available' or 'file APIs missing')
@@ -1729,8 +1884,8 @@ return function(A)
         local jobs,enabled={},{}
         for name,job in pairs(A.tasks) do jobs[name]={busy=job.busy,failures=job.failures,nextIn=math.max(0,job.next-os.clock())} end
         for key,value in pairs(A.settings) do if type(value)=='boolean' then enabled[key]=value end end
-        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='3.8',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
-            running=A.running,spendingPaused=A.spendPaused,
+        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='3.9',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
+            running=A.running,
             worlds=#C.keys(A.catalog.worlds),enemies=#C.keys(A.catalog.enemies)}))
         assert(A.safeLoad(A.folder..'/diagnostics.json'),'Could not read back diagnostics file')
         end)
@@ -1739,7 +1894,7 @@ return function(A)
         F:Notify({Title='Diagnostics',Content=A.status.Settings,Duration=8})
     end)
     button('Settings','Unload',A.stop); status('Settings','Rendering')
-    A.overlay=Instance.new('ScreenGui'); A.overlay.Name='AnimeSuiteBlackScreen'
+    A.overlay=Instance.new('ScreenGui'); A.overlay.Name='JoesAASBlackScreen'
     A.overlay.ResetOnSpawn=false; A.overlay.IgnoreGuiInset=true; A.overlay.DisplayOrder=100000; A.overlay.Enabled=false
     A.overlay.Parent=A.player:WaitForChild('PlayerGui')
     local black=Instance.new('TextButton'); black.Size=UDim2.fromScale(1,1); black.BackgroundColor3=Color3.new(0,0,0)
@@ -1777,5 +1932,5 @@ A.finishStartup()
 end)
 if not bootOK then
     if A.stop then pcall(A.stop) end
-    warn("Anime Suite startup failed: " .. tostring(bootError))
+    warn("JoesAAS startup failed: " .. tostring(bootError))
 end
