@@ -1,4 +1,4 @@
--- Anime Suite 3.5 Lite | standalone source | September 2026
+-- Anime Suite 3.8 Lite | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -35,14 +35,15 @@ function Core.merge(defaults, saved)
     return result
 end
 function Core.renameEligible(id,pet,named,target,petStats)
-    if type(id)~='string' or type(pet)~='table' then return false end
-    if not petStats or type(petStats.GetRarity)~='function' or petStats.GetRarity(pet)~='Astral' then return false end
-    -- Any existing named entry is protected, including older formats.
-    if named[id]~=nil and named[id]~=false then return false end
-    if (type(pet.CustomName)=='string' and pet.CustomName:match('%S')) or pet.Renamed==true then return false end
-    if pet.Name==target then return false end
-    if petStats and petStats.IsDynamicById and petStats.IsDynamicById(pet.PetId) then return false end
-    return true
+    if type(id)~='string' or type(pet)~='table' then return false,'unexpected inventory format' end
+    if not petStats or type(petStats.GetRarity)~='function' then return false,'rarity API missing' end
+    if petStats.GetRarity(pet)~='Astral' then return false,'not Astral' end
+    -- Match NamedStateUtil.IsNamed: only a table is a naming record.
+    if type(named)=='table' and type(named[id])=='table' then return false,'existing named record' end
+    if (type(pet.CustomName)=='string' and pet.CustomName:match('%S')) or pet.Renamed==true then return false,'already renamed' end
+    if pet.Name==target then return false,'name already matches' end
+    if petStats and petStats.IsDynamicById and petStats.IsDynamicById(pet.PetId) then return false,'percentage pet' end
+    return true,'eligible'
 end
 function Core.chooseTarget(items,mode)
     table.sort(items,function(a,b)
@@ -546,7 +547,8 @@ end)()(A);
 return function(A)
     A.outbox=A.safeLoad(A.folder..'/outbox.json') or {}
     A.httpRequest=(type(request)=='function' and request) or (type(http_request)=='function' and http_request)
-        or (type(syn)=='table' and syn.request)
+        or (type(http)=='table' and type(http.request)=='function' and http.request)
+        or (type(syn)=='table' and type(syn.request)=='function' and syn.request)
     A.webhookNext=0
     local env=(type(getgenv)=='function' and getgenv()) or _G
     env.AnimeSuiteHTTP=env.AnimeSuiteHTTP or {busy=false}
@@ -575,8 +577,10 @@ return function(A)
     end
     function A.notify(kind,message,force,attachment)
         local s=A.settings
-        if not s.webhook or (not force and s.webhookEvents[kind]==false) then return end
+        if not s.webhook then A.status.Webhook='Webhook disabled: enable it in this tab'; return end
+        if not force and s.webhookEvents[kind]==false then return end
         if kind=='Disconnect' and not s.sendDisconnect then return end
+        s.webhookURL=s.webhookURL:match('^%s*(.-)%s*$')
         if not s.webhookURL:match('^https://discord%.com/api/webhooks/%d+/[%w_%-]+')
             and not s.webhookURL:match('^https://discordapp%.com/api/webhooks/%d+/[%w_%-]+') then
             A.status.Webhook='Enter a Discord webhook URL'; return
@@ -599,20 +603,25 @@ return function(A)
         A.outbox[#A.outbox+1]={kind=kind,message=tostring(message):sub(1,1500),time=os.time(),attempt=0,
             target=fingerprint(s.webhookURL),ping=ping,attachment=attachment}
         local saved=persist(); A.webhookNext=kind=='Disconnect' and 0 or A.webhookNext
+        A.status.Webhook='Queued '..kind..' ('..#A.outbox..' waiting)'
         if attachment and not saved then return end
         return A.outbox[#A.outbox]
     end
     A.job('Webhook delivery',1,function()
-        if not A.alive or not A.settings.webhook or #A.outbox==0 or os.clock()<A.webhookNext or transport.busy then return end
+        if not A.alive or not A.settings.webhook or #A.outbox==0 or os.clock()<A.webhookNext then return end
+        if transport.busy then A.status.Webhook='Waiting for executor HTTP request to finish'; return end
         local entry=A.outbox[1]
         if type(entry)~='table' or type(entry.message)~='string' or entry.target~=fingerprint(A.settings.webhookURL) then
             table.remove(A.outbox,1); persist(); return
         end
         local payload={content=entry.ping and ('<@'..entry.ping..'>') or '',
-            allowed_mentions={parse={},users=entry.ping and {entry.ping} or {}},
             embeds={{title='Anime Suite / '..tostring(entry.kind),description=entry.message,
                 footer={text='Place '..tostring(game.PlaceId)..' | event '..tostring(entry.time)}}}}
         local contentType='application/json'; local data=A.S.HTTP:JSONEncode(payload)
+        -- Empty Lua tables may encode as objects. Discord requires arrays here.
+        local mentions='"allowed_mentions":{"parse":[],"users":'
+            ..(entry.ping and ('['..A.S.HTTP:JSONEncode(entry.ping)..']') or '[]')..'}'
+        data=data:sub(1,-2)..','..mentions..'}'
         if entry.attachment then
             local file=entry.attachment
             local valid=type(file.path)=='string' and file.path:sub(1,#A.folder+14)==A.folder..'/guild-export-'
@@ -646,7 +655,7 @@ return function(A)
             table.remove(A.outbox,1); A.status.Webhook='Delivered '..tostring(entry.kind); A.webhookNext=os.clock()+2
         elseif action=='stop' then
             table.remove(A.outbox,1); A.status.Webhook='Rejected with HTTP '..tostring(status)..'; check webhook URL'
-            if status==401 or status==403 or status==404 then A.settings.webhook=false end
+            -- Keep the user's toggle intact; report the rejection instead of silently disabling it.
         elseif entry.attempt>=8 and status~=429 then
             table.remove(A.outbox,1); A.status.Webhook='Failed after 8 attempts; event dropped'
         else
@@ -654,8 +663,14 @@ return function(A)
         end
         if action~='done' then
             local detail=type(response)=='table' and tostring(response.Body or ''):sub(1,500) or tostring(response):sub(1,500)
+            detail=detail:gsub('https://[^%s"<>]+/api/webhooks/[^%s"<>]+','[webhook redacted]')
             A.status.Webhook=A.status.Webhook..' | '..detail
             A.log('Webhook',A.status.Webhook)
+        end
+        A.webhookDiagnostic={at=os.time(),kind=entry.kind,httpStatus=status,attempt=entry.attempt,
+            result=A.status.Webhook,transportAvailable=type(A.httpRequest)=='function'}
+        if type(writefile)=='function' then
+            pcall(function() writefile(A.folder..'/webhook-diagnostics.json',A.S.HTTP:JSONEncode(A.webhookDiagnostic)) end)
         end
         if entry.attachment then A.status['Guild upload']=A.status.Webhook..' (local JSON retained)' end
         if entry.attachment and (action=='stop' or (action~='done' and entry.attempt>=8 and status~=429)) then
@@ -677,6 +692,7 @@ return function(A)
             A.status.Gameplay='Disconnected: rerun the script after reconnecting'
             if A.guildCheckpoint then A.guildCheckpoint('disconnect') end
             A.setRunning(false)
+            if A.runJob and A.tasks['Webhook delivery'] then A.runJob(A.tasks['Webhook delivery']) end
         end
     end
     local connected=false
@@ -739,10 +755,47 @@ end)()(A);
 return function(A)
     local C=A.Core
     A.sessionNamed={}
+    function A.renameDiagnostics()
+        local d=A.data() or {}; local stats=A.util('PetStatsUtil')
+        local report={version='3.8',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={}}
+        local named=type(d.NamedPets)=='table' and d.NamedPets or {}
+        local sampled={}
+        for _,id in ipairs(C.keys(type(d.Pets)=='table' and d.Pets or {})) do
+            local pet=d.Pets[id]; report.total=report.total+1
+            local ok,eligible,reason=pcall(C.renameEligible,id,pet,named,A.settings.petName,stats)
+            reason=ok and (A.sessionNamed[id] and 'renamed this session' or reason) or 'eligibility error'
+            report.reasons[reason]=(report.reasons[reason] or 0)+1
+            local rarityOK,rarity=pcall(function() return stats.GetRarity(pet) end)
+            rarity=rarityOK and tostring(rarity) or 'unknown'
+            report.rarities[rarity]=(report.rarities[rarity] or 0)+1
+            if #report.samples<40 and (sampled[reason] or 0)<5 then
+                sampled[reason]=(sampled[reason] or 0)+1
+                report.samples[#report.samples+1]={id=tostring(id),idType=type(id),petType=type(pet),
+                    petId=type(pet)=='table' and tostring(pet.PetId) or '',rarity=rarity,reason=reason,
+                    inventoryRarity=type(pet)=='table' and tostring(pet.Rarity) or '',
+                    namedRecordType=type(named[id]),
+                    fields=type(pet)=='table' and C.keys(pet) or {}}
+            end
+        end
+        return report
+    end
+    local lastDiagnostic,nextDiagnostic=nil,0
+    local function saveDiagnostic()
+        if A.status.Rename==lastDiagnostic or os.clock()<nextDiagnostic then return end
+        nextDiagnostic=os.clock()+60
+        local ok,err=pcall(function()
+            assert(type(writefile)=='function','File writing unavailable')
+            writefile(A.folder..'/rename-diagnostics.json',A.S.HTTP:JSONEncode(A.renameDiagnostics()))
+        end)
+        if ok then lastDiagnostic=A.status.Rename end
+        A.status['Rename report']=ok and ('Saved '..A.folder..'/rename-diagnostics.json')
+            or ('Could not save rename report: '..tostring(err))
+    end
     local function renameStep()
         if not A.settings.rename then return false end
         if A.S.UIS:GetFocusedTextBox() then A.status.Rename='Finish editing before naming pets'; return false end
         local cfg=A.config('NamedConfig'); local stats=A.util('PetStatsUtil'); local d=A.data()
+        if type(d.Pets)~='table' then A.status.Rename='Pet inventory unavailable'; return false end
         if not cfg or not stats or type(stats.GetRarity)~='function' then
             A.status.Rename='Naming configuration unavailable'; return false
         end
@@ -752,10 +805,14 @@ return function(A)
         local name=cfg:Normalize(A.settings.petName)
         local valid,reason=cfg:Validate(name)
         if not valid then A.status.Rename=cfg:GetErrorMessage(reason); return false end
-        local eligible=0
+        local eligible=0; local skipped={}; local total=0
         for _,id in ipairs(C.keys(d.Pets)) do
             local pet=d.Pets[id]
-            if not A.sessionNamed[id] and C.renameEligible(id,pet,d.NamedPets or {},name,stats) then
+            total=total+1
+            local canRename,skip=C.renameEligible(id,pet,d.NamedPets or {},name,stats)
+            if A.sessionNamed[id] then canRename=false; skip='renamed this session' end
+            if not canRename then skipped[skip]=(skipped[skip] or 0)+1 end
+            if canRename then
                 eligible=eligible+1
                 local cost=cfg:GetCost('Pet','Astral')
                 local balance=A.balance(cfg.ItemId)
@@ -770,21 +827,29 @@ return function(A)
                         A.sessionNamed[id]=true
                         A.status.Rename='Named Astral: '..tostring(payload.Name or name)
                     else
-                        A.status.Rename='Rename failed: '..tostring(why or accepted or 'unconfirmed response')
+                        A.status.Rename='Rename failed: '..tostring((not ok and accepted) or why or 'unconfirmed response')
                         A.log('Rename',A.status.Rename)
                     end
                     return true
                 end
             end
         end
-        A.status.Rename=eligible>0 and 'Waiting for Astral rename retry cooldown' or 'No eligible unnamed Astral pets'
+        local details={}
+        for _,reason in ipairs(C.keys(skipped)) do details[#details+1]=skipped[reason]..' '..reason end
+        A.status.Rename=eligible>0 and 'Waiting for Astral rename retry cooldown'
+            or ('Scanned '..total..' pets; none eligible. '..table.concat(details,', '))
         return false
     end
     A.job('Renaming',2,function()
         if not A.settings.rename then return end
         if not A.data() then A.status.Rename='Waiting for player data'; return end
         if A.spendPaused then A.status.Rename='Request timed out: check the pet, then Resume renaming after timeout'; return end
-        renameStep()
+        local ok,err=pcall(renameStep)
+        if not ok then
+            A.status.Rename='Rename error: '..tostring(err)
+            A.log('Rename',A.status.Rename)
+        end
+        if not tostring(A.status.Rename):find('^Named Astral:') then saveDiagnostic() end
     end)
 end
 
@@ -1362,7 +1427,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.5 Lite',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.8 Lite',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1616,6 +1681,7 @@ return function(A)
     toggle('Pets','Auto rename Astral pets ONLY','rename')
     note('Pets','Astral naming','Only verified Astral rarity is eligible. Existing names, matching names and percentage pets are skipped. Uses the normal Magicule cost. Check the status below for blockers.')
     status('Pets','Rename')
+    status('Pets','Rename report')
     button('Pets','Resume renaming after timeout',function()
         if not next(A.inflight) then A.spendPaused=false end
     end)
@@ -1657,15 +1723,20 @@ return function(A)
     status('Settings','Gameplay')
     button('Settings','Refresh catalogs',function() A.discover(); A.refreshUI() end)
     button('Settings','Write diagnostics',function()
+        local ok,err=pcall(function()
         assert(type(writefile)=='function','File API unavailable')
         pcall(makefolder,A.folder)
         local jobs,enabled={},{}
         for name,job in pairs(A.tasks) do jobs[name]={busy=job.busy,failures=job.failures,nextIn=math.max(0,job.next-os.clock())} end
         for key,value in pairs(A.settings) do if type(value)=='boolean' then enabled[key]=value end end
-        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='3.1',status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
+        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='3.8',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
             running=A.running,spendingPaused=A.spendPaused,
             worlds=#C.keys(A.catalog.worlds),enemies=#C.keys(A.catalog.enemies)}))
-        A.log('Diagnostics','Saved '..A.folder..'/diagnostics.json')
+        assert(A.safeLoad(A.folder..'/diagnostics.json'),'Could not read back diagnostics file')
+        end)
+        A.status.Settings=ok and ('Saved '..A.folder..'/diagnostics.json') or ('Diagnostics save failed: '..tostring(err))
+        A.log('Diagnostics',A.status.Settings)
+        F:Notify({Title='Diagnostics',Content=A.status.Settings,Duration=8})
     end)
     button('Settings','Unload',A.stop); status('Settings','Rendering')
     A.overlay=Instance.new('ScreenGui'); A.overlay.Name='AnimeSuiteBlackScreen'
