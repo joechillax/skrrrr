@@ -1,4 +1,4 @@
--- Anime Suite 3.3 Lite | standalone source | September 2026
+-- Anime Suite 3.4 Lite | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -1106,6 +1106,34 @@ return function(A)
         if entry then s.exportQueued=true; A.guildSave(); A.status['Guild upload']='JSON upload queued'
         else A.status['Guild upload']='JSON kept locally. Enable webhook and enter its URL, then press Stop Tracking to retry.' end
     end
+    local snapshotBusy=false
+    function A.guildSendSnapshot()
+        local s=A.guildSession
+        if not s then A.status['Guild upload']='Start tracking before sending a snapshot'; return end
+        if snapshotBusy then return end
+        snapshotBusy=true
+        local ok,err=pcall(function()
+            assert(A.guildSave(),'Could not save tracker state; check storage status')
+            local snapshot=C.copy(s); local now=os.time(); G.metrics(snapshot,now)
+            snapshot.exportType='progressSnapshot'; snapshot.snapshotAt=now
+            snapshot.snapshotAtISO=os.date('!%Y-%m-%dT%H:%M:%SZ',now)
+            local key=s.sessionId..':'..s.generation..':snapshot:'..s.revision
+            local path=A.folder..'/guild-export-'..s.sessionId:gsub('[^%w%-_]','_')..'-'..s.generation..'-snapshot-'..s.revision..'.json'
+            local encoded=A.S.HTTP:JSONEncode(snapshot)
+            writefile(path,encoded); assert(readfile(path)==encoded,'Snapshot read-back failed')
+            local message='Progress snapshot — '..(s.active and 'tracking remains ON' or 'tracking is OFF')
+                ..'\nCaptured: '..snapshot.snapshotAtISO
+                ..'\nACTIVE tracking: '..string.format('%.2f hours',snapshot.activeTrackingSeconds/3600)
+                ..'\nMembers: '..snapshot.trackedMemberCount
+                ..'\nLast roster: '..(s.lastObservedAt and os.date('!%Y-%m-%dT%H:%M:%SZ',s.lastObservedAt) or 'unavailable')
+            local entry=A.notify('GuildSnapshot',message,true,{path=path,
+                name='GuildTracking_Progress_'..os.date('!%Y-%m-%d_%H-%M-%S',now)..'.json',key=key})
+            A.status['Guild upload']=entry and 'Progress JSON queued; tracking state unchanged'
+                or 'Snapshot saved locally. Enable webhook and enter its URL, then send again.'
+        end)
+        snapshotBusy=false
+        if not ok then A.status['Guild upload']='Snapshot failed: '..tostring(err); A.log('Guild',A.status['Guild upload']) end
+    end
     function A.guildExportFailed(key)
         local s=A.guildSession
         if s and not s.active and key==s.sessionId..':'..s.generation then
@@ -1275,7 +1303,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.3 Lite',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.4 Lite',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1526,6 +1554,7 @@ return function(A)
     end)
     button('Guild Tracker','Start Tracking',A.guildStart)
     button('Guild Tracker','Stop Tracking',A.guildStop)
+    button('Guild Tracker','Send current JSON',A.guildSendSnapshot)
     local guildSummary=note('Guild Tracker','Tracking status',A.guildSummary())
     statuses[#statuses+1]=function() guildSummary:SetDesc(A.guildSummary()) end
 
