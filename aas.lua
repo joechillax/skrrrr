@@ -1,4 +1,4 @@
--- Anime Suite 3.2 Lite | standalone source | September 2026
+-- Anime Suite 3.3 Lite | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -292,7 +292,7 @@ return function(A)
     A.player=A.S.Players.LocalPlayer
     A.logs={}; A.status={}; A.connections={}; A.tasks={}; A.cache={}; A.cooldowns={}
     A.alive=true; A.running=false; A.epoch=0; A.started=os.clock(); A.spendPaused=false
-    A.defaults={version=3,world='0',mobsByWorld={},target='Nearest',farm=false,
+    A.defaults={version=3,world='0',mobsByWorld={},target='Nearest',farm=false,trialFollow=false,
         rename=false,petName='',webhook=false,webhookURL='',pingId='',ping=false,sendDisconnect=true,
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
@@ -870,7 +870,7 @@ return function(A)
         local char=A.player.Character; local hrp=char and char:FindFirstChild('HumanoidRootPart')
         local hum=char and char:FindFirstChildOfClass('Humanoid')
         if not hrp or not hum or hum.Health<=0 then A.status.Farm='Waiting for respawn'; return end
-        if not A.settings.farm or A.inMode() then
+        if not A.settings.farm or A.inMode() or (A.trialContext and A.trialContext()) then
             A.watchTarget(nil)
             if A.rangeOwned then A.fire('RangeToggle',false); A.rangeOwned=false; hum:Move(Vector3.zero) end
             return
@@ -895,6 +895,49 @@ return function(A)
             if A.fire('RangeToggle',true) then A.rangeOwned=true end
         end
         A.status.Farm='Target: '..chosen.label
+    end)
+end
+
+end)()(A);
+
+-- ===== trial_follow =====
+(function()
+return function(A)
+    function A.trialContext()
+        local context=A.player:GetAttribute('VisibilityContext')
+        return type(context)=='string' and context:match('^Trial:(.+)$') or nil
+    end
+    A.job('Trial follow',0.3,function()
+        if not A.settings.trialFollow then return end
+        local key=A.trialContext()
+        if not key then A.status['Trial follow']='Waiting for your script to enter a Time Trial'; return end
+        local ctrl=A.client('TeleportController')
+        if ctrl and ctrl:IsLoading() then A.status['Trial follow']='Waiting for trial loading'; return end
+        local character=A.player.Character
+        local root=character and character:FindFirstChild('HumanoidRootPart')
+        local human=character and character:FindFirstChildOfClass('Humanoid')
+        if not root or not human or human.Health<=0 then return end
+        local arenas=workspace:FindFirstChild('TimeTrialArenas')
+        local arena=arenas and arenas:FindFirstChild(key)
+        local enemies=arena and arena:FindFirstChild('Enemies')
+        if not enemies then A.status['Trial follow']='Waiting for trial enemies to load'; return end
+        local nearest,distance
+        for _,enemy in ipairs(enemies:GetChildren()) do
+            local h=enemy:FindFirstChildOfClass('Humanoid')
+            local part=enemy:FindFirstChild('HumanoidRootPart')
+            local context=enemy:GetAttribute('VisibilityContext')
+            if h and h.Health>0 and part and enemy:GetAttribute('EnemyDead')~=true
+                and enemy:GetAttribute('IsClientVisualClone')~=true
+                and (context==nil or context=='' or context=='Trial:'..key) then
+                local d=(part.Position-root.Position).Magnitude
+                if not distance or d<distance then nearest=part; distance=d end
+            end
+        end
+        if not nearest then A.status['Trial follow']='Room cleared; waiting for the next living mob'; return end
+        if distance>A.settings.distance+2 then
+            root.CFrame=CFrame.new(nearest.Position+Vector3.new(0,0,A.settings.distance),nearest.Position)
+        end
+        A.status['Trial follow']='Following trial mobs'
     end)
 end
 
@@ -1232,7 +1275,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.2 Lite',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.3 Lite',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1472,6 +1515,8 @@ return function(A)
     toggle('Farm','Auto farm selected mobs','farm')
     note('Farm','World handling','Joins through the normal world system before combat. Death triggers immediate retargeting. Selections are saved separately per world.')
     status('Farm','Farm'); status('Farm','Discovery')
+    toggle('Farm','Auto teleport to trial mobs','trialFollow')
+    status('Farm','Trial follow')
     input('Pets','Name for unnamed Astral pets','petName')
     toggle('Pets','Auto rename Astral pets ONLY','rename')
     note('Pets','Astral naming','Only verified Astral rarity is eligible. Existing names, matching names and percentage pets are skipped. Uses the normal Magicule cost. Check the status below for blockers.')
