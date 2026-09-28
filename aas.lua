@@ -1,4 +1,4 @@
--- Anime Suite 3.4 Lite | standalone source | September 2026
+-- Anime Suite 3.5 Lite | standalone source | September 2026
 -- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -292,7 +292,7 @@ return function(A)
     A.player=A.S.Players.LocalPlayer
     A.logs={}; A.status={}; A.connections={}; A.tasks={}; A.cache={}; A.cooldowns={}
     A.alive=true; A.running=false; A.epoch=0; A.started=os.clock(); A.spendPaused=false
-    A.defaults={version=3,world='0',mobsByWorld={},target='Nearest',farm=false,trialFollow=false,
+    A.defaults={version=3,world='0',mobsByWorld={},target='Nearest',farm=false,trialFollow=false,trialAutoJoin=false,trialJoinSelection={},
         rename=false,petName='',webhook=false,webhookURL='',pingId='',ping=false,sendDisconnect=true,
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
@@ -328,7 +328,7 @@ return function(A)
         s.distance=math.clamp(s.distance,2,20)
         if not Core.contains({'Nearest','Highest HP','Lowest HP'},s.target) then s.target='Nearest' end
         if not Core.contains({'Walk','Teleport'},s.moveStyle) then s.moveStyle='Walk' end
-        for _,k in ipairs({'webhookEvents','pingEvents'}) do
+        for _,k in ipairs({'webhookEvents','pingEvents','trialJoinSelection'}) do
             for id,v in pairs(s[k]) do if type(id)~='string' or type(v)~='boolean' then s[k][id]=nil end end
         end
         for world,selection in pairs(s.mobsByWorld) do
@@ -943,6 +943,65 @@ end
 
 end)()(A);
 
+-- ===== trial_join =====
+(function()
+return function(A)
+    local open,nextTry={},0
+    function A.trialChoices()
+        local cfg=A.config('TimeTrialConfig')
+        return cfg and cfg:GetAllTrials() or {}
+    end
+    function A.tryTrialJoin()
+        if not A.alive or not A.running or not A.settings.trialAutoJoin then return end
+        if os.clock()<nextTry or A.trialContext() or A.inMode() then return end
+        local ctrl=A.client('TeleportController')
+        if ctrl and ctrl:IsLoading() then return end
+        local trials=A.trialChoices()
+        for _,key in ipairs(A.Core.keys(open)) do
+            if open[key]<=os.clock() then open[key]=nil
+            elseif A.settings.trialJoinSelection[key]==true and trials[key] then
+                nextTry=os.clock()+15
+                if A.fire('TimeTrialJoin','Join',key) then
+                    A.status['Trial join']='Requested '..tostring(trials[key].Name or key)
+                else A.status['Trial join']='Trial join request unavailable' end
+                return
+            end
+        end
+    end
+    A.on('TimeTrialAnnouncement',function(p)
+        if type(p)~='table' or p.NotifyKind~='GamemodeOpen' or p.GamemodeType~='TimeTrial'
+            or type(p.Key)~='string' then return end
+        local lifetime=tonumber(p.ExpiresIn) or 10
+        if lifetime<=0 or lifetime~=lifetime then return end
+        open[p.Key]=os.clock()+math.min(lifetime,120)
+        A.tryTrialJoin()
+    end)
+    A.on('TimeTrialActiveStatus',function(_,p)
+        if type(p)~='table' then return end
+        open={}
+        if p.IsOpen==true then
+            if type(p.OpenTrialKeys)=='table' then
+                for key,value in pairs(p.OpenTrialKeys) do
+                    if type(key)=='string' and value==true then open[key]=os.clock()+15 end
+                end
+            elseif type(p.OpenTrialKey)=='string' then open[p.OpenTrialKey]=os.clock()+15 end
+        end
+        A.tryTrialJoin()
+    end)
+    A.on('TimeTrialJoin',function(accepted,reason,key)
+        if not A.settings.trialAutoJoin then return end
+        if accepted then
+            nextTry=os.clock()+30; A.status['Trial join']='Accepted; waiting for trial loading'
+        else
+            nextTry=os.clock()+10; A.status['Trial join']='Join response: '..tostring(reason)
+            if type(key)=='string' then open[key]=nil end
+        end
+    end)
+    A.job('Trial join',1,A.tryTrialJoin)
+end
+
+end)()(A);
+
 -- ===== guild_clock =====
 (function()
 return function(A)
@@ -1303,7 +1362,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.4 Lite',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='Anime Suite',SubTitle='3.5 Lite',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1545,6 +1604,14 @@ return function(A)
     status('Farm','Farm'); status('Farm','Discovery')
     toggle('Farm','Auto teleport to trial mobs','trialFollow')
     status('Farm','Trial follow')
+    dropdown('Farm','Trials to auto join','trialJoinSelection',function()
+        local rows={}
+        for key,trial in pairs(A.trialChoices()) do rows[#rows+1]={key=key,label=trial.Name or key} end
+        table.sort(rows,function(a,b) return a.label<b.label end); return rows
+    end,function(key) return A.settings.trialJoinSelection[key]==true end,
+    function(selected) A.settings.trialJoinSelection=selected end,true)
+    toggle('Farm','Auto join selected trials when open','trialAutoJoin',function() A.tryTrialJoin() end)
+    status('Farm','Trial join')
     input('Pets','Name for unnamed Astral pets','petName')
     toggle('Pets','Auto rename Astral pets ONLY','rename')
     note('Pets','Astral naming','Only verified Astral rarity is eligible. Existing names, matching names and percentage pets are skipped. Uses the normal Magicule cost. Check the status below for blockers.')
