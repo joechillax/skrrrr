@@ -1,4 +1,4 @@
--- JoesAAS 3.9.4 | standalone source | September 2026
+-- JoesAAS 3.9.5 | standalone source | September 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -782,7 +782,9 @@ return function(A)
     A.job('Discovery',30,function()
         if A.settings.farm then A.discover() end
     end)
-    A.on('WorldChanged',function(id) A.status.World=tostring(id) end)
+    A.on('WorldChanged',function(id)
+        A.confirmedWorld=tonumber(id); A.status.World=tostring(id)
+    end)
 end
 
 end)()(A);
@@ -932,15 +934,34 @@ return function(A)
         return (ctrl and ctrl:IsInGamemode()) or false
     end
     function A.travel(world)
-        if not world or tostring(A.currentWorld())==tostring(world) then A.worldTransition=nil; return true end
-        A.worldTransition=world
-        A.watchTarget(nil)
-        if A.rangeOwned then A.fire('RangeToggle',false); A.rangeOwned=false end
-        if A.inMode() then return false end
-        if not A.unlocked(world) then A.status.Farm='World locked: '..tostring(world); return false end
+        local wanted=tonumber(world)
+        if not wanted then A.status.Farm='Choose a valid world'; return false end
+        local current=tonumber(A.currentWorld())
+        local context=A.player:GetAttribute('VisibilityContext')
+        local contextWorld=type(context)=='string' and tonumber(context:match('^World:(%d+)$')) or nil
+        local attributeWorld=tonumber(A.player:GetAttribute('CurrentWorldId'))
         local ctrl=A.client('TeleportController')
-        if ctrl and ctrl.IsLoading and ctrl:IsLoading() then return false end
-        if A.ready('travel',5) then A.fire('RequestChangeWorld',tonumber(world)) end
+        local loading=ctrl and ctrl.IsLoading and ctrl:IsLoading()
+        -- Never treat a local/controller value alone as proof of server world membership.
+        local verified=(contextWorld==wanted or attributeWorld==wanted or A.confirmedWorld==wanted)
+            and (current==nil or current==wanted)
+            and (contextWorld==nil or contextWorld==wanted)
+            and (attributeWorld==nil or attributeWorld==wanted)
+        if verified and not loading and not A.inMode() then
+            A.worldTransition=nil; return true
+        end
+        A.worldTransition=wanted; A.watchTarget(nil)
+        local character=A.player.Character
+        local human=character and character:FindFirstChildOfClass('Humanoid')
+        if human then human:Move(Vector3.zero) end
+        if A.rangeOwned then A.fire('RangeToggle',false); A.rangeOwned=false end
+        if A.inMode() then A.status.Farm='Waiting for the current mode to finish'; return false end
+        if not A.unlocked(wanted) then A.status.Farm='World locked: '..wanted; return false end
+        A.status.Farm='Waiting for registered World '..wanted..' (current '..tostring(contextWorld or attributeWorld or current or 'unknown')..')'
+        if loading then return false end
+        if A.ready('travel',5) then
+            if not A.fire('RequestChangeWorld',wanted) then A.status.Farm='World teleport request failed' end
+        end
         return false
     end
     local function resolveEnemy(name)
@@ -1686,7 +1707,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.4',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.5',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
