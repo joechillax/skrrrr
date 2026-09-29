@@ -2275,9 +2275,11 @@ function state.skip()
     local wave=readValue(values,"LocalWave")
     local character=LocalPlayer.Character;local map=child(Workspace,"Map");local epoch=state.epoch
     state.skipBusy=true;state.skipStartedAt=os.clock()
+    state.skipLastAttempt=os.clock();state.skipLastWave=wave;state.skipLastError=nil;state.skipLastResult=nil
     local ok,result=pcall(remote,"RemoteFunctions","VoteSkip","InvokeServer")
     state.skipBusy=false;state.skipStartedAt=nil
-    if not ok then error(result) end
+    if not ok then state.skipLastError=tostring(result);error(result) end
+    state.skipLastResult=result==true and "acknowledged" or "not acknowledged"
     if not runtime.active or state.epoch~=epoch or LocalPlayer.Character~=character or child(Workspace,"Map")~=map
         or readValue(values,"LocalWave")~=wave or readValue(values,"Vote")~=true then return end
     if type(result)=="boolean" then
@@ -3103,7 +3105,7 @@ function state.actions()
         for _,player in ipairs(Players:GetPlayers()) do if child(player,"Loaded") then loaded=loaded+1 end end
         local message=readValue(values,"Vote")==true and ("Ready: "..tostring(readValue(values,"Voted") or "?").."/"..math.ceil(loaded/2).." votes. Your vote: "..(readValue(LocalPlayer,"Voted")==true and "confirmed" or "pending"))
             or ("Wave "..tostring(readValue(values,"LocalWave") or "?")..": ready-up closed by the game.")
-        if state.readyText~=message then state.readyText=message;state.readyStatus:SetText(message) end
+        if not e.Autofarm and state.readyText~=message then state.readyText=message;state.readyStatus:SetText(message) end
     end
     if e.AutoDonate and not (e.AutoC96 and state.farm and not state.farm.unlimitedOwned()) then job("Donate",e.DonateInterval,state.donate) end
     if e.MeleeAura and os.clock()>=(state.meleeAt or 0) then state.meleeAt=os.clock()+.05;state.melee() end
@@ -4375,6 +4377,50 @@ connect(RunService.Heartbeat,function()
         local text="Step: "..farm.webhookStep().."\nPurchase: "..nextPurchase.."\n"..farm.purchaseSummary().."\nPriority: "..priority.."\nNext drinks: "..farm.nextDrinkSummary(wave,game:GetService("Lighting"):GetMinutesAfterMidnight()).."\nMovement: "..(farm.motionStatus or "Idle")
         farm.detailLabel:SetText(text)
     end)
+end)
+
+-- Readiness must not depend on inventory refresh, purchase completion or pathfinding.
+function farm.voteStatus()
+    local values=child(storage(),"Values")
+    local wave=readValue(values,"LocalWave")
+    if not e.Autofarm then return "Autofarm ready-up: off" end
+    if not farm.active then return "Ready-up: waiting for autofarm initialization" end
+    if (readValue(values,"LocalLives") or 1)<=0 then return "Ready-up: run ended" end
+    if (readValue(values,"VotingTime") or 0)>0 then return "Ready-up: map voting in progress" end
+    if readValue(values,"Vote")~=true then return "Ready-up: CLOSED by game (wave "..tostring(wave)..")" end
+    if state.skipBusy then return "Ready-up: request pending for "..math.floor(os.clock()-(state.skipStartedAt or os.clock())).."s" end
+    if readValue(LocalPlayer,"Voted")==true then return "Ready-up: vote confirmed; waiting for game/other players" end
+    if readValue(LocalPlayer,"Voted")~=false then return "Ready-up: player vote state unavailable" end
+    if farm.recovering then return "Ready-up: held while returning from spawn to roof" end
+    if state.skipLastWave==wave and state.skipLastError then return "Ready-up request failed: "..state.skipLastError end
+    if state.jobs["Farm skip"] then return "Ready-up: vote dispatch queued/in flight" end
+    if state.skipLastWave==wave and state.skipLastResult=="not acknowledged" then return "Ready-up: game did not acknowledge vote; retrying" end
+    if farm.roofReached or (finite(wave) and wave>5) then return "Ready-up: eligible; automatic vote scheduled" end
+    if wave==5 then return "Ready-up: holding wave 5 until first rooftop arrival" end
+    return "Ready-up: early-wave sequence controls this vote"
+end
+function farm.voteMonitor()
+    if not runtime.active then return end
+    if e.Autofarm and farm.active and farm.supported() then
+        local _,humanoid=alive()
+        if humanoid then
+            local ok=pcall(farm.ongoingSkip)
+            farm.voteError=not ok and "Ready-up: scheduler failed; retrying" or nil
+        end
+    end
+    local message=farm.voteError or farm.voteStatus()
+    if farm.voteLabel then pcall(function() farm.voteLabel:SetText(message) end) end
+    if e.Autofarm and state.readyStatus then
+        local ok,result=pcall(function() return state.readyStatus:SetText(message) end)
+        if ok and result~=false then state.readyText=message end
+    end
+end
+farm.voteLabel=runtime.label(farmGroup,"Ready-up: off",true)
+connect(RunService.Heartbeat,function()
+    if os.clock()<(farm.voteMonitorAt or 0) then return end
+    farm.voteMonitorAt=os.clock()+1
+    local ok=pcall(farm.voteMonitor)
+    if not ok and farm.voteLabel then pcall(function() farm.voteLabel:SetText("Ready-up: unable to read live vote state") end) end
 end)
 
 function state.upgradeShopMoney()
