@@ -3393,6 +3393,8 @@ function farm.request(object,cost,event,...)
         farm.waitStatus("item use/refill/reload before "..object.Name.." purchase (available "..math.floor(budget)..", cost "..math.ceil(cost)..")");return false
     end
     local args={...};local character=LocalPlayer.Character;local run=farm.runId
+    farm.purchaseObservation={object=object,before=object.Value,event=event,item=args[1],name=object.Name,state="Queued"}
+    local observation=farm.purchaseObservation
     farm.inFlight=true;farm.requestAt=os.clock()+math.max(.5,e.ActionInterval)
     task.spawn(function()
         if not runtime.active or LocalPlayer.Character~=character or farm.runId~=run or not (e.Autofarm or e.AutoC96) then farm.inFlight=false;return end
@@ -3413,9 +3415,9 @@ function farm.request(object,cost,event,...)
         end)
         farm.inFlight=false
         if farm.runId~=run or LocalPlayer.Character~=character then return end
-        if not ok then farm.fault="Native purchase failed: "..tostring(result);farm.status(farm.fault)
-        elseif result then farm.status("Native purchase sent: "..object.Name..". Server acceptance unverified.")
-        else farm.status("Purchase waiting for native prerequisites: "..object.Name) end
+        if not ok then observation.state="Native request failed";farm.fault="Native purchase failed: "..tostring(result);farm.status(farm.fault)
+        elseif result then observation.state="Request sent";farm.status("Native purchase sent: "..object.Name..". Waiting for observed ownership/level change.")
+        else observation.state="Blocked by native prerequisites";farm.status("Purchase waiting for native prerequisites: "..object.Name) end
     end)
     return false
 end
@@ -3493,6 +3495,8 @@ function farm.inRegion(root,region)
     return math.abs(p.X)<=s.X and math.abs(p.Y)<=s.Y and math.abs(p.Z)<=s.Z
 end
 function farm.cancelWalk()
+    if farm.stopSprint then farm.stopSprint() end
+    farm.retreat=nil;farm.sprintClear=false;farm.clearAt=0
     if farm.route and farm.route.blocked then farm.route.blocked:Disconnect() end
     farm.epoch=farm.epoch+1;farm.route=nil;farm.pathBusy=false;farm.climbDirection=nil
     farm.walkPoint=nil;farm.jumpUntil=nil
@@ -3504,13 +3508,17 @@ function farm.walk(goal,message,tolerance)
     local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
     if not root or not humanoid then return false end
     local function distance(a,b) return Vector3.new(a.X-b.X,0,a.Z-b.Z).Magnitude end
-    if distance(root.Position,goal)<(tolerance or 1.5) and math.abs(root.Position.Y-goal.Y)<6 then farm.cancelWalk();return true end
+    if distance(root.Position,goal)<(tolerance or 1.5) and math.abs(root.Position.Y-goal.Y)<4 and farm.grounded(humanoid,root) then farm.cancelWalk();return true end
+    if farm.retreat then
+        if (farm.retreat.goal-goal).Magnitude>4 or os.clock()>=farm.retreat.untilAt then farm.cancelWalk();farm.pathAt=0
+        else farm.walkPoint=farm.retreat.point;farm.status("Backing up before recalculating route");return false end
+    end
     farm.status(message);farm.moving=true
     local route=farm.route
     if route and (route.goal-goal).Magnitude>4 then farm.cancelWalk();route=nil end
     if route then
         local point=route.points[route.index]
-        while point and distance(root.Position,point.Position)<1.25 and math.abs(root.Position.Y-point.Position.Y)<6 do
+        while point and (distance(root.Position,point.Position)<1.25 or farm.passedWaypoint(route,root)) and math.abs(root.Position.Y-point.Position.Y)<6 do
             route.index=route.index+1;point=route.points[route.index];route.progressAt=os.clock();route.best=nil
         end
         if not point then farm.cancelWalk();farm.pathAt=0;return false end
@@ -3518,10 +3526,11 @@ function farm.walk(goal,message,tolerance)
         if not route.best or remaining<route.best-.25 then route.best=remaining;route.progressAt=os.clock() end
         if route.obstructed or os.clock()-route.progressAt>2 then
             farm.cancelWalk();farm.pathAt=os.clock()+.25
+            farm.backoff(root,point.Position,goal)
             farm.status("Route obstructed or stalled; recalculating around obstacles.");return false
         end
         if point.Action==Enum.PathWaypointAction.Jump then humanoid.Jump=true;farm.jumpUntil=os.clock()+.25 end
-        farm.walkPoint=point.Position
+        farm.walkPoint=farm.movementTarget(route,root)
         if route.sentIndex~=route.index then humanoid:MoveTo(point.Position);route.sentIndex=route.index end
         return false
     end
@@ -3717,7 +3726,7 @@ function farm.holdFrontLedge(perkActive)
     local goal=surface+Vector3.new(0,offset,0)
     local horizontal=Vector3.new(goal.X-root.Position.X,0,goal.Z-root.Position.Z)
     local height=goal.Y-root.Position.Y
-    if horizontal.Magnitude<.75 and math.abs(height)<.65 then
+    if horizontal.Magnitude<.75 and math.abs(height)<.65 and farm.grounded(humanoid,root) then
         farm.cancelWalk();farm.ledgeSince=nil;farm.ledgeBlocked=nil
         if perkActive then return true end
         farm.status("At centered front ledge; waiting for Rooftop Camper effect.");return false
@@ -3744,6 +3753,7 @@ function farm.holdFrontLedge(perkActive)
         farm.status("Front ledge ascent stalled. Toggle autofarm off/on to retry.");return false
     end
     if farm.route or farm.climbDirection then farm.cancelWalk() end
+    farm.stopSprint()
     farm.moving=true;farm.walkPoint=goal
     humanoid:MoveTo(goal)
     if height>.65 and os.clock()>=(farm.ledgeJumpAt or 0) then
@@ -3980,15 +3990,16 @@ if RunService.BindToRenderStep then
         if runtime.active and (e.Autofarm or e.AutoLeaveSpawn) and (not e.Autofarm or farm.supported()) then
             local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
             if humanoid and root then
+                if farm.motionTick then farm.motionTick(humanoid,root) end
                 local direction=farm.climbDirection
                 if farm.walkPoint then
                     local offset=Vector3.new(farm.walkPoint.X-root.Position.X,0,farm.walkPoint.Z-root.Position.Z)
-                    direction=offset.Magnitude>.5 and offset.Unit or Vector3.new(0,0,0)
+                    direction=offset.Magnitude>.25 and offset.Unit*math.min(1,offset.Magnitude/2) or Vector3.new(0,0,0)
                 end
                 if direction then humanoid:Move(direction,false) end
                 farm.applyJump(humanoid)
-            end
-        end
+            elseif farm.stopSprint then farm.stopSprint() end
+        elseif farm.stopSprint then farm.stopSprint() end
     end)
     table.insert(runtime.connections,{Disconnect=function() RunService:UnbindFromRenderStep(binding) end})
 end
@@ -4098,6 +4109,239 @@ function farm.showDrinks()
         if ok and result~=false then farm.drinkDisplayed=message end
     end
 end
+
+-- Webhook credentials stay in memory, outside saved profiles.
+farm.webhook={enabled=false,url="",sent={}}
+function farm.webhookStep()
+    if farm.recovering then return "Returning to roof after respawn" end
+    if farm.healthDue() then return "Max Health / Health Regen" end
+    if farm.healingDue() then return "Healing items and upgrades" end
+    if farm.stage==6 then
+        local wave=readValue(child(storage(),"Values"),"LocalWave") or 0
+        return wave>=5 and "Climbing to roof" or "Early farming: C96 / Shop Money"
+    end
+    local names={"Leaving spawn","Leaving shop","C96 Unlimited Ammo","Completing first night","Roof access / ladder","Early farming","C96 / Shop Money","Armour upgrades","Barricade upgrades","Shop upgrades","Night Vision / drinks","Sniper / Handling Speed","Mortar upgrades"}
+    return names[farm.stage] or "Ammo Box damage upgrades"
+end
+function farm.webhookURL(value)
+    if type(value)~="string" then return nil end
+    value=value:match("^%s*(.-)%s*$")
+    if value:match("^https://discord%.com/api/webhooks/%d+/[%w_%-]+$") or value:match("^https://discordapp%.com/api/webhooks/%d+/[%w_%-]+$") then return value.."?wait=true" end
+end
+function farm.webhookTick()
+    local w=farm.webhook
+    local values=child(storage(),"Values")
+    local wave=readValue(values,"LocalWave")
+    if not finite(wave) or wave<1 or wave%1~=0 then return end
+    local map=child(Workspace,"Map")
+    if not map then return end
+    if w.map~=map or (w.wave and wave<w.wave) then w.map=map;w.sent={} end
+    w.wave=wave
+    if not runtime.active or not e.Autofarm or not farm.active or not w.enabled or wave%5~=0 or (readValue(values,"VotingTime") or 0)>0 then return end
+    if w.sent[wave] or w.busy or os.clock()<(w.retryAt or 0) then return end
+    local url=farm.webhookURL(w.url)
+    if not url then w.message="Enter a valid Discord webhook URL.";return end
+    local send=request or http_request
+    if type(send)~="function" then w.message="HTTP request function unavailable.";return end
+    local name=farm.mapName()
+    name=({Default="Forest",Winter="Arctic"})[name] or name or "Unknown"
+    name=tostring(name):gsub("[%c]"," "):sub(1,50)
+    local content="Currently wave "..wave.."\nMap: "..name.."\nCurrent step: "..farm.webhookStep()
+    local body=HttpService:JSONEncode({content=content,allowed_mentions={parse={}}})
+    -- Explicitly encode an empty JSON array, even on encoders that use {} for empty tables.
+    body=body:gsub('"parse"%s*:%s*{}','"parse":[]')
+    local sent=w.sent
+    sent[wave]="pending";w.busy=true;w.message="Sending wave "..wave.." update..."
+    task.spawn(function()
+        if not runtime.active or not e.Autofarm or not w.enabled or w.sent~=sent or farm.webhookURL(w.url)~=url then
+            sent[wave]=nil;w.busy=false;return
+        end
+        local ok,response=pcall(send,{Url=url,Method="POST",Headers={["Content-Type"]="application/json"},Body=body})
+        w.busy=false
+        if w.sent~=sent then return end
+        local code=ok and type(response)=="table" and tonumber(response.StatusCode)
+        if code and code>=200 and code<300 then
+            sent[wave]="sent";w.message="Sent wave "..wave.." update."
+        elseif code==429 then
+            local delay=60
+            local decoded,data=pcall(function() return HttpService:JSONDecode(response.Body) end)
+            if decoded and type(data)=="table" and finite(data.retry_after) then delay=math.max(delay,data.retry_after) end
+            w.retryAt=os.clock()+delay;sent[wave]=nil;w.message="Rate limited; waiting before retry."
+        else
+            sent[wave]="failed"
+            -- Never print response bodies/errors: they can contain the webhook token.
+            w.message=code and ("Webhook HTTP "..code.."; check URL/channel.") or "Delivery uncertain; not retrying this wave."
+        end
+    end)
+end
+local webhookGroup=automation:AddRightGroupbox("Wave webhook")
+addControl(webhookGroup,"Input","FarmWebhookURL",{Text="Discord webhook URL (session only)",Default="",Finished=true,Callback=function(value) farm.webhook.url=tostring(value or "") end})
+addControl(webhookGroup,"Toggle","FarmWebhookEnabled",{Text="Send every 5 waves",Default=false,Callback=function(value) farm.webhook.enabled=value==true end})
+farm.webhook.label=runtime.label(webhookGroup,"Off. Sends wave, map and current step only.",true)
+connect(RunService.Heartbeat,function()
+    local w=farm.webhook
+    if os.clock()<(w.tickAt or 0) then return end
+    w.tickAt=os.clock()+1
+    local ok=pcall(farm.webhookTick)
+    if not ok then w.message="Webhook update failed locally." end
+    if w.label then pcall(function() w.label:SetText(w.enabled and (w.message or "Waiting for a 5-wave milestone.") or "Off") end) end
+end)
+
+function farm.grounded(humanoid,root)
+    local material=humanoid.FloorMaterial
+    local velocity=root.AssemblyLinearVelocity
+    return material~=nil and material~=Enum.Material.Air and (not velocity or math.abs(velocity.Y)<2)
+end
+function farm.sprintKey(key,down)
+    if virtualInput then virtualInput:SendKey(down,key,false)
+    elseif legacyInput then legacyInput:SendKeyEvent(down,key,false,game)
+    else error("No virtual keyboard") end
+end
+function farm.stopSprint()
+    local held=farm.sprintHeld
+    if not held then return end
+    local ok=pcall(function()
+        if held.toggle then farm.sprintKey(held.key,true) end
+        farm.sprintKey(held.key,false)
+    end)
+    if ok then farm.sprintHeld=nil else farm.motionStatus="Sprint release failed; retrying" end
+end
+function farm.sprint(wanted)
+    if not wanted then farm.stopSprint();return end
+    if farm.sprintHeld then return end
+    local data=_G.LocalReplicatedDataStore
+    if type(getrenv)=="function" then
+        local ok,env=pcall(getrenv)
+        if ok and env and env._G and env._G.LocalReplicatedDataStore then data=env._G.LocalReplicatedDataStore end
+    end
+    local key=data and data.KeyBinds and data.KeyBinds.Sprint
+    if type(key)=="string" then key=Enum.KeyCode[key] end
+    if not key or not data then farm.motionStatus="Walking: sprint binding unavailable";return end
+    -- Toggle sprint can be independently cancelled by the native weapon script;
+    -- only hold mode gives us an unambiguous release without toggling it back on.
+    if data.ToggleSprint~=false then farm.motionStatus="Walking: use Hold Sprint for automatic sprint";return end
+    if UIS:GetFocusedTextBox() or guiService.MenuIsOpen then return end
+    if UIS:IsKeyDown(key) then return end
+    local ok=pcall(farm.sprintKey,key,true)
+    if ok then farm.sprintHeld={key=key};farm.motionStatus="Sprinting"
+    else farm.motionStatus="Walking: sprint input unavailable" end
+end
+function farm.clearGroundSegment(root,destination)
+    local delta=Vector3.new(destination.X-root.Position.X,0,destination.Z-root.Position.Z)
+    if delta.Magnitude<.1 then return false end
+    local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances={LocalPlayer.Character};params.RespectCanCollide=true
+    local sideways=Vector3.new(-delta.Unit.Z,0,delta.Unit.X)*1.5
+    for _,offset in ipairs({Vector3.new(0,0,0),sideways,sideways*-1}) do
+        if Workspace:Raycast(root.Position+offset,delta,params) then return false end
+    end
+    for distance=0,delta.Magnitude+2,2 do
+        local origin=root.Position+delta.Unit*math.min(distance,delta.Magnitude)
+        local floor=Workspace:Raycast(origin,Vector3.new(0,-6,0),params)
+        if not floor or floor.Normal.Y<.8 or math.abs(floor.Position.Y-(root.Position.Y-3))>1.5 then return false end
+    end
+    return true
+end
+function farm.movementTarget(route,root)
+    local point=route.points[route.index];if not point then return nil end
+    local target=point.Position
+    local base=Vector3.new(target.X-root.Position.X,0,target.Z-root.Position.Z)
+    if base.Magnitude<.1 or point.Action==Enum.PathWaypointAction.Jump then return target end
+    for i=route.index+1,#route.points do
+        local candidate=route.points[i]
+        local delta=Vector3.new(candidate.Position.X-root.Position.X,0,candidate.Position.Z-root.Position.Z)
+        local dot=base.Unit.X*delta.Unit.X+base.Unit.Z*delta.Unit.Z
+        if delta.Magnitude>12 or math.abs(candidate.Position.Y-target.Y)>1 or candidate.Action==Enum.PathWaypointAction.Jump or delta.Magnitude<.1 or dot<.98 then break end
+        target=candidate.Position
+    end
+    if target~=point.Position and farm.clearGroundSegment(root,target) then return target end
+    return point.Position
+end
+function farm.passedWaypoint(route,root)
+    local point,nextPoint=route.points[route.index],route.points[route.index+1]
+    if not point or not nextPoint or point.Action==Enum.PathWaypointAction.Jump then return false end
+    local delta=Vector3.new(nextPoint.Position.X-point.Position.X,0,nextPoint.Position.Z-point.Position.Z)
+    local offset=Vector3.new(root.Position.X-point.Position.X,0,root.Position.Z-point.Position.Z)
+    if delta.Magnitude<.1 then return false end
+    local along=offset.X*delta.Unit.X+offset.Z*delta.Unit.Z
+    return along>0 and along<=delta.Magnitude+1.25 and (offset-delta.Unit*along).Magnitude<1.25
+end
+function farm.motionTick(humanoid,root)
+    local route=farm.route
+    local values=child(LocalPlayer,"PlayerValues")
+    local stamina,maximum=readValue(values,"Stamina"),readValue(values,"StaminaMax")
+    local ratio=finite(stamina) and finite(maximum) and maximum>0 and stamina/maximum or 0
+    if ratio<=.3 then farm.staminaRest=true elseif ratio>=.6 then farm.staminaRest=false end
+    local wanted=false
+    if route and farm.walkPoint and not UIS:GetFocusedTextBox() and not guiService.MenuIsOpen and not farm.retreat and not farm.exitWalking and not farm.climbDirection and not farm.ladder and not farm.roofReached
+        and not farm.staminaRest and ratio>.3 and not runtime.consumableBusy and not runtime.refillBusy and not runtime.action and not reloadState.key
+        and farm.grounded(humanoid,root) then
+        local remaining=(Vector3.new(route.goal.X,0,route.goal.Z)-Vector3.new(root.Position.X,0,root.Position.Z)).Magnitude
+        local ahead=(farm.walkPoint-root.Position).Magnitude
+        local armed=LocalPlayer.Character:FindFirstChildOfClass("Tool")
+        if remaining>14 and ahead>7 and (not armed or child(child(LocalPlayer,"PlayerPerks"),"RunGun")) then
+            if os.clock()>=(farm.clearAt or 0) then
+                farm.clearAt=os.clock()+.15;farm.sprintClear=farm.clearGroundSegment(root,farm.walkPoint)
+            end
+            wanted=farm.sprintClear==true
+        end
+    end
+    farm.sprint(wanted)
+    if not wanted and not farm.sprintHeld then farm.motionStatus=farm.retreat and "Backing up and replanning" or (farm.staminaRest and "Walking: preserving stamina" or "Walking / precise approach") end
+end
+function farm.backoff(root,point,goal)
+    local away=Vector3.new(root.Position.X-point.X,0,root.Position.Z-point.Z)
+    if away.Magnitude<.1 then return end
+    local destination=root.Position+away.Unit*2
+    if farm.clearGroundSegment(root,destination) then
+        farm.retreat={goal=goal,point=destination,untilAt=os.clock()+.65}
+        farm.walkPoint=destination;farm.moving=true
+    end
+end
+table.insert(runtime.connections,{Disconnect=function() farm.stopSprint() end})
+
+function farm.purchaseSummary()
+    local p=farm.purchaseObservation
+    if not p then return "No request yet" end
+    if p.state=="Request sent" then
+        if p.event=="BuyHealing" then
+            local _,tools=ownedTools()
+            if tools[p.item] then p.state="Item received" end
+        elseif p.object and p.object.Value~=p.before then
+            if p.object.Value==true then p.state="Ownership observed"
+            elseif finite(p.object.Value) and finite(p.before) and p.object.Value>p.before then p.state="Level increase observed" end
+        end
+    end
+    return p.state..": "..tostring(p.item or p.name)
+end
+function farm.nextDrinkSummary(wave,minutes)
+    if wave<15 then return "Wave 15 at 18:15" end
+    local clock=farm.drinkClock
+    if clock then
+        for _,slot in pairs(clock.slots) do
+            for _,item in ipairs(farm.drinkItems) do
+                local entry=slot.items[item.name]
+                if not entry or entry.state=="pending" then return slot.at.." batch pending" end
+            end
+        end
+    end
+    if minutes>=1095 then return "00:00" end
+    return "18:15"
+end
+farm.detailLabel=runtime.label(farmGroup,"",true)
+connect(RunService.Heartbeat,function()
+    if os.clock()<(farm.detailAt or 0) then return end
+    farm.detailAt=os.clock()+1
+    if not e.Autofarm then return end
+    pcall(function()
+        local wave=readValue(child(storage(),"Values"),"LocalWave") or 0
+        local priority=farm.healthDue() and "Wave 28 health" or (farm.healingDue() and "Wave 21 healing" or "Normal upgrades")
+        local purchase=farm.purchaseBudget
+        local nextPurchase=purchase and (tostring(purchase.item).." ($"..math.ceil(purchase.cost)..")") or "Waiting for purchase selection"
+        local text="Step: "..farm.webhookStep().."\nPurchase: "..nextPurchase.."\n"..farm.purchaseSummary().."\nPriority: "..priority.."\nNext drinks: "..farm.nextDrinkSummary(wave,game:GetService("Lighting"):GetMinutesAfterMidnight()).."\nMovement: "..(farm.motionStatus or "Idle")
+        farm.detailLabel:SetText(text)
+    end)
+end)
 
 function state.upgradeShopMoney()
     if not e.AutoShopMoney or e.Autofarm or readValue(LocalPlayer,"FirstWave")~=false then return false end
