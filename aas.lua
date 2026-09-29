@@ -1,4 +1,4 @@
--- JoesAAS 3.9.5 | standalone source | September 2026
+-- JoesAAS 3.9.6 | standalone source | September 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -1202,10 +1202,10 @@ return function(A)
                         local tower=choices[key]
                         if cfg and cfg.Enabled~=false and util and d and A.unlocked(tower.WorldId)
                             and util.GetCooldownRemaining(d,tower)<=0 then return mode,key,{} end
-                    elseif entry and entry.deadline>os.clock() then return mode,key,entry
+                    elseif mode~='Raid' and entry and entry.deadline>os.clock() then return mode,key,entry
                     elseif mode=='Raid' or mode=='Defense' then
                         local cfg=choices[key]
-                        if cfg.GateOnly then waitingReason=mode..': waiting for a joinable gate run'
+                        if cfg.GateOnly then waitingReason=mode..': portal-only entry; own-run creation unavailable'
                         elseif cfg.WorldId and not A.unlocked(cfg.WorldId) then
                             waitingReason=mode..': unlock World '..tostring(cfg.WorldId)
                         elseif not A.data() then waitingReason='Waiting for player data'
@@ -1265,9 +1265,10 @@ return function(A)
         end
         if A.inMode() then status('Waiting for current mode to finish'); return end
         pending={mode=mode,key=key,action=entry.action or 'Join',at=os.clock()}; suspendFarm()
-        status('Joining '..mode..': '..key)
+        status((mode=='Raid' and 'Starting your own Raid: ' or ('Joining '..mode..': '))..key)
         local ok
         if mode=='Tower' then ok=A.fire('TowerJoin',{TowerKey=key})
+        elseif mode=='Raid' then ok=A.fire('RaidJoin','Create',key,true)
         elseif mode=='BossRush' then ok=A.fire('BossRushJoin','Join',key,entry.modeId or 'V1',true)
         else ok=A.fire(mode..'Join',entry.action or 'Join',key) end
         if not ok then backoff[mode..':'..key]=os.clock()+5; pending=nil; status('Join bridge unavailable: '..mode) end
@@ -1275,7 +1276,7 @@ return function(A)
     A.tryTrialJoin=A.coordinateActivities
     for _,name in ipairs(order) do
         local mode=name
-        A.on(mode..'Announcement',function(p)
+        if mode~='Raid' then A.on(mode..'Announcement',function(p)
             if type(p)~='table' or p.NotifyKind~='GamemodeOpen' or p.GamemodeType~=mode or type(p.Key)~='string' then return end
             -- A raid gate announcement is a world gate teleport, not a joinable raid.
             if p.GateTeleport then return end
@@ -1283,7 +1284,7 @@ return function(A)
             if duration<=0 or duration~=duration then return end
             available[mode][p.Key]={deadline=os.clock()+math.min(duration,600),modeId=p.ModeId}
             A.coordinateActivities()
-        end)
+        end) end
         A.on(mode..'Ended',function()
             local current=context()
             if current==mode or locked==mode then locked=nil; returning=mode end
@@ -1295,12 +1296,12 @@ return function(A)
                 if not pending or pending.mode~=mode then return end
                 if accepted==false then
                     local key=pending.key
-                    if (mode=='Raid' or mode=='Defense') and (reason=='raid_already_active' or reason=='defense_already_active') then
+                    if mode=='Defense' and reason=='defense_already_active' then
                         available[mode][key]={deadline=os.clock()+15}
                         backoff[mode..':'..key]=0
                     else
                         if reason=='no_active_raid' or reason=='no_active_defense' then available[mode][key]=nil end
-                        backoff[mode..':'..key]=os.clock()+5
+                        backoff[mode..':'..key]=os.clock()+(mode=='Raid' and 30 or 5)
                     end
                     pending=nil
                     A.status['Activity error']=mode..' refused: '..tostring(reason)
@@ -1309,7 +1310,7 @@ return function(A)
             end)
         end
     end
-    for _,name in ipairs({'Raid','Defense'}) do
+    for _,name in ipairs({'Defense'}) do
         local mode=name
         A.on(mode..'ActiveStatus',function(states)
             if type(states)~='table' then return end
@@ -1707,7 +1708,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.5',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.6',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1958,7 +1959,7 @@ return function(A)
     note('Farm','Trial priority','Insane > Hard > Medium > Easy among selected trials currently open. An active trial always finishes first.')
     status('Modes','Activities')
     status('Modes','Activity error')
-    note('Modes','Raid / Defense','Starts a selected run using its normal entry cost, or joins an available run. Missing keys and rejected requests appear above.')
+    note('Modes','Raid / Defense','Raid starts YOUR OWN run only; never joins other raids. Defense starts or joins an available run. Normal entry costs apply; errors appear above.')
     note('Modes','Activity priority','Tower > Time Trials > Raid / Defense > other modes > mob farming. Active Tower and Trial runs are never interrupted. Raid wins a tie with Defense; an active run keeps its place.')
     note('Modes','Movement','Only Time Trials move toward mobs. Tower opens your own tower. Turn off competing auto-join / movement in your other script to let this coordinator control switching.')
     for _,entry in ipairs({{'Tower','towerAutoJoin','towerSelection'},{'Raid','raidAutoJoin','raidSelection'},
@@ -1969,7 +1970,7 @@ return function(A)
             return A.activityRows(mode)
         end,function(key) return A.settings[selectionKey][key]==true end,
         function(selected) A.settings[selectionKey]=selected; A.coordinateActivities() end,true)
-        toggle('Modes','Auto join '..mode,toggleKey,A.coordinateActivities)
+        toggle('Modes',mode=='Raid' and 'Auto start my own Raid' or ('Auto join '..mode),toggleKey,A.coordinateActivities)
     end
     input('Pets','Name for unnamed Astral pets','petName')
     toggle('Pets','Auto rename Astral pets ONLY','rename')
@@ -2061,6 +2062,7 @@ return function(A)
         for _,update in ipairs(statuses) do update() end
     end,true)
 end
+
 
 end)()(A);
 
