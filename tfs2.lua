@@ -3232,13 +3232,29 @@ function farm.healingItem(name)
     for _,item in ipairs(farm.healingItems) do if item.name==name then return item end end
 end
 -- Match BuyTool's stock, price and weight checks without its selected-GUI dependencies.
+function farm.healingPrice(template,utility,manager)
+    -- Utility.ToolBuyPrice requires CharacterManager inside each invocation.
+    -- Use its saved formula with the already initialized manager instead.
+    local base=readValue(child(template,"OtherValues"),"PriceBuy")
+    if not finite(base) then return nil end
+    local perks=child(LocalPlayer,"PlayerPerks")
+    local multiplier=1
+    local secondary=readValue(perks,"SecondaryPrice")
+    if secondary~=nil and utility:CheckArmsDealDiscount(LocalPlayer,template) then multiplier=1+(-.875+secondary*-.025) end
+    if child(perks,"DamagePrice") and not manager:IsEquipment(template) and base>0 then multiplier=multiplier*1.5 end
+    local sell=readValue(perks,"SellValue")
+    if sell~=nil then multiplier=multiplier*(1-(sell*.05+.1)) end
+    local price=math.abs(math.ceil(base*multiplier-.001))
+    if readValue(child(storage(),"Values"),"Difficulty")==5 then price=utility:RoundPrice(price*utility:CareerMulti(price),"Tool") end
+    return price
+end
 function farm.healingBuyInfo(name)
     local template=child(child(storage(),"Tools"),name)
     local playerValues=child(LocalPlayer,"PlayerValues")
     if not farm.healingItem(name) or not template or not child(playerValues,"PerkValues") then return nil,"waiting for item/player data" end
     local utility,manager=gameModule("Utility"),gameModule("CharacterManager")
     if not utility:IsWeaponInStock(name,LocalPlayer) then return nil,"item not in stock" end
-    local price=utility:ToolBuyPrice(LocalPlayer,template)
+    local price=farm.healingPrice(template,utility,manager)
     local weight=manager:GetValue("WeightTool",LocalPlayer,{Tool=template})
     local maximum=manager:GetValue("MaxWeight")
     local current=readValue(playerValues,"WeightCurrent")
