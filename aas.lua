@@ -1,4 +1,4 @@
--- JoesAAS 3.9.8 | standalone source | September 2026
+-- JoesAAS 4.0 | standalone source | September 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -525,6 +525,7 @@ return function(A)
         if not A.alive then return end
         if A.guildCheckpoint then A.guildCheckpoint('unload') end
         A.setRunning(false); if A.render then A.render(false) end
+        if A.cleanupTrialMovement then A.cleanupTrialMovement() end
         A.alive=false
         for _,c in ipairs(A.connections) do pcall(function() c:Disconnect() end) end
         if A.fluent then A.fluent:Destroy() elseif A.gui then A.gui:Destroy() end
@@ -1088,7 +1089,7 @@ return function(A)
     local activeKey,target,loadingSince,endedKey
     local mapReady,state={},{}
     local streamBusy,nextStream=false,0
-    local stalledSince,lastReport,lastReportAt=nil,nil,0
+    local stalledSince,lastReportAt=nil,0
     function A.trialContext()
         local context=A.player:GetAttribute('VisibilityContext')
         return type(context)=='string' and context:match('^Trial:(.+)$') or nil
@@ -1098,7 +1099,7 @@ return function(A)
         if movingHuman then pcall(function() movingHuman:Move(Vector3.zero,false) end) end
         movingHuman=nil; movementRoot=nil; movementKey=nil; anchor=nil
     end
-    A.connect(A.S.Run.Heartbeat,function()
+    local function trialMovement()
         local key=A.trialContext()
         local character=A.player.Character
         local root=character and character:FindFirstChild('HumanoidRootPart')
@@ -1119,7 +1120,22 @@ return function(A)
         if length>0.05 then
             human:Move(Vector3.new(dx/length*0.2,0,dz/length*0.2),false)
         else human:Move(Vector3.zero,false) end
-    end)
+    end
+    local renderName='JoesAASTrialMovement'
+    local renderBound=false
+    if A.S.Run.BindToRenderStep then
+        local ok=pcall(function()
+            A.S.Run:BindToRenderStep(renderName,Enum.RenderPriority.Input.Value+1,function()
+                if A.alive then trialMovement() end
+            end)
+        end)
+        renderBound=ok
+    end
+    if not renderBound then A.connect(A.S.Run.Heartbeat,trialMovement) end
+    function A.cleanupTrialMovement()
+        A.stopTrialMovement()
+        if renderBound then A.S.Run:UnbindFromRenderStep(renderName); renderBound=false end
+    end
     A.on('TimeTrialMapReady',function(key,room,generation,position,token)
         if type(key)~='string' then return end
         mapReady={key=key,room=tonumber(room) or 1,generation=generation,position=position,token=token,at=os.clock()}
@@ -1153,11 +1169,13 @@ return function(A)
                 streamBusy=false
             end)
         end
-        if mapReady.key==key and not mapReady.acknowledged and os.clock()-mapReady.at>=3
+        if mapReady.key==key and (mapReady.attempts or 0)<3 and os.clock()-mapReady.at>=3
+            and os.clock()>=(mapReady.nextAck or 0)
             and type(mapReady.generation)=='number' and type(mapReady.token)=='string'
             and (not room or room==mapReady.room) and roomSpawn(arena,mapReady.room) then
-            -- Replay only the readiness acknowledgement issued for this exact loaded room.
-            mapReady.acknowledged=true
+            -- Bounded retries of the acknowledgement issued for this exact loaded room.
+            mapReady.acknowledged=true; mapReady.attempts=(mapReady.attempts or 0)+1
+            mapReady.nextAck=os.clock()+10
             A.fire('TimeTrialClientReady',key,mapReady.generation,mapReady.token)
         end
     end
@@ -1166,9 +1184,9 @@ return function(A)
         stalledSince=stalledSince or os.clock()
         if os.clock()-stalledSince<5 then return end
         if root and not endedKey then recoverLoading(key,arena) end
-        if os.clock()-lastReportAt<60 or lastReport==message then return end
+        if os.clock()-lastReportAt<60 then return end
         lastReportAt=os.clock()
-        local ok=pcall(function()
+        pcall(function()
             if type(writefile)~='function' then return end
             local samples={}
             for _,enemy in ipairs(enemies and enemies:GetChildren() or {}) do
@@ -1179,13 +1197,14 @@ return function(A)
                     context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
             end
             local ctrl=A.client('TeleportController')
-            writefile(A.folder..'/trial-diagnostics.json',A.S.HTTP:JSONEncode({version='3.9.8',reason=message,
+            writefile(A.folder..'/trial-diagnostics.json',A.S.HTTP:JSONEncode({version='4.0',reason=message,
                 context=A.player:GetAttribute('VisibilityContext'),room=state.TrialKey==key and state.Room,
                 serverEnemies=state.TrialKey==key and state.EnemyCount,anchored=root and root.Anchored,
-                loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,
+                loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
+                movementDriver=renderBound and 'after input' or 'heartbeat',
+                characterPosition=root and {x=root.Position.X,y=root.Position.Y,z=root.Position.Z},
                 hasArena=arena~=nil,hasEnemiesFolder=enemies~=nil,enemies=samples}))
         end)
-        if ok then lastReport=message end
     end
     A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),function()
         if A.trialContext()~=movementKey then A.stopTrialMovement() end
@@ -1194,7 +1213,7 @@ return function(A)
     A.job('Trial follow',0.2,function()
         if not A.settings.trialFollow then target=nil; loadingSince=nil; stalledSince=nil; return end
         local key=A.trialContext()
-        if key~=activeKey then activeKey=key; target=nil; loadingSince=nil; stalledSince=nil; lastReport=nil end
+        if key~=activeKey then activeKey=key; target=nil; loadingSince=nil; stalledSince=nil end
         if not key then A.status['Trial follow']='Waiting to enter a Time Trial'; return end
         if endedKey==key then A.status['Trial follow']='Trial ended; waiting for return teleport'; return end
         local character=A.player.Character
@@ -1235,7 +1254,7 @@ return function(A)
             -- Recover only with a living target in our exact arena and a usable character.
             -- Do not modify the game's loading flag or join/room-ready handshake.
         else loadingSince=nil end
-        stalledSince=nil; lastReport=nil
+        stalledSince=nil
         local offset=math.min(A.settings.distance,3)
         if (part.Position-root.Position).Magnitude>offset+0.5 then
             root.CFrame=CFrame.new(part.Position+Vector3.new(0,0,offset),part.Position)
@@ -1808,7 +1827,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.8',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='4.0',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
