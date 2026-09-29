@@ -3184,6 +3184,87 @@ end
 -- Uses the same client bookkeeping as ShopGui; local levels are not server acknowledgements.
 state.farm={stage=1,message="Off",next=0,epoch=0}
 local farm=state.farm
+farm.healingItems={
+    {name="Bandage",excluded={HealOverTime=true}},
+    {name="First Aid Kit",excluded={Range=true,StaminaHeal=true}},
+    {name="Booster Kit",excluded={}}
+}
+function farm.healingDue()
+    local wave=readValue(child(storage(),"Values"),"LocalWave")
+    return e.Autofarm and not farm.healingDone and type(wave)=="number" and wave>=21
+end
+function farm.healingItem(name)
+    for _,item in ipairs(farm.healingItems) do if item.name==name then return item end end
+end
+-- Match BuyTool's stock, price and weight checks without its selected-GUI dependencies.
+function farm.healingBuyInfo(name)
+    local template=child(child(storage(),"Tools"),name)
+    local playerValues=child(LocalPlayer,"PlayerValues")
+    if not farm.healingItem(name) or not template or not child(playerValues,"PerkValues") then return nil,"waiting for item/player data" end
+    local utility,manager=gameModule("Utility"),gameModule("CharacterManager")
+    if not utility:IsWeaponInStock(name,LocalPlayer) then return nil,"item not in stock" end
+    local price=utility:ToolBuyPrice(LocalPlayer,template)
+    local weight=manager:GetValue("WeightTool",LocalPlayer,{Tool=template})
+    local maximum=manager:GetValue("MaxWeight")
+    local current=readValue(playerValues,"WeightCurrent")
+    if not finite(price) or price<0 or not finite(weight) or not finite(maximum) or not finite(current) then return nil,"price/weight unavailable" end
+    if child(child(LocalPlayer,"PlayerPerks"),"SecondaryPrice") and not manager:IsEquipment(template) then
+        local backgear=child(LocalPlayer,"Backgear");if not backgear then return nil,"backgear unavailable" end
+        local largest=0
+        for _,tool in ipairs(backgear:GetChildren()) do
+            if not manager:IsEquipment(tool) then largest=math.max(largest,readValue(child(tool,"CurrentValues"),"Weight") or 0) end
+        end
+        weight=weight<=largest and math.min(1,weight) or weight-largest+1
+    end
+    if weight>maximum-current then return nil,"insufficient carrying capacity" end
+    return price
+end
+function farm.purchaseHealing(name)
+    local _,tools=ownedTools()
+    if tools[name] or child(child(LocalPlayer,"Backgear"),name) then return false end
+    local price,reason=farm.healingBuyInfo(name)
+    if not price or price>availableMoney() then farm.waitStatus(name..": "..(reason or "purchase budget changed"));return false end
+    remote("RemoteEvents","BuyWeapon","FireServer",name)
+    -- Ownership is only accepted when the actual tool arrives; never fabricate it.
+    return true
+end
+function farm.healingPriority()
+    if not farm.healingDue() then return true end
+    if not farm.confirmed() then return false end
+    local _,tools=ownedTools()
+    for _,item in ipairs(farm.healingItems) do
+        if not tools[item.name] then
+            if child(child(LocalPlayer,"Backgear"),item.name) then farm.waitStatus(item.name.." tool replication");return false end
+            local price,reason=farm.healingBuyInfo(item.name)
+            if not price then farm.waitStatus("Wave 21: "..item.name.." — "..reason);return false end
+            if os.clock()<(farm.healingBuyAt or 0) then farm.waitStatus("Wave 21: "..item.name.." ownership confirmation");return false end
+            return farm.request({Name=item.name},price,"BuyHealing",item.name)
+        end
+    end
+    -- Finish buying all three before spending on their upgrades.
+    for _,item in ipairs(farm.healingItems) do
+        local folder=toolUpgrades(item.name)
+        if not folder then farm.waitStatus("Wave 21: "..item.name.." upgrade data");return false end
+        local list=folder:GetChildren();table.sort(list,function(a,b) return a.Name<b.Name end)
+        local count,blocked=0,nil
+        for _,u in ipairs(list) do
+            if child(u,"Cost") and not item.excluded[u.Name] then
+                count=count+1
+                if not finite(u.Value) or not finite(u.MaxValue) then farm.waitStatus(item.name.." / "..u.Name.." level data");return false end
+                if u.Value<u.MaxValue then
+                    local allowed,reason=state.upgradeAllowed(folder,u)
+                    if allowed then return farm.request(u,state.upgradeCost(tools[item.name],u),"UpgradeWeapon",item.name,u.Name) end
+                    blocked=blocked or item.name.." / "..u.Name..": "..(reason or "upgrade prerequisite or path lock")
+                end
+            end
+        end
+        if count==0 then farm.waitStatus("Wave 21: no allowed upgrade data for "..item.name);return false end
+        if blocked then farm.waitStatus("Wave 21: "..blocked);return false end
+    end
+    farm.healingDone=true
+    farm.status("Wave 21 healing upgrades complete; resuming stage "..tostring(farm.stage))
+    return true
+end
 function farm.mapName() return readValue(child(storage(),"Values"),"MapName") end
 function farm.supported() local name=farm.mapName();return name=="Default" or name=="Winter" or name=="Lakeside" end
 function farm.voteMap()
@@ -3242,7 +3323,12 @@ function farm.request(object,cost,event,...)
     farm.inFlight=true;farm.requestAt=os.clock()+math.max(.5,e.ActionInterval)
     task.spawn(function()
         if not runtime.active or LocalPlayer.Character~=character or farm.runId~=run or not (e.Autofarm or e.AutoC96) then farm.inFlight=false;return end
+        if farm.healingDue() and not ((event=="UpgradeWeapon" or event=="BuyHealing") and farm.healingItem(args[1])) then farm.inFlight=false;return end
         local ok,result=pcall(function()
+            if event=="BuyHealing" then
+                farm.healingBuyAt=os.clock()+3
+                return farm.purchaseHealing(args[1])
+            end
             if event=="UpgradeWeapon" then return state.upgradeTool(args[1],args[2],true) end
             if event=="UpgradeStructurePlayer" then
                 local _,owned,structure=farm.shopData(args[1])
@@ -3655,6 +3741,7 @@ function farm.begin()
     farm.waitReason=nil;farm.waitSince=nil
     farm.earlyDone=false
     farm.roofReached=false;farm.recovering=nil;farm.lastWave=nil;farm.purchaseBudget=nil
+    farm.healingDone=false;farm.healingBuyAt=0
     farm.forwardDone=false;farm.forwardGoal=nil;farm.forwardScanAt=0
     farm.roofScanAt=0;farm.roofGoal=nil;farm.pathAt=0;farm.ladder=nil;farm.fault=nil;farm.exitTransit=nil;farm.exitWalking=nil
     farm.savedTrigger=config.Triggerbot;triggerToggle:SetValue(false)
@@ -3752,7 +3839,8 @@ function farm.step()
             if not config.Triggerbot then triggerToggle:SetValue(true) end
         elseif farm.stage<7 then farm.status("Waiting to equip C96.");return end
     end
-    if farm.stage>=7 and farm.stage~=8 and farm.stage~=11 and not farm.roof() then return end
+    if farm.stage>=7 and (farm.healingDue() or (farm.stage~=8 and farm.stage~=11)) and not farm.roof() then return end
+    if farm.stage>=3 and not farm.healingPriority() then return end
     local done=false
     if farm.stage==1 then done=farm.leave(1)
     elseif farm.stage==2 then done=farm.leave(2)
@@ -3812,7 +3900,7 @@ local farmGroup=automation:AddLeftGroupbox("C96 autofarm")
 control(farmGroup,"Autofarm","One-click C96 autofarm")
 control(farmGroup,"AutoLeaveSpawn","Auto Leave Spawn")
 farm.label=runtime.label(farmGroup,"Off",true)
-runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Experimental and support settings are preserved. Backup Weapon and Rooftop Camper required. Live routes remain unverified.",true)
+runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Wave 21 prioritizes Bandage, First Aid Kit and Booster Kit with selected exclusions, then resumes the interrupted upgrade step. Experimental and support settings are preserved. Backup Weapon and Rooftop Camper required. Live routes remain unverified.",true)
 
 function state.upgradeShopMoney()
     if not e.AutoShopMoney or e.Autofarm or readValue(LocalPlayer,"FirstWave")~=false then return false end
