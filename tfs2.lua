@@ -44,11 +44,12 @@ local function setMenuVisible(visible)
 end
 function runtime.label(group,text)
     local label=group:AddLabel("",true)
-    local rendered,blocked=false,false
+    local rendered,retryAt=false,0
     function label:SetText(value)
         value=tostring(value)
-        if blocked or rendered==value then return end
-        local ok=pcall(function()
+        if rendered==value then return true end
+        if os.clock()<retryAt then return false end
+        local ok,err=pcall(function()
         local lines={}
         for paragraph in (tostring(value).."\n"):gmatch("(.-)\n") do
             local line=""
@@ -67,12 +68,13 @@ function runtime.label(group,text)
             self.TextLabel.TextWrapped=true
             self.TextLabel.Size=UDim2.new(1,-4,0,math.max(1,#lines)*18)
             if group.Resize then group:Resize() end
-        end
+        else error("Status TextLabel unavailable") end
         end)
-        if ok then rendered=value else
-            blocked=true
-            if not runtime.uiWarning then runtime.uiWarning=true;warn("[Combat Assistant] A status label is inaccessible in this executor context; updates to that label were stopped to prevent error spam.") end
+        if ok then rendered=value;self.renderError=nil else
+            retryAt=os.clock()+2;self.renderError=tostring(err)
+            if not runtime.uiWarning then runtime.uiWarning=true;warn("[Combat Assistant] Status update unavailable; retrying quietly every two seconds.") end
         end
+        return ok
     end
     label:SetText(text)
     return label
@@ -539,7 +541,7 @@ local function exposedPoint(candidate, origin, center, limit)
                 and (not contact or (point-origin).Magnitude>=.001)
                 and withinRange(origin, point, limit)
                 and (not (config.WeaponClearance or ignoreFOV) or clearPath(origin, point, model))
-                and (not (config.VisibleCheck or ignoreFOV) or clearPath(Camera.CFrame.Position, point, model)) then
+                and (ignoreFOV or not config.VisibleCheck or clearPath(Camera.CFrame.Position, point, model)) then
                 if not runtime.extra.OP2 then return part, point end
                 local actual=part
                 local start=origin or Camera.CFrame.Position
@@ -2287,7 +2289,9 @@ local function shop()
     local scripts=child(LocalPlayer,"PlayerScripts")
     local module=child(child(child(child(scripts,"GuiManager"),"MainGui"),"ShopGui"),"ShopPurchase")
     assert(module,"ShopPurchase module is unavailable")
-    return require(module)
+    local cached=runtime.gameModules and runtime.gameModules.ShopPurchase
+    assert(cached and cached.module==module and cached.value,"ShopPurchase initialization unavailable; reload after game loads. "..tostring(cached and cached.error or "module changed"))
+    return cached.value
 end
 function state.stop()
     state.restoreHipADS()
@@ -2667,9 +2671,25 @@ for index=1,3 do
         state.refreshTools()
     end)
 end
+-- Resolve dependencies in the script's initialization context, before Heartbeat
+-- callbacks. Requiring them from an engine callback fails in some executors.
+runtime.gameModules={}
+for _,name in ipairs({"Utility","CharacterManager","ShopModule"}) do
+    local module=child(child(storage(),"ModuleScripts"),name)
+    local ok,value=pcall(function() assert(module,name.." unavailable");return require(module) end)
+    runtime.gameModules[name]={module=module,value=ok and value or nil,error=not ok and tostring(value) or nil}
+end
+do
+    local scripts=child(LocalPlayer,"PlayerScripts")
+    local module=child(child(child(child(scripts,"GuiManager"),"MainGui"),"ShopGui"),"ShopPurchase")
+    local ok,value=pcall(function() assert(module,"ShopPurchase unavailable");return require(module) end)
+    runtime.gameModules.ShopPurchase={module=module,value=ok and value or nil,error=not ok and tostring(value) or nil}
+end
 local function gameModule(name)
     local module=child(child(storage(),"ModuleScripts"),name)
-    assert(module,name.." unavailable");return require(module)
+    local cached=runtime.gameModules[name]
+    assert(cached and cached.module==module and cached.value,name.." initialization failed; reload after game loads. "..tostring(cached and cached.error or "module changed"))
+    return cached.value
 end
 function state.upgradeCost(tool,upgrade)
     local level,minimum=upgrade.Value,upgrade.MinValue
@@ -3296,8 +3316,9 @@ function farm.status(message)
     farm.message=message
     if farm.displayed==message or not farm.label or os.clock()<(farm.displayRetryAt or 0) then return end
     farm.displayRetryAt=os.clock()+.5
-    local ok,err=pcall(function() farm.label:SetText(message) end)
-    if ok then farm.displayed=message;farm.displayError=nil else farm.displayError=tostring(err) end
+    local ok,result=pcall(function() return farm.label:SetText(message) end)
+    if ok and result~=false then farm.displayed=message;farm.displayError=nil
+    else farm.displayError=tostring(farm.label.renderError or result) end
 end
 function farm.waitStatus(reason)
     if farm.waitReason~=reason then farm.waitReason=reason;farm.waitSince=os.clock() end
@@ -3506,9 +3527,15 @@ function farm.leave(which)
     if transit and (transit.character~=character or transit.region~=region) then farm.exitTransit=nil;transit=nil end
     if transit and transit.which==which then
         if not inside and beyondDoor then return finish() end
-        farm.exitWalking=which
-        farm.walk(transit.goal,"Clearing "..(which==1 and "spawn" or "shop").." doorway",.6)
-        return false
+        if inside and os.clock()-(transit.startedAt or os.clock())>=5 then
+            -- A rejected transition or return to the same doorway must not
+            -- leave the route permanently stuck in its clearing phase.
+            farm.cancelWalk();farm.exitTransit=nil;farm.pathAt=0
+        else
+            farm.exitWalking=which
+            farm.walk(transit.goal,"Clearing "..(which==1 and "spawn" or "shop").." doorway",.6)
+            return false
+        end
     end
     local shopRoom=child(regions,"MainShopRegion")
     local inShop=which==2 and shopRoom and farm.inRegion(root,shopRoom)
@@ -3517,7 +3544,7 @@ function farm.leave(which)
     if which==1 and readValue(LocalPlayer,"CanExitSpawn")~=true then farm.status("At spawn door; waiting for CanExitSpawn.");return false end
     if (which==1 and not daytime) or (which==2 and daytime) then
         farm.cancelWalk();farm.exitWalking=which;farm.pathAt=0
-        farm.exitTransit={which=which,character=character,region=region,goal=Vector3.new(root.Position.X,root.Position.Y,region.Position.Z+region.Size.Z/2+4)}
+        farm.exitTransit={which=which,character=character,region=region,startedAt=os.clock(),goal=Vector3.new(root.Position.X,root.Position.Y,region.Position.Z+region.Size.Z/2+4)}
         farm.walk(farm.exitTransit.goal,"Walking through open door",.6);return false
     end
     if os.clock()>=(farm.exitAt or 0) then
@@ -3526,7 +3553,7 @@ function farm.leave(which)
         remote("RemoteEvents","PlayerTeleport","FireServer",root.Position,which)
         -- This small transition is part of MainGui.ExitRoom, after the region-checked request.
         character:TranslateBy(Vector3.new(0,.2,8))
-        farm.exitTransit={which=which,character=character,region=region,goal=Vector3.new(root.Position.X,root.Position.Y,region.Position.Z+region.Size.Z/2+4)}
+        farm.exitTransit={which=which,character=character,region=region,startedAt=os.clock(),goal=Vector3.new(root.Position.X,root.Position.Y,region.Position.Z+region.Size.Z/2+4)}
         farm.status("Native exit performed; clearing doorway before continuing.")
     end
     return false
@@ -3835,6 +3862,19 @@ function farm.step()
         farm.cancelWalk();farm.status("Waiting for respawn.");return
     end
     if farm.stage>=7 then farm.roofReached=true end
+    -- Some returns to spawn keep the Character instance, or finish between
+    -- polling ticks. Reconcile the live interaction region as well as identity.
+    if not farm.recovering and farm.stage>=3 then
+        local root=child(LocalPlayer.Character,"HumanoidRootPart")
+        local spawn=child(child(storage(),"ShopRegions"),"SpawnExit")
+        local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
+        if minutes>=360 and minutes<1080 and readValue(LocalPlayer,"CanExitSpawn")==true and farm.inRegion(root,spawn) then
+            if farm.roofReached then farm.resumeCharacter()
+            else
+                farm.resumeCharacter();farm.recovering=nil;farm.stage=1;farm.forwardDone=false
+            end
+        end
+    end
     -- Recovery holds ready-up until the character is safely back on the ledge.
     if farm.recovering then
         if farm.recovering<=2 then
@@ -3846,7 +3886,7 @@ function farm.step()
         return
     end
     farm.ongoingSkip()
-    if runtime.action then farm.waitStatus("active item action; rooftop ready-up remains independent");return end
+    if runtime.action and farm.stage>=3 then farm.waitStatus("active item action; rooftop ready-up remains independent");return end
     if os.clock()<farm.next then return end;farm.next=os.clock()+.1
     if farm.stage>=3 and not farm.forwardDone then
         if not farm.forwardPosition() then return end
@@ -4245,3 +4285,4 @@ task.defer(function()
         profileNotice("Autoloaded: " .. name)
     end)
 end)
+
