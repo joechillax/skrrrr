@@ -3660,7 +3660,13 @@ function farm.ladderStep(base,roof,identity)
     local function retry()
         if l.attempt>=3 then phase("blocked") else phase("backoff") end
     end
-    if l.phase=="blocked" then farm.status("Ladder blocked during "..tostring(l.blockedFrom or "unknown phase")..", attempt "..tostring(l.attempt).."/3. Need live route geometry.");return false end
+    if l.phase=="blocked" then
+        farm.status("Ladder stalled during "..tostring(l.blockedFrom or "unknown phase").."; refreshing route in "..math.max(0,math.ceil(5-(os.clock()-l.at))).."s.")
+        if os.clock()-l.at>=5 then
+            farm.cancelWalk();farm.avoidLadder=l.identity;farm.ladder=nil;farm.pathAt=0
+        end
+        return false
+    end
     if l.phase=="backoff" then
         local retreat=l.base-l.toward*7
         if farm.walk(retreat,"Backing away from ladder before retry",1) then l.attempt=l.attempt+1;phase("approach")
@@ -3672,7 +3678,20 @@ function farm.ladderStep(base,roof,identity)
     local offset=({0,-.35,.35})[l.attempt]
     local approach=l.base-l.toward*4+l.side*offset
     if l.phase=="approach" then
-        if farm.walk(approach,"Approaching ladder: attempt "..l.attempt.."/3",.9) then phase("engage")
+        -- A path can touch the ladder before its final waypoint. Native climbing
+        -- must take over immediately; climbing characters are not grounded.
+        if humanoid:GetState()==Enum.HumanoidStateType.Climbing then
+            phase("climb");l.sawClimbing=true;return false
+        end
+        approach=farm.ladderApproach(approach,root,humanoid) or approach
+        local near=Vector3.new(root.Position.X-approach.X,0,root.Position.Z-approach.Z).Magnitude
+        if near<.95 and math.abs(root.Position.Y-approach.Y)<2 and farm.grounded(humanoid,root) then phase("engage")
+        elseif near<8 and math.abs(root.Position.Y-approach.Y)<2 and farm.clearGroundSegment(root,approach) then
+            if farm.route or farm.pathBusy then farm.cancelWalk() end
+            farm.walkPoint=approach;farm.moving=true;humanoid:MoveTo(approach)
+            farm.status("Aligning with ladder on verified clear ground")
+            if os.clock()-l.at>15 then retry() end
+        elseif farm.walk(approach,"Approaching ladder: attempt "..l.attempt.."/3",.9) then phase("engage")
         elseif os.clock()-l.at>15 then retry() end
         return false
     end
@@ -3813,6 +3832,7 @@ function farm.roof()
                 local candidate,top=farm.ladderDestination(region,surface)
                 if candidate then
                     local d=(root.Position-candidate).Magnitude
+                    if region==farm.avoidLadder then d=d+10000 end
                     if not distance or d<distance then ladder=region;base=candidate;landing=top;distance=d end
                 end
             end
@@ -3824,6 +3844,7 @@ function farm.roof()
 end
 local conflicts={"AutoVote","AutoSkip","AutoEquip","AutoUpgrade1","AutoUpgrade2","AutoUpgrade3","AutoPurchase","AutoDonate","AutoC96","AutoLeaveSpawn","MeleeAura"}
 function farm.begin()
+    farm.avoidLadder=nil
     farm.runId=(farm.runId or 0)+1
     if runtime.cancelRefill then runtime.cancelRefill() end
     if runtime.cancelAction then runtime.cancelAction() end
@@ -3869,12 +3890,13 @@ function farm.resumeCharacter()
 end
 function farm.ongoingSkip()
     local values=child(storage(),"Values")
-    if not e.Autofarm or not farm.roofReached or farm.recovering then return end
+    local currentWave=readValue(values,"LocalWave")
+    if not e.Autofarm or (not farm.roofReached and not (finite(currentWave) and currentWave>5)) or farm.recovering then return end
     if (readValue(values,"LocalLives") or 1)<=0 or (readValue(values,"VotingTime") or 0)>0 then return end
     if readValue(values,"Vote")~=true or readValue(LocalPlayer,"Voted")~=false then return end
     local run,character,map,wave=farm.runId,LocalPlayer.Character,child(Workspace,"Map"),readValue(values,"LocalWave")
     job("Farm skip",3,function()
-        if e.Autofarm and farm.active and farm.roofReached and not farm.recovering and farm.runId==run
+        if e.Autofarm and farm.active and (farm.roofReached or (finite(wave) and wave>5)) and not farm.recovering and farm.runId==run
             and LocalPlayer.Character==character and child(Workspace,"Map")==map
             and readValue(values,"LocalWave")==wave and (readValue(values,"LocalLives") or 1)>0
             and (readValue(values,"VotingTime") or 0)<=0 and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==false then state.skip() end
@@ -4191,6 +4213,18 @@ function farm.grounded(humanoid,root)
     local material=humanoid.FloorMaterial
     local velocity=root.AssemblyLinearVelocity
     return material~=nil and material~=Enum.Material.Air and (not velocity or math.abs(velocity.Y)<2)
+end
+function farm.ladderApproach(approach,root,humanoid)
+    local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances={LocalPlayer.Character};params.RespectCanCollide=true
+    local hit=Workspace:Raycast(approach+Vector3.new(0,6,0),Vector3.new(0,-24,0),params)
+    if not hit or not hit.Normal or hit.Normal.Y<.8 then return nil end
+    local leg=child(LocalPlayer.Character,"Left Leg")
+    if not root.Size then return nil end
+    local offset=(humanoid.HipHeight or 0)+root.Size.Y/2+(leg and leg.Size.Y or 0)
+    local goal=hit.Position+Vector3.new(0,offset,0)
+    if math.abs(goal.Y-root.Position.Y)>3 then return nil end
+    return goal
 end
 function farm.sprintKey(key,down)
     if virtualInput then virtualInput:SendKey(down,key,false)
