@@ -1,5 +1,5 @@
--- JoesAAS 3.9.1 | standalone source | September 2026
--- Built against the supplied client export. See AnimeSuite-README.md for limits and validation.
+-- JoesAAS 3.9.4 | standalone source | September 2026
+-- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 local previous = environment.JoesAAS or environment.AnimeSuite
@@ -44,6 +44,26 @@ function Core.renameEligible(id,pet,named,target,petStats)
     -- Pet.Name is catalog data; the game stores custom names in NamedPets.
     if petStats and petStats.IsDynamicById and petStats.IsDynamicById(pet.PetId) then return false,'percentage pet' end
     return true,'eligible'
+end
+function Core.activityKeys(choices,mode)
+    local keys=Core.keys(choices)
+    local function trialRank(key)
+        local label=(tostring(key)..' '..tostring(choices[key].Name or '')):lower()
+        for rank,name in ipairs({'insane','hard','medium','easy'}) do
+            if label:find('%f[%a]'..name..'%f[%A]') then return rank end
+        end
+        return 5
+    end
+    table.sort(keys,function(a,b)
+        local x,y
+        if mode=='TimeTrial' then x,y=trialRank(a),trialRank(b)
+        else x,y=tonumber(choices[a].WorldId) or math.huge,tonumber(choices[b].WorldId) or math.huge end
+        if x~=y then return x<y end
+        local an,bn=tostring(choices[a].Name or a),tostring(choices[b].Name or b)
+        if an~=bn then return an<bn end
+        return tostring(a)<tostring(b)
+    end)
+    return keys
 end
 function Core.chooseTarget(items,mode)
     table.sort(items,function(a,b)
@@ -928,6 +948,22 @@ return function(A)
             if key==name or e.Name==name or e.ModelName==name then return key,e end
         end
     end
+    local function enemyHealth(enemy)
+        if enemy:GetAttribute('EnemyDead')==true then return false end
+        local big=A.util('BigNum'); local real=enemy:GetAttribute('HealthReal')
+        if real~=nil and big then
+            local ok,alive,health=pcall(function()
+                local value=big.Decode(real)
+                if value==nil then return nil end
+                return big.IsPositive(value),big.Log10(value)
+            end)
+            if ok and alive~=nil then return alive,health end
+        end
+        local hum=enemy:FindFirstChildOfClass('Humanoid')
+        if not hum then return nil end
+        return hum.Health>0,math.log10(math.max(hum.Health,1e-300))
+    end
+    A.enemyHealth=enemyHealth
     function A.findEnemies(world)
         local folders={}
         local root=workspace:FindFirstChild('Worlds')
@@ -935,20 +971,16 @@ return function(A)
         local f=w and w:FindFirstChild('Enemies'); if f then folders[#folders+1]=f end
         local items={}; local char=A.player.Character; local hrp=char and char:FindFirstChild('HumanoidRootPart')
         if not hrp then return items end
-        local big=A.util('BigNum')
         for _,folder in ipairs(folders) do
             for _,enemy in ipairs(folder:GetChildren()) do
-                local humanoid=enemy:FindFirstChildOfClass('Humanoid')
                 local part=enemy:FindFirstChild('HumanoidRootPart')
                 local id,info=resolveEnemy(enemy.Name)
                 local selection=A.settings.mobsByWorld[tostring(world)] or {}
                 local allowed=next(selection)==nil or selection[id]==true
-                if allowed and part and humanoid and humanoid.Health>0
+                local alive,health=enemyHealth(enemy)
+                if allowed and part and alive==true
                     and enemy:GetAttribute('EnemyDead')~=true and enemy:GetAttribute('IsClientVisualClone')~=true
                     and not A.S.Players:GetPlayerFromCharacter(enemy) and id then
-                    local health=math.log10(math.max(humanoid.Health,1e-300))
-                    local real=enemy:GetAttribute('HealthReal')
-                    if real and big then local ok,v=pcall(function() return big.Log10(big.Decode(real)) end); if ok then health=v end end
                     items[#items+1]={model=enemy,part=part,health=health,distance=(part.Position-hrp.Position).Magnitude,
                         id=enemy:GetFullName(),label=info and info.Name or enemy.Name}
                 end
@@ -961,9 +993,11 @@ return function(A)
         if A.currentTarget==target then return end
         for _,c in ipairs(A.targetConnections) do c:Disconnect() end
         A.targetConnections={}; A.currentTarget=target
+        A.targetWorld=target and tostring(A.settings.world) or nil
         if not target then return end
         local function died()
-            if not A.alive or not A.running then return end
+            if not A.alive or not A.running or A.currentTarget~=target then return end
+            if target.Parent and enemyHealth(target)~=false then return end
             A.watchTarget(nil)
             task.defer(function()
                 if A.alive and A.running and A.runJob then
@@ -972,7 +1006,11 @@ return function(A)
             end)
         end
         local hum=target:FindFirstChildOfClass('Humanoid')
-        if hum then A.targetConnections[#A.targetConnections+1]=hum.Died:Connect(died) end
+        if hum then
+            A.targetConnections[#A.targetConnections+1]=hum.Died:Connect(died)
+            A.targetConnections[#A.targetConnections+1]=hum:GetPropertyChangedSignal('Health'):Connect(died)
+        end
+        A.targetConnections[#A.targetConnections+1]=target:GetAttributeChangedSignal('HealthReal'):Connect(died)
         A.targetConnections[#A.targetConnections+1]=target:GetAttributeChangedSignal('EnemyDead'):Connect(function()
             if target:GetAttribute('EnemyDead') then died() end
         end)
@@ -991,12 +1029,21 @@ return function(A)
         local targetMode=A.settings.target; local world=A.settings.world
         if not A.travel(world) then return end
         local ctrl=A.client('TeleportController'); if ctrl and ctrl:IsLoading() then return end
-        local items=A.findEnemies(world)
         local chosen
-        for _,item in ipairs(items) do if item.model==A.currentTarget then chosen=item; break end end
-        chosen=chosen or C.chooseTarget(items,targetMode)
-        if not chosen then A.watchTarget(nil); A.status.Farm='Waiting for a live matching enemy'; return end
-        A.watchTarget(chosen.model)
+        local target=A.currentTarget
+        if target and (A.targetWorld~=tostring(world) or not target.Parent or enemyHealth(target)==false) then
+            A.watchTarget(nil); target=nil
+        end
+        if target then
+            -- Selection and HP ranking changes only affect the NEXT target.
+            local part=target:FindFirstChild('HumanoidRootPart')
+            if not part then A.status.Farm='Target locked; waiting for its root part'; return end
+            chosen={model=target,part=part,label=target.Name,distance=(part.Position-hrp.Position).Magnitude}
+        else
+            chosen=C.chooseTarget(A.findEnemies(world),targetMode)
+            if not chosen then A.status.Farm='Waiting for a live matching enemy'; return end
+            A.watchTarget(chosen.model)
+        end
         local destination=chosen.part.Position+Vector3.new(0,0,A.settings.distance)
         if chosen.distance>A.settings.distance+2 then
             if A.settings.moveStyle=='Teleport' then hrp.CFrame=CFrame.new(destination,chosen.part.Position)
@@ -1016,41 +1063,64 @@ end)()(A);
 -- ===== trial_follow =====
 (function()
 return function(A)
+    local activeKey,target,loadingSince,endedKey
     function A.trialContext()
         local context=A.player:GetAttribute('VisibilityContext')
         return type(context)=='string' and context:match('^Trial:(.+)$') or nil
     end
-    A.job('Trial follow',0.3,function()
-        if not A.settings.trialFollow then return end
+    A.on('TimeTrialEnded',function() endedKey=A.trialContext(); target=nil end)
+    A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),function()
+        if A.trialContext()~=activeKey then target=nil; loadingSince=nil; endedKey=nil end
+    end)
+    A.job('Trial follow',0.2,function()
+        if not A.settings.trialFollow then target=nil; loadingSince=nil; return end
         local key=A.trialContext()
-        if not key then A.status['Trial follow']='Waiting for your script to enter a Time Trial'; return end
-        local ctrl=A.client('TeleportController')
-        if ctrl and ctrl:IsLoading() then A.status['Trial follow']='Waiting for trial loading'; return end
+        if key~=activeKey then activeKey=key; target=nil; loadingSince=nil end
+        if not key then A.status['Trial follow']='Waiting to enter a Time Trial'; return end
+        if endedKey==key then A.status['Trial follow']='Trial ended; waiting for return teleport'; return end
         local character=A.player.Character
         local root=character and character:FindFirstChild('HumanoidRootPart')
         local human=character and character:FindFirstChildOfClass('Humanoid')
-        if not root or not human or human.Health<=0 then return end
+        if not root or not human or human.Health<=0 then
+            target=nil; loadingSince=nil; A.status['Trial follow']='Waiting for your character to respawn'; return
+        end
         local arenas=workspace:FindFirstChild('TimeTrialArenas')
         local arena=arenas and arenas:FindFirstChild(key)
         local enemies=arena and arena:FindFirstChild('Enemies')
-        if not enemies then A.status['Trial follow']='Waiting for trial enemies to load'; return end
-        local nearest,distance
-        for _,enemy in ipairs(enemies:GetChildren()) do
-            local h=enemy:FindFirstChildOfClass('Humanoid')
-            local part=enemy:FindFirstChild('HumanoidRootPart')
+        if not enemies then target=nil; loadingSince=nil; A.status['Trial follow']='Waiting for your trial arena to load'; return end
+        local function eligible(enemy)
+            if enemy.Parent~=enemies or enemy:GetAttribute('IsClientVisualClone')==true then return end
             local context=enemy:GetAttribute('VisibilityContext')
-            if h and h.Health>0 and part and enemy:GetAttribute('EnemyDead')~=true
-                and enemy:GetAttribute('IsClientVisualClone')~=true
-                and (context==nil or context=='' or context=='Trial:'..key) then
-                local d=(part.Position-root.Position).Magnitude
-                if not distance or d<distance then nearest=part; distance=d end
+            if context~=nil and context~='' and context~='Trial:'..key then return end
+            if A.enemyHealth(enemy)~=true then return end
+            return enemy:FindFirstChild('HumanoidRootPart')
+        end
+        local part=target and eligible(target)
+        if not part then
+            target=nil; local closest
+            for _,enemy in ipairs(enemies:GetChildren()) do
+                local candidate=eligible(enemy)
+                if candidate then
+                    local distance=(candidate.Position-root.Position).Magnitude
+                    if not closest or distance<closest then target=enemy; part=candidate; closest=distance end
+                end
             end
         end
-        if not nearest then A.status['Trial follow']='Room cleared; waiting for the next living mob'; return end
-        if distance>A.settings.distance+2 then
-            root.CFrame=CFrame.new(nearest.Position+Vector3.new(0,0,A.settings.distance),nearest.Position)
+        if not part then loadingSince=nil; A.status['Trial follow']='Waiting for living enemies in your trial'; return end
+        if root.Anchored then loadingSince=nil; A.status['Trial follow']='Character anchored by game; waiting for release'; return end
+        local ctrl=A.client('TeleportController')
+        local loading=ctrl and ctrl:IsLoading()
+        if loading then
+            loadingSince=loadingSince or os.clock()
+            if os.clock()-loadingSince<3 then A.status['Trial follow']='Waiting for trial loading'; return end
+            -- Recover only with a living target in our exact arena and a usable character.
+            -- Do not modify the game's loading flag or join/room-ready handshake.
+        else loadingSince=nil end
+        local offset=math.min(A.settings.distance,3)
+        if (part.Position-root.Position).Magnitude>offset+0.5 then
+            root.CFrame=CFrame.new(part.Position+Vector3.new(0,0,offset),part.Position)
         end
-        A.status['Trial follow']='Following trial mobs'
+        A.status['Trial follow']=(loading and 'Following own trial despite stale loading flag: ' or 'Following trial mob: ')..target.Name
     end)
 end
 
@@ -1069,7 +1139,7 @@ return function(A)
     }
     local order={'Tower','TimeTrial','Raid','Defense','Dungeon','BossRush'}
     local available,backoff={},{}
-    local pending,leaving,locked,returning
+    local pending,leaving,locked,returning,waitingReason
     for _,mode in ipairs(order) do available[mode]={} end
     function A.activityChoices(mode)
         local def=definitions[mode]; if not def then return {} end
@@ -1077,6 +1147,18 @@ return function(A)
         return cfg and type(cfg[def.method])=='function' and cfg[def.method](cfg) or {}
     end
     function A.trialChoices() return A.activityChoices('TimeTrial') end
+    function A.activityRows(mode)
+        local choices=A.activityChoices(mode); local rows={}
+        for _,key in ipairs(A.Core.activityKeys(choices,mode)) do
+            local cfg=choices[key]; local label=cfg.Name or key
+            if mode~='TimeTrial' then
+                local id=tonumber(cfg.WorldId)
+                label=(id and ('World '..id..' | ') or 'Other | ')..label
+            end
+            rows[#rows+1]={key=key,label=label}
+        end
+        return rows
+    end
     local function context()
         local raw=A.player:GetAttribute('VisibilityContext')
         local mode=type(raw)=='string' and raw:match('^([^:]+):') or nil
@@ -1088,9 +1170,10 @@ return function(A)
         return A.settings[def.toggle] and A.settings[def.selection][key]==true
     end
     local function selectCandidate()
+        waitingReason=nil
         for _,mode in ipairs(order) do
             local choices=A.settings[definitions[mode].toggle] and A.activityChoices(mode) or {}
-            for _,key in ipairs(A.Core.keys(choices)) do
+            for _,key in ipairs(mode=='TimeTrial' and A.Core.activityKeys(choices,mode) or A.Core.keys(choices)) do
                 if enabled(mode,key) and (backoff[mode..':'..key] or 0)<=os.clock() then
                     local entry=available[mode][key]
                     if mode=='Tower' then
@@ -1098,7 +1181,20 @@ return function(A)
                         local tower=choices[key]
                         if cfg and cfg.Enabled~=false and util and d and A.unlocked(tower.WorldId)
                             and util.GetCooldownRemaining(d,tower)<=0 then return mode,key,{} end
-                    elseif entry and entry.deadline>os.clock() then return mode,key,entry end
+                    elseif entry and entry.deadline>os.clock() then return mode,key,entry
+                    elseif mode=='Raid' or mode=='Defense' then
+                        local cfg=choices[key]
+                        if cfg.GateOnly then waitingReason=mode..': waiting for a joinable gate run'
+                        elseif cfg.WorldId and not A.unlocked(cfg.WorldId) then
+                            waitingReason=mode..': unlock World '..tostring(cfg.WorldId)
+                        elseif not A.data() then waitingReason='Waiting for player data'
+                        else
+                            local cost=cfg.Cost
+                            if type(cost)=='table' and A.balance(cost.ItemId)<(tonumber(cost.Amount) or 0) then
+                                waitingReason=mode..': need '..tostring(cost.Amount)..' '..tostring(cost.ItemId)
+                            else return mode,key,{action='Create'} end
+                        end
+                    end
                 end
             end
         end
@@ -1137,7 +1233,7 @@ return function(A)
         if leaving then status('Waiting for '..leaving..' exit confirmation'); return end
         if loading then return end
         local mode,key,entry=selectCandidate()
-        if not mode then status(current and ('In '..current) or 'Waiting for a selected activity'); return end
+        if not mode then status(current and ('In '..current) or (waitingReason or 'Waiting for a selected activity')); return end
         if current then
             -- Only these two modes may be interrupted. Equal priority never interrupts a run.
             if (current=='Raid' or current=='Defense') and definitions[mode].rank>200 then
@@ -1147,12 +1243,12 @@ return function(A)
             return
         end
         if A.inMode() then status('Waiting for current mode to finish'); return end
-        pending={mode=mode,key=key,at=os.clock()}; suspendFarm()
+        pending={mode=mode,key=key,action=entry.action or 'Join',at=os.clock()}; suspendFarm()
         status('Joining '..mode..': '..key)
         local ok
         if mode=='Tower' then ok=A.fire('TowerJoin',{TowerKey=key})
         elseif mode=='BossRush' then ok=A.fire('BossRushJoin','Join',key,entry.modeId or 'V1',true)
-        else ok=A.fire(mode..'Join','Join',key) end
+        else ok=A.fire(mode..'Join',entry.action or 'Join',key) end
         if not ok then backoff[mode..':'..key]=os.clock()+5; pending=nil; status('Join bridge unavailable: '..mode) end
     end
     A.tryTrialJoin=A.coordinateActivities
@@ -1177,12 +1273,34 @@ return function(A)
             A.on(mode..'Join',function(accepted,reason)
                 if not pending or pending.mode~=mode then return end
                 if accepted==false then
-                    backoff[mode..':'..pending.key]=os.clock()+5; pending=nil
+                    local key=pending.key
+                    if (mode=='Raid' or mode=='Defense') and (reason=='raid_already_active' or reason=='defense_already_active') then
+                        available[mode][key]={deadline=os.clock()+15}
+                        backoff[mode..':'..key]=0
+                    else
+                        if reason=='no_active_raid' or reason=='no_active_defense' then available[mode][key]=nil end
+                        backoff[mode..':'..key]=os.clock()+5
+                    end
+                    pending=nil
                     A.status['Activity error']=mode..' refused: '..tostring(reason)
                     status(A.status['Activity error'])
                 end
             end)
         end
+    end
+    for _,name in ipairs({'Raid','Defense'}) do
+        local mode=name
+        A.on(mode..'ActiveStatus',function(states)
+            if type(states)~='table' then return end
+            local replacement={}
+            for key,value in pairs(states) do
+                if type(key)=='string' and (value==true or (type(value)=='table' and value.Active~=false)) then
+                    replacement[key]={deadline=os.clock()+30}
+                end
+            end
+            available[mode]=replacement
+            A.coordinateActivities()
+        end)
     end
     A.on('TowerState',function(p)
         if type(p)=='table' and p.Refused and pending and pending.mode=='Tower' then
@@ -1568,7 +1686,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.1',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.4',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -1770,7 +1888,7 @@ return function(A)
     end
     local function choose(tab,title,key,provider)
         return dropdown(tab,title,key,provider,function(id) return tostring(A.settings[key])==id end,
-            function(id) A.settings[key]=id; A.watchTarget(nil); A.refreshUI() end)
+            function(id) A.settings[key]=id; if key=='world' then A.watchTarget(nil) end; A.refreshUI() end)
     end
     local function multi(tab,title,key,provider)
         dropdown(tab,title,key,provider,function(id) return A.settings[key][id]~=false end,function(selected)
@@ -1788,7 +1906,7 @@ return function(A)
     dropdown('Farm','Mobs in selected world','worldMobs',function()
         local out={}
         for key,e in pairs(A.catalog.enemies) do
-            if tostring(e.World)==A.settings.world then out[#out+1]={key=key,label=(e.Name or key)..' ['..key..']'} end
+            if tostring(e.World)==A.settings.world then out[#out+1]={key=key,label=tostring(e.ModelName or key)} end
         end
         table.sort(out,function(a,b) return a.label<b.label end); return out
     end,function(id)
@@ -1798,26 +1916,28 @@ return function(A)
         -- Explicit false values distinguish selecting none from the initial all-mobs setting.
         local saved=A.settings.mobsByWorld[A.settings.world] or {}
         for id,value in pairs(selected) do saved[id]=value end
-        A.settings.mobsByWorld[A.settings.world]=saved; A.watchTarget(nil)
+        A.settings.mobsByWorld[A.settings.world]=saved
     end,true)
     button('Farm','Select all mobs / include future mobs in this world',function()
-        A.settings.mobsByWorld[A.settings.world]={}; A.watchTarget(nil); A.refreshUI()
+        A.settings.mobsByWorld[A.settings.world]={}; A.refreshUI()
     end)
     choose('Farm','Target order','target',choices({'Nearest','Highest HP','Lowest HP'}))
     choose('Farm','Movement','moveStyle',choices({'Walk','Teleport'}))
     toggle('Farm','Auto farm selected mobs','farm')
-    note('Farm','World handling','Joins through the normal world system before combat. Death triggers immediate retargeting. Selections are saved separately per world.')
+    note('Farm','World handling','Joins through the normal world system before combat. Keeps one target until death or removal, then immediately picks across all selected mobs. Selections are saved separately per world.')
     status('Farm','Farm'); status('Farm','Discovery')
     toggle('Farm','Auto teleport to trial mobs','trialFollow')
     status('Farm','Trial follow')
     dropdown('Farm','Trials to auto join','trialJoinSelection',function()
-        local rows={}
-        for key,trial in pairs(A.trialChoices()) do rows[#rows+1]={key=key,label=trial.Name or key} end
-        table.sort(rows,function(a,b) return a.label<b.label end); return rows
+        return A.activityRows('TimeTrial')
     end,function(key) return A.settings.trialJoinSelection[key]==true end,
     function(selected) A.settings.trialJoinSelection=selected end,true)
     toggle('Farm','Auto join selected trials when open','trialAutoJoin',function() A.tryTrialJoin() end)
     status('Farm','Trial join')
+    note('Farm','Trial priority','Insane > Hard > Medium > Easy among selected trials currently open. An active trial always finishes first.')
+    status('Modes','Activities')
+    status('Modes','Activity error')
+    note('Modes','Raid / Defense','Starts a selected run using its normal entry cost, or joins an available run. Missing keys and rejected requests appear above.')
     note('Modes','Activity priority','Tower > Time Trials > Raid / Defense > other modes > mob farming. Active Tower and Trial runs are never interrupted. Raid wins a tie with Defense; an active run keeps its place.')
     note('Modes','Movement','Only Time Trials move toward mobs. Tower opens your own tower. Turn off competing auto-join / movement in your other script to let this coordinator control switching.')
     for _,entry in ipairs({{'Tower','towerAutoJoin','towerSelection'},{'Raid','raidAutoJoin','raidSelection'},
@@ -1825,15 +1945,11 @@ return function(A)
         {'BossRush','bossRushAutoJoin','bossRushSelection'}}) do
         local mode,toggleKey,selectionKey=entry[1],entry[2],entry[3]
         dropdown('Modes',mode..' selection',selectionKey,function()
-            local rows={}
-            for key,config in pairs(A.activityChoices(mode)) do rows[#rows+1]={key=key,label=config.Name or key} end
-            table.sort(rows,function(a,b) return a.label<b.label end); return rows
+            return A.activityRows(mode)
         end,function(key) return A.settings[selectionKey][key]==true end,
         function(selected) A.settings[selectionKey]=selected; A.coordinateActivities() end,true)
         toggle('Modes','Auto join '..mode,toggleKey,A.coordinateActivities)
     end
-    status('Modes','Activities')
-    status('Modes','Activity error')
     input('Pets','Name for unnamed Astral pets','petName')
     toggle('Pets','Auto rename Astral pets ONLY','rename')
     note('Pets','Astral naming','Only verified Astral rarity is eligible. Already named and percentage pets are skipped. Uses the normal Magicule cost. Check the status below for blockers.')
