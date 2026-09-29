@@ -1,4 +1,4 @@
--- JoesAAS 3.9.6 | standalone source | September 2026
+-- JoesAAS 3.9.7 | standalone source | September 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -1085,18 +1085,87 @@ end)()(A);
 (function()
 return function(A)
     local activeKey,target,loadingSince,endedKey
+    local mapReady,state={},{}
+    local streamBusy,nextStream=false,0
+    local stalledSince,lastReport,lastReportAt=nil,nil,0
     function A.trialContext()
         local context=A.player:GetAttribute('VisibilityContext')
         return type(context)=='string' and context:match('^Trial:(.+)$') or nil
     end
-    A.on('TimeTrialEnded',function() endedKey=A.trialContext(); target=nil end)
+    A.on('TimeTrialMapReady',function(key,room,generation,position,token)
+        if type(key)~='string' then return end
+        mapReady={key=key,room=tonumber(room) or 1,generation=generation,position=position,token=token,at=os.clock()}
+        state={TrialKey=key,Room=tonumber(room) or 1}
+        endedKey=nil
+    end)
+    A.on('TimeTrialState',function(packet)
+        if type(packet)~='table' or packet.Refused then return end
+        if packet.Full or (packet.TrialKey and packet.TrialKey~=state.TrialKey) then state={} end
+        for k,v in pairs(packet) do if k~='Full' and k~='Cleared' then state[k]=v end end
+        for _,k in ipairs(type(packet.Cleared)=='table' and packet.Cleared or {}) do state[k]=nil end
+    end)
+    A.on('TimeTrialEnded',function() endedKey=A.trialContext(); target=nil; mapReady={}; state={} end)
+    local function roomSpawn(arena,index)
+        local rooms=arena and arena:FindFirstChild('Rooms')
+        local room=rooms and rooms:FindFirstChild('Room'..tostring(index))
+        local spawn=room and room:FindFirstChild('Spawn',true)
+        return spawn and spawn:IsA('BasePart') and spawn or nil
+    end
+    local function recoverLoading(key,arena)
+        local room=state.TrialKey==key and state.Room or (mapReady.key==key and mapReady.room)
+        local spawn=room and roomSpawn(arena,room)
+        local position=spawn and spawn.Position or (mapReady.key==key and mapReady.position)
+        if position and not streamBusy and os.clock()>=nextStream then
+            nextStream=os.clock()+10; streamBusy=true
+            task.spawn(function()
+                if A.alive and A.running and A.settings.trialFollow and A.trialContext()==key then
+                    local ok,err=pcall(function() A.player:RequestStreamAroundAsync(position) end)
+                    A.status['Trial streaming']=ok and 'Requested current room streaming' or ('Streaming request failed: '..tostring(err))
+                end
+                streamBusy=false
+            end)
+        end
+        if mapReady.key==key and not mapReady.acknowledged and os.clock()-mapReady.at>=3
+            and type(mapReady.generation)=='number' and type(mapReady.token)=='string'
+            and (not room or room==mapReady.room) and roomSpawn(arena,mapReady.room) then
+            -- Replay only the readiness acknowledgement issued for this exact loaded room.
+            mapReady.acknowledged=true
+            A.fire('TimeTrialClientReady',key,mapReady.generation,mapReady.token)
+        end
+    end
+    local function stalled(message,key,root,arena,enemies)
+        A.status['Trial follow']=message
+        stalledSince=stalledSince or os.clock()
+        if os.clock()-stalledSince<5 then return end
+        if root and not endedKey then recoverLoading(key,arena) end
+        if os.clock()-lastReportAt<60 or lastReport==message then return end
+        lastReportAt=os.clock()
+        local ok=pcall(function()
+            if type(writefile)~='function' then return end
+            local samples={}
+            for _,enemy in ipairs(enemies and enemies:GetChildren() or {}) do
+                if #samples>=12 then break end
+                local h=enemy:FindFirstChildOfClass('Humanoid')
+                samples[#samples+1]={name=enemy.Name,health=h and h.Health,real=tostring(enemy:GetAttribute('HealthReal')),
+                    dead=enemy:GetAttribute('EnemyDead'),clone=enemy:GetAttribute('IsClientVisualClone'),
+                    context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
+            end
+            local ctrl=A.client('TeleportController')
+            writefile(A.folder..'/trial-diagnostics.json',A.S.HTTP:JSONEncode({version='3.9.7',reason=message,
+                context=A.player:GetAttribute('VisibilityContext'),room=state.TrialKey==key and state.Room,
+                serverEnemies=state.TrialKey==key and state.EnemyCount,anchored=root and root.Anchored,
+                loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,
+                hasArena=arena~=nil,hasEnemiesFolder=enemies~=nil,enemies=samples}))
+        end)
+        if ok then lastReport=message end
+    end
     A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),function()
         if A.trialContext()~=activeKey then target=nil; loadingSince=nil; endedKey=nil end
     end)
     A.job('Trial follow',0.2,function()
-        if not A.settings.trialFollow then target=nil; loadingSince=nil; return end
+        if not A.settings.trialFollow then target=nil; loadingSince=nil; stalledSince=nil; return end
         local key=A.trialContext()
-        if key~=activeKey then activeKey=key; target=nil; loadingSince=nil end
+        if key~=activeKey then activeKey=key; target=nil; loadingSince=nil; stalledSince=nil; lastReport=nil end
         if not key then A.status['Trial follow']='Waiting to enter a Time Trial'; return end
         if endedKey==key then A.status['Trial follow']='Trial ended; waiting for return teleport'; return end
         local character=A.player.Character
@@ -1108,7 +1177,7 @@ return function(A)
         local arenas=workspace:FindFirstChild('TimeTrialArenas')
         local arena=arenas and arenas:FindFirstChild(key)
         local enemies=arena and arena:FindFirstChild('Enemies')
-        if not enemies then target=nil; loadingSince=nil; A.status['Trial follow']='Waiting for your trial arena to load'; return end
+        if not enemies then target=nil; loadingSince=nil; stalled('Waiting for your trial arena to load',key,root,arena,enemies); return end
         local function eligible(enemy)
             if enemy.Parent~=enemies or enemy:GetAttribute('IsClientVisualClone')==true then return end
             local context=enemy:GetAttribute('VisibilityContext')
@@ -1127,8 +1196,8 @@ return function(A)
                 end
             end
         end
-        if not part then loadingSince=nil; A.status['Trial follow']='Waiting for living enemies in your trial'; return end
-        if root.Anchored then loadingSince=nil; A.status['Trial follow']='Character anchored by game; waiting for release'; return end
+        if not part then loadingSince=nil; stalled('Waiting for living enemies in your trial',key,root,arena,enemies); return end
+        if root.Anchored then loadingSince=nil; stalled('Character anchored by game; waiting for release',key,root,arena,enemies); return end
         local ctrl=A.client('TeleportController')
         local loading=ctrl and ctrl:IsLoading()
         if loading then
@@ -1137,6 +1206,7 @@ return function(A)
             -- Recover only with a living target in our exact arena and a usable character.
             -- Do not modify the game's loading flag or join/room-ready handshake.
         else loadingSince=nil end
+        stalledSince=nil; lastReport=nil
         local offset=math.min(A.settings.distance,3)
         if (part.Position-root.Position).Magnitude>offset+0.5 then
             root.CFrame=CFrame.new(part.Position+Vector3.new(0,0,offset),part.Position)
@@ -1708,7 +1778,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.6',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.7',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
