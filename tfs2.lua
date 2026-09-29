@@ -3193,6 +3193,21 @@ function farm.healingDue()
     local wave=readValue(child(storage(),"Values"),"LocalWave")
     return e.Autofarm and not farm.healingDone and type(wave)=="number" and wave>=21
 end
+function farm.healthDue()
+    local wave=readValue(child(storage(),"Values"),"LocalWave")
+    return e.Autofarm and not farm.healthDone and type(wave)=="number" and wave>=28
+end
+function farm.healthPriority()
+    if not farm.healthDue() then return true end
+    if not farm.upgrades("Health",{Health=true,HealthRegen=true}) then return false end
+    farm.healthDone=true
+    farm.status("Wave 28 Max Health and Health Regen complete; resuming interrupted progression.")
+    return true
+end
+function farm.sniperAndHandling()
+    if not farm.upgrades("Sniper") then return false end
+    return farm.upgrades("Health",{Handling=true})
+end
 function farm.healingItem(name)
     for _,item in ipairs(farm.healingItems) do if item.name==name then return item end end
 end
@@ -3323,7 +3338,9 @@ function farm.request(object,cost,event,...)
     farm.inFlight=true;farm.requestAt=os.clock()+math.max(.5,e.ActionInterval)
     task.spawn(function()
         if not runtime.active or LocalPlayer.Character~=character or farm.runId~=run or not (e.Autofarm or e.AutoC96) then farm.inFlight=false;return end
-        if farm.healingDue() and not ((event=="UpgradeWeapon" or event=="BuyHealing") and farm.healingItem(args[1])) then farm.inFlight=false;return end
+        if farm.healthDue() then
+            if not (args[1]=="Health" and (event=="BuyPlayerUpgrade" or (event=="UpgradeStructurePlayer" and (args[2]=="Health" or args[2]=="HealthRegen")))) then farm.inFlight=false;return end
+        elseif farm.healingDue() and not ((event=="UpgradeWeapon" or event=="BuyHealing") and farm.healingItem(args[1])) then farm.inFlight=false;return end
         local ok,result=pcall(function()
             if event=="BuyHealing" then
                 farm.healingBuyAt=os.clock()+3
@@ -3742,6 +3759,7 @@ function farm.begin()
     farm.earlyDone=false
     farm.roofReached=false;farm.recovering=nil;farm.lastWave=nil;farm.purchaseBudget=nil
     farm.healingDone=false;farm.healingBuyAt=0
+    farm.healthDone=false
     farm.forwardDone=false;farm.forwardGoal=nil;farm.forwardScanAt=0
     farm.roofScanAt=0;farm.roofGoal=nil;farm.pathAt=0;farm.ladder=nil;farm.fault=nil;farm.exitTransit=nil;farm.exitWalking=nil
     farm.savedTrigger=config.Triggerbot;triggerToggle:SetValue(false)
@@ -3839,7 +3857,8 @@ function farm.step()
             if not config.Triggerbot then triggerToggle:SetValue(true) end
         elseif farm.stage<7 then farm.status("Waiting to equip C96.");return end
     end
-    if farm.stage>=7 and (farm.healingDue() or (farm.stage~=8 and farm.stage~=11)) and not farm.roof() then return end
+    if farm.stage>=7 and (farm.healthDue() or farm.healingDue() or (farm.stage~=8 and farm.stage~=11)) and not farm.roof() then return end
+    if farm.stage>=3 and not farm.healthPriority() then return end
     if farm.stage>=3 and not farm.healingPriority() then return end
     local done=false
     if farm.stage==1 then done=farm.leave(1)
@@ -3861,7 +3880,7 @@ function farm.step()
     elseif farm.stage==9 then done=farm.upgrades("Barricade")
     elseif farm.stage==10 then done=farm.upgrades("Shop")
     elseif farm.stage==11 then done=farm.upgrades("NightVision",{CriticalChance=true})
-    elseif farm.stage==12 then done=farm.upgrades("Sniper")
+    elseif farm.stage==12 then done=farm.sniperAndHandling()
     elseif farm.stage==13 then done=farm.upgrades("MortarSquad")
     else
         if not farm.roof() then return end
@@ -3900,7 +3919,7 @@ local farmGroup=automation:AddLeftGroupbox("C96 autofarm")
 control(farmGroup,"Autofarm","One-click C96 autofarm")
 control(farmGroup,"AutoLeaveSpawn","Auto Leave Spawn")
 farm.label=runtime.label(farmGroup,"Off",true)
-runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Wave 21 prioritizes Bandage, First Aid Kit and Booster Kit with selected exclusions, then resumes the interrupted upgrade step. Experimental and support settings are preserved. Backup Weapon and Rooftop Camper required. Live routes remain unverified.",true)
+runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Sniper is followed by Body Building Handling. Wave 21 prioritizes healing items; wave 28 prioritizes Max Health and Health Regen, then resumes interrupted upgrades. Experimental and support settings are preserved. Backup Weapon and Rooftop Camper required. Live routes remain unverified.",true)
 
 function state.upgradeShopMoney()
     if not e.AutoShopMoney or e.Autofarm or readValue(LocalPlayer,"FirstWave")~=false then return false end
