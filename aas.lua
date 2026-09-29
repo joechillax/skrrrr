@@ -1,4 +1,4 @@
--- JoesAAS 3.9.7 | standalone source | September 2026
+-- JoesAAS 3.9.8 | standalone source | September 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -513,6 +513,7 @@ return function(A)
         A.running=value; A.epoch=A.epoch+1
         A.status.Gameplay=value and 'Ready: each feature uses its own toggle' or 'Stopped or disconnected; rerun after reconnecting'
         if not value then
+            if A.stopTrialMovement then A.stopTrialMovement() end
             if A.watchTarget then A.watchTarget(nil) end
             local h=A.player.Character and A.player.Character:FindFirstChildOfClass('Humanoid')
             if h then h:Move(Vector3.zero) end
@@ -1092,6 +1093,33 @@ return function(A)
         local context=A.player:GetAttribute('VisibilityContext')
         return type(context)=='string' and context:match('^Trial:(.+)$') or nil
     end
+    local movingHuman,movementRoot,movementKey,anchor
+    function A.stopTrialMovement()
+        if movingHuman then pcall(function() movingHuman:Move(Vector3.zero,false) end) end
+        movingHuman=nil; movementRoot=nil; movementKey=nil; anchor=nil
+    end
+    A.connect(A.S.Run.Heartbeat,function()
+        local key=A.trialContext()
+        local character=A.player.Character
+        local root=character and character:FindFirstChild('HumanoidRootPart')
+        local human=character and character:FindFirstChildOfClass('Humanoid')
+        if not A.running or not A.settings.trialFollow or not key or endedKey==key
+            or not root or not human or human.Health<=0 or root.Anchored or human.Sit then
+            A.stopTrialMovement(); return
+        end
+        if movingHuman~=human or movementRoot~=root or movementKey~=key then
+            A.stopTrialMovement(); movingHuman=human; movementRoot=root; movementKey=key
+        end
+        -- Recenter after a room teleport; small steps should never pull back to the old room.
+        if not anchor or (root.Position-anchor).Magnitude>6 then anchor=root.Position end
+        local phase=os.clock()*2
+        local dx=anchor.X+math.cos(phase)*0.75-root.Position.X
+        local dz=anchor.Z+math.sin(phase)*0.75-root.Position.Z
+        local length=math.sqrt(dx*dx+dz*dz)
+        if length>0.05 then
+            human:Move(Vector3.new(dx/length*0.2,0,dz/length*0.2),false)
+        else human:Move(Vector3.zero,false) end
+    end)
     A.on('TimeTrialMapReady',function(key,room,generation,position,token)
         if type(key)~='string' then return end
         mapReady={key=key,room=tonumber(room) or 1,generation=generation,position=position,token=token,at=os.clock()}
@@ -1104,7 +1132,7 @@ return function(A)
         for k,v in pairs(packet) do if k~='Full' and k~='Cleared' then state[k]=v end end
         for _,k in ipairs(type(packet.Cleared)=='table' and packet.Cleared or {}) do state[k]=nil end
     end)
-    A.on('TimeTrialEnded',function() endedKey=A.trialContext(); target=nil; mapReady={}; state={} end)
+    A.on('TimeTrialEnded',function() A.stopTrialMovement(); endedKey=A.trialContext(); target=nil; mapReady={}; state={} end)
     local function roomSpawn(arena,index)
         local rooms=arena and arena:FindFirstChild('Rooms')
         local room=rooms and rooms:FindFirstChild('Room'..tostring(index))
@@ -1151,7 +1179,7 @@ return function(A)
                     context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
             end
             local ctrl=A.client('TeleportController')
-            writefile(A.folder..'/trial-diagnostics.json',A.S.HTTP:JSONEncode({version='3.9.7',reason=message,
+            writefile(A.folder..'/trial-diagnostics.json',A.S.HTTP:JSONEncode({version='3.9.8',reason=message,
                 context=A.player:GetAttribute('VisibilityContext'),room=state.TrialKey==key and state.Room,
                 serverEnemies=state.TrialKey==key and state.EnemyCount,anchored=root and root.Anchored,
                 loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,
@@ -1160,6 +1188,7 @@ return function(A)
         if ok then lastReport=message end
     end
     A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),function()
+        if A.trialContext()~=movementKey then A.stopTrialMovement() end
         if A.trialContext()~=activeKey then target=nil; loadingSince=nil; endedKey=nil end
     end)
     A.job('Trial follow',0.2,function()
@@ -1210,6 +1239,7 @@ return function(A)
         local offset=math.min(A.settings.distance,3)
         if (part.Position-root.Position).Magnitude>offset+0.5 then
             root.CFrame=CFrame.new(part.Position+Vector3.new(0,0,offset),part.Position)
+            anchor=nil
         end
         A.status['Trial follow']=(loading and 'Following own trial despite stale loading flag: ' or 'Following trial mob: ')..target.Name
     end)
@@ -1778,7 +1808,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.7',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='3.9.8',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2018,7 +2048,10 @@ return function(A)
     toggle('Farm','Auto farm selected mobs','farm')
     note('Farm','World handling','Joins through the normal world system before combat. Keeps one target until death or removal, then immediately picks across all selected mobs. Selections are saved separately per world.')
     status('Farm','Farm'); status('Farm','Discovery')
-    toggle('Farm','Auto teleport to trial mobs','trialFollow')
+    toggle('Farm','Auto teleport to trial mobs','trialFollow',function()
+        if not A.settings.trialFollow then A.stopTrialMovement() end
+    end)
+    note('Farm','Trial movement','While enabled, takes small continuous steps inside your current Trial, including between waves. Stops on exit, death, run end or toggle off.')
     status('Farm','Trial follow')
     dropdown('Farm','Trials to auto join','trialJoinSelection',function()
         return A.activityRows('TimeTrial')
