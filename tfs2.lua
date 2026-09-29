@@ -2389,6 +2389,9 @@ function state.automation()
     if state.farm and (e.Autofarm or state.farm.active) then
         local ok,err=pcall(state.farm.step)
         if not ok then state.farm.lastError=tostring(err);state.farm.status("Autofarm error: "..tostring(err)) else state.farm.lastError=nil end
+        local drinksOK,drinksError=pcall(state.farm.drinkTick)
+        if not drinksOK then state.farm.drinkMessage="Drink scheduler: "..tostring(drinksError) end
+        state.farm.showDrinks()
         if e.Autofarm and state.farm.supported() and state.farm.stage>=3 and not state.farm.inFlight and not runtime.action and not state.farm.moving then
             runtime.refillStep()
             if state.farm.unlimitedOwned() then state.spending(true) end
@@ -3209,6 +3212,19 @@ farm.healingItems={
     {name="First Aid Kit",excluded={Range=true,StaminaHeal=true}},
     {name="Booster Kit",excluded={}}
 }
+farm.drinkItems={
+    {name="Energy Drink",excluded={AnimationDuration=true,Stamina=true,StaminaDuration=true}},
+    {name="Experimental Drink",excluded={AnimationDuration=true,DrinkLifesteal=true}},
+    {name="Speed Drink",excluded={DrinkMovementSpeed=true,TimeFreeze=true,AnimationDuration=true}},
+    {name="Deadeye Drink",excluded={DrinkAutoReload=true,DrinkCritChance=true}}
+}
+function farm.drinkItem(name)
+    for _,item in ipairs(farm.drinkItems) do if item.name==name then return item end end
+end
+function farm.nightVisionAndDrinks()
+    if not farm.upgrades("NightVision",{CriticalChance=true}) then return false end
+    return farm.itemSequence(farm.drinkItems,"Drinks")
+end
 function farm.healingDue()
     local wave=readValue(child(storage(),"Values"),"LocalWave")
     return e.Autofarm and not farm.healingDone and type(wave)=="number" and wave>=21
@@ -3251,7 +3267,7 @@ end
 function farm.healingBuyInfo(name)
     local template=child(child(storage(),"Tools"),name)
     local playerValues=child(LocalPlayer,"PlayerValues")
-    if not farm.healingItem(name) or not template or not child(playerValues,"PerkValues") then return nil,"waiting for item/player data" end
+    if not (farm.healingItem(name) or farm.drinkItem(name)) or not template or not child(playerValues,"PerkValues") then return nil,"waiting for item/player data" end
     local utility,manager=gameModule("Utility"),gameModule("CharacterManager")
     if not utility:IsWeaponInStock(name,LocalPlayer) then return nil,"item not in stock" end
     local price=farm.healingPrice(template,utility,manager)
@@ -3279,23 +3295,22 @@ function farm.purchaseHealing(name)
     -- Ownership is only accepted when the actual tool arrives; never fabricate it.
     return true
 end
-function farm.healingPriority()
-    if not farm.healingDue() then return true end
+function farm.itemSequence(items,label)
     if not farm.confirmed() then return false end
     local _,tools=ownedTools()
-    for _,item in ipairs(farm.healingItems) do
+    for _,item in ipairs(items) do
         if not tools[item.name] then
             if child(child(LocalPlayer,"Backgear"),item.name) then farm.waitStatus(item.name.." tool replication");return false end
             local price,reason=farm.healingBuyInfo(item.name)
-            if not price then farm.waitStatus("Wave 21: "..item.name.." — "..reason);return false end
-            if os.clock()<(farm.healingBuyAt or 0) then farm.waitStatus("Wave 21: "..item.name.." ownership confirmation");return false end
+            if not price then farm.waitStatus(label..": "..item.name.." — "..reason);return false end
+            if os.clock()<(farm.healingBuyAt or 0) then farm.waitStatus(label..": "..item.name.." ownership confirmation");return false end
             return farm.request({Name=item.name},price,"BuyHealing",item.name)
         end
     end
-    -- Finish buying all three before spending on their upgrades.
-    for _,item in ipairs(farm.healingItems) do
+    -- Finish buying the whole item group before spending on its upgrades.
+    for _,item in ipairs(items) do
         local folder=toolUpgrades(item.name)
-        if not folder then farm.waitStatus("Wave 21: "..item.name.." upgrade data");return false end
+        if not folder then farm.waitStatus(label..": "..item.name.." upgrade data");return false end
         local list=folder:GetChildren();table.sort(list,function(a,b) return a.Name<b.Name end)
         local count,blocked=0,nil
         for _,u in ipairs(list) do
@@ -3309,9 +3324,15 @@ function farm.healingPriority()
                 end
             end
         end
-        if count==0 then farm.waitStatus("Wave 21: no allowed upgrade data for "..item.name);return false end
-        if blocked then farm.waitStatus("Wave 21: "..blocked);return false end
+        if count==0 then farm.waitStatus(label..": no allowed upgrade data for "..item.name);return false end
+        if blocked then farm.waitStatus(label..": "..blocked);return false end
     end
+
+    return true
+end
+function farm.healingPriority()
+    if not farm.healingDue() then return true end
+    if not farm.itemSequence(farm.healingItems,"Wave 21") then return false end
     farm.healingDone=true
     farm.status("Wave 21 healing upgrades complete; resuming stage "..tostring(farm.stage))
     return true
@@ -3935,7 +3956,7 @@ function farm.step()
     elseif farm.stage==8 then done=farm.upgrades("Armour",{ArmourDurability=true,Absorption=true})
     elseif farm.stage==9 then done=farm.upgrades("Barricade")
     elseif farm.stage==10 then done=farm.upgrades("Shop")
-    elseif farm.stage==11 then done=farm.upgrades("NightVision",{CriticalChance=true})
+    elseif farm.stage==11 then done=farm.nightVisionAndDrinks()
     elseif farm.stage==12 then done=farm.sniperAndHandling()
     elseif farm.stage==13 then done=farm.upgrades("MortarSquad")
     else
@@ -3976,6 +3997,107 @@ control(farmGroup,"Autofarm","One-click C96 autofarm")
 control(farmGroup,"AutoLeaveSpawn","Auto Leave Spawn")
 farm.label=runtime.label(farmGroup,"Off",true)
 runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Sniper is followed by Body Building Handling. Wave 21 prioritizes healing items; wave 28 prioritizes Max Health and Health Regen, then resumes interrupted upgrades. Experimental and support settings are preserved. Backup Weapon and Rooftop Camper required. Live routes remain unverified.",true)
+
+-- One entry per drink, per scheduled activation. This is independent of routing.
+function farm.drinkSchedule(wave,minutes,map)
+    local clock=farm.drinkClock
+    if not clock or clock.map~=map or wave<clock.wave then
+        clock={map=map,wave=wave,slots={}};farm.drinkClock=clock
+    end
+    clock.wave=wave
+    if wave<15 then return clock end
+    if minutes>=1080 then
+        if clock.night~=wave then clock.night=wave;clock.slots={} end
+        if minutes>=1095 and not clock.slots.evening then clock.slots.evening={at="18:15",items={}} end
+    elseif minutes<360 then
+        if not clock.night then clock.night=wave end
+        if not clock.slots.midnight then clock.slots.midnight={at="00:00",items={}} end
+    end
+    return clock
+end
+function farm.drinkTick()
+    if not e.Autofarm or not farm.active or not farm.supported() then return end
+    local values=child(storage(),"Values")
+    if (readValue(values,"LocalLives") or 1)<=0 or (readValue(values,"VotingTime") or 0)>0 then return end
+    local wave=readValue(values,"LocalWave")
+    if not finite(wave) then return end
+    local clock=farm.drinkSchedule(wave,game:GetService("Lighting"):GetMinutesAfterMidnight(),child(Workspace,"Map"))
+    if wave<15 then return end
+    local _,humanoid=alive()
+    if not humanoid or runtime.consumableBusy or runtime.refillBusy or runtime.action or farm.inFlight or reloadState.key then return end
+    local c=runtime.consumables;c.itemAt=c.itemAt or {}
+    if os.clock()<(c.drinkAt or 0) then return end
+    local slot;local entries={};local longest=1
+    for _,key in ipairs({"evening","midnight"}) do
+        local candidate=clock.slots[key]
+        if candidate then
+            for _,item in ipairs(farm.drinkItems) do
+                local entry=candidate.items[item.name] or {state="pending",retryAt=0};candidate.items[item.name]=entry
+                if entry.state=="pending" and os.clock()>=entry.retryAt and os.clock()>=(c.itemAt[item.name] or 0) then
+                    entry.retryAt=os.clock()+5
+                    local ok,tool,target,duration,_,character=pcall(runtime.consumableContext,item.name)
+                    if ok then
+                        table.insert(entries,{name=item.name,record=entry,tool=tool,target=target,character=character})
+                        longest=math.max(longest,duration)
+                    else entry.reason=tostring(tool) end
+                end
+            end
+            if #entries>0 then slot=candidate;break end
+        end
+    end
+    if not slot then
+        local requested,pending,unknown=0,0,0
+        local reason
+        for _,scheduled in pairs(clock.slots) do
+            for name,entry in pairs(scheduled.items) do
+                if entry.state=="requested" then requested=requested+1
+                elseif entry.state=="unknown" then unknown=unknown+1
+                else pending=pending+1;reason=reason or name..": "..tostring(entry.reason or "cooldown") end
+            end
+        end
+        farm.drinkMessage="Drinks: "..requested.." requests returned, "..pending.." pending, "..unknown.." uncertain."..(reason and " "..reason or "")
+        return
+    end
+    if not releaseHeld() then return end
+    local event=child(child(storage(),"RemoteFunctions"),"UseConsumable")
+    if not event or not event:IsA("RemoteFunction") then farm.drinkMessage="UseConsumable unavailable";return end
+    runtime.consumableBusy=true;runtime.consumableEpoch=(runtime.consumableEpoch or 0)+1
+    local epoch=runtime.consumableEpoch;local remaining=#entries
+    c.drinkAt=os.clock()+longest
+    farm.drinkMessage=slot.at..": requesting "..#entries.." drinks without equipping"
+    for _,entry in ipairs(entries) do
+        entry.record.state="inflight"
+        task.spawn(function()
+            local invoked=false
+            local ok,result=pcall(function()
+                if not runtime.active or not e.Autofarm or farm.drinkClock~=clock or runtime.consumableEpoch~=epoch or LocalPlayer.Character~=entry.character then return false end
+                local tool,target=runtime.consumableContext(entry.name)
+                if tool~=entry.tool or target~=entry.target then return false end
+                c.itemAt[entry.name]=os.clock()+longest
+                invoked=true
+                return event:InvokeServer(entry.name,target)
+            end)
+            if not invoked then entry.record.state="pending"
+            elseif not ok then entry.record.state="unknown";entry.record.reason=tostring(result)
+            elseif result==false or result=="FAIL" then entry.record.state="pending";entry.record.reason="Rejected by server"
+            else entry.record.state="requested";entry.record.reason=nil end
+            -- An ambiguous response is never automatically repeated: it may have consumed a charge.
+            remaining=remaining-1
+            if remaining==0 and runtime.consumableEpoch==epoch then
+                runtime.consumableBusy=false
+                farm.drinkMessage=slot.at..": batch returned; actual effects remain unverified"
+            end
+        end)
+    end
+end
+farm.drinkLabel=runtime.label(farmGroup,"Drinks: scheduled at 18:15 and 00:00 from wave 15, including during recovery.",true)
+function farm.showDrinks()
+    local message=farm.drinkMessage
+    if message and message~=farm.drinkDisplayed then
+        local ok,result=pcall(function() return farm.drinkLabel:SetText(message) end)
+        if ok and result~=false then farm.drinkDisplayed=message end
+    end
+end
 
 function state.upgradeShopMoney()
     if not e.AutoShopMoney or e.Autofarm or readValue(LocalPlayer,"FirstWave")~=false then return false end
