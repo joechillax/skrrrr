@@ -1551,7 +1551,7 @@ function runtime.consumableContext(name)
     assert(targetHumanoid and targetHumanoid.Health>0, "Target player is not alive.")
     local current = tool:FindFirstChild("CurrentValues")
     local duration = readValue(current, "AnimationDuration")
-    assert(type(duration)=="number" and duration>0 and duration<math.huge, "Unknown consumable use duration.")
+    if type(duration)~="number" or duration<=0 or duration>=math.huge then duration=1 end
     if rangeManager then
         local ok, speed = pcall(function()
             return rangeManager:GetMulti("UseSpeed",LocalPlayer,{Tool=tool})
@@ -1563,148 +1563,45 @@ function runtime.consumableContext(name)
     assert(readValue(actions,"Meleeing")~=true and readValue(tool,"Consuming")~=true, "Already using an item or meleeing.")
     return tool, target, duration, amount, character, humanoid
 end
+function runtime.consumableResult(entry,status,reason)
+    runtime.consumables.message=entry.name..": "..(status=="consumed" and "charge used." or (reason or "Use unconfirmed."))
+end
 function runtime.useDrinkBatch(indices)
     local c=runtime.consumables
-    if runtime.consumableBusy or runtime.refillBusy or os.clock()<(c.drinkAt or 0) or reloadState.key then return end
-    local entries={};local longest=0
+    if runtime.refillBusy or os.clock()<(c.drinkAt or 0) then return end
+    local entries={}
     for _,index in ipairs(indices) do
         if index>=1 and index<=4 and runtime.extra["UseItem"..index] then
-            local name=runtime.consumableDefinitions[index][1]
-            local ok,tool,target,duration,_,character=pcall(runtime.consumableContext,name)
-            if ok then table.insert(entries,{index=index,name=name,tool=tool,target=target,character=character});longest=math.max(longest,duration) end
+            table.insert(entries,{name=runtime.consumableDefinitions[index][1],index=index})
         end
     end
-    if #entries==0 then c.message="No enabled drinks with charges are available.";return end
-    if not releaseHeld() then return end
-    local folder=game:GetService("ReplicatedStorage"):FindFirstChild("RemoteFunctions")
-    local remote=folder and folder:FindFirstChild("UseConsumable")
-    if not remote or not remote:IsA("RemoteFunction") then c.message="UseConsumable is unavailable.";return end
-    runtime.consumableBusy=true;runtime.consumableEpoch=(runtime.consumableEpoch or 0)+1
-    local epoch=runtime.consumableEpoch;local remaining=#entries;local sent,failed=0,0
-    c.drinkAt=os.clock()+longest
-    c.message="Requesting "..#entries.." drinks together (experimental)."
-    if not runtime.extra.IgnoreEquippingTool then
-        c.message="Using selected drinks in an equipped, timed sequence."
-        local character=LocalPlayer.Character
-        local humanoid=character:FindFirstChildOfClass("Humanoid")
-        local previous=character:FindFirstChildOfClass("Tool")
-        task.spawn(function()
-            local lastTool
-            for _,entry in ipairs(entries) do
-                if not runtime.active or runtime.consumableEpoch~=epoch or LocalPlayer.Character~=character or humanoid.Health<=0 then break end
-                local ok,result=pcall(function()
-                    if not runtime.extra["UseItem"..entry.index] then return false end
-                    local tool,target,duration=runtime.consumableContext(entry.name)
-                    if tool~=entry.tool then return false end
-                    if tool.Parent~=character then humanoid:EquipTool(tool) end
-                    lastTool=tool
-                    task.wait(duration)
-                    if not runtime.active or runtime.consumableEpoch~=epoch or LocalPlayer.Character~=character then return false end
-                    if tool.Parent~=character then error("Item changed during use") end
-                    if not runtime.extra["UseItem"..entry.index] then return false end
-                    local liveTool,liveTarget=runtime.consumableContext(entry.name)
-                    if liveTool~=tool or liveTarget~=target then return false end
-                    local response=remote:InvokeServer(entry.name,target)
-                    return response~=false and response~="FAIL"
-                end)
-                if ok and result then sent=sent+1 else failed=failed+1 end
-                if lastTool and lastTool.Parent~=character then break end
-            end
-            if runtime.active and LocalPlayer.Character==character and humanoid.Health>0 and lastTool and lastTool.Parent==character
-                and previous and previous.Parent==LocalPlayer:FindFirstChild("Backpack") then
-                pcall(function() humanoid:EquipTool(previous) end)
-            end
-            runtime.consumableBusy=false
-            if runtime.active and runtime.consumableEpoch==epoch then
-                c.message=sent.." drink requests completed; "..failed.." failed/skipped. Check effects."
-            end
-        end)
-        return
-    end
-
-    for _,entry in ipairs(entries) do
-        task.spawn(function()
-            local ok,result=pcall(function()
-                if not runtime.active or runtime.consumableEpoch~=epoch or LocalPlayer.Character~=entry.character or not runtime.extra["UseItem"..entry.index] then return false end
-                local tool,target=runtime.consumableContext(entry.name)
-                if tool~=entry.tool or target~=entry.target then return false end
-                local response=remote:InvokeServer(entry.name,entry.target)
-                return response~=false and response~="FAIL"
-            end)
-            if ok and result then sent=sent+1 else failed=failed+1 end
-            remaining=remaining-1
-            if remaining==0 then
-                runtime.consumableBusy=false
-                if runtime.active and runtime.consumableEpoch==epoch then
-                    c.message=sent.." drink requests completed; "..failed.." failed/cancelled. Check effects; server timing is unverified."
-                end
-            end
-        end)
-    end
+    if #entries==0 then return end
+    local started=runtime.instantConsumableBatch(entries,function(entry)
+        return runtime.extra["UseItem"..entry.index]==true
+    end,runtime.consumableResult,"manual")
+    if started then c.drinkAt=os.clock()+1;c.message="Immediate backpack requests for selected drinks." end
+    return started
 end
-
 function runtime.useConsumable(name,automatic)
-    local c = runtime.consumables
-    if runtime.consumableBusy or runtime.refillBusy or runtime.action then return end
-    local supported=false
-    for index,item in ipairs(runtime.consumableDefinitions) do if item[1]==name then supported=true end end
-    if not supported then return end
-    local ok, tool, target, duration, amount, character, humanoid = pcall(runtime.consumableContext,name)
-    if not ok then if not automatic then c.message=tostring(tool) end return end
-    local targetCharacter=target.Character
-    local function autoEligible()
+    if runtime.refillBusy then return end
+    local character=LocalPlayer.Character
+    local function eligible()
         if not automatic then return true end
-        local health=target.Character and target.Character:FindFirstChildOfClass("Humanoid")
-        return runtime.extra[automatic.key]==true and target.Character==targetCharacter
+        local health=character and character:FindFirstChildOfClass("Humanoid")
+        return runtime.extra[automatic.key]==true and LocalPlayer.Character==character
             and health and health.Health>0 and health.MaxHealth>0 and health.MaxHealth<math.huge
             and health.Health<=health.MaxHealth*runtime.extra[automatic.threshold]/100
     end
-    if not autoEligible() then return end
-    c.itemAt=c.itemAt or {}
-    local cooldownKey=name
-    if os.clock()<(c.itemAt[cooldownKey] or 0) then return end
-    if reloadState.key or not releaseHeld() then c.message="Wait for input release before using an item." return end
-    runtime.consumableBusy = true
-    runtime.consumableEpoch = (runtime.consumableEpoch or 0) + 1
-    local epoch = runtime.consumableEpoch
-    local ignoreEquip=automatic~=nil or runtime.extra.IgnoreEquippingTool
-    c.itemAt[cooldownKey]=os.clock()+math.max(1,duration)
-    c.message="Using " .. tool.Name .. " on " .. target.Name .. "..."
-    task.spawn(function()
-        if not runtime.active or runtime.consumableEpoch~=epoch then runtime.consumableBusy=false return end
-        local previous = character:FindFirstChildOfClass("Tool")
-        local success, err = pcall(function()
-            if not ignoreEquip and tool.Parent~=character then humanoid:EquipTool(tool) end
-            if not ignoreEquip then task.wait(duration) end
-            if not runtime.active or runtime.consumableEpoch~=epoch or not autoEligible() then return end
-            assert(LocalPlayer.Character==character and (tool.Parent==character or (ignoreEquip and tool.Parent==LocalPlayer:FindFirstChild("Backpack"))), "Use cancelled: character or item ownership changed.")
-            local liveTool, liveTarget = runtime.consumableContext(name)
-            assert(liveTool==tool and liveTarget==target, "Use cancelled: selection changed.")
-            local remote = game:GetService("ReplicatedStorage"):FindFirstChild("RemoteFunctions")
-            remote = remote and remote:FindFirstChild("UseConsumable")
-            assert(remote and remote:IsA("RemoteFunction"), "UseConsumable remote is unavailable.")
-            local response=remote:InvokeServer(tool.Name,target)
-            if runtime.active then
-                c.message=(response==false or response=="FAIL") and "Use rejected by game." or "Use request completed; check charges/effect."
-            end
-        end)
-        if runtime.active then
-            if not success then c.message=tostring(err) end
-            if not ignoreEquip and LocalPlayer.Character==character and tool.Parent==character and previous and previous.Parent then
-                pcall(function() humanoid:EquipTool(previous) end)
-            end
-        end
-        runtime.consumableBusy = false
-    end)
-    return true
+    if not eligible() then return end
+    return runtime.instantConsumableBatch({{name=name}},eligible,runtime.consumableResult,automatic and "healing" or "manual")
 end
 
 runtime.label(menuGroup,"Show / hide: Right Ctrl", true)
 runtime.label(menuGroup,"Triggerbot: Delete", true)
 local function unloadAssistant()
     if not runtime.active then return true end
-    if runtime.cancelNativeConsumables and not runtime.cancelNativeConsumables() then
-        notifyTrigger("Unload waiting for drink-input release. Try Unload again.");return false
+    if runtime.cancelInstantConsumables and not runtime.cancelInstantConsumables() then
+        return false
     end
     runtime.cancelRefill()
     if runtime.cancelAction then runtime.cancelAction() end
@@ -2060,7 +1957,7 @@ local function control(group,key,text,choices)
     local options={Text=text,Default=e[key],Callback=function(value)
         e[key]=value==nil and spec[1] or value
         if key=="Autofarm" and not e[key] and state.farm then state.farm.stop() end
-        if key=="AutoNightDrinks" and not e[key] and not e.Autofarm and runtime.cancelNativeConsumables then runtime.cancelNativeConsumables() end
+        if key=="AutoNightDrinks" and not e[key] and not e.Autofarm and runtime.cancelInstantConsumables then runtime.cancelInstantConsumables("standalone") end
         if key=="AutoLeaveSpawn" and not e[key] and state.farm and not e.Autofarm then state.farm.cancelWalk() end
         if selection then selection:SetText(table.concat(namesFromSet(e[key]),", ")) end
     end}
@@ -2300,7 +2197,7 @@ end
 function state.stop()
     state.restoreHipADS()
     if state.farm then state.farm.stop() end
-    if runtime.cancelNativeConsumables then runtime.cancelNativeConsumables() end
+    if runtime.cancelInstantConsumables then runtime.cancelInstantConsumables() end
     for _,definition in ipairs(runtime.opDefinitions) do local key="OP"..definition[1];e[key]=false;if ui[key] then ui[key]:SetValue(false) end end
     if runtime.op then runtime.op.cleanup() end
     if runtime.cancelAction then runtime.cancelAction() end
@@ -2403,7 +2300,7 @@ function state.automation()
         end
         return
     end
-    if e.AutoLeaveSpawn and state.farm and not runtime.nativeConsumableJob then state.farm.leave(1) end
+    if e.AutoLeaveSpawn and state.farm then state.farm.leave(1) end
     runtime.refillStep()
     if state.actions then state.actions() end
     if state.spending then state.spending() end
@@ -2549,7 +2446,7 @@ end)
 local items=runtime.extensionTabs.Items
 local itemOptions=items:AddLeftGroupbox("Item activation")
 control(itemOptions,"IgnoreEquippingTool","ignore equipping tool")
-runtime.label(itemOptions,"Experimental backpack use for manual drinks / healing. Autofarm scheduled drinks always equip and use native animations. Throwables equip and restore your previous tool. Backpack acceptance remains unverified.")
+runtime.label(itemOptions,"All drinks and healing items always use immediate backpack requests, regardless of this toggle. Throwables equip and restore your previous tool.")
 local use=items:AddLeftGroupbox("Use consumables")
 for index,item in ipairs(runtime.consumableDefinitions) do
     if index==5 then use:AddDivider() end
@@ -2563,7 +2460,7 @@ for index,item in ipairs(runtime.consumableDefinitions) do
 end
 use:AddDivider()
 runtime.consumables.label=runtime.label(use,runtime.consumables.message,true)
-runtime.label(use,"Shared drink key selects every enabled drink. Ignore equipping on: concurrent requests. Off: equipped, timed sequence.",true)
+runtime.label(use,"Shared drink key sends every enabled drink immediately from your backpack. No equip or animation wait. Charges still apply.",true)
 connect(UIS.InputBegan,function(input,processed)
     if processed or UIS:GetFocusedTextBox() or runtime.consumableBusy or runtime.refillBusy or runtime.throwKeyMatches(input) then return end
     local drinks={}
@@ -2585,7 +2482,7 @@ connect(RunService.Heartbeat,function()
     if c.displayed~=c.message then c.displayed=c.message;c.label:SetText(c.message) end
 end)
 
-local healing=automation:AddLeftGroupbox("Automatic healing")
+local healing=automation:AddLeftGroupbox("Automatic consumables")
 for _,entry in ipairs(runtime.healDefinitions) do
     control(healing,entry.key,"Auto-Use "..entry.name)
     control(healing,entry.threshold,entry.name.." HP threshold (%)")
@@ -2593,7 +2490,7 @@ end
 runtime.label(healing,"Heals yourself at or below each HP threshold. Backpack requests; no equip or animation wait. Charges still apply.",true)
 function runtime.autoHealStep()
     local c=runtime.consumables
-    if not runtime.active or runtime.consumableBusy or runtime.refillBusy or runtime.action or (state.farm and state.farm.inFlight) or os.clock()<(c.healScanAt or 0) then return end
+    if not runtime.active or runtime.consumableBusy or runtime.refillBusy or runtime.action or os.clock()<(c.healScanAt or 0) then return end
     c.healScanAt=os.clock()+.1
     for offset=1,#runtime.healDefinitions do
         local index=((c.healIndex or 0)+offset-1)%#runtime.healDefinitions+1
@@ -3880,7 +3777,7 @@ function farm.begin()
     farm.status("Starting ordered C96 autofarm.")
 end
 function farm.stop()
-    if runtime.cancelNativeConsumables then runtime.cancelNativeConsumables() end
+    if runtime.cancelInstantConsumables then runtime.cancelInstantConsumables("autofarm") end
     farm.runId=(farm.runId or 0)+1
     farm.cancelWalk()
     farm.exitTransit=nil;farm.exitWalking=nil
@@ -3897,7 +3794,7 @@ function farm.equipC96()
     return true
 end
 function farm.resumeCharacter()
-    if runtime.cancelNativeConsumables then runtime.cancelNativeConsumables() end
+    if runtime.cancelInstantConsumables then runtime.cancelInstantConsumables() end
     farm.runId=(farm.runId or 0)+1
     farm.cancelWalk()
     if runtime.cancelRefill then runtime.cancelRefill() end
@@ -3951,10 +3848,6 @@ function farm.step()
         farm.cancelWalk();farm.status("Waiting for respawn.");return
     end
     if farm.stage>=7 then farm.roofReached=true end
-    if runtime.nativeConsumableJob then
-        farm.ongoingSkip()
-        farm.status("Using scheduled drinks; movement resumes after native use.");return
-    end
     -- Some returns to spawn keep the Character instance, or finish between
     -- polling ticks. Reconcile the live interaction region as well as identity.
     if not farm.recovering and farm.stage>=3 then
@@ -4036,11 +3929,6 @@ if RunService.BindToRenderStep then
         if runtime.active and (e.Autofarm or e.AutoLeaveSpawn) and (not e.Autofarm or farm.supported()) then
             local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
             if humanoid and root then
-                if runtime.nativeConsumableJob then
-                    if farm.stopSprint then farm.stopSprint() end
-                    if farm.moving then humanoid:Move(Vector3.new(0,0,0),false) end
-                    return
-                end
                 if farm.motionTick then farm.motionTick(humanoid,root) end
                 local direction=farm.climbDirection
                 if farm.walkPoint then
@@ -4060,171 +3948,86 @@ control(farmGroup,"AutoLeaveSpawn","Auto Leave Spawn")
 farm.label=runtime.label(farmGroup,"Off",true)
 runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Sniper is followed by Body Building Handling. Wave 21 prioritizes healing items; wave 28 prioritizes Max Health and Health Regen, then resumes interrupted upgrades. Weapon and support settings are preserved. Backup Weapon and Rooftop Camper required. Live routes remain unverified.",true)
 
--- Scheduled drinks use the equipped ConsumableScript lifecycle from the game dump.
--- This code does not manufacture Consuming values or call UseConsumable itself.
+-- All drinks and healing items share immediate backpack requests. Never equip,
+-- synthesize input, wait for animations, or take the gun/movement lock here.
+runtime.instantUses={}
 function runtime.consumableAmount(name)
     return readValue(child(child(LocalPlayer,"Charges"),name),"Amount")
 end
-function runtime.consumableCallbacks(tool)
-    if type(getconnections)~="function" or type(getfenv)~="function" then return nil end
-    local scriptObject=child(tool,"ConsumableScript")
-    if not scriptObject then return nil end
-    local function find(signal)
-        if not signal then return end
-        local ok,list=pcall(getconnections,signal)
-        if not ok or type(list)~="table" then return end
-        for i=#list,1,-1 do
-            local found,fn=pcall(function() return list[i].Enabled~=false and list[i].Function end)
-            if found and type(fn)=="function" then
-                local success,env=pcall(getfenv,fn)
-                if success and type(env)=="table" and env.script==scriptObject then return fn end
-            end
+function runtime.finishInstantUse(job,status,reason)
+    if job.reported then return end
+    job.reported=true
+    if runtime.instantUses[job.entry.name]==job and (job.returned or not job.invoked) then
+        runtime.instantUses[job.entry.name]=nil
+    end
+    if job.done then job.done(job.entry,status,reason) end
+end
+function runtime.instantConsumableMonitor()
+    for name,job in pairs(runtime.instantUses) do
+        local amount=runtime.consumableAmount(name)
+        if finite(amount) and finite(job.entry.before) and amount<job.entry.before then
+            runtime.finishInstantUse(job,"consumed")
+        elseif not runtime.active or LocalPlayer.Character~=job.character or job.humanoid.Health<=0 then
+            runtime.finishInstantUse(job,job.invoked and "unknown" or "pending","Character changed before confirmation")
+        elseif os.clock()>=job.deadline then
+            runtime.finishInstantUse(job,job.invoked and "unknown" or "pending","No charge decrease observed")
+        end
+        if job.reported and job.returned and runtime.instantUses[name]==job then runtime.instantUses[name]=nil end
+    end
+end
+function runtime.cancelInstantConsumables(scope)
+    for name,job in pairs(runtime.instantUses) do
+        if not scope or job.scope==scope then
+            job.cancelled=true
+            runtime.finishInstantUse(job,job.invoked and "unknown" or "pending","Use cancelled")
+            -- An outstanding network call retains only its per-item lease until it
+            -- returns. It cannot freeze firing, movement, or other consumables.
+            if not job.invoked or job.returned then runtime.instantUses[name]=nil end
         end
     end
-    local ok,mouse=pcall(function() return LocalPlayer:GetMouse() end)
-    if not ok then return end
-    local down,up=find(mouse.Button1Down),find(mouse.Button1Up)
-    if down and up then return {down=down,up=up} end
-    local screen=child(child(LocalPlayer,"PlayerGui"),"ScreenGui")
-    local attack=child(child(child(screen,"TouchControls"),"RightSide"),"AttackButton")
-    down=attack and find(attack.MouseButton1Down);up=attack and find(attack.InputEnded)
-    if down and up then return {down=down,up=up} end
-end
-function runtime.releaseConsumableInput()
-    local held=runtime.consumableInput
-    if not held then return true end
-    local ok,err=pcall(function()
-        if held.up then held.up()
-        elseif virtualInput then virtualInput:SendMouseButton(held.point,Enum.UserInputType.MouseButton1,false,0)
-        elseif legacyInput then legacyInput:SendMouseButtonEvent(held.point.X,held.point.Y,0,false,game,0)
-        else error("Mouse release unavailable") end
-    end)
-    if ok or duplicateButtonState(err) then runtime.consumableInput=nil;return true end
-    return false
-end
-function runtime.pressConsumable(tool)
-    local callbacks=runtime.consumableCallbacks(tool)
-    if callbacks then
-        runtime.consumableInput={up=callbacks.up}
-        callbacks.down()
-        return
-    end
-    assert(not UIS:GetFocusedTextBox() and not guiService.MenuIsOpen,"Close Roblox menus before drink use")
-    assert(not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1),"Release the mouse before drink use")
-    local camera=Workspace.CurrentCamera
-    assert(camera,"Camera unavailable")
-    local point=camera.ViewportSize/2
-    -- Never click through a menu or another GUI when scoped native callbacks are unavailable.
-    for _,container in ipairs({playerGui,coreGui}) do
-        if container then
-            local ok,objects=pcall(function() return container:GetGuiObjectsAtPosition(point.X,point.Y) end)
-            assert(ok,"Cannot verify drink input position")
-            for _,object in ipairs(objects) do
-                assert(not (object.Visible and (object.Active or object:IsA("GuiButton") or object:IsA("TextBox"))),"Drink input blocked by GUI")
-            end
-        end
-    end
-    runtime.consumableInput={point=point}
-    if virtualInput then virtualInput:SendMouseButton(point,Enum.UserInputType.MouseButton1,true,0)
-    elseif legacyInput then legacyInput:SendMouseButtonEvent(point.X,point.Y,0,true,game,0)
-    else runtime.consumableInput=nil;error("Native drink input unavailable") end
-end
-function runtime.finishNativeConsumables(job)
-    if runtime.nativeConsumableJob~=job then return end
-    if not runtime.releaseConsumableInput() then job.finishing=true;return end
-    if LocalPlayer.Character==job.character and job.humanoid.Health>0 and job.lastTool
-        and job.lastTool.Parent==job.character then
-        pcall(function()
-            if job.previous and job.previous.Parent==child(LocalPlayer,"Backpack") then job.humanoid:EquipTool(job.previous)
-            elseif not job.previous then job.humanoid:UnequipTools() end
-        end)
-    end
-    runtime.nativeConsumableJob=nil;runtime.consumableBusy=false
-end
-function runtime.cancelNativeConsumables()
-    local job=runtime.nativeConsumableJob
-    if job then job.cancelled=true;runtime.finishNativeConsumables(job)
-    else return runtime.releaseConsumableInput() end
-    return runtime.consumableInput==nil
-end
-function runtime.nativeDrinkBatch(entries,eligible,done)
-    if runtime.consumableBusy or runtime.refillBusy or runtime.action or reloadState.key or not releaseHeld() then return false end
-    local character,humanoid=alive()
-    if not humanoid then return false end
-    local job={character=character,humanoid=humanoid,previous=character:FindFirstChildOfClass("Tool")}
-    runtime.nativeConsumableJob=job;runtime.consumableBusy=true
-    local farm=runtime.extensions and runtime.extensions.farm
-    if farm then farm.cancelWalk() end
-    task.spawn(function()
-        local function valid()
-            local ok,allowed=pcall(eligible)
-            return runtime.active and runtime.nativeConsumableJob==job and not job.cancelled
-                and LocalPlayer.Character==character and humanoid.Health>0 and ok and allowed
-        end
-        local completed=0
-        for _,entry in ipairs(entries) do
-            local started,consumed,finished=false,false,false
-            local observation
-            local ok,reason=pcall(function()
-                assert(valid(),"Drink batch cancelled")
-                local tool,_,duration,before,owner=runtime.consumableContext(entry.name)
-                assert(owner==character,"Character changed")
-                entry.before=before
-                job.lastTool=tool;job.name=entry.name
-                local amount=child(child(child(LocalPlayer,"Charges"),entry.name),"Amount")
-                local function observe()
-                    local value=amount and amount.Value
-                    if finite(value) and value<before then consumed=true end
-                end
-                if amount and amount.Changed then observation=amount.Changed:Connect(observe) end
-                if tool.Parent~=character then humanoid:EquipTool(tool) end
-                task.wait(.15) -- allow the native Equipped handler to attach its input callbacks
-                assert(valid() and tool.Parent==character,"Drink equip cancelled")
-                runtime.pressConsumable(tool)
-                local deadline=os.clock()+1.5
-                repeat
-                    task.wait(.05);observe()
-                    started=started or readValue(tool,"Consuming")==true
-                until consumed or started or not valid() or os.clock()>=deadline
-                assert(runtime.releaseConsumableInput(),"Drink mouse release failed")
-                if not started and not consumed then error("Native use did not start") end
-                deadline=os.clock()+duration+6
-                repeat
-                    observe()
-                    finished=(started or consumed) and readValue(tool,"Consuming")==false
-                    if tool.Parent~=character then job.cancelled=true;break end
-                    if finished or not valid() or os.clock()>=deadline then break end
-                    task.wait(.05)
-                until false
-                -- Permit the charge update to follow the completed native animation.
-                if finished and not consumed then
-                    local replicationDeadline=os.clock()+1
-                    repeat task.wait(.05);observe() until consumed or not valid() or os.clock()>=replicationDeadline
-                end
-            end)
-            if job.lastTool and job.lastTool.Name==entry.name then started=started or readValue(job.lastTool,"Consuming")==true end
-            if observation then pcall(function() observation:Disconnect() end) end
-            runtime.releaseConsumableInput()
-            local status=consumed and "consumed" or (started and not finished and "unknown" or "pending")
-            local message=consumed and "Charge decrease observed" or (ok and (finished and "No charge consumed" or "Use interrupted / timed out") or tostring(reason))
-            -- Report exactly one result, even on cancellation. Ambiguous uses are not repeated.
-            local reported=pcall(done,entry,status,message)
-            completed=completed+1
-            if not reported or not valid() or runtime.consumableInput then break end
-        end
-        for i=completed+1,#entries do pcall(done,entries[i],"pending","Batch interrupted before use") end
-        runtime.finishNativeConsumables(job)
-    end)
     return true
 end
-connect(RunService.Heartbeat,function()
-    local job=runtime.nativeConsumableJob
-    if runtime.consumableInput and not job then runtime.releaseConsumableInput() end
-    if job and (job.finishing or not runtime.active or job.cancelled or LocalPlayer.Character~=job.character or job.humanoid.Health<=0) then
-        job.cancelled=true;runtime.finishNativeConsumables(job)
+function runtime.instantConsumableBatch(entries,eligible,done,scope)
+    runtime.instantConsumableMonitor()
+    local folder=child(game:GetService("ReplicatedStorage"),"RemoteFunctions")
+    local remote=child(folder,"UseConsumable")
+    if not remote or not remote:IsA("RemoteFunction") then return false end
+    local c=runtime.consumables;c.itemAt=c.itemAt or {}
+    local started=0
+    for _,entry in ipairs(entries) do
+        local supported=false
+        for _,item in ipairs(runtime.consumableDefinitions) do if item[1]==entry.name then supported=true;break end end
+        local ok,tool,target,duration,amount,character,humanoid=pcall(runtime.consumableContext,entry.name)
+        if supported and ok and not runtime.instantUses[entry.name] and os.clock()>=(c.itemAt[entry.name] or 0) then
+            entry.before=amount
+            local job={entry=entry,tool=tool,target=target,character=character,humanoid=humanoid,
+                done=done,scope=scope,deadline=os.clock()+8}
+            runtime.instantUses[entry.name]=job;started=started+1
+            c.itemAt[entry.name]=os.clock()+math.max(1,duration)
+            task.spawn(function()
+                if job.cancelled or not runtime.active or runtime.instantUses[entry.name]~=job then return end
+                local valid,liveTool,liveTarget=pcall(runtime.consumableContext,entry.name)
+                if not valid or liveTool~=tool or liveTarget~=target or LocalPlayer.Character~=character or (eligible and not eligible(entry)) then
+                    runtime.finishInstantUse(job,"pending","Use cancelled before dispatch");return
+                end
+                job.invoked=true;c.lastItem=entry.name
+                local success,response=pcall(function() return remote:InvokeServer(entry.name,target) end)
+                job.returned=true
+                local after=runtime.consumableAmount(entry.name)
+                if finite(after) and after<amount then runtime.finishInstantUse(job,"consumed")
+                elseif success and (response==false or response=="FAIL") then runtime.finishInstantUse(job,"pending","Game rejected use")
+                elseif not success then runtime.finishInstantUse(job,"unknown",tostring(response))
+                else c.message=entry.name..": request returned; awaiting charge confirmation." end
+                if job.reported and runtime.instantUses[entry.name]==job then runtime.instantUses[entry.name]=nil end
+            end)
+        elseif done then
+            done(entry,"pending",not ok and tostring(tool) or "Item already requested or cooling down")
+        end
     end
-end)
-table.insert(runtime.connections,{Disconnect=function() runtime.cancelNativeConsumables() end})
+    return started>0
+end
+connect(RunService.Heartbeat,runtime.instantConsumableMonitor)
+table.insert(runtime.connections,{Disconnect=function() runtime.cancelInstantConsumables() end})
 
 -- One activation per drink per night slot; routing does not own the clock.
 function farm.drinkSchedule(wave,minutes,map,minimumWave)
@@ -4273,15 +4076,8 @@ function farm.drinkTick()
     if minutes>=360 and minutes<1080 then
         farm.drinkMessage="Drinks: next night at 18:15 and 00:10.";return
     end
-    if runtime.nativeConsumableJob then
-        farm.drinkMessage="Drinks: using "..tostring(runtime.nativeConsumableJob.name or "equipped sequence").."; waiting for charge confirmation.";return
-    end
     local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
-    if not humanoid or not root or runtime.consumableBusy or runtime.refillBusy or runtime.action or (owner=="autofarm" and farm.inFlight) or reloadState.key then return end
-    -- Do not unequip the gun or stop movement halfway up a ladder / during a jump.
-    if not farm.grounded(humanoid,root) or humanoid:GetState()==Enum.HumanoidStateType.Climbing then
-        farm.drinkMessage="Drinks: scheduled batch waiting for stable footing.";return
-    end
+    if not humanoid or not root or runtime.consumableBusy or runtime.refillBusy or runtime.action then return end
     local c=runtime.consumables;c.itemAt=c.itemAt or {}
     if os.clock()<(c.drinkAt or 0) then return end
     local slot;local entries={}
@@ -4305,7 +4101,7 @@ function farm.drinkTick()
     end
     if not slot then farm.drinkMessage=farm.drinkSummary(clock);return end
     for _,entry in ipairs(entries) do entry.record.owner=entry;entry.record.state="inflight" end
-    local started=runtime.nativeDrinkBatch(entries,function()
+    local started=runtime.instantConsumableBatch(entries,function()
         local t=game:GetService("Lighting"):GetMinutesAfterMidnight()
         local active,currentMinimum,currentOwner=farm.drinkPolicy()
         local currentWave=readValue(values,"LocalWave")
@@ -4322,21 +4118,24 @@ function farm.drinkTick()
         entry.record.retryAt=os.clock()+math.min(60,5*entry.record.attempts)
         c.itemAt[entry.name]=os.clock()+1
         farm.drinkMessage=farm.drinkSummary(clock)
-    end)
+    end,owner)
     if started then
         c.drinkAt=os.clock()+1
-        farm.drinkMessage=slot.at..": using "..#entries.." drinks with native animations."
+        farm.drinkMessage=slot.at..": using "..#entries.." immediate backpack drink requests."
     else
         for _,entry in ipairs(entries) do
             if entry.record.owner==entry then entry.record.owner=nil;entry.record.state="pending" end
         end
     end
 end
-farm.drinkLabel=runtime.label(farmGroup,"Drinks: native use at 18:15 and 00:10 from wave 15; charge confirmation required.",true)
-local nightDrinks=automation:AddLeftGroupbox("Nightly drinks")
-control(nightDrinks,"AutoNightDrinks","Auto use drinks at 18:15 / 00:10")
-runtime.label(nightDrinks,"Uses owned Energy, Experimental, Speed and Deadeye drinks every night on any map, without autofarm. Uses normal animations and confirms charges. Autofarm takes over from wave 15; the two schedules do not double-use drinks.",true)
-farm.nightDrinkLabel=runtime.label(nightDrinks,"Nightly drinks: off",true)
+farm.drinkLabel=runtime.label(farmGroup,"Drinks: immediate backpack use at 18:15 and 00:10 from wave 15; charge confirmation required.",true)
+function farm.addNightDrinkControls(group)
+    group:AddDivider()
+    control(group,"AutoNightDrinks","Auto use drinks at 18:15 / 00:10")
+    runtime.label(group,"Uses all four owned drinks immediately from your backpack every night. No equip or animation wait. Autofarm uses the same schedule from wave 15; shared tracking prevents duplicate activations.",true)
+    farm.nightDrinkLabel=runtime.label(group,"Nightly drinks: off",true)
+end
+farm.addNightDrinkControls(healing)
 function farm.showDrinks()
     local message=farm.drinkMessage
     if message and message~=farm.drinkDisplayed then
@@ -4345,7 +4144,7 @@ function farm.showDrinks()
     end
     local status=not e.AutoNightDrinks and "Nightly drinks: off" or
         (e.Autofarm and "Nightly drinks: autofarm controls the wave 15+ schedule." or (message or "Nightly drinks: waiting for 18:15 / 00:10."))
-    if status~=farm.nightDrinkDisplayed then
+    if farm.nightDrinkLabel and status~=farm.nightDrinkDisplayed then
         local ok,result=pcall(function() return farm.nightDrinkLabel:SetText(status) end)
         if ok and result~=false then farm.nightDrinkDisplayed=status end
     end
@@ -4622,7 +4421,6 @@ function farm.purchaseSummary()
 end
 function farm.nextDrinkSummary(wave,minutes)
     if wave<15 then return "Wave 15 at 18:15" end
-    if runtime.nativeConsumableJob then return "Using "..tostring(runtime.nativeConsumableJob.name or "scheduled batch") end
     if minutes>=360 and minutes<1080 then return "18:15" end
     local clock=farm.drinkClock
     if clock then
@@ -4742,7 +4540,7 @@ function farm.deathSample(humanoid)
         position=vector(root and root.Position),velocity=vector(root and root.AssemblyLinearVelocity),
         floor=humanoid and tostring(humanoid.FloorMaterial),state=humanoid and tostring(humanoid:GetState()),
         recovering=farm.recovering,ladder=farm.ladder and farm.ladder.phase,moving=farm.moving==true,
-        drink=runtime.nativeConsumableJob and runtime.nativeConsumableJob.name,
+        drink=runtime.consumables.lastItem,
         exit=farm.exitTransit and farm.exitTransit.which,nativeDamageCounter=farm.diagnostics.damageValue}
     if root then
         local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
@@ -4766,7 +4564,7 @@ function farm.recordDeath(humanoid)
         local saved=pcall(function() writefile("CombatAssistantDeaths.json",HttpService:JSONEncode({version=1,deaths=d.deaths})) end)
         d.message=d.message..(saved and " Diagnostic saved." or " Diagnostic remains in memory.")
     end
-    if runtime.cancelNativeConsumables then runtime.cancelNativeConsumables() end
+    if runtime.cancelInstantConsumables then runtime.cancelInstantConsumables() end
     farm.cancelWalk()
 end
 function farm.deathMonitor()
@@ -5080,4 +4878,3 @@ task.defer(function()
         profileNotice("Autoloaded: " .. name)
     end)
 end)
-
