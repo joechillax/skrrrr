@@ -1,4 +1,4 @@
--- JoesAAS 4.2 | standalone source | September 2026
+-- JoesAAS 4.4 | standalone source | September 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -315,7 +315,7 @@ return function(A)
     A.alive=true; A.running=false; A.epoch=0; A.started=os.clock()
     A.defaults={version=3,world='0',mobsByWorld={},target='Nearest',farm=false,trialFollow=false,trialAutoJoin=false,trialJoinSelection={},
         towerAutoJoin=false,towerSelection={},raidAutoJoin=false,raidSelection={},defenseAutoJoin=false,defenseSelection={},
-        gateAutoJoin=false,gateSelection={},dungeonFollow=false,dungeonAutoJoin=false,dungeonSelection={},bossRushAutoJoin=false,bossRushSelection={},
+        gateAutoJoin=false,gateSelection={},gateRanks={S=true,A=true,B=true,C=true,D=true,E=true},dungeonAutoJoin=false,dungeonSelection={},bossRushAutoJoin=false,bossRushSelection={},
         rename=false,petName='',webhook=false,webhookURL='',pingId='',ping=false,sendDisconnect=true,
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
@@ -348,11 +348,12 @@ return function(A)
     end
     function A.validate(saved)
         local s=Core.merge(A.defaults,saved)
+        if type(saved)=='table' and saved.dungeonFollow==true then s.trialFollow=true end
         local n=tonumber(s.distance); s.distance=(n and n==n and n<math.huge) and n or 5
         s.distance=math.clamp(s.distance,2,20)
         if not Core.contains({'Nearest','Highest HP','Lowest HP'},s.target) then s.target='Nearest' end
         if not Core.contains({'Walk','Teleport'},s.moveStyle) then s.moveStyle='Walk' end
-        for _,k in ipairs({'webhookEvents','pingEvents','trialJoinSelection','towerSelection','raidSelection','defenseSelection','dungeonSelection','gateSelection','bossRushSelection'}) do
+        for _,k in ipairs({'webhookEvents','pingEvents','trialJoinSelection','towerSelection','raidSelection','defenseSelection','dungeonSelection','gateSelection','gateRanks','bossRushSelection'}) do
             for id,v in pairs(s[k]) do if type(id)~='string' or type(v)~='boolean' then s[k][id]=nil end end
         end
         for world,selection in pairs(s.mobsByWorld) do
@@ -1203,7 +1204,7 @@ return function(A)
                         context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
                 end
                 local ctrl=A.client('TeleportController')
-                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='4.2',reason=message,
+                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='4.4',reason=message,
                     context=A.player:GetAttribute('VisibilityContext'),room=state[keyField]==key and state.Room,
                     serverEnemies=state[keyField]==key and state.EnemyCount,anchored=root and root.Anchored,
                     loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
@@ -1270,7 +1271,7 @@ return function(A)
         end)
     end
     install('Trial','TimeTrial','TimeTrialArenas','trialFollow','Trial','TrialKey')
-    install('Dungeon','Dungeon','DungeonArenas','dungeonFollow','Dungeon','DungeonKey')
+    install('Dungeon','Dungeon','DungeonArenas','trialFollow','Dungeon','DungeonKey')
 end
 
 end)()(A);
@@ -1288,7 +1289,7 @@ return function(A)
         BossRush={rank=100,config='BossRushConfig',method='GetAllRushes',toggle='bossRushAutoJoin',selection='bossRushSelection'}
     }
     local order={'Tower','TimeTrial','Dungeon','Gate','Raid','Defense','BossRush'}
-    local protected={Tower=true,TimeTrial=true,Dungeon=true,Gate=true}
+    local protected={Tower=true,TimeTrial=true,Dungeon=true}
     local available,backoff={},{}
     local pending,leaving,locked,returning,waitingReason
     local raidInstance,raidKey
@@ -1305,6 +1306,31 @@ return function(A)
             return filtered
         end
         return choices
+    end
+    local rankOrder={'S','A','B','C','D','E'}
+    local rankWeight={S=6,A=5,B=4,C=3,D=2,E=1}
+    function A.gateRankRows()
+        local present={}; local rows={}
+        for _,cfg in pairs(A.activityChoices('Gate')) do
+            for _,rank in ipairs(type(cfg.GateRanks)=='table' and cfg.GateRanks or {}) do
+                if type(rank)=='table' and type(rank.Rank)=='string' then present[rank.Rank]=true end
+            end
+        end
+        for _,rank in ipairs(rankOrder) do if present[rank] then rows[#rows+1]={key=rank,label=rank} end end
+        return rows
+    end
+    local function candidateKeys(mode,choices)
+        if mode=='TimeTrial' then return A.Core.activityKeys(choices,mode) end
+        local keys=A.Core.keys(choices)
+        if mode=='Gate' then
+            table.sort(keys,function(a,b)
+                local left=available.Gate[a]; local right=available.Gate[b]
+                local x=left and rankWeight[left.rank] or 0; local y=right and rankWeight[right.rank] or 0
+                if x~=y then return x>y end
+                return a<b
+            end)
+        end
+        return keys
     end
     function A.trialChoices() return A.activityChoices('TimeTrial') end
     function A.activityRows(mode)
@@ -1339,7 +1365,7 @@ return function(A)
         waitingReason=nil
         for _,mode in ipairs(order) do
             local choices=A.settings[definitions[mode].toggle] and A.activityChoices(mode) or {}
-            for _,key in ipairs(mode=='TimeTrial' and A.Core.activityKeys(choices,mode) or A.Core.keys(choices)) do
+            for _,key in ipairs(candidateKeys(mode,choices)) do
                 if enabled(mode,key) and (backoff[mode..':'..key] or 0)<=os.clock() then
                     local entry=available[mode][key]
                     if mode=='Tower' then
@@ -1347,6 +1373,11 @@ return function(A)
                         local tower=choices[key]
                         if cfg and cfg.Enabled~=false and util and d and A.unlocked(tower.WorldId)
                             and util.GetCooldownRemaining(d,tower)<=0 then return mode,key,{} end
+                    elseif mode=='Gate' then
+                        if entry and entry.deadline>os.clock() then
+                            if not entry.rank then waitingReason='Gate rank not provided; waiting for a ranked announcement'
+                            elseif A.settings.gateRanks[entry.rank] then return mode,key,entry end
+                        end
                     elseif mode~='Raid' and entry and entry.deadline>os.clock() then return mode,key,entry
                     elseif mode=='Raid' or mode=='Defense' then
                         local cfg=choices[key]
@@ -1391,6 +1422,10 @@ return function(A)
         if type(raw)=='string' and raw:match('^World:') and not A.inMode() and not loading then
             locked=nil; returning=nil; leaving=nil
         end
+        if pending and not pending.accepted and not loading and not protected[current] then
+            local nextMode=selectCandidate()
+            if nextMode and definitions[nextMode].rank>definitions[pending.mode].rank then pending=nil end
+        end
         if pending then
             if current==pending.mode then
                 pending=nil; returning=nil
@@ -1398,7 +1433,8 @@ return function(A)
             elseif not loading and (not current or definitions[current]) then
                 local entry=available[pending.mode][pending.key]
                 local scheduled=pending.mode~='Raid' and pending.mode~='Tower' and pending.mode~='Defense'
-                if not enabled(pending.mode,pending.key) or (scheduled and (not entry or entry.deadline<=os.clock())) then
+                if not enabled(pending.mode,pending.key) or (scheduled and (not entry or entry.deadline<=os.clock()))
+                    or (pending.mode=='Gate' and (not entry or not entry.rank or not A.settings.gateRanks[entry.rank] or entry.rank~=pending.entry.rank)) then
                     pending=nil
                 elseif not pending.accepted and os.clock()-pending.lastSent>=8 then
                     if pending.attempts<3 then
@@ -1427,7 +1463,7 @@ return function(A)
             if not direct then
                 if returning==current then status('Waiting for '..current..' return teleport'); return end
                 leaving=current; suspendFarm(); status('Leaving '..current..' for '..mode)
-                if not A.fire(current..'Leave') then leaving=nil; status('Leave bridge unavailable: '..current) end
+                if not A.fire(current=='Gate' and 'RaidLeave' or current..'Leave') then leaving=nil; status('Leave bridge unavailable: '..current) end
                 return
             end
         elseif returning then status('Waiting for '..returning..' return teleport'); return
@@ -1486,7 +1522,11 @@ return function(A)
         if type(p)~='table' or p.NotifyKind~='GamemodeOpen' or p.GateTeleport~=true or type(p.Key)~='string' then return end
         local duration=tonumber(p.ExpiresIn) or 60
         if duration<=0 or duration~=duration then return end
-        available.Gate[p.Key]={deadline=os.clock()+math.min(duration,600)}
+        local rank=type(p.GateRank)=='string' and p.GateRank
+            or (type(p.Name)=='string' and p.Name:match('Rank%s+([A-Z]+)'))
+            or (type(p.Title)=='string' and p.Title:match('Rank%s+([A-Z]+)'))
+        if not rankWeight[rank] then rank=nil end
+        available.Gate[p.Key]={deadline=os.clock()+math.min(duration,600),rank=rank}
         A.coordinateActivities()
     end)
     A.on('RaidMapReady',function(instance,key)
@@ -1897,7 +1937,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='4.2',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='4.4',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2137,11 +2177,11 @@ return function(A)
     toggle('Farm','Auto farm selected mobs','farm')
     note('Farm','World handling','Joins through the normal world system before combat. Keeps one target until death or removal, then immediately picks across all selected mobs. Selections are saved separately per world.')
     status('Farm','Farm'); status('Farm','Discovery')
-    toggle('Farm','Auto teleport to trial mobs','trialFollow',function()
-        if not A.settings.trialFollow then A.stopTrialMovement() end
+    toggle('Farm','Auto teleport to Trial / Dungeon mobs','trialFollow',function()
+        if not A.settings.trialFollow then A.stopTrialMovement(); A.stopDungeonMovement() end
     end)
-    note('Farm','Trial movement','While enabled, takes small continuous steps inside your current Trial, including between waves. Stops on exit, death, run end or toggle off.')
-    status('Farm','Trial follow')
+    note('Farm','Trial / Dungeon movement','Teleports to mobs in your current Trial or Dungeon and keeps small anti-stuck steps running between rooms. Stops on exit, death, run end or toggle off.')
+    status('Farm','Trial follow'); status('Farm','Dungeon follow')
     dropdown('Farm','Trials to auto join','trialJoinSelection',function()
         return A.activityRows('TimeTrial')
     end,function(key) return A.settings.trialJoinSelection[key]==true end,
@@ -2152,7 +2192,7 @@ return function(A)
     status('Modes','Activities')
     status('Modes','Activity error')
     note('Modes','Raid / Defense','Raid starts YOUR OWN run only; never joins other raids. Defense starts or joins an available run. Normal entry costs apply; errors appear above.')
-    note('Modes','Activity priority','Tower > Time Trials > Dungeon > Gate > Raid / Defense > Boss Rush > mob farming. Tower, Trial, Dungeon and Gate runs finish or fail before switching. Raid wins a tie with Defense; an active run keeps its place.')
+    note('Modes','Activity priority','Tower > Time Trials > Dungeon > Gate > Raid / Defense > Boss Rush > mob farming. Tower, Trial and Dungeon runs finish or fail before switching. Gate can yield to a higher-priority mode. Raid wins a tie with Defense; an active run keeps its place.')
     note('Modes','Transfers','Tower, Trials and Dungeons use direct native entry. Gate and lower modes wait for normal exit. Gate and Tower stay at their join position.')
     note('Modes','Movement','Time Trials and Dungeons follow mobs with continuous anti-stuck steps. Tower opens your own tower. Turn off competing auto-join / movement in your other script to let this coordinator control switching.')
     for _,entry in ipairs({{'Tower','towerAutoJoin','towerSelection'},{'Dungeon','dungeonAutoJoin','dungeonSelection'},{'Gate','gateAutoJoin','gateSelection'},{'Raid','raidAutoJoin','raidSelection'},
@@ -2163,12 +2203,14 @@ return function(A)
             return A.activityRows(mode)
         end,function(key) return A.settings[selectionKey][key]==true end,
         function(selected) A.settings[selectionKey]=selected; A.coordinateActivities() end,true)
+        if mode=='Gate' then
+            dropdown('Modes','Gate ranks','gateRanks',A.gateRankRows,
+                function(key) return A.settings.gateRanks[key]==true end,
+                function(selected) A.settings.gateRanks=selected; A.coordinateActivities() end,true)
+            note('Modes','Gate rank priority','S > A > B > C > D > E among selected open Gates. Only ranks exposed by the game are listed.')
+        end
         toggle('Modes',mode=='Raid' and 'Auto start my own Raid' or ('Auto join '..mode),toggleKey,A.coordinateActivities)
     end
-    toggle('Modes','Auto farm Dungeon mobs + anti-stuck','dungeonFollow',function()
-        if not A.settings.dungeonFollow then A.stopDungeonMovement() end
-    end)
-    status('Modes','Dungeon follow')
     input('Pets','Name for unnamed Astral pets','petName')
     toggle('Pets','Auto rename Astral pets ONLY','rename')
     note('Pets','Astral naming','Only verified Astral rarity is eligible. Already named and percentage pets are skipped. Uses the normal Magicule cost. Check the status below for blockers.')
