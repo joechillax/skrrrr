@@ -4139,8 +4139,35 @@ function farm.showDrinks()
     end
 end
 
--- Webhook credentials stay in memory, outside saved profiles.
+-- Separate local settings file; not included in shareable gameplay profiles.
 farm.webhook={enabled=false,url="",sent={}}
+farm.webhookFile="CombatAssistantWebhook.json"
+function farm.saveWebhook()
+    local w=farm.webhook
+    if w.loading then return end
+    if w.url~="" and not farm.webhookURL(w.url) then w.saveMessage="Not saved: invalid webhook URL.";return false end
+    if type(writefile)~="function" then w.saveMessage="Not saved: file writing unavailable.";return false end
+    local ok=pcall(function()
+        writefile(farm.webhookFile,HttpService:JSONEncode({Version=1,URL=w.url,Enabled=w.enabled}))
+    end)
+    w.saveMessage=ok and "Webhook settings saved locally." or "Webhook settings could not be saved."
+    return ok
+end
+function farm.loadWebhook()
+    local w=farm.webhook
+    if type(readfile)~="function" then w.saveMessage="Local settings unavailable: no file reader.";return end
+    if type(isfile)=="function" then
+        local ok,exists=pcall(isfile,farm.webhookFile)
+        if ok and not exists then return end
+    end
+    local ok,data=pcall(function() return HttpService:JSONDecode(readfile(farm.webhookFile)) end)
+    if not ok or type(data)~="table" or data.Version~=1 or type(data.URL)~="string" or type(data.Enabled)~="boolean"
+        or (data.URL~="" and not farm.webhookURL(data.URL)) then
+        w.saveMessage="Saved webhook settings unavailable or invalid; enter them again.";return
+    end
+    w.url=data.URL:match("^%s*(.-)%s*$");w.enabled=data.Enabled
+    w.saveMessage="Saved webhook settings loaded."
+end
 function farm.webhookStep()
     if farm.recovering then return "Returning to roof after respawn" end
     if farm.healthDue() then return "Max Health / Health Regen" end
@@ -4204,8 +4231,11 @@ function farm.webhookTick()
     end)
 end
 local webhookGroup=automation:AddRightGroupbox("Wave webhook")
-addControl(webhookGroup,"Input","FarmWebhookURL",{Text="Discord webhook URL (session only)",Default="",Finished=true,Callback=function(value) farm.webhook.url=tostring(value or "") end})
-addControl(webhookGroup,"Toggle","FarmWebhookEnabled",{Text="Send every 5 waves",Default=false,Callback=function(value) farm.webhook.enabled=value==true end})
+farm.loadWebhook()
+farm.webhook.loading=true
+addControl(webhookGroup,"Input","FarmWebhookURL",{Text="Discord webhook URL (saved locally)",Default=farm.webhook.url,Finished=true,Callback=function(value) farm.webhook.url=tostring(value or ""):match("^%s*(.-)%s*$");farm.saveWebhook() end})
+addControl(webhookGroup,"Toggle","FarmWebhookEnabled",{Text="Send every 5 waves",Default=farm.webhook.enabled,Callback=function(value) farm.webhook.enabled=value==true;farm.saveWebhook() end})
+farm.webhook.loading=false
 farm.webhook.label=runtime.label(webhookGroup,"Off. Sends wave, map and current step only.",true)
 connect(RunService.Heartbeat,function()
     local w=farm.webhook
@@ -4214,6 +4244,7 @@ connect(RunService.Heartbeat,function()
     local ok=pcall(farm.webhookTick)
     if not ok then w.message="Webhook update failed locally." end
     local message=w.enabled and (w.message or "Waiting for a 5-wave milestone.") or "Off"
+    if w.saveMessage then message=message.."\n"..w.saveMessage end
     if w.label and w.displayed~=message then
         local ok,result=pcall(function() return w.label:SetText(message) end)
         if ok and result~=false then w.displayed=message end
