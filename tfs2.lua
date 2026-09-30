@@ -115,7 +115,7 @@ local config = {
 }
 -- Optional extensions: every automatic or resource-using feature starts disabled.
 runtime.extraSpecs = {
-    Autofarm={false}, AutoC96={false}, AutoLeaveSpawn={false},
+    Autofarm={false}, AutoC96={false}, AutoLeaveSpawn={false}, AutoNightDrinks={false},
     AutoEquip={false}, EquipWeapon={""}, FireModeOverride={false}, FireMode={"FullAuto",{"Single","Burst","FullAuto"}},
     OverheatManagement={false}, ClosePriority={false}, CloseDistance={60,20,200}, SkipCloaked={true},
     MeleeAura={false}, UseKnife={true}, ThrowMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position"}}, LureMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position","Boss–Enemy Spawn"}},
@@ -1703,6 +1703,9 @@ runtime.label(menuGroup,"Show / hide: Right Ctrl", true)
 runtime.label(menuGroup,"Triggerbot: Delete", true)
 local function unloadAssistant()
     if not runtime.active then return true end
+    if runtime.cancelNativeConsumables and not runtime.cancelNativeConsumables() then
+        notifyTrigger("Unload waiting for drink-input release. Try Unload again.");return false
+    end
     runtime.cancelRefill()
     if runtime.cancelAction then runtime.cancelAction() end
     config.HeadshotConversion = false
@@ -2057,6 +2060,7 @@ local function control(group,key,text,choices)
     local options={Text=text,Default=e[key],Callback=function(value)
         e[key]=value==nil and spec[1] or value
         if key=="Autofarm" and not e[key] and state.farm then state.farm.stop() end
+        if key=="AutoNightDrinks" and not e[key] and not e.Autofarm and runtime.cancelNativeConsumables then runtime.cancelNativeConsumables() end
         if key=="AutoLeaveSpawn" and not e[key] and state.farm and not e.Autofarm then state.farm.cancelWalk() end
         if selection then selection:SetText(table.concat(namesFromSet(e[key]),", ")) end
     end}
@@ -2296,6 +2300,7 @@ end
 function state.stop()
     state.restoreHipADS()
     if state.farm then state.farm.stop() end
+    if runtime.cancelNativeConsumables then runtime.cancelNativeConsumables() end
     for _,definition in ipairs(runtime.opDefinitions) do local key="OP"..definition[1];e[key]=false;if ui[key] then ui[key]:SetValue(false) end end
     if runtime.op then runtime.op.cleanup() end
     if runtime.cancelAction then runtime.cancelAction() end
@@ -2398,7 +2403,7 @@ function state.automation()
         end
         return
     end
-    if e.AutoLeaveSpawn and state.farm then state.farm.leave(1) end
+    if e.AutoLeaveSpawn and state.farm and not runtime.nativeConsumableJob then state.farm.leave(1) end
     runtime.refillStep()
     if state.actions then state.actions() end
     if state.spending then state.spending() end
@@ -2544,7 +2549,7 @@ end)
 local items=runtime.extensionTabs.Items
 local itemOptions=items:AddLeftGroupbox("Item activation")
 control(itemOptions,"IgnoreEquippingTool","ignore equipping tool")
-runtime.label(itemOptions,"Experimental backpack use for drinks / healing only. Throwables always equip and restore your previous tool for reliability. Server acceptance remains unverified.")
+runtime.label(itemOptions,"Experimental backpack use for manual drinks / healing. Autofarm scheduled drinks always equip and use native animations. Throwables equip and restore your previous tool. Backpack acceptance remains unverified.")
 local use=items:AddLeftGroupbox("Use consumables")
 for index,item in ipairs(runtime.consumableDefinitions) do
     if index==5 then use:AddDivider() end
@@ -3751,9 +3756,15 @@ function farm.holdFrontLedge(perkActive)
     local height=goal.Y-root.Position.Y
     if horizontal.Magnitude<.75 and math.abs(height)<.65 and farm.grounded(humanoid,root) then
         farm.cancelWalk();farm.ledgeSince=nil;farm.ledgeBlocked=nil
+        if not farm.ledgeSupported(root,ledge,offset) then
+            farm.ledgeStableAt=nil;farm.status("At ledge center; verifying support before continuing.");return false
+        end
+        farm.ledgeStableAt=farm.ledgeStableAt or os.clock()
+        if os.clock()-farm.ledgeStableAt<.35 then farm.status("Checking stable ledge arrival.");return false end
         if perkActive then return true end
         farm.status("At centered front ledge; waiting for Rooftop Camper effect.");return false
     end
+    farm.ledgeStableAt=nil
     if farm.ledgeBlocked then
         if os.clock()-(farm.ledgeBlockedAt or 0)<5 then farm.status("Front ledge ascent stalled; retrying after a short pause.");return false end
         farm.ledgeBlocked=nil;farm.ledgeSince=nil;farm.ledgeJumpAt=0;farm.pathAt=0
@@ -3782,7 +3793,7 @@ function farm.holdFrontLedge(perkActive)
     farm.stopSprint()
     farm.moving=true;farm.walkPoint=goal
     humanoid:MoveTo(goal)
-    if height>.65 and os.clock()>=(farm.ledgeJumpAt or 0) then
+    if height>.65 and farm.grounded(humanoid,root) and os.clock()>=(farm.ledgeJumpAt or 0) then
         humanoid.Jump=true;farm.jumpUntil=os.clock()+.25;farm.ledgeJumpAt=os.clock()+1
     end
     farm.status("Stepping onto raised front ledge center")
@@ -3856,7 +3867,7 @@ function farm.begin()
     if runtime.cancelRefill then runtime.cancelRefill() end
     if runtime.cancelAction then runtime.cancelAction() end
     farm.stage=1;farm.character=LocalPlayer.Character;farm.map=child(Workspace,"Map");farm.mapId=farm.mapName();farm.requestAt=farm.requestAt or 0;farm.active=true
-    farm.ledgeSince=nil;farm.ledgeBlocked=nil;farm.ledgeJumpAt=0
+    farm.ledgeSince=nil;farm.ledgeBlocked=nil;farm.ledgeStableAt=nil;farm.ledgeJumpAt=0
     farm.waitReason=nil;farm.waitSince=nil
     farm.earlyDone=false
     farm.roofReached=false;farm.recovering=nil;farm.lastWave=nil;farm.purchaseBudget=nil
@@ -3869,6 +3880,7 @@ function farm.begin()
     farm.status("Starting ordered C96 autofarm.")
 end
 function farm.stop()
+    if runtime.cancelNativeConsumables then runtime.cancelNativeConsumables() end
     farm.runId=(farm.runId or 0)+1
     farm.cancelWalk()
     farm.exitTransit=nil;farm.exitWalking=nil
@@ -3885,13 +3897,14 @@ function farm.equipC96()
     return true
 end
 function farm.resumeCharacter()
+    if runtime.cancelNativeConsumables then runtime.cancelNativeConsumables() end
     farm.runId=(farm.runId or 0)+1
     farm.cancelWalk()
     if runtime.cancelRefill then runtime.cancelRefill() end
     if runtime.cancelAction then runtime.cancelAction() end
     farm.character=LocalPlayer.Character;farm.recovering=1
     farm.exitTransit=nil;farm.exitWalking=nil;farm.ladder=nil;farm.pathAt=0
-    farm.ledgeSince=nil;farm.ledgeBlocked=nil;farm.ledgeJumpAt=0
+    farm.ledgeSince=nil;farm.ledgeBlocked=nil;farm.ledgeStableAt=nil;farm.ledgeJumpAt=0
     farm.forwardDone=true;farm.next=0
     triggerToggle:SetValue(false);releaseHeld()
 end
@@ -3938,6 +3951,10 @@ function farm.step()
         farm.cancelWalk();farm.status("Waiting for respawn.");return
     end
     if farm.stage>=7 then farm.roofReached=true end
+    if runtime.nativeConsumableJob then
+        farm.ongoingSkip()
+        farm.status("Using scheduled drinks; movement resumes after native use.");return
+    end
     -- Some returns to spawn keep the Character instance, or finish between
     -- polling ticks. Reconcile the live interaction region as well as identity.
     if not farm.recovering and farm.stage>=3 then
@@ -4019,6 +4036,11 @@ if RunService.BindToRenderStep then
         if runtime.active and (e.Autofarm or e.AutoLeaveSpawn) and (not e.Autofarm or farm.supported()) then
             local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
             if humanoid and root then
+                if runtime.nativeConsumableJob then
+                    if farm.stopSprint then farm.stopSprint() end
+                    if farm.moving then humanoid:Move(Vector3.new(0,0,0),false) end
+                    return
+                end
                 if farm.motionTick then farm.motionTick(humanoid,root) end
                 local direction=farm.climbDirection
                 if farm.walkPoint then
@@ -4038,106 +4060,308 @@ control(farmGroup,"AutoLeaveSpawn","Auto Leave Spawn")
 farm.label=runtime.label(farmGroup,"Off",true)
 runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Sniper is followed by Body Building Handling. Wave 21 prioritizes healing items; wave 28 prioritizes Max Health and Health Regen, then resumes interrupted upgrades. Weapon and support settings are preserved. Backup Weapon and Rooftop Camper required. Live routes remain unverified.",true)
 
--- One entry per drink, per scheduled activation. This is independent of routing.
-function farm.drinkSchedule(wave,minutes,map)
+-- Scheduled drinks use the equipped ConsumableScript lifecycle from the game dump.
+-- This code does not manufacture Consuming values or call UseConsumable itself.
+function runtime.consumableAmount(name)
+    return readValue(child(child(LocalPlayer,"Charges"),name),"Amount")
+end
+function runtime.consumableCallbacks(tool)
+    if type(getconnections)~="function" or type(getfenv)~="function" then return nil end
+    local scriptObject=child(tool,"ConsumableScript")
+    if not scriptObject then return nil end
+    local function find(signal)
+        if not signal then return end
+        local ok,list=pcall(getconnections,signal)
+        if not ok or type(list)~="table" then return end
+        for i=#list,1,-1 do
+            local found,fn=pcall(function() return list[i].Enabled~=false and list[i].Function end)
+            if found and type(fn)=="function" then
+                local success,env=pcall(getfenv,fn)
+                if success and type(env)=="table" and env.script==scriptObject then return fn end
+            end
+        end
+    end
+    local ok,mouse=pcall(function() return LocalPlayer:GetMouse() end)
+    if not ok then return end
+    local down,up=find(mouse.Button1Down),find(mouse.Button1Up)
+    if down and up then return {down=down,up=up} end
+    local screen=child(child(LocalPlayer,"PlayerGui"),"ScreenGui")
+    local attack=child(child(child(screen,"TouchControls"),"RightSide"),"AttackButton")
+    down=attack and find(attack.MouseButton1Down);up=attack and find(attack.InputEnded)
+    if down and up then return {down=down,up=up} end
+end
+function runtime.releaseConsumableInput()
+    local held=runtime.consumableInput
+    if not held then return true end
+    local ok,err=pcall(function()
+        if held.up then held.up()
+        elseif virtualInput then virtualInput:SendMouseButton(held.point,Enum.UserInputType.MouseButton1,false,0)
+        elseif legacyInput then legacyInput:SendMouseButtonEvent(held.point.X,held.point.Y,0,false,game,0)
+        else error("Mouse release unavailable") end
+    end)
+    if ok or duplicateButtonState(err) then runtime.consumableInput=nil;return true end
+    return false
+end
+function runtime.pressConsumable(tool)
+    local callbacks=runtime.consumableCallbacks(tool)
+    if callbacks then
+        runtime.consumableInput={up=callbacks.up}
+        callbacks.down()
+        return
+    end
+    assert(not UIS:GetFocusedTextBox() and not guiService.MenuIsOpen,"Close Roblox menus before drink use")
+    assert(not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1),"Release the mouse before drink use")
+    local camera=Workspace.CurrentCamera
+    assert(camera,"Camera unavailable")
+    local point=camera.ViewportSize/2
+    -- Never click through a menu or another GUI when scoped native callbacks are unavailable.
+    for _,container in ipairs({playerGui,coreGui}) do
+        if container then
+            local ok,objects=pcall(function() return container:GetGuiObjectsAtPosition(point.X,point.Y) end)
+            assert(ok,"Cannot verify drink input position")
+            for _,object in ipairs(objects) do
+                assert(not (object.Visible and (object.Active or object:IsA("GuiButton") or object:IsA("TextBox"))),"Drink input blocked by GUI")
+            end
+        end
+    end
+    runtime.consumableInput={point=point}
+    if virtualInput then virtualInput:SendMouseButton(point,Enum.UserInputType.MouseButton1,true,0)
+    elseif legacyInput then legacyInput:SendMouseButtonEvent(point.X,point.Y,0,true,game,0)
+    else runtime.consumableInput=nil;error("Native drink input unavailable") end
+end
+function runtime.finishNativeConsumables(job)
+    if runtime.nativeConsumableJob~=job then return end
+    if not runtime.releaseConsumableInput() then job.finishing=true;return end
+    if LocalPlayer.Character==job.character and job.humanoid.Health>0 and job.lastTool
+        and job.lastTool.Parent==job.character then
+        pcall(function()
+            if job.previous and job.previous.Parent==child(LocalPlayer,"Backpack") then job.humanoid:EquipTool(job.previous)
+            elseif not job.previous then job.humanoid:UnequipTools() end
+        end)
+    end
+    runtime.nativeConsumableJob=nil;runtime.consumableBusy=false
+end
+function runtime.cancelNativeConsumables()
+    local job=runtime.nativeConsumableJob
+    if job then job.cancelled=true;runtime.finishNativeConsumables(job)
+    else return runtime.releaseConsumableInput() end
+    return runtime.consumableInput==nil
+end
+function runtime.nativeDrinkBatch(entries,eligible,done)
+    if runtime.consumableBusy or runtime.refillBusy or runtime.action or reloadState.key or not releaseHeld() then return false end
+    local character,humanoid=alive()
+    if not humanoid then return false end
+    local job={character=character,humanoid=humanoid,previous=character:FindFirstChildOfClass("Tool")}
+    runtime.nativeConsumableJob=job;runtime.consumableBusy=true
+    local farm=runtime.extensions and runtime.extensions.farm
+    if farm then farm.cancelWalk() end
+    task.spawn(function()
+        local function valid()
+            local ok,allowed=pcall(eligible)
+            return runtime.active and runtime.nativeConsumableJob==job and not job.cancelled
+                and LocalPlayer.Character==character and humanoid.Health>0 and ok and allowed
+        end
+        local completed=0
+        for _,entry in ipairs(entries) do
+            local started,consumed,finished=false,false,false
+            local observation
+            local ok,reason=pcall(function()
+                assert(valid(),"Drink batch cancelled")
+                local tool,_,duration,before,owner=runtime.consumableContext(entry.name)
+                assert(owner==character,"Character changed")
+                entry.before=before
+                job.lastTool=tool;job.name=entry.name
+                local amount=child(child(child(LocalPlayer,"Charges"),entry.name),"Amount")
+                local function observe()
+                    local value=amount and amount.Value
+                    if finite(value) and value<before then consumed=true end
+                end
+                if amount and amount.Changed then observation=amount.Changed:Connect(observe) end
+                if tool.Parent~=character then humanoid:EquipTool(tool) end
+                task.wait(.15) -- allow the native Equipped handler to attach its input callbacks
+                assert(valid() and tool.Parent==character,"Drink equip cancelled")
+                runtime.pressConsumable(tool)
+                local deadline=os.clock()+1.5
+                repeat
+                    task.wait(.05);observe()
+                    started=started or readValue(tool,"Consuming")==true
+                until consumed or started or not valid() or os.clock()>=deadline
+                assert(runtime.releaseConsumableInput(),"Drink mouse release failed")
+                if not started and not consumed then error("Native use did not start") end
+                deadline=os.clock()+duration+6
+                repeat
+                    observe()
+                    finished=(started or consumed) and readValue(tool,"Consuming")==false
+                    if tool.Parent~=character then job.cancelled=true;break end
+                    if finished or not valid() or os.clock()>=deadline then break end
+                    task.wait(.05)
+                until false
+                -- Permit the charge update to follow the completed native animation.
+                if finished and not consumed then
+                    local replicationDeadline=os.clock()+1
+                    repeat task.wait(.05);observe() until consumed or not valid() or os.clock()>=replicationDeadline
+                end
+            end)
+            if job.lastTool and job.lastTool.Name==entry.name then started=started or readValue(job.lastTool,"Consuming")==true end
+            if observation then pcall(function() observation:Disconnect() end) end
+            runtime.releaseConsumableInput()
+            local status=consumed and "consumed" or (started and not finished and "unknown" or "pending")
+            local message=consumed and "Charge decrease observed" or (ok and (finished and "No charge consumed" or "Use interrupted / timed out") or tostring(reason))
+            -- Report exactly one result, even on cancellation. Ambiguous uses are not repeated.
+            local reported=pcall(done,entry,status,message)
+            completed=completed+1
+            if not reported or not valid() or runtime.consumableInput then break end
+        end
+        for i=completed+1,#entries do pcall(done,entries[i],"pending","Batch interrupted before use") end
+        runtime.finishNativeConsumables(job)
+    end)
+    return true
+end
+connect(RunService.Heartbeat,function()
+    local job=runtime.nativeConsumableJob
+    if runtime.consumableInput and not job then runtime.releaseConsumableInput() end
+    if job and (job.finishing or not runtime.active or job.cancelled or LocalPlayer.Character~=job.character or job.humanoid.Health<=0) then
+        job.cancelled=true;runtime.finishNativeConsumables(job)
+    end
+end)
+table.insert(runtime.connections,{Disconnect=function() runtime.cancelNativeConsumables() end})
+
+-- One activation per drink per night slot; routing does not own the clock.
+function farm.drinkSchedule(wave,minutes,map,minimumWave)
     local clock=farm.drinkClock
     if not clock or clock.map~=map or wave<clock.wave then
         clock={map=map,wave=wave,slots={}};farm.drinkClock=clock
     end
     clock.wave=wave
-    if wave<15 then return clock end
+    if wave<(minimumWave or 15) then return clock end
     if minutes>=1080 then
         if clock.night~=wave then clock.night=wave;clock.slots={} end
         if minutes>=1095 and not clock.slots.evening then clock.slots.evening={at="18:15",items={}} end
     elseif minutes<360 then
         if not clock.night then clock.night=wave end
-        if not clock.slots.midnight then clock.slots.midnight={at="00:00",items={}} end
+        if minutes>=10 and not clock.slots.midnight then clock.slots.midnight={at="00:10",items={}} end
     end
     return clock
 end
+function farm.drinkSummary(clock)
+    local consumed,pending,unknown=0,0,0
+    local reason
+    for _,slot in pairs(clock.slots) do
+        for _,item in ipairs(farm.drinkItems) do
+            local entry=slot.items[item.name]
+            if entry and entry.state=="consumed" then consumed=consumed+1
+            elseif entry and entry.state=="unknown" then unknown=unknown+1
+            else pending=pending+1;reason=reason or (entry and entry.reason and item.name..": "..entry.reason) end
+        end
+    end
+    return "Drinks: "..consumed.." consumed, "..pending.." pending, "..unknown.." unconfirmed."..(reason and " "..reason or "")
+end
+function farm.drinkPolicy()
+    if e.Autofarm then return farm.active and farm.supported(),15,"autofarm" end
+    return e.AutoNightDrinks==true,1,"standalone"
+end
 function farm.drinkTick()
-    if not e.Autofarm or not farm.active or not farm.supported() then return end
+    local enabled,minimumWave,owner=farm.drinkPolicy()
+    if not enabled then return end
     local values=child(storage(),"Values")
     if (readValue(values,"LocalLives") or 1)<=0 or (readValue(values,"VotingTime") or 0)>0 then return end
     local wave=readValue(values,"LocalWave")
     if not finite(wave) then return end
-    local clock=farm.drinkSchedule(wave,game:GetService("Lighting"):GetMinutesAfterMidnight(),child(Workspace,"Map"))
-    if wave<15 then return end
-    local _,humanoid=alive()
-    if not humanoid or runtime.consumableBusy or runtime.refillBusy or runtime.action or farm.inFlight or reloadState.key then return end
+    local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
+    local clock=farm.drinkSchedule(wave,minutes,child(Workspace,"Map"),minimumWave)
+    if wave<minimumWave then return end
+    if minutes>=360 and minutes<1080 then
+        farm.drinkMessage="Drinks: next night at 18:15 and 00:10.";return
+    end
+    if runtime.nativeConsumableJob then
+        farm.drinkMessage="Drinks: using "..tostring(runtime.nativeConsumableJob.name or "equipped sequence").."; waiting for charge confirmation.";return
+    end
+    local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
+    if not humanoid or not root or runtime.consumableBusy or runtime.refillBusy or runtime.action or (owner=="autofarm" and farm.inFlight) or reloadState.key then return end
+    -- Do not unequip the gun or stop movement halfway up a ladder / during a jump.
+    if not farm.grounded(humanoid,root) or humanoid:GetState()==Enum.HumanoidStateType.Climbing then
+        farm.drinkMessage="Drinks: scheduled batch waiting for stable footing.";return
+    end
     local c=runtime.consumables;c.itemAt=c.itemAt or {}
     if os.clock()<(c.drinkAt or 0) then return end
-    local slot;local entries={};local longest=1
+    local slot;local entries={}
     for _,key in ipairs({"evening","midnight"}) do
         local candidate=clock.slots[key]
         if candidate then
             for _,item in ipairs(farm.drinkItems) do
                 local entry=candidate.items[item.name] or {state="pending",retryAt=0};candidate.items[item.name]=entry
+                -- Late replication can resolve a previously uncertain use without another click.
+                local amount=runtime.consumableAmount(item.name)
+                if entry.state=="unknown" and finite(amount) and finite(entry.before) and amount<entry.before then entry.state="consumed";entry.reason=nil end
                 if entry.state=="pending" and os.clock()>=entry.retryAt and os.clock()>=(c.itemAt[item.name] or 0) then
+                    local ok,err=pcall(runtime.consumableContext,item.name)
                     entry.retryAt=os.clock()+5
-                    local ok,tool,target,duration,_,character=pcall(runtime.consumableContext,item.name)
-                    if ok then
-                        table.insert(entries,{name=item.name,record=entry,tool=tool,target=target,character=character})
-                        longest=math.max(longest,duration)
-                    else entry.reason=tostring(tool) end
+                    if ok then table.insert(entries,{name=item.name,record=entry})
+                    else entry.reason=tostring(err) end
                 end
             end
             if #entries>0 then slot=candidate;break end
         end
     end
-    if not slot then
-        local requested,pending,unknown=0,0,0
-        local reason
-        for _,scheduled in pairs(clock.slots) do
-            for name,entry in pairs(scheduled.items) do
-                if entry.state=="requested" then requested=requested+1
-                elseif entry.state=="unknown" then unknown=unknown+1
-                else pending=pending+1;reason=reason or name..": "..tostring(entry.reason or "cooldown") end
-            end
+    if not slot then farm.drinkMessage=farm.drinkSummary(clock);return end
+    for _,entry in ipairs(entries) do entry.record.owner=entry;entry.record.state="inflight" end
+    local started=runtime.nativeDrinkBatch(entries,function()
+        local t=game:GetService("Lighting"):GetMinutesAfterMidnight()
+        local active,currentMinimum,currentOwner=farm.drinkPolicy()
+        local currentWave=readValue(values,"LocalWave")
+        return active and currentOwner==owner and finite(currentWave) and currentWave>=currentMinimum and farm.drinkClock==clock
+            and (clock.slots.evening==slot or clock.slots.midnight==slot) and (t>=1080 or t<360)
+            and (readValue(values,"LocalLives") or 1)>0 and child(Workspace,"Map")==clock.map
+            and (readValue(values,"VotingTime") or 0)<=0
+    end,function(entry,status,reason)
+        if entry.record.owner~=entry then return end
+        entry.record.owner=nil
+        entry.record.state=status;entry.record.reason=status~="consumed" and reason or nil
+        entry.record.before=entry.before
+        entry.record.attempts=(entry.record.attempts or 0)+1
+        entry.record.retryAt=os.clock()+math.min(60,5*entry.record.attempts)
+        c.itemAt[entry.name]=os.clock()+1
+        farm.drinkMessage=farm.drinkSummary(clock)
+    end)
+    if started then
+        c.drinkAt=os.clock()+1
+        farm.drinkMessage=slot.at..": using "..#entries.." drinks with native animations."
+    else
+        for _,entry in ipairs(entries) do
+            if entry.record.owner==entry then entry.record.owner=nil;entry.record.state="pending" end
         end
-        farm.drinkMessage="Drinks: "..requested.." requests returned, "..pending.." pending, "..unknown.." uncertain."..(reason and " "..reason or "")
-        return
-    end
-    if not releaseHeld() then return end
-    local event=child(child(storage(),"RemoteFunctions"),"UseConsumable")
-    if not event or not event:IsA("RemoteFunction") then farm.drinkMessage="UseConsumable unavailable";return end
-    runtime.consumableBusy=true;runtime.consumableEpoch=(runtime.consumableEpoch or 0)+1
-    local epoch=runtime.consumableEpoch;local remaining=#entries
-    c.drinkAt=os.clock()+longest
-    farm.drinkMessage=slot.at..": requesting "..#entries.." drinks without equipping"
-    for _,entry in ipairs(entries) do
-        entry.record.state="inflight"
-        task.spawn(function()
-            local invoked=false
-            local ok,result=pcall(function()
-                if not runtime.active or not e.Autofarm or farm.drinkClock~=clock or runtime.consumableEpoch~=epoch or LocalPlayer.Character~=entry.character then return false end
-                local tool,target=runtime.consumableContext(entry.name)
-                if tool~=entry.tool or target~=entry.target then return false end
-                c.itemAt[entry.name]=os.clock()+longest
-                invoked=true
-                return event:InvokeServer(entry.name,target)
-            end)
-            if not invoked then entry.record.state="pending"
-            elseif not ok then entry.record.state="unknown";entry.record.reason=tostring(result)
-            elseif result==false or result=="FAIL" then entry.record.state="pending";entry.record.reason="Rejected by server"
-            else entry.record.state="requested";entry.record.reason=nil end
-            -- An ambiguous response is never automatically repeated: it may have consumed a charge.
-            remaining=remaining-1
-            if remaining==0 and runtime.consumableEpoch==epoch then
-                runtime.consumableBusy=false
-                farm.drinkMessage=slot.at..": batch returned; actual effects remain unverified"
-            end
-        end)
     end
 end
-farm.drinkLabel=runtime.label(farmGroup,"Drinks: scheduled at 18:15 and 00:00 from wave 15, including during recovery.",true)
+farm.drinkLabel=runtime.label(farmGroup,"Drinks: native use at 18:15 and 00:10 from wave 15; charge confirmation required.",true)
+local nightDrinks=automation:AddLeftGroupbox("Nightly drinks")
+control(nightDrinks,"AutoNightDrinks","Auto use drinks at 18:15 / 00:10")
+runtime.label(nightDrinks,"Uses owned Energy, Experimental, Speed and Deadeye drinks every night on any map, without autofarm. Uses normal animations and confirms charges. Autofarm takes over from wave 15; the two schedules do not double-use drinks.",true)
+farm.nightDrinkLabel=runtime.label(nightDrinks,"Nightly drinks: off",true)
 function farm.showDrinks()
     local message=farm.drinkMessage
     if message and message~=farm.drinkDisplayed then
         local ok,result=pcall(function() return farm.drinkLabel:SetText(message) end)
         if ok and result~=false then farm.drinkDisplayed=message end
     end
+    local status=not e.AutoNightDrinks and "Nightly drinks: off" or
+        (e.Autofarm and "Nightly drinks: autofarm controls the wave 15+ schedule." or (message or "Nightly drinks: waiting for 18:15 / 00:10."))
+    if status~=farm.nightDrinkDisplayed then
+        local ok,result=pcall(function() return farm.nightDrinkLabel:SetText(status) end)
+        if ok and result~=false then farm.nightDrinkDisplayed=status end
+    end
 end
+-- Standalone use has its own timer and does not require the autofarm route.
+function farm.standaloneDrinkMonitor()
+    if not runtime.active then return end
+    if os.clock()<(farm.standaloneDrinkAt or 0) then return end
+    farm.standaloneDrinkAt=os.clock()+.2
+    if not e.Autofarm and e.AutoNightDrinks then
+        local ok,err=pcall(farm.drinkTick)
+        if not ok then farm.drinkMessage="Drink scheduler: "..tostring(err) end
+    end
+    farm.showDrinks()
+end
+connect(RunService.Heartbeat,farm.standaloneDrinkMonitor)
 
 -- Separate local settings file; not included in shareable gameplay profiles.
 farm.webhook={enabled=false,url="",sent={}}
@@ -4255,6 +4479,12 @@ function farm.grounded(humanoid,root)
     local material=humanoid.FloorMaterial
     local velocity=root.AssemblyLinearVelocity
     return material~=nil and material~=Enum.Material.Air and (not velocity or math.abs(velocity.Y)<2)
+end
+function farm.ledgeSupported(root,ledge,offset)
+    local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Include
+    params.FilterDescendantsInstances={ledge};params.RespectCanCollide=true
+    local hit=Workspace:Raycast(root.Position,Vector3.new(0,-offset-.75,0),params)
+    return hit and hit.Instance==ledge and hit.Normal.Y>.8 or false
 end
 function farm.ladderApproach(approach,root,humanoid)
     local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
@@ -4392,6 +4622,8 @@ function farm.purchaseSummary()
 end
 function farm.nextDrinkSummary(wave,minutes)
     if wave<15 then return "Wave 15 at 18:15" end
+    if runtime.nativeConsumableJob then return "Using "..tostring(runtime.nativeConsumableJob.name or "scheduled batch") end
+    if minutes>=360 and minutes<1080 then return "18:15" end
     local clock=farm.drinkClock
     if clock then
         for _,slot in pairs(clock.slots) do
@@ -4401,7 +4633,7 @@ function farm.nextDrinkSummary(wave,minutes)
             end
         end
     end
-    if minutes>=1095 then return "00:00" end
+    if minutes>=1095 or minutes<10 then return "00:10" end
     return "18:15"
 end
 farm.detailLabel=runtime.label(farmGroup,"",true)
@@ -4498,6 +4730,100 @@ connect(RunService.Heartbeat,function()
     local ok=pcall(farm.voteMonitor)
     if not ok and farm.voteLabel then pcall(function() farm.voteLabel:SetText("Ready-up: unable to read live vote state") end) end
 end)
+
+-- Bounded, local evidence only. The client dump cannot identify a server kill reason.
+farm.diagnostics={samples={},deaths={}}
+function farm.deathSample(humanoid)
+    local character=LocalPlayer.Character;local root=child(character,"HumanoidRootPart")
+    local function vector(value) return value and {value.X,value.Y,value.Z} or nil end
+    local values=child(storage(),"Values")
+    local sample={at=os.clock(),wave=readValue(values,"LocalWave"),minutes=game:GetService("Lighting"):GetMinutesAfterMidnight(),
+        map=farm.mapName(),step=farm.stage,health=humanoid and humanoid.Health,
+        position=vector(root and root.Position),velocity=vector(root and root.AssemblyLinearVelocity),
+        floor=humanoid and tostring(humanoid.FloorMaterial),state=humanoid and tostring(humanoid:GetState()),
+        recovering=farm.recovering,ladder=farm.ladder and farm.ladder.phase,moving=farm.moving==true,
+        drink=runtime.nativeConsumableJob and runtime.nativeConsumableJob.name,
+        exit=farm.exitTransit and farm.exitTransit.which,nativeDamageCounter=farm.diagnostics.damageValue}
+    if root then
+        local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances={character};params.RespectCanCollide=true
+        local hit=Workspace:Raycast(root.Position,Vector3.new(0,-8,0),params)
+        if hit then sample.support=hit.Instance and hit.Instance.Name;sample.floorDistance=root.Position.Y-hit.Position.Y end
+    end
+    return sample
+end
+function farm.recordDeath(humanoid)
+    local d=farm.diagnostics
+    if not e.Autofarm or not farm.active or d.logged or humanoid~=d.humanoid then return end
+    d.logged=true
+    local ok,sample=pcall(farm.deathSample,humanoid)
+    local history={};for _,record in ipairs(d.samples) do table.insert(history,record) end
+    if ok then table.insert(history,sample) end
+    local record={previousHealth=d.lastPositive,serverCause="Not available in client dump",samples=history}
+    table.insert(d.deaths,record);if #d.deaths>5 then table.remove(d.deaths,1) end
+    d.message="Last death: HP "..tostring(d.lastPositive or "?").." → 0. Cause unconfirmed."
+    if type(writefile)=="function" then
+        local saved=pcall(function() writefile("CombatAssistantDeaths.json",HttpService:JSONEncode({version=1,deaths=d.deaths})) end)
+        d.message=d.message..(saved and " Diagnostic saved." or " Diagnostic remains in memory.")
+    end
+    if runtime.cancelNativeConsumables then runtime.cancelNativeConsumables() end
+    farm.cancelWalk()
+end
+function farm.deathMonitor()
+    local d=farm.diagnostics
+    local character=LocalPlayer.Character;local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+    if d.humanoid~=humanoid then
+        for _,connection in ipairs(d.connections or {}) do connection:Disconnect() end
+        d.connections={};d.humanoid=humanoid;d.samples={};d.logged=false;d.lastPositive=humanoid and humanoid.Health
+        if humanoid then
+            if humanoid.HealthChanged then table.insert(d.connections,humanoid.HealthChanged:Connect(function(value)
+                if value>0 then d.lastPositive=value;d.logged=false
+                else farm.recordDeath(humanoid) end
+            end)) end
+            if humanoid.Died then table.insert(d.connections,humanoid.Died:Connect(function() farm.recordDeath(humanoid) end)) end
+        end
+    end
+    local damage=child(child(storage(),"RemoteEvents"),"SendPlayerDamage")
+    if damage~=d.damageRemote then
+        if d.damageConnection then d.damageConnection:Disconnect() end
+        d.damageRemote=damage;d.damageValue=nil;d.damageConnection=nil
+        if damage and damage.OnClientEvent then d.damageConnection=damage.OnClientEvent:Connect(function(value)
+            d.damageValue=finite(value) and value or nil
+        end) end
+    end
+    if e.Autofarm and farm.active and humanoid then
+        if humanoid.Health<=0 then farm.recordDeath(humanoid)
+        else
+            local ok,sample=pcall(farm.deathSample,humanoid)
+            if ok then table.insert(d.samples,sample);if #d.samples>48 then table.remove(d.samples,1) end end
+        end
+    end
+    if d.message and d.message~=d.displayed then
+        local ok,result=pcall(function() return d.label:SetText(d.message) end)
+        if ok and result~=false then d.displayed=d.message end
+    end
+end
+farm.diagnostics.label=runtime.label(farmGroup,"Death diagnostic: waiting for evidence.",true)
+farmGroup:AddButton({Text="Copy death diagnostic",Func=function()
+    local d=farm.diagnostics
+    if #d.deaths==0 then d.message="No autofarm death recorded yet.";return end
+    local ok=pcall(function()
+        assert(type(setclipboard)=="function","Clipboard unavailable")
+        setclipboard(HttpService:JSONEncode({version=1,deaths=d.deaths}))
+    end)
+    d.message=ok and "Death diagnostic copied." or "Clipboard unavailable; use CombatAssistantDeaths.json."
+end})
+connect(RunService.Heartbeat,function()
+    local d=farm.diagnostics
+    if os.clock()<(d.nextAt or 0) then return end;d.nextAt=os.clock()+.25
+    pcall(farm.deathMonitor)
+end)
+table.insert(runtime.connections,{Disconnect=function()
+    local d=farm.diagnostics
+    for _,connection in ipairs(d.connections or {}) do pcall(function() connection:Disconnect() end) end
+    d.connections={}
+    if d.damageConnection then pcall(function() d.damageConnection:Disconnect() end);d.damageConnection=nil end
+end})
 
 function state.upgradeShopMoney()
     if not e.AutoShopMoney or e.Autofarm or readValue(LocalPlayer,"FirstWave")~=false then return false end
