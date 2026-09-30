@@ -660,6 +660,17 @@ end
 function runtime.automaticFacing()
     return config.Triggerbot or (runtime.extra and runtime.extra.Autofarm==true) or false
 end
+function runtime.facingADSActive()
+    local character=LocalPlayer.Character
+    local tool=character and character:FindFirstChildOfClass("Tool")
+    local current=tool and tool:FindFirstChild("CurrentValues")
+    local hold=current and current:FindFirstChild("HoldType")
+    -- Dual guns cannot ADS in the native GunScript. Do not accept a lingering
+    -- ADS value from the previously equipped weapon, or a toggle that failed.
+    if not hold or hold.Value=="Dual" then return false end
+    local data=runtime.facing.network:GetPlayerNetworkData(LocalPlayer)
+    return data and data.Adsing==true or false
+end
 function runtime.facingContext()
     local a=runtime.facing
     local automatic=runtime.automaticFacing()
@@ -730,35 +741,40 @@ function runtime.installFacing()
         a.rotationWrapper=function(self,dt,...)
             local success,point,humanoid,root,holding=pcall(runtime.facingContext)
             if not success then runtime.facingFailure(point);point=nil end
-            if point and holding then
+            local ads,movement=false,false
+            if point then
+                local ok,value=pcall(runtime.facingADSActive)
+                if not ok then runtime.facingFailure(value);point=nil else ads=value end
+            end
+            if point and ads and not holding then
+                local state=humanoid:GetState()
+                local types=Enum.HumanoidStateType
+                local farm=runtime.extensions and runtime.extensions.farm
+                movement=humanoid.Sit or (types and (state==types.Climbing or state==types.Swimming or state==types.Physics
+                    or state==types.PlatformStanding)) or (farm and (farm.moving or farm.walkPoint or farm.climbDirection
+                    or farm.exitWalking or farm.exitTransit)) or humanoid.FloorMaterial==Enum.Material.Air
+            end
+            if point and (holding or not ads or movement) then
                 runtime.releaseFacing()
-                -- Preserve normal body/camera movement. Native rotation must see
-                -- mouse aim, otherwise a retained local angle can turn it each frame.
+                -- Arms see the zombie (or retained pose), while normal body/camera
+                -- rotation sees mouse aim. Target-driven body turning requires ADS.
                 local data=a.network:GetPlayerNetworkData(LocalPlayer)
                 local saved=data and data.LookPos
                 if data then data.LookPos=a.nativePoint or saved end
                 local result=table.pack(pcall(a.originalRotation,self,dt,...))
                 if data then data.LookPos=saved end
                 if not result[1] then error(result[2],0) end
-                local valid,held=pcall(runtime.facingContext)
+                local valid,held,_,_,stillHolding=pcall(runtime.facingContext)
                 if not valid then runtime.facingFailure(held)
                 elseif held then
                     local updated,reason=pcall(a.network.PassDataA,a.network,"LookPos",held)
                     if not updated then runtime.facingFailure(reason)
-                    else a.status=a.neutralPose and "Mouse-independent idle pose" or "Holding last aim pose" end
+                    else a.status=stillHolding and (a.neutralPose and "Mouse-independent idle pose" or "Holding last aim pose")
+                        or (movement and "Arms aiming; movement controls facing" or "Arms tracking target; body follows movement") end
                 end
                 return table.unpack(result,2,result.n)
             end
             if point then
-                local state=humanoid:GetState()
-                local types=Enum.HumanoidStateType
-                local farm=runtime.extensions and runtime.extensions.farm
-                local route=farm and (farm.moving or farm.walkPoint or farm.climbDirection or farm.exitWalking or farm.exitTransit)
-                if humanoid.Sit or (types and (state==types.Climbing or state==types.Swimming or state==types.Physics
-                    or state==types.PlatformStanding)) or route or humanoid.FloorMaterial==Enum.Material.Air then
-                    runtime.releaseFacing();a.status="Arms aiming; movement controls facing"
-                    return a.originalRotation(self,dt,...)
-                end
                 local rotated,reason=pcall(function()
                     if a.humanoid~=humanoid then runtime.releaseFacing();a.humanoid=humanoid;a.autoRotate=humanoid.AutoRotate end
                     local delta=Vector3.new(point.X-root.Position.X,0,point.Z-root.Position.Z)
@@ -772,7 +788,7 @@ function runtime.installFacing()
                         root.CFrame=root.CFrame*CFrame.Angles(0,turn,0)
                     end
                     a.pose=root.CFrame:VectorToObjectSpace(point-root.Position)
-                    a.status="Character and arms tracking target"
+                    a.status="ADS: body and arms tracking target"
                 end)
                 if rotated then return end
                 runtime.facingFailure(reason)
