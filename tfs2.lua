@@ -655,11 +655,15 @@ end
 function runtime.clearFacingPose()
     runtime.releaseFacing()
     local a=runtime.facing
-    a.pose=nil;a.poseCharacter=nil;a.poseTool=nil;a.poseRoot=nil
+    a.pose=nil;a.poseCharacter=nil;a.poseTool=nil;a.poseRoot=nil;a.neutralPose=nil
+end
+function runtime.automaticFacing()
+    return config.Triggerbot or (runtime.extra and runtime.extra.Autofarm==true) or false
 end
 function runtime.facingContext()
     local a=runtime.facing
-    if not runtime.active or not a.available or pointState.picking or not (config.SilentAim or config.Triggerbot) then
+    local automatic=runtime.automaticFacing()
+    if not runtime.active or not a.available or (pointState.picking and not automatic) or not (config.SilentAim or automatic) then
         runtime.clearFacingPose();return
     end
     local character=LocalPlayer.Character
@@ -673,16 +677,23 @@ function runtime.facingContext()
     local other=tool:FindFirstChild("OtherValues")
     local mounted=other and other:FindFirstChild("MountedWeapon")
     if mounted and mounted.Value then runtime.clearFacingPose();return end -- Retain native mounted angle limits.
-    if runtime.action or runtime.refillBusy or runtime.consumableBusy then return end
-    if cachedTarget and cachedTarget.Parent and os.clock()-cachedAt<=.15 and typeof(cachedPosition)=="Vector3" then
+    if not automatic and (runtime.action or runtime.refillBusy or runtime.consumableBusy) then return end
+    if not pointState.picking and cachedTarget and cachedTarget.Parent and os.clock()-cachedAt<=.15 and typeof(cachedPosition)=="Vector3" then
         local point=cachedPosition;local valid=true
         for _,n in ipairs({point.X,point.Y,point.Z}) do if n~=n or math.abs(n)==math.huge then valid=false;break end end
         if valid then
             -- Store character-relative aim, without retaining the killed zombie.
             a.pose=root.CFrame:VectorToObjectSpace(point-root.Position)
             a.poseCharacter=character;a.poseTool=tool;a.poseRoot=root
+            a.neutralPose=nil
             return point,humanoid,root,false
         end
+    end
+    if automatic and not a.pose then
+        -- Automatic modes never initialize their idle gun pose from mouse aim.
+        -- Recreate a level forward pose after equip or respawn, until a target appears.
+        a.pose=Vector3.new(0,1.5,-100);a.neutralPose=true
+        a.poseCharacter=character;a.poseTool=tool;a.poseRoot=root
     end
     if a.pose then return root.Position+root.CFrame:VectorToWorldSpace(a.pose),humanoid,root,true end
 end
@@ -734,7 +745,7 @@ function runtime.installFacing()
                 elseif held then
                     local updated,reason=pcall(a.network.PassDataA,a.network,"LookPos",held)
                     if not updated then runtime.facingFailure(reason)
-                    else a.status="Holding last aim pose" end
+                    else a.status=a.neutralPose and "Mouse-independent idle pose" or "Holding last aim pose" end
                 end
                 return table.unpack(result,2,result.n)
             end
