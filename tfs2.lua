@@ -255,6 +255,7 @@ local scanWarned = false
 local function invalidateTarget()
     cachedTarget, cachedPosition, cachedAt = nil, nil, 0
     nextScan = 0
+    if runtime.releaseFacing then runtime.releaseFacing() end
 end
 local function validPoint(point)
     local camera = Workspace.CurrentCamera
@@ -640,6 +641,107 @@ connect(RunService.Heartbeat, function()
         scanWarned = false
     end
 end)
+
+-- Share the selected shot point with the game's normal arm-aim data. The
+-- native LookPos rays and camera stay intact; no extra packet sender is added.
+runtime.facing={status="Waiting for target",available=false}
+function runtime.releaseFacing()
+    local a=runtime.facing
+    if a.humanoid and a.humanoid.AutoRotate==false then
+        pcall(function() a.humanoid.AutoRotate=a.autoRotate end)
+    end
+    a.humanoid=nil;a.autoRotate=nil
+end
+function runtime.facingContext()
+    if not runtime.active or not runtime.facing.available or pointState.picking or not (config.SilentAim or config.Triggerbot)
+        or not cachedTarget or not cachedTarget.Parent or os.clock()-cachedAt>.15 or typeof(cachedPosition)~="Vector3" then return end
+    local point=cachedPosition
+    for _,n in ipairs({point.X,point.Y,point.Z}) do if n~=n or math.abs(n)==math.huge then return end end
+    local character=LocalPlayer.Character
+    local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+    local root=character and character:FindFirstChild("HumanoidRootPart")
+    local tool=character and character:FindFirstChildOfClass("Tool")
+    if not humanoid or humanoid.Health<=0 or not root or not tool or not tool:FindFirstChild("GunScript") then return end
+    local other=tool:FindFirstChild("OtherValues")
+    local mounted=other and other:FindFirstChild("MountedWeapon")
+    if mounted and mounted.Value then return end -- Retain the game's mounted angle limits.
+    if runtime.action or runtime.refillBusy or runtime.consumableBusy then return end
+    return point,humanoid,root
+end
+function runtime.facingFailure(reason)
+    runtime.releaseFacing();runtime.facing.available=false
+    runtime.facing.status="Unavailable: "..tostring(reason)
+end
+function runtime.installFacing()
+    local a=runtime.facing
+    local ok,err=pcall(function()
+        local scripts=LocalPlayer:FindFirstChild("PlayerScripts")
+        local manager=scripts and scripts:FindFirstChild("LocalManager")
+        assert(manager,"LocalManager missing; reload after the game loads")
+        -- Require once in the executor initialization context, never inside a
+        -- Roblox render callback, and never call the modules' Init a second time.
+        a.look=require(assert(manager:FindFirstChild("LookPosManager"),"LookPosManager missing"))
+        a.rotation=require(assert(manager:FindFirstChild("RotationManager"),"RotationManager missing"))
+        a.network=require(assert(manager:FindFirstChild("NetworkManager"),"NetworkManager missing"))
+        assert(type(a.look.UpdateLocalLookPos)=="function" and type(a.rotation.RenderStepped)=="function"
+            and type(a.network.PassDataA)=="function","Unsupported native aim modules")
+        a.originalLook=a.look.UpdateLocalLookPos;a.originalRotation=a.rotation.RenderStepped
+        a.lookWrapper=function(self,...)
+            local result=table.pack(a.originalLook(self,...))
+            local success,point=pcall(runtime.facingContext)
+            if not success then runtime.facingFailure(point)
+            elseif point then
+                local passed,reason=pcall(a.network.PassDataA,a.network,"LookPos",point)
+                if not passed then runtime.facingFailure(reason) end
+            end
+            return table.unpack(result,1,result.n)
+        end
+        a.rotationWrapper=function(self,dt,...)
+            local success,point,humanoid,root=pcall(runtime.facingContext)
+            if not success then runtime.facingFailure(point);point=nil end
+            if point then
+                local state=humanoid:GetState()
+                local types=Enum.HumanoidStateType
+                local farm=runtime.extensions and runtime.extensions.farm
+                local route=farm and (farm.moving or farm.walkPoint or farm.climbDirection or farm.exitWalking or farm.exitTransit)
+                if humanoid.Sit or (types and (state==types.Climbing or state==types.Swimming or state==types.Physics
+                    or state==types.PlatformStanding)) or route or humanoid.FloorMaterial==Enum.Material.Air then
+                    runtime.releaseFacing();a.status="Arms aiming; movement controls facing"
+                    return a.originalRotation(self,dt,...)
+                end
+                local rotated,reason=pcall(function()
+                    if a.humanoid~=humanoid then runtime.releaseFacing();a.humanoid=humanoid;a.autoRotate=humanoid.AutoRotate end
+                    local delta=Vector3.new(point.X-root.Position.X,0,point.Z-root.Position.Z)
+                    if delta.Magnitude>.05 then
+                        local look=root.CFrame.LookVector
+                        local angle=math.atan2(delta.X,delta.Z)-math.atan2(look.X,look.Z)
+                        angle=(angle+math.pi)%(2*math.pi)-math.pi
+                        local step=type(dt)=="number" and dt==dt and dt>=0 and math.min(dt,.05) or 0
+                        local turn=math.max(-4*math.pi*step,math.min(4*math.pi*step,angle))
+                        humanoid.AutoRotate=false
+                        root.CFrame=root.CFrame*CFrame.Angles(0,turn,0)
+                    end
+                    a.status="Character and arms tracking target"
+                end)
+                if rotated then return end
+                runtime.facingFailure(reason)
+            end
+            runtime.releaseFacing()
+            if a.available then a.status="Waiting for target" end
+            return a.originalRotation(self,dt,...)
+        end
+        a.look.UpdateLocalLookPos=a.lookWrapper;a.rotation.RenderStepped=a.rotationWrapper
+        a.available=true;a.status="Waiting for target"
+    end)
+    if not ok then runtime.facingFailure(err) end
+end
+function runtime.restoreFacing()
+    local a=runtime.facing;runtime.releaseFacing();a.available=false
+    if a.look and a.look.UpdateLocalLookPos==a.lookWrapper then a.look.UpdateLocalLookPos=a.originalLook end
+    if a.rotation and a.rotation.RenderStepped==a.rotationWrapper then a.rotation.RenderStepped=a.originalRotation end
+end
+runtime.installFacing()
+table.insert(runtime.connections,{Disconnect=runtime.restoreFacing})
 
 -- LookPosManager and camera modules use this ray API too. Only redirect
 -- calls from the equipped weapon's GunScript; never change their rays.
@@ -1457,7 +1559,7 @@ connect(RunService.Heartbeat, function()
         (runtime.lastRedirect and os.clock() - runtime.lastRedirect < 2 and "redirecting shots" or "ON - no recent redirected shot"))
     local input = runtime.lastInputError and "Input: rejected; close menus/console" or "Input: no recorded rejection"
     local super = (runtime.superSeen or 0) > 0 and runtime.targetTier ~= "Super" and "\nSuper zombies present but filtered out" or ""
-    runtime.targetLabel:SetText("Target: " .. target .. "\nSilent Aim: " .. aim .. "\n" .. input .. super)
+    runtime.targetLabel:SetText("Target: " .. target .. "\nSilent Aim: " .. aim .. "\n" .. input .. "\nFacing: " .. tostring(runtime.facing and runtime.facing.status or "Unavailable") .. super)
 end)
 local function zombieFilter(key, text, flag)
     return addControl(firing, "Dropdown", flag, {
