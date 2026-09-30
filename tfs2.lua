@@ -255,7 +255,7 @@ local scanWarned = false
 local function invalidateTarget()
     cachedTarget, cachedPosition, cachedAt = nil, nil, 0
     nextScan = 0
-    if runtime.releaseFacing then runtime.releaseFacing() end
+    if runtime.clearFacingPose then runtime.clearFacingPose() end
 end
 local function validPoint(point)
     local camera = Workspace.CurrentCamera
@@ -652,24 +652,42 @@ function runtime.releaseFacing()
     end
     a.humanoid=nil;a.autoRotate=nil
 end
+function runtime.clearFacingPose()
+    runtime.releaseFacing()
+    local a=runtime.facing
+    a.pose=nil;a.poseCharacter=nil;a.poseTool=nil;a.poseRoot=nil
+end
 function runtime.facingContext()
-    if not runtime.active or not runtime.facing.available or pointState.picking or not (config.SilentAim or config.Triggerbot)
-        or not cachedTarget or not cachedTarget.Parent or os.clock()-cachedAt>.15 or typeof(cachedPosition)~="Vector3" then return end
-    local point=cachedPosition
-    for _,n in ipairs({point.X,point.Y,point.Z}) do if n~=n or math.abs(n)==math.huge then return end end
+    local a=runtime.facing
+    if not runtime.active or not a.available or pointState.picking or not (config.SilentAim or config.Triggerbot) then
+        runtime.clearFacingPose();return
+    end
     local character=LocalPlayer.Character
     local humanoid=character and character:FindFirstChildOfClass("Humanoid")
     local root=character and character:FindFirstChild("HumanoidRootPart")
     local tool=character and character:FindFirstChildOfClass("Tool")
-    if not humanoid or humanoid.Health<=0 or not root or not tool or not tool:FindFirstChild("GunScript") then return end
+    if not humanoid or humanoid.Health<=0 or not root or not tool or not tool:FindFirstChild("GunScript") then
+        runtime.clearFacingPose();return
+    end
+    if a.pose and (a.poseCharacter~=character or a.poseTool~=tool or a.poseRoot~=root) then runtime.clearFacingPose() end
     local other=tool:FindFirstChild("OtherValues")
     local mounted=other and other:FindFirstChild("MountedWeapon")
-    if mounted and mounted.Value then return end -- Retain the game's mounted angle limits.
+    if mounted and mounted.Value then runtime.clearFacingPose();return end -- Retain native mounted angle limits.
     if runtime.action or runtime.refillBusy or runtime.consumableBusy then return end
-    return point,humanoid,root
+    if cachedTarget and cachedTarget.Parent and os.clock()-cachedAt<=.15 and typeof(cachedPosition)=="Vector3" then
+        local point=cachedPosition;local valid=true
+        for _,n in ipairs({point.X,point.Y,point.Z}) do if n~=n or math.abs(n)==math.huge then valid=false;break end end
+        if valid then
+            -- Store character-relative aim, without retaining the killed zombie.
+            a.pose=root.CFrame:VectorToObjectSpace(point-root.Position)
+            a.poseCharacter=character;a.poseTool=tool;a.poseRoot=root
+            return point,humanoid,root,false
+        end
+    end
+    if a.pose then return root.Position+root.CFrame:VectorToWorldSpace(a.pose),humanoid,root,true end
 end
 function runtime.facingFailure(reason)
-    runtime.releaseFacing();runtime.facing.available=false
+    runtime.clearFacingPose();runtime.facing.available=false
     runtime.facing.status="Unavailable: "..tostring(reason)
 end
 function runtime.installFacing()
@@ -684,10 +702,12 @@ function runtime.installFacing()
         a.rotation=require(assert(manager:FindFirstChild("RotationManager"),"RotationManager missing"))
         a.network=require(assert(manager:FindFirstChild("NetworkManager"),"NetworkManager missing"))
         assert(type(a.look.UpdateLocalLookPos)=="function" and type(a.rotation.RenderStepped)=="function"
-            and type(a.network.PassDataA)=="function","Unsupported native aim modules")
+            and type(a.network.PassDataA)=="function" and type(a.network.GetPlayerNetworkData)=="function","Unsupported native aim modules")
         a.originalLook=a.look.UpdateLocalLookPos;a.originalRotation=a.rotation.RenderStepped
         a.lookWrapper=function(self,...)
             local result=table.pack(a.originalLook(self,...))
+            local data=a.network:GetPlayerNetworkData(LocalPlayer)
+            a.nativePoint=data and data.LookPos
             local success,point=pcall(runtime.facingContext)
             if not success then runtime.facingFailure(point)
             elseif point then
@@ -697,8 +717,27 @@ function runtime.installFacing()
             return table.unpack(result,1,result.n)
         end
         a.rotationWrapper=function(self,dt,...)
-            local success,point,humanoid,root=pcall(runtime.facingContext)
+            local success,point,humanoid,root,holding=pcall(runtime.facingContext)
             if not success then runtime.facingFailure(point);point=nil end
+            if point and holding then
+                runtime.releaseFacing()
+                -- Preserve normal body/camera movement. Native rotation must see
+                -- mouse aim, otherwise a retained local angle can turn it each frame.
+                local data=a.network:GetPlayerNetworkData(LocalPlayer)
+                local saved=data and data.LookPos
+                if data then data.LookPos=a.nativePoint or saved end
+                local result=table.pack(pcall(a.originalRotation,self,dt,...))
+                if data then data.LookPos=saved end
+                if not result[1] then error(result[2],0) end
+                local valid,held=pcall(runtime.facingContext)
+                if not valid then runtime.facingFailure(held)
+                elseif held then
+                    local updated,reason=pcall(a.network.PassDataA,a.network,"LookPos",held)
+                    if not updated then runtime.facingFailure(reason)
+                    else a.status="Holding last aim pose" end
+                end
+                return table.unpack(result,2,result.n)
+            end
             if point then
                 local state=humanoid:GetState()
                 local types=Enum.HumanoidStateType
@@ -721,6 +760,7 @@ function runtime.installFacing()
                         humanoid.AutoRotate=false
                         root.CFrame=root.CFrame*CFrame.Angles(0,turn,0)
                     end
+                    a.pose=root.CFrame:VectorToObjectSpace(point-root.Position)
                     a.status="Character and arms tracking target"
                 end)
                 if rotated then return end
@@ -736,7 +776,7 @@ function runtime.installFacing()
     if not ok then runtime.facingFailure(err) end
 end
 function runtime.restoreFacing()
-    local a=runtime.facing;runtime.releaseFacing();a.available=false
+    local a=runtime.facing;runtime.clearFacingPose();a.available=false
     if a.look and a.look.UpdateLocalLookPos==a.lookWrapper then a.look.UpdateLocalLookPos=a.originalLook end
     if a.rotation and a.rotation.RenderStepped==a.rotationWrapper then a.rotation.RenderStepped=a.originalRotation end
 end
