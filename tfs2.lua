@@ -128,13 +128,10 @@ runtime.extraSpecs = {
     TargetMarker={false}, TargetTracer={false}, ScavengerHighlights={false},
 
 }
-runtime.opDefinitions={{2,"Armour-Aware Aim Points"},{3,"Hot Harmony Heat Optimization"},{5,"Smarter Manual Throwable Placement","Predict throwable targets"},{6,"Hotkey Explosive-Can Detonation","Detonate owned can [J]"},{8,"Energy Rifle Maximum-Charge Shots","Maximum Energy Rifle charge"},{9,"Increased Bullet Penetration","Penetration multiplier"},{10,"Extra Pellets per Shot","Pellet multiplier"},{14,"No Explosion Damage Falloff","No explosion falloff request"},{17,"Projectile Trajectory Override","Projectile velocity multiplier"},{18,"Faster-than-normal Firing","Fire-rate multiplier"},{21,"Scoped Damage while Hip-firing","Hip-fire scoped damage"},{22,"Guaranteed Super-critical Headshots","Super-critical request"},{23,"Direct-hit Bonus on Splash Impacts","Splash direct-hit request"}}
+runtime.opDefinitions={{2,"Armour-Aware Aim Points"},{3,"Hot Harmony Heat Optimization"},{5,"Smarter Manual Throwable Placement","Predict throwable targets"},{6,"Hotkey Explosive-Can Detonation","Detonate owned can [J]"},{17,"Projectile Trajectory Override","Projectile velocity multiplier"}}
 for _,entry in ipairs(runtime.opDefinitions) do runtime.extraSpecs["OP"..entry[1]]={false} end
 runtime.extraSpecs.OPPredictionSeconds={1,0,3}
-runtime.extraSpecs.PenetrationMultiplier={2,1,3}
-runtime.extraSpecs.PelletMultiplier={1.5,1,3}
 runtime.extraSpecs.ProjectileMultiplier={1.5,1,3}
-runtime.extraSpecs.FireRateMultiplier={1,1,3}
 runtime.extraSpecs.AssassinShotGuard={false}
 runtime.extraSpecs.QuietReload={false}
 runtime.extraSpecs.QuietReloadPercent={40,10,90}
@@ -3501,6 +3498,7 @@ function farm.cancelWalk()
     if farm.stopSprint then farm.stopSprint() end
     farm.retreat=nil;farm.sprintClear=false;farm.clearAt=0
     if farm.route and farm.route.blocked then farm.route.blocked:Disconnect() end
+    if farm.route and farm.route.path then pcall(function() farm.route.path:Destroy() end) end
     farm.epoch=farm.epoch+1;farm.route=nil;farm.pathBusy=false;farm.climbDirection=nil
     farm.walkPoint=nil;farm.jumpUntil=nil
     local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
@@ -3540,18 +3538,21 @@ function farm.walk(goal,message,tolerance)
     if farm.pathBusy or os.clock()<(farm.pathAt or 0) then return false end
     farm.pathBusy=true;farm.pathAt=os.clock()+3;local epoch=farm.epoch
     task.spawn(function()
+        local created
         local ok,path=pcall(function()
             local p=game:GetService("PathfindingService"):CreatePath({AgentRadius=2.5,AgentHeight=5,AgentCanJump=true,AgentCanClimb=true,WaypointSpacing=2})
+            created=p
             p:ComputeAsync(root.Position,goal);return p
         end)
-        if epoch~=farm.epoch or LocalPlayer.Character~=character or not runtime.active then return end
+        local function dispose() if created then pcall(function() created:Destroy() end) end end
+        if epoch~=farm.epoch or LocalPlayer.Character~=character or not runtime.active then dispose();return end
         farm.pathBusy=false
         if ok and path.Status==Enum.PathStatus.Success then
-            local route={points=path:GetWaypoints(),index=1,goal=goal,progressAt=os.clock()};farm.route=route
+            local route={path=path,points=path:GetWaypoints(),index=1,goal=goal,progressAt=os.clock()};farm.route=route
             if path.Blocked then route.blocked=path.Blocked:Connect(function(index)
                 if farm.route==route and index>=route.index then route.obstructed=true end
             end) end
-        else farm.status("No walkable path: "..message..". Waiting; no teleport fallback.") end
+        else dispose();farm.status("No walkable path: "..message..". Waiting; no teleport fallback.") end
     end)
     return false
 end
@@ -3753,7 +3754,10 @@ function farm.holdFrontLedge(perkActive)
         if perkActive then return true end
         farm.status("At centered front ledge; waiting for Rooftop Camper effect.");return false
     end
-    if farm.ledgeBlocked then farm.status("Front ledge ascent stalled. Toggle autofarm off/on to retry.");return false end
+    if farm.ledgeBlocked then
+        if os.clock()-(farm.ledgeBlockedAt or 0)<5 then farm.status("Front ledge ascent stalled; retrying after a short pause.");return false end
+        farm.ledgeBlocked=nil;farm.ledgeSince=nil;farm.ledgeJumpAt=0;farm.pathAt=0
+    end
     -- Reach the deck behind the rail using pathfinding. A narrow rail may not
     -- have a navmesh, so the last short ascent uses ordinary walking/jumping.
     if horizontal.Magnitude>4 then
@@ -3771,8 +3775,8 @@ function farm.holdFrontLedge(perkActive)
     if height>5 or height< -3 then farm.status("Front ledge height is outside a normal short jump.");return false end
     farm.ledgeSince=farm.ledgeSince or os.clock()
     if os.clock()-farm.ledgeSince>8 then
-        farm.cancelWalk();farm.ledgeBlocked=true
-        farm.status("Front ledge ascent stalled. Toggle autofarm off/on to retry.");return false
+        farm.cancelWalk();farm.ledgeBlocked=true;farm.ledgeBlockedAt=os.clock()
+        farm.status("Front ledge ascent stalled; movement stopped, automatic retry in 5s.");return false
     end
     if farm.route or farm.climbDirection then farm.cancelWalk() end
     farm.stopSprint()
@@ -4032,7 +4036,7 @@ local farmGroup=automation:AddLeftGroupbox("C96 autofarm")
 control(farmGroup,"Autofarm","One-click C96 autofarm")
 control(farmGroup,"AutoLeaveSpawn","Auto Leave Spawn")
 farm.label=runtime.label(farmGroup,"Off",true)
-runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Sniper is followed by Body Building Handling. Wave 21 prioritizes healing items; wave 28 prioritizes Max Health and Health Regen, then resumes interrupted upgrades. Experimental and support settings are preserved. Backup Weapon and Rooftop Camper required. Live routes remain unverified.",true)
+runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Sniper is followed by Body Building Handling. Wave 21 prioritizes healing items; wave 28 prioritizes Max Health and Health Regen, then resumes interrupted upgrades. Weapon and support settings are preserved. Backup Weapon and Rooftop Camper required. Live routes remain unverified.",true)
 
 -- One entry per drink, per scheduled activation. This is independent of routing.
 function farm.drinkSchedule(wave,minutes,map)
@@ -4209,7 +4213,11 @@ connect(RunService.Heartbeat,function()
     w.tickAt=os.clock()+1
     local ok=pcall(farm.webhookTick)
     if not ok then w.message="Webhook update failed locally." end
-    if w.label then pcall(function() w.label:SetText(w.enabled and (w.message or "Waiting for a 5-wave milestone.") or "Off") end) end
+    local message=w.enabled and (w.message or "Waiting for a 5-wave milestone.") or "Off"
+    if w.label and w.displayed~=message then
+        local ok,result=pcall(function() return w.label:SetText(message) end)
+        if ok and result~=false then w.displayed=message end
+    end
 end)
 
 function farm.grounded(humanoid,root)
@@ -4376,7 +4384,10 @@ connect(RunService.Heartbeat,function()
         local purchase=farm.purchaseBudget
         local nextPurchase=purchase and (tostring(purchase.item).." ($"..math.ceil(purchase.cost)..")") or "Waiting for purchase selection"
         local text="Step: "..farm.webhookStep().."\nPurchase: "..nextPurchase.."\n"..farm.purchaseSummary().."\nPriority: "..priority.."\nNext drinks: "..farm.nextDrinkSummary(wave,game:GetService("Lighting"):GetMinutesAfterMidnight()).."\nMovement: "..(farm.motionStatus or "Idle")
-        farm.detailLabel:SetText(text)
+        if farm.detailDisplayed~=text then
+            local result=farm.detailLabel:SetText(text)
+            if result~=false then farm.detailDisplayed=text end
+        end
     end)
 end)
 
@@ -4440,8 +4451,11 @@ function farm.voteMonitor()
         end
     end
     local message=farm.voteError or farm.voteStatus()
-    if farm.voteLabel then pcall(function() farm.voteLabel:SetText(message) end) end
-    if e.Autofarm and state.readyStatus then
+    if farm.voteLabel and farm.voteDisplayed~=message then
+        local ok,result=pcall(function() return farm.voteLabel:SetText(message) end)
+        if ok and result~=false then farm.voteDisplayed=message end
+    end
+    if e.Autofarm and state.readyStatus and state.readyText~=message then
         local ok,result=pcall(function() return state.readyStatus:SetText(message) end)
         if ok and result~=false then state.readyText=message end
     end
@@ -4514,10 +4528,9 @@ connect(RunService.Heartbeat,function()
     if os.clock()>=state.catalogAt then state.catalogAt=os.clock()+3;local ok,err=pcall(state.refresh);if not ok then notice(err) end end
     if state.displayed~=state.message then state.displayed=state.message;state.status:SetText(state.message) end
 end)
-local op={patches={},wrappers={},created={},hits={},last="No experimental requests sent",any=false}
+local op={wrappers={},hits={},last="No modifier requests sent",any=false}
 runtime.op=op
 local function on(id) return runtime.active and e["OP"..id]==true end
-local function perk(name) return child(child(LocalPlayer,"PlayerPerks"),name) end
 local function copy(t) local n={} for k,v in pairs(t or {}) do n[k]=v end return n end
 local function currentTool() local c=LocalPlayer.Character;return c and c:FindFirstChildOfClass("Tool") end
 local function owned(tool) return tool and (tool.Parent==LocalPlayer.Character or tool.Parent==child(LocalPlayer,"Backpack")) end
@@ -4525,38 +4538,6 @@ local function mark(id,text) op.hits[id]=(op.hits[id] or 0)+1;op.last=text.."; s
 local function modsFor(tool)
     local saved=_G.ClientPlayerMods and _G.ClientPlayerMods[tool.Name]
     return saved and rangeMods and rangeMods:GetModStats(saved) or {}
-end
-function op.tags(tags,tool)
-    if type(tags)~="table" or not owned(tool) then return tags end
-    local t=copy(tags);local cv=child(tool,"CurrentValues")
-    if on(8) and tool.Name=="Energy Rifle" then
-        local amount=readValue(cv,"MaxClip")
-        local ok,multi=pcall(function() return rangeManager:GetMulti("MaxClip",LocalPlayer,{Tool=tool,ModStats=modsFor(tool)}) end)
-        if finite(amount) and amount>0 and ok and finite(multi) and multi>0 then t.ClipCharge=math.floor(amount*multi+.5);mark(8,"Energy charge data modified") end
-    end
-    if on(14) then t.DamageDrop=0;t.IgnoreDamageDrop=true;mark(14,"Falloff data modified") end
-    if on(21) and readValue(child(tool,"OtherValues"),"ScopedDamage") then t.ADS=true;mark(21,"ADS damage data modified") end
-    if on(22) and perk("CriticalHead") then
-        if t.Critical==true then t.SuperCrit=true end
-        if type(t.SuperCritRolls)=="table" then t.SuperCritRolls=copy(t.SuperCritRolls);for k in pairs(t.SuperCritRolls) do t.SuperCritRolls[k]=true end end
-        mark(22,"Eligible super-critical data modified")
-    end
-    if on(23) and perk("ImpactDamage") and (readValue(child(tool,"OtherValues"),"Type")=="Launcher" or tool.Name=="CAR-15" and t.AltDamage) then t.DirectHit=true;mark(23,"Direct-impact data modified") end
-    return t
-end
-local function restore(record)
-    pcall(function() if record.object[record.property]==record.last then record.object[record.property]=record.original end end)
-end
-function op.clearPatches()
-    for _,r in pairs(op.patches) do restore(r) end;op.patches={}
-    for _,object in pairs(op.created) do pcall(function() object:Destroy() end) end;op.created={}
-end
-local function patch(object,property,value)
-    if not object then return end
-    local key=object;local r=op.patches[key]
-    if not r then r={object=object,property=property,original=object[property]};op.patches[key]=r
-    elseif object[property]~=r.last then r.original=object[property] end
-    if object[property]~=value then object[property]=value end;r.last=value;r.keep=true
 end
 local function wrap(object,key,factory)
     if not object or type(object[key])~="function" then return end
@@ -4568,23 +4549,16 @@ function op.install()
     op.installed=true
     wrap(rangeManager,"GetMulti",function(original) return function(self,key,player,context)
         local value=original(self,key,player,context)
-        if player~=LocalPlayer or not finite(value) or (key~="AttackSpeed" and key~="Pierce" and key~="ProjectileSpeed") then return value end
+        if player~=LocalPlayer or not finite(value) or key~="ProjectileSpeed" then return value end
         local tool=context and context.Tool
         if owned(tool) then
-            if on(18) and key=="AttackSpeed" and child(tool,"GunScript") then return value*e.FireRateMultiplier end
-            if on(9) and key=="Pierce" then return value*e.PenetrationMultiplier end
             if on(17) and key=="ProjectileSpeed" then return value*e.ProjectileMultiplier end
         end
         return value
     end end)
-    wrap(rangeManager,"GetDamageDrop",function(original) return function(self,player,context,...)
-        if player==LocalPlayer and on(14) then mark(14,"Local explosion falloff suppressed");return 0 end
-        return original(self,player,context,...)
-    end end)
 
 end
 function op.cleanup()
-    op.clearPatches()
     for i=#op.wrappers,1,-1 do local r=op.wrappers[i];if r.object[r.key]==r.wrapper then r.object[r.key]=r.original end end
     op.wrappers={};op.installed=false
 end
@@ -4631,7 +4605,7 @@ function op.namecall(object,method,args)
                     if type(entry)=="table" then
                         local tool=typeof(entry[1])=="Instance" and entry[1] or currentTool()
                         if owned(tool) and (entry[1]==tool or entry[1]==tool.Name) then
-                            local shot=copy(entry);shot[3]=op.tags(entry[3],tool)
+                            local shot=copy(entry)
                             shot[2]=op.overrideHits(kind,entry[2],tool,entry[3])
                             entries[i]=shot;changed=true
                         end
@@ -4641,13 +4615,11 @@ function op.namecall(object,method,args)
             end
         end
         if changed then args[1]=data;return args end
-    elseif name=="RemoteProjectileEvent" and owned(args[1]) then
-        args[6]=op.tags(args[6],args[1]);return args
     elseif name=="RemoteFireMelee" and (owned(args[1]) or args[1]=="Melee") and type(args[2])=="table" then
         local knife=args[1]=="Melee"
         local tool=not knife and args[1] or nil;local hits={};local seen={}
         for _,hit in ipairs(args[2]) do
-            if type(hit)=="table" then local nextHit=copy(hit);nextHit[2]=op.tags(hit[2],tool);table.insert(hits,nextHit);if hit[1] then seen[hit[1].Parent]=true end end
+            if type(hit)=="table" then local nextHit=copy(hit);table.insert(hits,nextHit);if hit[1] then seen[hit[1].Parent]=true end end
         end
         if e.MeleeAura and (knife or child(tool,"MeleeScript")) then
             local root=child(LocalPlayer.Character,"HumanoidRootPart");local base=knife and rangeManager:GetValue("MeleeRange",LocalPlayer) or readValue(child(tool,"CurrentValues"),"Range")
@@ -4660,12 +4632,12 @@ function op.namecall(object,method,args)
                 range=math.min(100,range)
                 for _,target in ipairs(state.actionTargets(root.Position,range,true)) do
                     if #hits>=20 then break end
-                    if not seen[target.model] then table.insert(hits,{target.part,op.tags({},tool)});seen[target.model]=true end
+                    if not seen[target.model] then table.insert(hits,{target.part,{}});seen[target.model]=true end
                 end
                 mark(16,"Melee sweep hit list modified")
             end
         end
-        args[2]=hits;args[3]=op.tags(args[3],tool);return args
+        args[2]=hits;return args
     end
 end
 function op.step()
@@ -4675,16 +4647,7 @@ function op.step()
         return
     end
     op.install()
-    for _,r in pairs(op.patches) do r.keep=false end
-    local tool=currentTool();local cv=child(tool,"CurrentValues")
-    if on(10) and child(tool,"GunScript") then
-        local f=child(cv,"NumBullets");if f and finite(f.Value) and f.Value>0 then
-            local old=op.patches[f];local base=old and f.Value==old.last and old.original or f.Value
-            patch(f,"Value",math.max(base,math.min(32,math.floor(base*e.PelletMultiplier))));mark(10,"Local pellet multiplier; rounded down, capped at 32")
-        end
-    end
-    for object,r in pairs(op.patches) do if not r.keep then restore(r);op.patches[object]=nil end end
-    for i=#op.created,1,-1 do local object=op.created[i];if not op.patches[object] then pcall(function() object:Destroy() end);table.remove(op.created,i) end end
+
 end
 function op.detonate()
     if not on(6) or os.clock()<(op.canAt or 0) then return end
@@ -4703,31 +4666,14 @@ function op.detonate()
     end
     if best then best:FireServer();mark(6,"Owned can detonation requested") else op.last="No owned can with known radius and safe player clearance" end
 end
-local tab=Window:AddTab("Experimental OP Features")
-local left=tab:AddLeftGroupbox("Experiments 1–5")
-local right=tab:AddRightGroupbox("Experiments 6–9")
 local utilities=runtime.extensionTabs.Items:AddRightGroupbox("Throwable utilities")
-local displayIndex=0
-for _,definition in ipairs(runtime.opDefinitions) do
-    local id,name=definition[1],definition[2]
-    if id~=2 and id~=3 then
-        local group,label
-        if id==5 or id==6 then group=utilities;label=definition[3] or name
-        else
-            displayIndex=displayIndex+1;group=displayIndex<=5 and left or right
-            label=string.format("%02d %s",displayIndex,definition[3] or name)
-        end
-        local toggle=control(group,"OP"..id,label)
-        local multiplier=({[9]="PenetrationMultiplier",[10]="PelletMultiplier",[17]="ProjectileMultiplier",[18]="FireRateMultiplier"})[id]
-        if multiplier then control(group,multiplier,"Multiplier (1–3x)") end
-        if id==6 then
-            toggle:AddKeyPicker("OPCanHotkey",{Default=e.OPCanKey,NoUI=true,Mode="Toggle",Modes={"Toggle"},SyncToggleState=false,Text="Detonate owned can",ChangedCallback=function() if ui.OPCanKey then e.OPCanKey=ui.OPCanKey.Value end end})
-            ui.OPCanKey=toggle.Addons[#toggle.Addons]
-        end
-    end
-end
-runtime.label(right,"Experimental client changes. Damage, ammo and server acceptance are NOT verified. Most weapon modifiers require the equipped weapon; manually re-equip after changing cached modifiers.",true)
-op.label=runtime.label(right,"No experimental requests sent",true)
+control(utilities,"OP5","Predict throwable targets")
+local canToggle=control(utilities,"OP6","Detonate owned can [J]")
+canToggle:AddKeyPicker("OPCanHotkey",{Default=e.OPCanKey,NoUI=true,Mode="Toggle",Modes={"Toggle"},SyncToggleState=false,Text="Detonate owned can",ChangedCallback=function() if ui.OPCanKey then e.OPCanKey=ui.OPCanKey.Value end end})
+ui.OPCanKey=canToggle.Addons[#canToggle.Addons]
+control(weapons,"OP17","Projectile velocity multiplier (PVM)")
+control(weapons,"ProjectileMultiplier","Projectile velocity (1–3x)")
+runtime.label(weapons,"Projectile weapons only. Re-equip if the gun caches its values. Server acceptance remains unverified.",true)
 control(priority,"OP2","Armour-aware aim points")
 runtime.label(priority,"Skips armour and shield intersections. Hit Override independently requests head damage; server acceptance is unverified.",true)
 control(weapons,"OP3","Hot Harmony heat optimization")
@@ -4739,8 +4685,7 @@ connect(UIS.InputBegan,function(input,processed)
 end)
 connect(RunService.Heartbeat,function()
     if os.clock()<(op.next or 0) then return end;op.next=os.clock()+.1
-    local ok,err=pcall(op.step);if not ok then op.last="Experiment error: "..tostring(err) end
-    if op.label and op.displayed~=op.last then op.displayed=op.last;op.label:SetText(op.last) end
+    local ok,err=pcall(op.step);if not ok then op.last="Weapon modifier error: "..tostring(err) end
 end)
 
 control(utilities,"OPPredictionSeconds","Throw prediction seconds")
