@@ -2274,13 +2274,14 @@ function state.skip()
     if state.skipBusy then return end
     local wave=readValue(values,"LocalWave")
     local character=LocalPlayer.Character;local map=child(Workspace,"Map");local epoch=state.epoch
+    local voteCycle=state.skipCycle
     state.skipBusy=true;state.skipStartedAt=os.clock()
     state.skipLastAttempt=os.clock();state.skipLastWave=wave;state.skipLastError=nil;state.skipLastResult=nil
     local ok,result=pcall(remote,"RemoteFunctions","VoteSkip","InvokeServer")
     state.skipBusy=false;state.skipStartedAt=nil
     if not ok then state.skipLastError=tostring(result);error(result) end
     state.skipLastResult=result==true and "acknowledged" or "not acknowledged"
-    if not runtime.active or state.epoch~=epoch or LocalPlayer.Character~=character or child(Workspace,"Map")~=map
+    if not runtime.active or state.epoch~=epoch or state.skipCycle~=voteCycle or LocalPlayer.Character~=character or child(Workspace,"Map")~=map
         or readValue(values,"LocalWave")~=wave or readValue(values,"Vote")~=true then return end
     if type(result)=="boolean" then
         local voted=child(LocalPlayer,"Voted");if voted then voted.Value=result end
@@ -4380,6 +4381,31 @@ connect(RunService.Heartbeat,function()
 end)
 
 -- Readiness must not depend on inventory refresh, purchase completion or pathfinding.
+function farm.reconcileVote()
+    local values=child(storage(),"Values")
+    local wave=readValue(values,"LocalWave")
+    local map=child(Workspace,"Map")
+    local open=readValue(values,"Vote")==true
+    local cycle=farm.voteCycle
+    if not cycle or cycle.wave~=wave or cycle.map~=map or cycle.open~=open then
+        farm.voteCycle={wave=wave,map=map,open=open}
+        state.skipCycle=(state.skipCycle or 0)+1
+        farm.voteMismatchAt=nil
+    end
+    local flag=child(LocalPlayer,"Voted")
+    local count=readValue(values,"Voted")
+    if not e.Autofarm or not farm.active or not open or (readValue(values,"VotingTime") or 0)>0
+        or not flag or flag.Value~=true or count~=0 or state.skipBusy then
+        farm.voteMismatchAt=nil;return
+    end
+    -- An aggregate count of zero contradicts a local affirmative vote. Allow
+    -- replication to catch up before clearing ONLY the local vote latch.
+    farm.voteMismatchAt=farm.voteMismatchAt or os.clock()
+    if os.clock()-farm.voteMismatchAt<10 or os.clock()-(state.skipLastAttempt or -100)<10 then return end
+    flag.Value=false
+    farm.voteMismatchAt=nil;farm.voteRepairs=(farm.voteRepairs or 0)+1
+    state.skipLastResult=nil
+end
 function farm.voteStatus()
     local values=child(storage(),"Values")
     local wave=readValue(values,"LocalWave")
@@ -4389,7 +4415,11 @@ function farm.voteStatus()
     if (readValue(values,"VotingTime") or 0)>0 then return "Ready-up: map voting in progress" end
     if readValue(values,"Vote")~=true then return "Ready-up: CLOSED by game (wave "..tostring(wave)..")" end
     if state.skipBusy then return "Ready-up: request pending for "..math.floor(os.clock()-(state.skipStartedAt or os.clock())).."s" end
-    if readValue(LocalPlayer,"Voted")==true then return "Ready-up: vote confirmed; waiting for game/other players" end
+    if readValue(LocalPlayer,"Voted")==true then
+        local count=readValue(values,"Voted")
+        if count==0 then return "Ready-up: local vote conflicts with 0 counted votes; checking before retry" end
+        return "Ready-up: local vote recorded; counted votes "..tostring(count or "unknown")
+    end
     if readValue(LocalPlayer,"Voted")~=false then return "Ready-up: player vote state unavailable" end
     if farm.recovering then return "Ready-up: held while returning from spawn to roof" end
     if state.skipLastWave==wave and state.skipLastError then return "Ready-up request failed: "..state.skipLastError end
@@ -4401,6 +4431,7 @@ function farm.voteStatus()
 end
 function farm.voteMonitor()
     if not runtime.active then return end
+    farm.reconcileVote()
     if e.Autofarm and farm.active and farm.supported() then
         local _,humanoid=alive()
         if humanoid then
