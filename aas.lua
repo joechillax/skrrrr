@@ -1,4 +1,4 @@
--- JoesAAS 4.4 | standalone source | September 2026
+-- JoesAAS 4.5 | standalone source | September 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -525,6 +525,7 @@ return function(A)
     end
     function A.stop()
         if not A.alive then return end
+        if A.flushJoinDiagnostics then A.flushJoinDiagnostics() end
         if A.guildCheckpoint then A.guildCheckpoint('unload') end
         A.setRunning(false); if A.render then A.render(false) end
         if A.cleanupTrialMovement then A.cleanupTrialMovement() end
@@ -1204,7 +1205,7 @@ return function(A)
                         context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
                 end
                 local ctrl=A.client('TeleportController')
-                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='4.4',reason=message,
+                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='4.5',reason=message,
                     context=A.player:GetAttribute('VisibilityContext'),room=state[keyField]==key and state.Room,
                     serverEnemies=state[keyField]==key and state.EnemyCount,anchored=root and root.Anchored,
                     loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
@@ -1272,6 +1273,82 @@ return function(A)
     end
     install('Trial','TimeTrial','TimeTrialArenas','trialFollow','Trial','TrialKey')
     install('Dungeon','Dungeon','DungeonArenas','trialFollow','Dungeon','DungeonKey')
+end
+
+end)()(A);
+
+-- ===== join_diagnostics =====
+(function()
+return function(A)
+    local path=A.folder..'/join-diagnostics.json'
+    local saved=A.safeLoad(path)
+    local events,openings={},{}
+    local dirty=true
+    local fields={mode=true,key=true,reason=true,accepted=true,selected=true,duration=true,rank=true,
+        source=true,action=true,sent=true,retry=true,autoRetry=true,timeTrialTransfer=true}
+    local function clean(input)
+        local result={}
+        for key,value in pairs(type(input)=='table' and input or {}) do
+            if fields[key] then
+                if type(value)=='string' then result[key]=value:sub(1,240)
+                elseif type(value)=='boolean' then result[key]=value
+                elseif type(value)=='number' and value==value and math.abs(value)<1e12 then result[key]=value end
+            end
+        end
+        return result
+    end
+    if type(saved)=='table' and saved.schema==1 and saved.userId==A.player.UserId and saved.gameId==game.GameId then
+        for _,event in ipairs(type(saved.events)=='table' and saved.events or {}) do
+            if #events>=400 then break end
+            if type(event)=='table' and type(event.kind)=='string' then
+                events[#events+1]={time=tonumber(event.time),kind=event.kind:sub(1,60),details=clean(event.details),
+                    context=type(event.context)=='string' and event.context:sub(1,120) or nil,loading=event.loading==true}
+            end
+        end
+    end
+    local lastStatus
+    function A.joinTrace(kind,details)
+        if kind=='status' then
+            local reason=details and details.reason
+            if reason==lastStatus then return end
+            lastStatus=reason
+        end
+        local ctrl=A.client('TeleportController')
+        local ok,loading=pcall(function() return ctrl and ctrl:IsLoading() end)
+        local event={time=os.time(),kind=kind,details=clean(details),
+            context=A.player:GetAttribute('VisibilityContext'),loading=ok and loading==true,running=A.running}
+        events[#events+1]=event; if #events>400 then table.remove(events,1) end
+        if kind=='opening' then
+            openings[#openings+1]={time=event.time,mode=event.details.mode,key=event.details.key,
+                selected=event.details.selected,rank=event.details.rank,duration=event.details.duration}
+            if #openings>40 then table.remove(openings,1) end
+        end
+        dirty=true
+    end
+    function A.flushJoinDiagnostics()
+        if not dirty then return true end
+        if type(writefile)~='function' then A.status['Join diagnostics']='File writing unavailable'; return false end
+        local ctrl=A.client('TeleportController')
+        local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
+        local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
+        local activityJob=A.tasks.Activities
+        local snapshot={schema=1,version='4.5',userId=A.player.UserId,gameId=game.GameId,
+            savedAt=os.time(),context=A.player:GetAttribute('VisibilityContext'),running=A.running,
+            activities=A.status.Activities,error=A.status['Activity error'],events=events,openings=openings,
+            coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
+            gameState=stateOK and gameState or {error=tostring(gameState):sub(1,240)},
+            eventError=A.status.Event,activityJobFailures=activityJob and activityJob.failures,settings={}}
+        for _,key in ipairs({'towerAutoJoin','towerSelection','trialAutoJoin','trialJoinSelection','dungeonAutoJoin',
+            'dungeonSelection','gateAutoJoin','gateSelection','gateRanks','raidAutoJoin','raidSelection',
+            'defenseAutoJoin','defenseSelection','bossRushAutoJoin','bossRushSelection'}) do snapshot.settings[key]=A.settings[key] end
+        local ok,err=pcall(function() writefile(path,A.S.HTTP:JSONEncode(snapshot)) end)
+        A.status['Join diagnostics']=ok and 'Recording: join-diagnostics.json' or ('Save failed: '..tostring(err))
+        if ok then dirty=false end
+        return ok
+    end
+    A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),function() A.joinTrace('context',{}) end)
+    A.job('Join diagnostics',5,A.flushJoinDiagnostics,true)
+    A.joinTrace('script started',{})
 end
 
 end)()(A);
@@ -1396,7 +1473,7 @@ return function(A)
             end
         end
     end
-    local function status(text) A.status.Activities=text; A.status['Trial join']=text end
+    local function status(text) A.status.Activities=text; A.status['Trial join']=text; A.joinTrace('status',{reason=text}) end
     local function suspendFarm()
         A.watchTarget(nil)
         local c=A.player.Character; local h=c and c:FindFirstChildOfClass('Humanoid')
@@ -1406,12 +1483,18 @@ return function(A)
         local mode=context()
         return mode~=nil or pending~=nil or leaving~=nil or locked~=nil or returning~=nil
     end
-    local function sendJoin(mode,key,entry)
+    local function sendRequest(mode,key,entry)
         if mode=='Gate' then return A.fire('RaidGateTeleport',key) end
         if mode=='Tower' then return A.fire('TowerJoin',{TowerKey=key}) end
         if mode=='Raid' then return A.fire('RaidJoin','Create',key,true) end
         if mode=='BossRush' then return A.fire('BossRushJoin','Join',key,entry.modeId or 'V1',true) end
         return A.fire(mode..'Join',entry.action or 'Join',key)
+    end
+    local function sendJoin(mode,key,entry)
+        A.joinTrace('join request',{mode=mode,key=key,action=entry.action or 'Join',rank=entry.rank})
+        local sent=sendRequest(mode,key,entry)
+        A.joinTrace('join sent',{mode=mode,key=key,sent=sent==true})
+        return sent
     end
     function A.coordinateActivities()
         if not A.alive or not A.running then return end
@@ -1450,7 +1533,7 @@ return function(A)
             else status('Waiting for '..pending.mode..' entry confirmation'); return end
         end
         if locked then status(locked..' locked until the run ends'); return end
-        if loading then return end
+        if loading then status('Blocked by game loading'); return end
         local mode,key,entry=selectCandidate()
         if not mode then status(current and ('In '..current) or (waitingReason or 'Waiting for a selected activity')); return end
         local direct=mode=='Tower' or mode=='TimeTrial' or mode=='Dungeon'
@@ -1459,7 +1542,7 @@ return function(A)
             local def=definitions[current]
             if not def then status('Waiting for current mode to finish'); return end
             -- Finished protected runs may transfer next; unfinished ones stay locked above.
-            if returning~=current and definitions[mode].rank<=def.rank then return end
+            if returning~=current and definitions[mode].rank<=def.rank then status('Current '..current..' has equal/higher priority than '..mode); return end
             if not direct then
                 if returning==current then status('Waiting for '..current..' return teleport'); return end
                 leaving=current; suspendFarm(); status('Leaving '..current..' for '..mode)
@@ -1485,12 +1568,14 @@ return function(A)
             if type(p)~='table' or p.NotifyKind~='GamemodeOpen' or p.GamemodeType~=mode or type(p.Key)~='string' then return end
             -- A raid gate announcement is a world gate teleport, not a joinable raid.
             if p.GateTeleport then return end
+            A.joinTrace('opening',{mode=mode,key=p.Key,selected=enabled(mode,p.Key),duration=tonumber(p.ExpiresIn),source='bridge'})
             local duration=tonumber(p.ExpiresIn) or 10
             if duration<=0 or duration~=duration then return end
             available[mode][p.Key]={deadline=os.clock()+math.min(duration,600),modeId=p.ModeId}
             A.coordinateActivities()
         end) end
-        A.on(mode..'Ended',function()
+        A.on(mode..'Ended',function(_,packet)
+            A.joinTrace('run ended',{mode=mode,autoRetry=type(packet)=='table' and packet.AutoRetry==true,timeTrialTransfer=type(packet)=='table' and packet.TimeTrialTransfer==true})
             local current=context()
             local ended=mode=='Raid' and (current=='Gate' or locked=='Gate') and 'Gate' or mode
             if current==ended or locked==ended then locked=nil; returning=ended end
@@ -1499,6 +1584,7 @@ return function(A)
         end)
         if mode~='Tower' then
             A.on(mode..'Join',function(accepted,reason)
+                A.joinTrace('server reply',{mode=mode,accepted=accepted==true,reason=tostring(reason)})
                 if not pending or pending.mode~=mode then return end
                 if accepted==true then pending.accepted=true end
                 if accepted==false then
@@ -1526,6 +1612,7 @@ return function(A)
             or (type(p.Name)=='string' and p.Name:match('Rank%s+([A-Z]+)'))
             or (type(p.Title)=='string' and p.Title:match('Rank%s+([A-Z]+)'))
         if not rankWeight[rank] then rank=nil end
+        A.joinTrace('opening',{mode='Gate',key=p.Key,rank=rank,selected=enabled('Gate',p.Key) and rank~=nil and A.settings.gateRanks[rank]==true,duration=duration,source='bridge'})
         available.Gate[p.Key]={deadline=os.clock()+math.min(duration,600),rank=rank}
         A.coordinateActivities()
     end)
@@ -1554,14 +1641,18 @@ return function(A)
         end)
     end
     A.on('TowerState',function(p)
+        if type(p)=='table' and p.Refused then A.joinTrace('server reply',{mode='Tower',accepted=false,reason=tostring(p.Refused)}) end
         if type(p)=='table' and p.Refused and pending and pending.mode=='Tower' then
             backoff['Tower:'..pending.key]=os.clock()+10; pending=nil
             A.status['Activity error']='Tower refused: '..tostring(p.Refused)
             status(A.status['Activity error'])
         end
     end)
+    local lastTrialSchedule
     A.on('TimeTrialActiveStatus',function(_,p)
         if type(p)~='table' then return end
+        local signature=tostring(p.IsOpen)..':'..table.concat(A.Core.keys(type(p.OpenTrialKeys)=='table' and p.OpenTrialKeys or {[p.OpenTrialKey or '']=true}),',')
+        if signature~=lastTrialSchedule then A.joinTrace('Trial schedule',{mode='TimeTrial',key=p.OpenTrialKey,reason=signature}); lastTrialSchedule=signature end
         available.TimeTrial={}
         if p.IsOpen==true then
             local keys=p.OpenTrialKeys or {[p.OpenTrialKey or '']=true}
@@ -1571,6 +1662,17 @@ return function(A)
         end
         A.coordinateActivities()
     end)
+    function A.joinSnapshot()
+        local openings={}
+        for mode,entries in pairs(available) do
+            openings[mode]={}
+            for key,entry in pairs(entries) do
+                openings[mode][key]={open=entry.deadline>os.clock(),remaining=entry.deadline==math.huge and 'until schedule closes' or math.max(0,entry.deadline-os.clock()),rank=entry.rank}
+            end
+        end
+        return {pending=pending and {mode=pending.mode,key=pending.key,accepted=pending.accepted==true,
+            attempts=pending.attempts,age=os.clock()-pending.at},locked=locked,leaving=leaving,returning=returning,available=openings}
+    end
     A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),A.coordinateActivities)
     A.job('Activities',0.2,A.coordinateActivities)
 end
@@ -1937,7 +2039,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='4.4',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='4.5',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2190,7 +2292,7 @@ return function(A)
     status('Farm','Trial join')
     note('Farm','Trial priority','Insane > Hard > Medium > Easy among selected trials currently open. An active trial always finishes first.')
     status('Modes','Activities')
-    status('Modes','Activity error')
+    status('Modes','Activity error'); status('Modes','Join diagnostics')
     note('Modes','Raid / Defense','Raid starts YOUR OWN run only; never joins other raids. Defense starts or joins an available run. Normal entry costs apply; errors appear above.')
     note('Modes','Activity priority','Tower > Time Trials > Dungeon > Gate > Raid / Defense > Boss Rush > mob farming. Tower, Trial and Dungeon runs finish or fail before switching. Gate can yield to a higher-priority mode. Raid wins a tie with Defense; an active run keeps its place.')
     note('Modes','Transfers','Tower, Trials and Dungeons use direct native entry. Gate and lower modes wait for normal exit. Gate and Tower stay at their join position.')
