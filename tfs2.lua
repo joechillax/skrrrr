@@ -117,7 +117,7 @@ local config = {
 runtime.extraSpecs = {
     Autofarm={false}, AutoC96={false}, AutoLeaveSpawn={false}, AutoNightDrinks={false},
     AutoEquip={false}, EquipWeapon={""}, FireModeOverride={false}, FireMode={"FullAuto",{"Single","Burst","FullAuto"}},
-    OverheatManagement={false}, ClosePriority={false}, CloseDistance={60,20,200}, SkipCloaked={true},
+    OverheatManagement={false}, ClosePriority={false}, CloseDistance={60,20,200}, SkipCloaked={false},
     MeleeAura={false}, UseKnife={true}, ThrowMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position"}}, LureMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position","Boss–Enemy Spawn"}},
     AutoDonate={false}, DonatePlayer={""}, DonateAmount={100,1,10000}, DonateInterval={10,1,60},
     IgnoreEquippingTool={false}, AutoRefillAmmo={false}, ExperimentalFire={false}, AutoVote={false}, VoteMap={""}, AutoSkip={false}, 
@@ -472,6 +472,15 @@ end
 RunService:BindToRenderStep("CombatAssistantPickerCursor", Enum.RenderPriority.Last.Value + 1, updatePickerCursor)
 local visibilityParams = RaycastParams.new()
 visibilityParams.FilterType = Enum.RaycastFilterType.Exclude
+function runtime.zombiePart(part)
+    local parent=part and part.Parent
+    for _=1,8 do
+        if not parent then return false end
+        if parent.Parent==zombiesFolder then return true end
+        parent=parent.Parent
+    end
+    return false
+end
 function runtime.traceVisible(origin, direction, ignored, ignoreWater)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
@@ -483,7 +492,7 @@ function runtime.traceVisible(origin, direction, ignored, ignoreWater)
         params.FilterDescendantsInstances = excluded
         result = Workspace:Raycast(origin, direction, params)
         local part = result and result.Instance
-        if not part or not part:IsA("BasePart") or part.Transparency ~= 1 then return result, excluded end
+        if not part or not part:IsA("BasePart") or part.Transparency ~= 1 or runtime.zombiePart(part) then return result, excluded end
         -- Bound the work and leave the final hit blocking if the limit is reached.
         if table.find(excluded, part) then return result, excluded end
         if #excluded >= #ignored + 31 then return result, excluded end
@@ -500,9 +509,36 @@ local function clearPath(origin, point, model)
     else
         result = Workspace:Raycast(origin, offset, visibilityParams)
     end
-    return result == nil or result.Instance:IsDescendantOf(model)
+    return result == nil or result.Instance:IsDescendantOf(model),result
 end
 
+function runtime.targetPoints(part,origin,expanded)
+    local points={part.Position}
+    if not expanded or not part.Size or not part.CFrame then return points end
+    local frame,size=part.CFrame,part.Size
+    local up,right=frame.UpVector*(size.Y*.4),frame.RightVector*(size.X*.4)
+    table.insert(points,part.Position+up)
+    table.insert(points,part.Position+right)
+    table.insert(points,part.Position-right)
+    table.insert(points,part.Position-up)
+    if frame.LookVector then
+        local forward=frame.LookVector*(size.Z*.4)
+        table.insert(points,part.Position+forward)
+        table.insert(points,part.Position-forward)
+        local delta=origin and origin-part.Position
+        if delta then
+            local function side(axis) return delta.X*axis.X+delta.Y*axis.Y+delta.Z*axis.Z>=0 and 1 or -1 end
+            table.insert(points,part.Position+up*side(frame.UpVector)+right*side(frame.RightVector)+forward*side(frame.LookVector))
+        end
+    end
+    return points
+end
+function runtime.immediateThreat(model,root)
+    if not config.Triggerbot or not root then return false end
+    local body=model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso") or model:FindFirstChild("Head")
+    return body and (body.Position-root.Position).Magnitude<=20
+        and (model.Name=="Assassin" or body.Position.Y<root.Position.Y-3) or false
+end
 local function exposedPoint(candidate, origin, center, limit)
     local model = candidate.model
     local root=LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
@@ -513,7 +549,7 @@ local function exposedPoint(candidate, origin, center, limit)
     local parts = {}
     local head = model:FindFirstChild("Head")
     if head and head:IsA("BasePart") then table.insert(parts, head) end
-    if config.BodyFallback or runtime.extra.OP2 or contact then
+    if config.BodyFallback or runtime.extra.OP2 or contact or runtime.immediateThreat(model,root) then
         for _, name in ipairs({
             "UpperTorso", "Torso", "LowerTorso",
             "LeftUpperArm", "RightUpperArm", "LeftLowerArm", "RightLowerArm",
@@ -525,50 +561,65 @@ local function exposedPoint(candidate, origin, center, limit)
             if part and part:IsA("BasePart") then table.insert(parts, part) end
         end
     end
-    local bestPart,bestPoint,bestDamage
+    local bestPart,bestPoint,bestDamage,fallbackPart,fallbackPoint
+    local damageCache={};local reason="No aimable body parts";local reachedRange=false
     for _, part in ipairs(parts) do
-        local points = {part.Position}
-        if config.WeaponClearance or contact then
-            table.insert(points, part.Position + part.CFrame.UpVector * (part.Size.Y * 0.35))
-            table.insert(points, part.Position + part.CFrame.RightVector * (part.Size.X * 0.3))
-            table.insert(points, part.Position - part.CFrame.RightVector * (part.Size.X * 0.3))
-        end
+        local points = runtime.targetPoints(part,origin,config.WeaponClearance or ignoreFOV or contact)
         for _, point in ipairs(points) do
             local screen, onScreen = Camera:WorldToViewportPoint(point)
-            if (ignoreFOV or (onScreen and (Vector2.new(screen.X, screen.Y) - center).Magnitude <= config.FOVRadius))
-                and (not contact or (point-origin).Magnitude>=.001)
-                and withinRange(origin, point, limit)
-                and (not (config.WeaponClearance or ignoreFOV) or clearPath(origin, point, model))
-                and (ignoreFOV or not config.VisibleCheck or clearPath(Camera.CFrame.Position, point, model)) then
+            local eligible=ignoreFOV or (onScreen and (Vector2.new(screen.X, screen.Y) - center).Magnitude <= config.FOVRadius)
+            local hit
+            if not eligible then reason="Outside manual aim FOV"
+            elseif not withinRange(origin,point,limit) then if not reachedRange then reason="Outside gun range" end;eligible=false
+            else
+                reachedRange=true
+                if config.WeaponClearance or ignoreFOV then
+                    local clear;clear,hit=clearPath(origin,point,model)
+                    if not clear then reason="Shot path blocked: "..tostring(hit and hit.Instance and hit.Instance.Name or "geometry");eligible=false end
+                end
+                if eligible and not ignoreFOV and config.VisibleCheck and not clearPath(Camera.CFrame.Position,point,model) then
+                    reason="Camera visibility blocked";eligible=false
+                end
+            end
+            if eligible and (not contact or (point-origin).Magnitude>=.001) then
                 if not runtime.extra.OP2 then return part, point end
                 local actual=part
                 local start=origin or Camera.CFrame.Position
-                local hit
-                if config.IgnoreInvisibleParts then hit=runtime.traceVisible(start,point-start,visibilityParams.FilterDescendantsInstances,false) else hit=Workspace:Raycast(start,point-start,visibilityParams) end
+                if not (config.WeaponClearance or ignoreFOV) then
+                    if config.IgnoreInvisibleParts then hit=runtime.traceVisible(start,point-start,visibilityParams.FilterDescendantsInstances,false) else hit=Workspace:Raycast(start,point-start,visibilityParams) end
+                end
                 if hit and hit.Instance and hit.Instance:IsDescendantOf(model) then actual=hit.Instance
                 elseif hit then actual=nil end
                 if actual and not runtime.armouredPart(actual) then
                     if config.HeadshotConversion then return actual,hit and hit.Position or point end
-                    local tool=equippedGun()
-                    local ok,damage=pcall(function() return rangeManager:GetDamage(LocalPlayer,actual,tool,{}) end)
-                    if ok and validRange(damage) and (not bestDamage or damage>bestDamage) then bestDamage,bestPart,bestPoint=damage,actual,hit and hit.Position or point end
-                end
+                    local damage=damageCache[actual]
+                    if damage==nil then
+                        local ok,value=pcall(function() return rangeManager:GetDamage(LocalPlayer,actual,equippedGun(),{}) end)
+                        damage=ok and validRange(value) and value or false;damageCache[actual]=damage
+                    end
+                    if damage==false then
+                        -- Missing client damage estimates must not disable an otherwise clear shot.
+                        runtime.damageEstimateUnavailable=true
+                        if not fallbackPart then fallbackPart,fallbackPoint=actual,hit and hit.Position or point end
+                    elseif damage>0 and (not bestDamage or damage>bestDamage) then bestDamage,bestPart,bestPoint=damage,actual,hit and hit.Position or point
+                    elseif damage==0 then reason="Estimated damage is zero" end
+                else reason="Armour or shield blocks exposed points" end
             end
         end
     end
-    return bestPart,bestPoint
+    return bestPart or fallbackPart,bestPoint or fallbackPoint,reason
 end
 
 local function protectedZombie(model)
+    if model:FindFirstChildOfClass("ForceField") then return true,"ForceField" end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.MaxHealth==math.huge then return true,"Invulnerable (infinite MaxHealth)" end
     if runtime.extra.SkipCloaked and model.Name=="Assassin" then
         -- Visibility proxy: the extracted client does not expose its server vulnerability flag.
         local body=model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso") or model:FindFirstChild("Head")
-        if body and body:IsA("BasePart") and body.Transparency>=.95 then return true end
+        if body and body:IsA("BasePart") and body.Transparency>=.95 then return true,"Skip cloaked Assassins is enabled (appearance check)" end
     end
-    if model:FindFirstChildOfClass("ForceField") then return true end
-    -- CharacterManager.GetDamage returns zero for this exact state.
-    local humanoid = model:FindFirstChildOfClass("Humanoid")
-    return humanoid ~= nil and humanoid.MaxHealth == math.huge
+    return false
 end
 function runtime.closeZombie(model,root)
     local part=model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChild("Head")
@@ -576,6 +627,7 @@ function runtime.closeZombie(model,root)
 end
 local function getTargetHead()
     runtime.targetName, runtime.targetTier = nil, nil
+    runtime.targetBlocked=nil;runtime.damageEstimateUnavailable=nil
     runtime.superSeen = 0
     Camera = Workspace.CurrentCamera
     local center = getAimPoint()
@@ -598,24 +650,35 @@ local function getTargetHead()
     local candidate
     for _, zombie in ipairs(zombiesFolder:GetChildren()) do
         if config.SuperPriorityList[zombie.Name] then runtime.superSeen = runtime.superSeen + 1 end
-        if zombie:IsA("Model") and not protectedZombie(zombie) and (not config.IgnoreList[zombie.Name] or runtime.closeZombie(zombie,root)) then
+        local protected,blockReason=protectedZombie(zombie)
+        if config.IgnoreList[zombie.Name] then blockReason=blockReason or "Ignore list" end
+        if zombie:IsA("Model") and not protected and (not config.IgnoreList[zombie.Name] or runtime.closeZombie(zombie,root)) then
             local humanoid = zombie:FindFirstChildOfClass("Humanoid")
             if humanoid and humanoid.Health > 0 then
-                local part, point = exposedPoint({model = zombie}, origin, center, limit)
+                local part, point,reason = exposedPoint({model = zombie}, origin, center, limit)
+                if not part then blockReason=reason end
                 if part then
+                    blockReason=nil
                     local projected = Camera:WorldToViewportPoint(point)
                     local score = (Vector2.new(projected.X, projected.Y) - center).Magnitude
                     if (ignoreFOV or config.TargetMode == "Closest to Player") and root then score = (point - root.Position).Magnitude end
                     local found = {part = part, point = point, model = zombie, score = score,
-                        priority = runtime.closeZombie(zombie,root) and 3 or (config.SuperPriorityList[zombie.Name] and 2 or (config.PriorityList[zombie.Name] and 1 or 0))}
+                        priority = runtime.immediateThreat(zombie,root) and 4 or runtime.closeZombie(zombie,root) and 3 or (config.SuperPriorityList[zombie.Name] and 2 or (config.PriorityList[zombie.Name] and 1 or 0))}
                     if not candidate or found.priority>candidate.priority or (found.priority==candidate.priority and found.score<candidate.score) then candidate=found end
                 end
+            end
+        end
+        if blockReason and root then
+            local body=zombie:FindFirstChild("HumanoidRootPart") or zombie:FindFirstChild("Torso") or zombie:FindFirstChild("UpperTorso") or zombie:FindFirstChild("Head")
+            local distance=body and (body.Position-root.Position).Magnitude
+            if distance and distance<=30 and (not runtime.targetBlocked or distance<runtime.targetBlocked.distance) then
+                runtime.targetBlocked={name=zombie.Name,reason=blockReason,distance=distance}
             end
         end
     end
     if candidate then
         runtime.targetName = candidate.model.Name
-        runtime.targetTier = candidate.priority == 3 and "Close" or candidate.priority == 2 and "Super" or (candidate.priority == 1 and "Priority" or "Normal")
+        runtime.targetTier = candidate.priority == 4 and "Threat" or candidate.priority == 3 and "Close" or candidate.priority == 2 and "Super" or (candidate.priority == 1 and "Priority" or "Normal")
         return candidate.part, candidate.point
     end
 end
@@ -1625,8 +1688,11 @@ connect(RunService.Heartbeat, function()
         (not runtime.callerLookup and "unavailable (caller API)" or
         (runtime.lastRedirect and os.clock() - runtime.lastRedirect < 2 and "redirecting shots" or "ON - no recent redirected shot"))
     local input = runtime.lastInputError and "Input: rejected; close menus/console" or "Input: no recorded rejection"
-    local super = (runtime.superSeen or 0) > 0 and runtime.targetTier ~= "Super" and "\nSuper zombies present but filtered out" or ""
-    runtime.targetLabel:SetText("Target: " .. target .. "\nSilent Aim: " .. aim .. "\n" .. input .. "\nFacing: " .. tostring(runtime.facing and runtime.facing.status or "Unavailable") .. super)
+    local super = (runtime.superSeen or 0) > 0 and not runtime.targetName and "\nSuper zombies present but filtered out" or ""
+    local rejected=runtime.targetBlocked
+    local detail=rejected and ("\nNearby "..rejected.name..": "..rejected.reason) or ""
+    if runtime.damageEstimateUnavailable then detail=detail.."\nDamage estimate unavailable; using exposed aim points" end
+    runtime.targetLabel:SetText("Target: " .. target .. "\nSilent Aim: " .. aim .. "\n" .. input .. "\nFacing: " .. tostring(runtime.facing and runtime.facing.status or "Unavailable") .. super .. detail)
 end)
 local function zombieFilter(key, text, flag)
     return addControl(firing, "Dropdown", flag, {
@@ -2549,13 +2615,14 @@ local priority=CombatTab:AddLeftGroupbox("Priority & protection")
 control(priority,"ClosePriority","Close Range Prioritize")
 control(priority,"CloseDistance","Close distance (studs)")
 control(priority,"SkipCloaked","Skip cloaked Assassins")
+runtime.label(priority,"Optional appearance filter: skips highly transparent Assassins. Transparency alone does not prove immunity. Off by default; saved profiles retain their setting.",true)
 control(priority,"AssassinShotGuard","Assassin protection: single-hit hitscan")
 runtime.label(priority,"Silent aim / triggerbot: each hitscan pellet stops after its first zombie hit; no fire pause. Overrides penetration while enabled. Does not protect against an Assassin in front, separate pellets, projectiles or splash.",true)
 control(priority,"QuietReload","Reload early during quiet periods")
 control(priority,"QuietReloadPercent","Reload at magazine % or below")
 control(priority,"ReloadClearance","No enemies within (studs)")
 runtime.label(priority,"Requires 1.5 seconds clear of all nearby zombies, including cloaked / ignored ones. Cannot cancel a reload or guarantee a damage-free challenge.",true)
-runtime.label(priority,"Close > Super > Priority > Normal. Close overrides Ignore. Cloaked / protected zombies stay excluded.",true)
+runtime.label(priority,"Threat > Close > Super > Priority > Normal. Triggerbot prioritizes nearby Assassins and zombies below you within 20 studs. Close overrides Ignore. Cloaked / protected zombies stay excluded.",true)
 runtime.label(priority,"Triggerbot always ignores FOV and uses built-in aim. Range, obstacles and priorities still apply. FOV only limits manual silent aim. Off-screen server acceptance remains unverified.",true)
 local actions=CombatTab:AddRightGroupbox("Melee")
 control(actions,"MeleeAura","Melee aura")
@@ -3297,8 +3364,7 @@ function farm.nightVisionAndDrinks()
     return farm.itemSequence(farm.drinkItems,"Drinks")
 end
 function farm.healingDue()
-    local wave=readValue(child(storage(),"Values"),"LocalWave")
-    return e.Autofarm and not farm.healingDone and type(wave)=="number" and wave>=21
+    return e.Autofarm and not farm.healingDone and farm.stage==12
 end
 function farm.healthDue()
     local wave=readValue(child(storage(),"Values"),"LocalWave")
@@ -3403,9 +3469,9 @@ function farm.itemSequence(items,label)
 end
 function farm.healingPriority()
     if not farm.healingDue() then return true end
-    if not farm.itemSequence(farm.healingItems,"Wave 21") then return false end
+    if not farm.itemSequence(farm.healingItems,"Post-Handling") then return false end
     farm.healingDone=true
-    farm.status("Wave 21 healing upgrades complete; resuming stage "..tostring(farm.stage))
+    farm.status("Healing upgrades complete; continuing after stage "..tostring(farm.stage))
     return true
 end
 function farm.mapName() return readValue(child(storage(),"Values"),"MapName") end
@@ -3636,7 +3702,7 @@ function farm.leave(which)
     if not region then farm.status("Exit region unavailable.");return false end
     local inside=farm.inRegion(root,region)
     local function finish()
-        -- An already-completed exit check must not cancel a ladder/roof route.
+        -- An already-completed exit check must not cancel a positioning route.
         if farm.exitWalking==which then farm.cancelWalk();farm.exitWalking=nil;farm.pathAt=0 end
         if farm.exitTransit and farm.exitTransit.which==which then farm.exitTransit=nil end
         return true
@@ -3696,7 +3762,7 @@ function farm.earlyWaves()
     local time=game:GetService("Lighting"):GetMinutesAfterMidnight()
     local daytime=time>=360 and time<1080
     if wave>=5 then
-        farm.status("Holding wave-5 vote; moving to rooftop position.")
+        farm.status("Holding wave-5 vote; moving to Ammo Box position.")
         return true
     end
     if wave<5 and daytime and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==false then
@@ -3706,241 +3772,151 @@ function farm.earlyWaves()
         job("Farm early waves",3,function()
             local current=readValue(values,"LocalWave")
             local t=game:GetService("Lighting"):GetMinutesAfterMidnight()
-            if e.Autofarm and farm.stage==6 and farm.runId==run and LocalPlayer.Character==character and child(Workspace,"Map")==map and type(current)=="number" and current<5 and t>=360 and t<1080 then state.skip() end
+            if e.Autofarm and farm.stage==5 and farm.runId==run and LocalPlayer.Character==character and child(Workspace,"Map")==map and type(current)=="number" and current<5 and t>=360 and t<1080 then state.skip() end
         end)
     end
     if not farm.forwardPosition() then return false end
     if wave>=2 and wave<=4 then farm.priorityUpgrades() end
     if farm.inFlight then farm.waitStatus("native priority purchase response; early-wave voting still active")
     elseif state.spendingBusy then farm.waitStatus("support purchase/repair response; early-wave voting still active")
-    else farm.status("Early-wave farming: "..wave..". Ready "..tostring(readValue(values,"Vote"))..", voted "..tostring(readValue(LocalPlayer,"Voted"))..". C96 then Shop Money; climb on day 5 before voting.") end
+    else farm.status("Early-wave farming: "..wave..". Ready "..tostring(readValue(values,"Vote"))..", voted "..tostring(readValue(LocalPlayer,"Voted"))..". C96 then Shop Money; mount Ammo Box on day 5 before voting.") end
     return false
 end
-function farm.ladderStep(base,roof,identity)
-    local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
-    if not humanoid or not root then return false end
-    local l=farm.ladder
-    if not l or l.identity~=identity or l.character~=character then
-        farm.cancelWalk()
-        local toward=Vector3.new(roof.X-base.X,0,roof.Z-base.Z)
-        if toward.Magnitude<1 then farm.status("Ladder direction unavailable; need ladder geometry from Dex.");return false end
-        toward=toward.Unit
-        l={identity=identity,character=character,base=base,toward=toward,side=Vector3.new(-toward.Z,0,toward.X),phase="approach",attempt=1,at=os.clock()}
-        farm.ladder=l
-    end
-    local function phase(name)
-        if name=="blocked" then l.blockedFrom=l.phase end
-        farm.cancelWalk();farm.pathAt=0;l.phase=name;l.at=os.clock();l.progressAt=os.clock();l.high=root.Position.Y
-    end
-    local function retry()
-        if l.attempt>=3 then phase("blocked") else phase("backoff") end
-    end
-    if l.phase=="blocked" then
-        farm.status("Ladder stalled during "..tostring(l.blockedFrom or "unknown phase").."; refreshing route in "..math.max(0,math.ceil(5-(os.clock()-l.at))).."s.")
-        if os.clock()-l.at>=5 then
-            farm.cancelWalk();farm.avoidLadder=l.identity;farm.ladder=nil;farm.pathAt=0
-        end
-        return false
-    end
-    if l.phase=="backoff" then
-        local retreat=l.base-l.toward*7
-        if farm.walk(retreat,"Backing away from ladder before retry",1) then l.attempt=l.attempt+1;phase("approach")
-        elseif os.clock()-l.at>10 then
-            if l.attempt<3 then l.attempt=l.attempt+1;phase("approach") else phase("blocked") end
-        end
-        return false
-    end
-    local offset=({0,-.35,.35})[l.attempt]
-    local approach=l.base-l.toward*4+l.side*offset
-    if l.phase=="approach" then
-        -- A path can touch the ladder before its final waypoint. Native climbing
-        -- must take over immediately; climbing characters are not grounded.
-        if humanoid:GetState()==Enum.HumanoidStateType.Climbing then
-            phase("climb");l.sawClimbing=true;return false
-        end
-        approach=farm.ladderApproach(approach,root,humanoid) or approach
-        local near=Vector3.new(root.Position.X-approach.X,0,root.Position.Z-approach.Z).Magnitude
-        if near<.95 and math.abs(root.Position.Y-approach.Y)<2 and farm.grounded(humanoid,root) then phase("engage")
-        elseif near<8 and math.abs(root.Position.Y-approach.Y)<2 and farm.clearGroundSegment(root,approach) then
-            if farm.route or farm.pathBusy then farm.cancelWalk() end
-            farm.walkPoint=approach;farm.moving=true;humanoid:MoveTo(approach)
-            farm.status("Aligning with ladder on verified clear ground")
-            if os.clock()-l.at>15 then retry() end
-        elseif farm.walk(approach,"Approaching ladder: attempt "..l.attempt.."/3",.9) then phase("engage")
-        elseif os.clock()-l.at>15 then retry() end
-        return false
-    end
-    if l.phase=="crest" then
-        farm.walk(roof,"Stepping onto roof; waiting for Rooftop Camper",1)
-        if os.clock()-l.at>12 then phase("blocked") end
-        return false
-    end
-    -- Move into the physical ladder; do not force position, velocity or Humanoid state.
-    farm.walkPoint=nil;farm.climbDirection=l.toward;farm.moving=true
-    humanoid:Move(l.toward,false)
-    local climbing=humanoid:GetState()==Enum.HumanoidStateType.Climbing
-    if root.Position.Y>l.high+.35 then l.high=root.Position.Y;l.progressAt=os.clock() end
-    if l.phase=="engage" then
-        if climbing then l.phase="climb";l.at=os.clock();l.progressAt=os.clock();l.sawClimbing=true
-        elseif os.clock()-l.at>3 then retry() end
-        farm.status("Engaging ladder: waiting for native Climbing state ("..l.attempt.."/3)")
-    else
-        if l.sawClimbing and root.Position.Y>=roof.Y-1.5 then phase("crest")
-        elseif os.clock()-l.progressAt>3 or os.clock()-l.at>25 then retry()
-        else farm.status("Climbing: checking upward progress ("..l.attempt.."/3)") end
-    end
-    return false
+-- Resolve the shop's physical AmmoBox, never RoofAmmo or a deployable.
+function farm.rootOffset(character,humanoid,root)
+    local leg=child(character,"Left Leg") or child(character,"Right Leg")
+    return (humanoid.HipHeight or 0)+root.Size.Y/2+(leg and leg.Size.Y or 0)
 end
-function farm.frontLedge()
-    local map=child(Workspace,"Map")
-    local frame=child(child(map,"Shop"),"Frame")
-    local exit=child(child(storage(),"ShopRegions"),"ShopExit")
-    if not frame then return nil end
-    local chosen,score,ambiguous
-    for _,part in ipairs(frame:GetChildren()) do
-        if part.Name=="OutsideTop" and part:IsA("BasePart") and part.CanCollide
-            and math.abs(part.Size.X-92)<.05 and math.abs(part.Size.Y-.5)<.05
-            and math.abs(part.Size.Z-2)<.05 and part.CFrame.UpVector.Y>.95 then
-            -- Shared ledge geometry; use the live transform, never a map coordinate table.
-            local d=exit and Vector3.new(part.Position.X-exit.Position.X,0,part.Position.Z-exit.Position.Z).Magnitude or 0
-            if not score or d<score-.05 then chosen=part;score=d;ambiguous=false
-            elseif math.abs(d-score)<=.05 then ambiguous=true end
-        end
+function farm.ammoSurface()
+    local box=child(child(child(Workspace,"Map"),"Upgrades"),"AmmoBox")
+    if not box then return nil,"Shop Ammo Box has not loaded" end
+    local cached=farm.ammoTop
+    if cached and cached.box==box and cached.part.Parent and (cached.part==box or cached.part:IsDescendantOf(box)) and cached.part.CanCollide
+        and (cached.part.Size-cached.partSize).Magnitude<.05 and cached.part.CFrame.UpVector.Y>.9 then
+        return box,cached.part.CFrame:PointToWorldSpace(cached.localPoint),cached.part
     end
-    if not chosen or ambiguous then return nil end
-    return chosen,chosen.CFrame:PointToWorldSpace(Vector3.new(0,chosen.Size.Y/2,0))
-end
-function farm.holdFrontLedge(perkActive)
-    local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
-    if not root or not humanoid then return false end
-    local ledge,surface=farm.frontLedge()
-    if not ledge then farm.status("Front OutsideTop ledge unavailable; waiting for matching map geometry.");return false end
-    local foot=child(character,"Left Leg")
-    local offset=(humanoid.HipHeight or 0)+root.Size.Y/2+(foot and foot.Size.Y or 0)
-    local goal=surface+Vector3.new(0,offset,0)
-    local horizontal=Vector3.new(goal.X-root.Position.X,0,goal.Z-root.Position.Z)
-    local height=goal.Y-root.Position.Y
-    if horizontal.Magnitude<.75 and math.abs(height)<.65 and farm.grounded(humanoid,root) then
-        farm.cancelWalk();farm.ledgeSince=nil;farm.ledgeBlocked=nil
-        if not farm.ledgeSupported(root,ledge,offset) then
-            farm.ledgeStableAt=nil;farm.status("At ledge center; verifying support before continuing.");return false
-        end
-        farm.ledgeStableAt=farm.ledgeStableAt or os.clock()
-        if os.clock()-farm.ledgeStableAt<.35 then farm.status("Checking stable ledge arrival.");return false end
-        if perkActive then return true end
-        farm.status("At centered front ledge; waiting for Rooftop Camper effect.");return false
-    end
-    farm.ledgeStableAt=nil
-    if farm.ledgeBlocked then
-        if os.clock()-(farm.ledgeBlockedAt or 0)<5 then farm.status("Front ledge ascent stalled; retrying after a short pause.");return false end
-        farm.ledgeBlocked=nil;farm.ledgeSince=nil;farm.ledgeJumpAt=0;farm.pathAt=0
-    end
-    -- Reach the deck behind the rail using pathfinding. A narrow rail may not
-    -- have a navmesh, so the last short ascent uses ordinary walking/jumping.
-    if horizontal.Magnitude>4 then
-        farm.ledgeSince=nil
-        local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Include
-        params.FilterDescendantsInstances={child(Workspace,"Map")};params.RespectCanCollide=true
-        local inward=ledge.CFrame:PointToWorldSpace(Vector3.new(0,ledge.Size.Y/2+1,-3))
-        local hit=Workspace:Raycast(inward,Vector3.new(0,-10,0),params)
-        if not hit or hit.Normal.Y<.7 or hit.Position.Y>surface.Y+.25 then
-            farm.status("Cannot verify deck approach behind front ledge.");return false
-        end
-        farm.walk(hit.Position,"Walking to middle of front roof ledge",.8)
-        return false
-    end
-    if height>5 or height< -3 then farm.status("Front ledge height is outside a normal short jump.");return false end
-    farm.ledgeSince=farm.ledgeSince or os.clock()
-    if os.clock()-farm.ledgeSince>8 then
-        farm.cancelWalk();farm.ledgeBlocked=true;farm.ledgeBlockedAt=os.clock()
-        farm.status("Front ledge ascent stalled; movement stopped, automatic retry in 5s.");return false
-    end
-    if farm.route or farm.climbDirection then farm.cancelWalk() end
-    farm.stopSprint()
-    farm.moving=true;farm.walkPoint=goal
-    humanoid:MoveTo(goal)
-    if height>.65 and farm.grounded(humanoid,root) and os.clock()>=(farm.ledgeJumpAt or 0) then
-        humanoid.Jump=true;farm.jumpUntil=os.clock()+.25;farm.ledgeJumpAt=os.clock()+1
-    end
-    farm.status("Stepping onto raised front ledge center")
-    return false
-end
-function farm.ladderDestination(region,surface)
-    local map=child(Workspace,"Map");local upgrades=child(map,"Upgrades")
-    local parts=child(upgrades,"LaddersMetal") or child(upgrades,"Ladders")
-    if not parts then return nil end
-    local lowest
-    for _,p in ipairs(parts:GetDescendants()) do
-        if p:IsA("BasePart") and p.CanCollide and math.abs(p.Position.X-region.Position.X)<1
-            and math.abs(p.Position.Z-region.Position.Z)<5 then
-            if not lowest or p.Position.Y<lowest.Position.Y then lowest=p end
-        end
-    end
-    if not lowest then return nil end
-    -- Use the rungs' centerline, not the distant upper roof's center.
-    local base=Vector3.new(lowest.Position.X,region.Position.Y-region.Size.Y/2+3,lowest.Position.Z)
-    local landing=Vector3.new(lowest.Position.X,surface.Y+3,surface.Z)
-    return base,landing
-end
-function farm.roof()
-    local perks=child(child(LocalPlayer,"PlayerValues"),"PerkValues")
-    local active=readValue(perks,"RoofCamp")==true
-    local root=child(LocalPlayer.Character,"HumanoidRootPart")
-    if not root then return false end
-    if not child(child(LocalPlayer,"PlayerPerks"),"RoofCamp") then farm.status("Rooftop Camper perk is required for this route.");return false end
-    local ledge,surface=farm.frontLedge()
-    if not ledge then farm.status("Shared front balcony ledge is unavailable.");return false end
-    -- A perk can activate before clearing the ladder. Clear its top first.
-    if active and root.Position.Y>=surface.Y-1 then
-        local _,humanoid=alive()
-        if humanoid and humanoid:GetState()~=Enum.HumanoidStateType.Climbing then
-            if farm.ladder then farm.cancelWalk();farm.ladder=nil end
-            return farm.holdFrontLedge(true)
-        end
-    end
-    -- Check the exit only on entry into this route. Re-running it on each
-    -- ladder tick can compete with an approach/backoff path.
-    if not farm.ladder then
-        local exit=child(child(storage(),"ShopRegions"),"ShopExit")
-        if exit and root.Position.Y<exit.Position.Y+exit.Size.Y/2 and root.Position.Z<=exit.Position.Z+exit.Size.Z/2+.5 then
-            if not farm.leave(2) then return false end
-        end
-    end
-    local regions=child(storage(),"ShopRegions");local ladder=farm.ladder and farm.ladder.identity
-    local base,landing,distance
-    if ladder then base,landing=farm.ladderDestination(ladder,surface)
-    else
-        for _,name in ipairs({"LadderRegionL","LadderRegionR"}) do
-            local region=child(regions,name)
-            if region then
-                local candidate,top=farm.ladderDestination(region,surface)
-                if candidate then
-                    local d=(root.Position-candidate).Magnitude
-                    if region==farm.avoidLadder then d=d+10000 end
-                    if not distance or d<distance then ladder=region;base=candidate;landing=top;distance=d end
-                end
+    if os.clock()<(farm.ammoScanAt or 0) then return nil,"Waiting for a standable Ammo Box top" end
+    farm.ammoScanAt=os.clock()+1
+    local ok,frame,size=pcall(function()
+        if box:IsA("BasePart") then return box.CFrame,box.Size end
+        return box:GetBoundingBox()
+    end)
+    if not ok or not frame or not size then return nil,"Ammo Box geometry unavailable" end
+    local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Include
+    params.FilterDescendantsInstances={box};params.RespectCanCollide=true
+    local height=size.Magnitude+4
+    for _,offset in ipairs({Vector3.new(0,0,0),Vector3.new(size.X*.2,0,0),Vector3.new(-size.X*.2,0,0),Vector3.new(0,0,size.Z*.2),Vector3.new(0,0,-size.Z*.2)}) do
+        local sample=frame:PointToWorldSpace(offset)
+        local hit=Workspace:Raycast(sample+Vector3.new(0,height,0),Vector3.new(0,-height*2,0),params)
+        if hit and hit.Instance and hit.Instance.CanCollide and hit.Normal.Y>.9 then
+            -- Verify a small footprint so a decorative edge cannot count as a safe top.
+            local supported=true
+            for _,foot in ipairs({Vector3.new(.65,0,0),Vector3.new(-.65,0,0),Vector3.new(0,0,.65),Vector3.new(0,0,-.65)}) do
+                local contact=Workspace:Raycast(hit.Position+foot+Vector3.new(0,.5,0),Vector3.new(0,-1,0),params)
+                if not contact or contact.Normal.Y<.9 or math.abs(contact.Position.Y-hit.Position.Y)>.15 then supported=false;break end
+            end
+            if supported then
+                farm.ammoTop={box=box,part=hit.Instance,partSize=hit.Instance.Size,localPoint=hit.Instance.CFrame:PointToObjectSpace(hit.Position),frame=frame,size=size}
+                return box,hit.Position,hit.Instance
             end
         end
     end
-    if not base then farm.status("Waiting for matching physical ladder rungs.");return false end
-    farm.roofGoal=landing
-    return farm.ladderStep(base,landing,ladder)
+    return nil,"No flat, collidable Ammo Box top with enough footing"
 end
+function farm.ammoSupported(root,box,offset)
+    local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Include
+    params.FilterDescendantsInstances={box};params.RespectCanCollide=true
+    local hit=Workspace:Raycast(root.Position,Vector3.new(0,-offset-.75,0),params)
+    return hit and hit.Instance and (hit.Instance==box or hit.Instance:IsDescendantOf(box)) and hit.Normal.Y>.9 or false
+end
+function farm.ammoApproach(box,surface,humanoid,root,avoid)
+    local cached=farm.ammoTop
+    if not cached or cached.box~=box then return nil end
+    local frame,size=cached.part.CFrame,cached.part.Size
+    local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances={LocalPlayer.Character,box};params.RespectCanCollide=true
+    local chosen,score
+    for _,offset in ipairs({Vector3.new(size.X/2+2,0,0),Vector3.new(-size.X/2-2,0,0),Vector3.new(0,0,size.Z/2+2),Vector3.new(0,0,-size.Z/2-2)}) do
+        local point=frame:PointToWorldSpace(offset)
+        local hit=Workspace:Raycast(Vector3.new(point.X,surface.Y+3,point.Z),Vector3.new(0,-30,0),params)
+        if hit and hit.Normal.Y>.8 and hit.Position.Y<=surface.Y+.1 then
+            local goal=hit.Position+Vector3.new(0,farm.rootOffset(LocalPlayer.Character,humanoid,root),0)
+            local distance=(goal-root.Position).Magnitude
+            if avoid and (goal-avoid).Magnitude<.5 then distance=distance+10000 end
+            if not score or distance<score then chosen=goal;score=distance end
+        end
+    end
+    return chosen
+end
+function farm.holdAmmoBox()
+    local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
+    if not root or not humanoid or not root.Size then return false end
+    local room=child(child(storage(),"ShopRegions"),"MainShopRegion")
+    if readValue(LocalPlayer,"InsideShop")==true or (room and farm.inRegion(root,room)) then
+        if not farm.leave(2) then return false end
+    end
+    local box,surface,part=farm.ammoSurface()
+    if not box then farm.cancelWalk();farm.boxPosition=nil;farm.status(tostring(surface));return false end
+    local state=farm.boxPosition
+    if not state or state.box~=box or state.part~=part or state.character~=character then
+        farm.cancelWalk();state={box=box,part=part,character=character,at=os.clock()};farm.boxPosition=state
+    end
+    local offset=farm.rootOffset(character,humanoid,root)
+    local goal=surface+Vector3.new(0,offset,0)
+    local horizontal=Vector3.new(goal.X-root.Position.X,0,goal.Z-root.Position.Z).Magnitude
+    local height=goal.Y-root.Position.Y
+    if horizontal<.7 and math.abs(height)<.65 and farm.grounded(humanoid,root) and farm.ammoSupported(root,box,offset) then
+        farm.cancelWalk();state.stableAt=state.stableAt or os.clock();state.at=os.clock()
+        if os.clock()-state.stableAt<.35 then farm.status("Checking stable Ammo Box arrival");return false end
+        state.phase="holding";farm.status("Holding center of Ammo Box top");return true
+    end
+    state.stableAt=nil
+    if state.phase=="holding" then state.phase=nil;state.at=os.clock() end
+    if state.retryAt and os.clock()<state.retryAt then farm.stopSprint();farm.status("Ammo Box ascent stalled; retrying shortly");return false end
+    if (horizontal>3 and state.phase~="mounting") or height< -3 then
+        local approach=state.approach or farm.ammoApproach(box,surface,humanoid,root,state.avoidApproach)
+        if not approach then farm.cancelWalk();farm.status("No supported ground approach to Ammo Box");return false end
+        local distance=(approach-root.Position).Magnitude
+        if not state.approach then state.approach=approach;state.progressAt=os.clock();state.best=distance end
+        if distance<(state.best or distance)-.25 then state.progressAt=os.clock();state.best=distance end
+        if os.clock()-(state.progressAt or os.clock())>12 then
+            farm.cancelWalk();state.avoidApproach=approach;state.approach=nil;state.best=nil
+            farm.status("Ammo Box approach stalled; selecting another supported side");return false
+        end
+        state.phase="approach"
+        if farm.walk(approach,"Walking to Ammo Box ground approach",.8) then state.phase="mounting";state.at=os.clock();state.approach=nil;state.best=nil end
+        return false
+    end
+    local jumpHeight=humanoid.JumpHeight or 7
+    if humanoid.UseJumpPower~=false and finite(humanoid.JumpPower) and finite(Workspace.Gravity) and Workspace.Gravity>0 then jumpHeight=humanoid.JumpPower^2/(2*Workspace.Gravity) end
+    if height>jumpHeight+.5 then farm.cancelWalk();farm.status("Ammo Box top exceeds native jump height");return false end
+    if os.clock()-state.at>8 then
+        farm.cancelWalk();state.retryAt=os.clock()+3;state.at=state.retryAt;state.phase=nil;state.approach=nil;state.best=nil
+        farm.status("Ammo Box ascent stalled; stopping before retry");return false
+    end
+    if farm.route or farm.pathBusy then farm.cancelWalk() end
+    farm.stopSprint();state.phase="mounting";farm.moving=true;farm.walkPoint=goal
+    humanoid:MoveTo(goal)
+    if height>.65 and farm.grounded(humanoid,root) and os.clock()>=(state.jumpAt or 0) then
+        humanoid.Jump=true;farm.jumpUntil=os.clock()+.25;state.jumpAt=os.clock()+1
+    end
+    farm.status("Jumping / adjusting onto Ammo Box top");return false
+end
+
 local conflicts={"AutoVote","AutoSkip","AutoEquip","AutoUpgrade1","AutoUpgrade2","AutoUpgrade3","AutoPurchase","AutoDonate","AutoC96","AutoLeaveSpawn","MeleeAura"}
 function farm.begin()
-    farm.avoidLadder=nil
     farm.runId=(farm.runId or 0)+1
     if runtime.cancelRefill then runtime.cancelRefill() end
     if runtime.cancelAction then runtime.cancelAction() end
     farm.stage=1;farm.character=LocalPlayer.Character;farm.map=child(Workspace,"Map");farm.mapId=farm.mapName();farm.requestAt=farm.requestAt or 0;farm.active=true
-    farm.ledgeSince=nil;farm.ledgeBlocked=nil;farm.ledgeStableAt=nil;farm.ledgeJumpAt=0
+    farm.ammoTop=nil;farm.ammoScanAt=0;farm.boxPosition=nil
     farm.waitReason=nil;farm.waitSince=nil
     farm.earlyDone=false
-    farm.roofReached=false;farm.recovering=nil;farm.lastWave=nil;farm.purchaseBudget=nil
+    farm.positionReached=false;farm.recovering=nil;farm.lastWave=nil;farm.purchaseBudget=nil
     farm.healingDone=false;farm.healingBuyAt=0
     farm.healthDone=false
     farm.forwardDone=false;farm.forwardGoal=nil;farm.forwardScanAt=0
-    farm.roofScanAt=0;farm.roofGoal=nil;farm.pathAt=0;farm.ladder=nil;farm.fault=nil;farm.exitTransit=nil;farm.exitWalking=nil
+    farm.pathAt=0;farm.fault=nil;farm.exitTransit=nil;farm.exitWalking=nil
     farm.savedTrigger=config.Triggerbot;triggerToggle:SetValue(false)
     for _,key in ipairs(conflicts) do if e[key] then e[key]=false;if ui[key] then ui[key]:SetValue(false) end end end
     farm.status("Starting ordered C96 autofarm.")
@@ -3950,13 +3926,13 @@ function farm.stop()
     farm.runId=(farm.runId or 0)+1
     farm.cancelWalk()
     farm.exitTransit=nil;farm.exitWalking=nil
-    farm.ladder=nil
     if farm.active then triggerToggle:SetValue(farm.savedTrigger==true) end
     farm.active=false;farm.status("Off")
 end
 function farm.equipC96()
     local character,humanoid=alive();local tool=child(character,"C96") or child(child(LocalPlayer,"Backpack"),"C96")
     if not humanoid or not tool then return false end
+    if farm.sprintSavedTool then return false end
     if tool.Parent==character then return true end
     if runtime.consumableBusy or runtime.refillBusy or reloadState.key then farm.waitStatus("item use/refill/reload before C96 equip");return false end
     if tool.Parent~=character then if not releaseHeld() then return false end;humanoid:EquipTool(tool) end
@@ -3969,20 +3945,20 @@ function farm.resumeCharacter()
     if runtime.cancelRefill then runtime.cancelRefill() end
     if runtime.cancelAction then runtime.cancelAction() end
     farm.character=LocalPlayer.Character;farm.recovering=1
-    farm.exitTransit=nil;farm.exitWalking=nil;farm.ladder=nil;farm.pathAt=0
-    farm.ledgeSince=nil;farm.ledgeBlocked=nil;farm.ledgeStableAt=nil;farm.ledgeJumpAt=0
+    farm.exitTransit=nil;farm.exitWalking=nil;farm.pathAt=0
+    farm.ammoTop=nil;farm.ammoScanAt=0;farm.boxPosition=nil
     farm.forwardDone=true;farm.next=0
     triggerToggle:SetValue(false);releaseHeld()
 end
 function farm.ongoingSkip()
     local values=child(storage(),"Values")
     local currentWave=readValue(values,"LocalWave")
-    if not e.Autofarm or (not farm.roofReached and not (finite(currentWave) and currentWave>5)) or farm.recovering then return end
+    if not e.Autofarm or (not farm.positionReached and not (finite(currentWave) and currentWave>5)) or farm.recovering then return end
     if (readValue(values,"LocalLives") or 1)<=0 or (readValue(values,"VotingTime") or 0)>0 then return end
     if readValue(values,"Vote")~=true or readValue(LocalPlayer,"Voted")~=false then return end
     local run,character,map,wave=farm.runId,LocalPlayer.Character,child(Workspace,"Map"),readValue(values,"LocalWave")
     job("Farm skip",3,function()
-        if e.Autofarm and farm.active and (farm.roofReached or (finite(wave) and wave>5)) and not farm.recovering and farm.runId==run
+        if e.Autofarm and farm.active and (farm.positionReached or (finite(wave) and wave>5)) and not farm.recovering and farm.runId==run
             and LocalPlayer.Character==character and child(Workspace,"Map")==map
             and readValue(values,"LocalWave")==wave and (readValue(values,"LocalLives") or 1)>0
             and (readValue(values,"VotingTime") or 0)<=0 and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==false then state.skip() end
@@ -3997,7 +3973,7 @@ function farm.step()
     if farm.map~=child(Workspace,"Map") or farm.mapId~=farm.mapName() or newRound then
         farm.stop();farm.begin()
     elseif farm.character~=LocalPlayer.Character then
-        if farm.roofReached or farm.stage>=7 then farm.roofReached=true;farm.resumeCharacter()
+        if farm.positionReached or farm.stage>=6 then farm.positionReached=true;farm.resumeCharacter()
         else farm.stop();farm.begin() end
     end
     farm.lastWave=wave;farm.lastTick=os.clock()
@@ -4013,10 +3989,10 @@ function farm.step()
     if (readValue(values,"LocalLives") or 1)<=0 then farm.cancelWalk();triggerToggle:SetValue(false);farm.status("Run lost; waiting for map voting.");return end
     local _,humanoid=alive()
     if not humanoid then
-        if farm.roofReached or farm.stage>=7 then farm.roofReached=true;farm.recovering=1 end
+        if farm.positionReached or farm.stage>=6 then farm.positionReached=true;farm.recovering=1 end
         farm.cancelWalk();farm.status("Waiting for respawn.");return
     end
-    if farm.stage>=7 then farm.roofReached=true end
+    if farm.stage>=6 then farm.positionReached=true end
     -- Some returns to spawn keep the Character instance, or finish between
     -- polling ticks. Reconcile the live interaction region as well as identity.
     if not farm.recovering and farm.stage>=3 then
@@ -4024,24 +4000,24 @@ function farm.step()
         local spawn=child(child(storage(),"ShopRegions"),"SpawnExit")
         local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
         if minutes>=360 and minutes<1080 and readValue(LocalPlayer,"CanExitSpawn")==true and farm.inRegion(root,spawn) then
-            if farm.roofReached then farm.resumeCharacter()
+            if farm.positionReached then farm.resumeCharacter()
             else
                 farm.resumeCharacter();farm.recovering=nil;farm.stage=1;farm.forwardDone=false
             end
         end
     end
-    -- Recovery holds ready-up until the character is safely back on the ledge.
+    -- Recovery holds ready-up until the character is securely back on the Ammo Box.
     if farm.recovering then
         if farm.recovering<=2 then
             if farm.leave(farm.recovering) then farm.recovering=farm.recovering+1 end
         else
             if farm.equipC96() and not config.Triggerbot then triggerToggle:SetValue(true) end
-            if farm.roof() then farm.recovering=nil;farm.status("Respawn recovery complete; resuming upgrades and ready-up.") end
+            if farm.holdAmmoBox() then farm.recovering=nil;farm.status("Respawn recovery complete; resuming upgrades and ready-up.") end
         end
         return
     end
     farm.ongoingSkip()
-    if runtime.action and farm.stage>=3 then farm.waitStatus("active item action; rooftop ready-up remains independent");return end
+    if runtime.action and farm.stage>=3 then farm.waitStatus("active item action; ready-up remains independent");return end
     if os.clock()<farm.next then return end;farm.next=os.clock()+.1
     if farm.stage>=3 and not farm.forwardDone then
         if not farm.forwardPosition() then return end
@@ -4050,11 +4026,11 @@ function farm.step()
     if farm.stage>=3 then
         if farm.equipC96() then
             if not config.Triggerbot then triggerToggle:SetValue(true) end
-        elseif farm.stage<7 then farm.status("Waiting to equip C96.");return end
+        elseif farm.sprintSavedTool then farm.status("Sprinting on clear route; C96 resumes at approach")
+        elseif farm.stage<6 then farm.status("Waiting to equip C96.");return end
     end
-    if farm.stage>=7 and (farm.healthDue() or farm.healingDue() or (farm.stage~=8 and farm.stage~=11)) and not farm.roof() then return end
+    if farm.stage>=6 and (farm.healthDue() or farm.healingDue() or (farm.stage~=7 and farm.stage~=10)) and not farm.holdAmmoBox() then return end
     if farm.stage>=3 and not farm.healthPriority() then return end
-    if farm.stage>=3 and not farm.healingPriority() then return end
     local done=false
     if farm.stage==1 then done=farm.leave(1)
     elseif farm.stage==2 then done=farm.leave(2)
@@ -4063,29 +4039,29 @@ function farm.step()
         done=readValue(LocalPlayer,"FirstWave")==false
         if not done and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==false then job("Farm first night",3,state.skip) end
         if not done then farm.status("Waiting for first night completion; vote alone is not completion.") end
-    elseif farm.stage==5 then done=farm.upgrades("Ladders",{Ladders=true},true)
-    elseif farm.stage==6 then
+    elseif farm.stage==5 then
         if not farm.earlyDone then
             if not farm.earlyWaves() then return end
             farm.earlyDone=true
         end
-        done=farm.roof()
-    elseif farm.stage==7 then done=farm.priorityUpgrades()
-    elseif farm.stage==8 then done=farm.upgrades("Armour",{ArmourDurability=true,Absorption=true})
-    elseif farm.stage==9 then done=farm.upgrades("Barricade")
-    elseif farm.stage==10 then done=farm.upgrades("Shop")
-    elseif farm.stage==11 then done=farm.nightVisionAndDrinks()
-    elseif farm.stage==12 then done=farm.sniperAndHandling()
+        done=farm.holdAmmoBox()
+    elseif farm.stage==6 then done=farm.priorityUpgrades()
+    elseif farm.stage==7 then done=farm.upgrades("Armour",{ArmourDurability=true,Absorption=true})
+    elseif farm.stage==8 then done=farm.upgrades("Barricade")
+    elseif farm.stage==9 then done=farm.upgrades("Shop")
+    elseif farm.stage==10 then done=farm.nightVisionAndDrinks()
+    elseif farm.stage==11 then done=farm.sniperAndHandling()
+    elseif farm.stage==12 then done=farm.healingPriority()
     elseif farm.stage==13 then done=farm.upgrades("MortarSquad")
     else
-        if not farm.roof() then return end
+        if not farm.holdAmmoBox() then return end
         done=farm.upgrades("AmmoBox",{AmmoDamage=true})
-        if done then farm.status("All available ordered upgrades complete. Holding roof, C96 and skip.") end
+        if done then farm.status("All available ordered upgrades complete. Holding Ammo Box, C96 and skip.") end
         return
     end
     if done then
         farm.stage=farm.stage+1
-        if farm.stage==7 then farm.roofReached=true end
+        if farm.stage==6 then farm.positionReached=true end
         farm.status("Autofarm stage "..farm.stage)
     end
 end
@@ -4115,7 +4091,7 @@ local farmGroup=automation:AddLeftGroupbox("C96 autofarm")
 control(farmGroup,"Autofarm","One-click C96 autofarm")
 control(farmGroup,"AutoLeaveSpawn","Auto Leave Spawn")
 farm.label=runtime.label(farmGroup,"Off",true)
-runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Sniper is followed by Body Building Handling. Wave 21 prioritizes healing items; wave 28 prioritizes Max Health and Health Regen, then resumes interrupted upgrades. Weapon and support settings are preserved. Backup Weapon and Rooftop Camper required. Live routes remain unverified.",true)
+runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Sniper is followed by Body Building Handling, then Bandage, First Aid Kit and Booster Kit before Mortar Squad. Wave 28 prioritizes Max Health and Health Regen, then resumes interrupted upgrades. Weapon and support settings are preserved. Backup Weapon required for starting C96. Farm stands on the shop Ammo Box; no roof access or Rooftop Camper required. Live routes remain unverified.",true)
 
 -- All drinks and healing items share immediate backpack requests. Never equip,
 -- synthesize input, wait for animations, or take the gun/movement lock here.
@@ -4361,14 +4337,14 @@ function farm.loadWebhook()
     w.saveMessage="Saved webhook settings loaded."
 end
 function farm.webhookStep()
-    if farm.recovering then return "Returning to roof after respawn" end
+    if farm.recovering then return "Returning to Ammo Box after respawn" end
     if farm.healthDue() then return "Max Health / Health Regen" end
     if farm.healingDue() then return "Healing items and upgrades" end
-    if farm.stage==6 then
+    if farm.stage==5 then
         local wave=readValue(child(storage(),"Values"),"LocalWave") or 0
-        return wave>=5 and "Climbing to roof" or "Early farming: C96 / Shop Money"
+        return wave>=5 and "Mounting Ammo Box" or "Early farming: C96 / Shop Money"
     end
-    local names={"Leaving spawn","Leaving shop","C96 Unlimited Ammo","Completing first night","Roof access / ladder","Early farming","C96 / Shop Money","Armour upgrades","Barricade upgrades","Shop upgrades","Night Vision / drinks","Sniper / Handling Speed","Mortar upgrades"}
+    local names={"Leaving spawn","Leaving shop","C96 Unlimited Ammo","Completing first night","Early farming / Ammo Box","C96 / Shop Money","Armour upgrades","Barricade upgrades","Shop upgrades","Night Vision / drinks","Sniper / Handling Speed","Healing items and upgrades","Mortar upgrades"}
     return names[farm.stage] or "Ammo Box damage upgrades"
 end
 function farm.webhookURL(value)
@@ -4448,23 +4424,18 @@ function farm.grounded(humanoid,root)
     local velocity=root.AssemblyLinearVelocity
     return material~=nil and material~=Enum.Material.Air and (not velocity or math.abs(velocity.Y)<2)
 end
-function farm.ledgeSupported(root,ledge,offset)
-    local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Include
-    params.FilterDescendantsInstances={ledge};params.RespectCanCollide=true
-    local hit=Workspace:Raycast(root.Position,Vector3.new(0,-offset-.75,0),params)
-    return hit and hit.Instance==ledge and hit.Normal.Y>.8 or false
+function farm.nativeSprinting()
+    local actions=child(child(LocalPlayer,"PlayerScripts"),"PlayerActions")
+    return readValue(actions,"Sprinting")
 end
-function farm.ladderApproach(approach,root,humanoid)
-    local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances={LocalPlayer.Character};params.RespectCanCollide=true
-    local hit=Workspace:Raycast(approach+Vector3.new(0,6,0),Vector3.new(0,-24,0),params)
-    if not hit or not hit.Normal or hit.Normal.Y<.8 then return nil end
-    local leg=child(LocalPlayer.Character,"Left Leg")
-    if not root.Size then return nil end
-    local offset=(humanoid.HipHeight or 0)+root.Size.Y/2+(leg and leg.Size.Y or 0)
-    local goal=hit.Position+Vector3.new(0,offset,0)
-    if math.abs(goal.Y-root.Position.Y)>3 then return nil end
-    return goal
+function farm.restoreSprintTool()
+    local saved=farm.sprintSavedTool
+    if not saved then return end
+    farm.sprintSavedTool=nil
+    local character,humanoid=alive()
+    if character==saved.character and humanoid and saved.tool.Parent==child(LocalPlayer,"Backpack") and not character:FindFirstChildOfClass("Tool") then
+        pcall(function() humanoid:EquipTool(saved.tool) end)
+    end
 end
 function farm.sprintKey(key,down)
     if virtualInput then virtualInput:SendKey(down,key,false)
@@ -4473,16 +4444,23 @@ function farm.sprintKey(key,down)
 end
 function farm.stopSprint()
     local held=farm.sprintHeld
-    if not held then return end
+    if not held then farm.restoreSprintTool();return end
     local ok=pcall(function()
-        if held.toggle then farm.sprintKey(held.key,true) end
+        -- Only turn native toggle sprint off when its replicated local state is on.
+        if held.toggle and farm.nativeSprinting()==true then farm.sprintKey(held.key,true) end
         farm.sprintKey(held.key,false)
     end)
-    if ok then farm.sprintHeld=nil else farm.motionStatus="Sprint release failed; retrying" end
+    if ok then farm.sprintHeld=nil;farm.restoreSprintTool() else farm.motionStatus="Sprint release failed; retrying" end
 end
 function farm.sprint(wanted)
     if not wanted then farm.stopSprint();return end
-    if farm.sprintHeld then return end
+    if farm.sprintHeld then
+        if farm.sprintHeld.toggle and farm.nativeSprinting()==false and os.clock()-farm.sprintHeld.at>.75 then
+            farm.stopSprint();farm.sprintRetryAt=os.clock()+1
+        end
+        return
+    end
+    if os.clock()<(farm.sprintRetryAt or 0) then return end
     local data=_G.LocalReplicatedDataStore
     if type(getrenv)=="function" then
         local ok,env=pcall(getrenv)
@@ -4491,14 +4469,23 @@ function farm.sprint(wanted)
     local key=data and data.KeyBinds and data.KeyBinds.Sprint
     if type(key)=="string" then key=Enum.KeyCode[key] end
     if not key or not data then farm.motionStatus="Walking: sprint binding unavailable";return end
-    -- Toggle sprint can be independently cancelled by the native weapon script;
-    -- only hold mode gives us an unambiguous release without toggling it back on.
-    if data.ToggleSprint~=false then farm.motionStatus="Walking: use Hold Sprint for automatic sprint";return end
+    local toggle=data.ToggleSprint==true
+    if toggle and type(farm.nativeSprinting())~="boolean" then farm.motionStatus="Walking: native toggle sprint state unavailable";return end
     if UIS:GetFocusedTextBox() or guiService.MenuIsOpen then return end
     if UIS:IsKeyDown(key) then return end
-    local ok=pcall(farm.sprintKey,key,true)
-    if ok then farm.sprintHeld={key=key};farm.motionStatus="Sprinting"
-    else farm.motionStatus="Walking: sprint input unavailable" end
+    if toggle and farm.nativeSprinting()==true then return end -- Leave a user's existing sprint alone.
+    local character,humanoid=alive()
+    local armed=character and character:FindFirstChildOfClass("Tool")
+    if armed and not child(child(LocalPlayer,"PlayerPerks"),"RunGun") then
+        if not e.Autofarm or not child(armed,"GunScript") or not releaseHeld() then return end
+        farm.sprintSavedTool={character=character,tool=armed}
+        local stowed=pcall(function() humanoid:UnequipTools() end)
+        if not stowed or character:FindFirstChildOfClass("Tool") then farm.restoreSprintTool();return end
+    end
+    farm.sprintHeld={key=key,toggle=toggle,at=os.clock()}
+    local ok=pcall(function() farm.sprintKey(key,true);if toggle then farm.sprintKey(key,false) end end)
+    if ok then farm.motionStatus="Sprint requested"
+    else farm.motionStatus="Walking: sprint input unavailable";farm.stopSprint() end
 end
 function farm.clearGroundSegment(root,destination)
     local delta=Vector3.new(destination.X-root.Position.X,0,destination.Z-root.Position.Z)
@@ -4506,13 +4493,15 @@ function farm.clearGroundSegment(root,destination)
     local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances={LocalPlayer.Character};params.RespectCanCollide=true
     local sideways=Vector3.new(-delta.Unit.Z,0,delta.Unit.X)*1.5
+    local _,humanoid=alive()
+    local standingOffset=root.Size and humanoid and farm.rootOffset(LocalPlayer.Character,humanoid,root) or 3
     for _,offset in ipairs({Vector3.new(0,0,0),sideways,sideways*-1}) do
         if Workspace:Raycast(root.Position+offset,delta,params) then return false end
     end
     for distance=0,delta.Magnitude+2,2 do
         local origin=root.Position+delta.Unit*math.min(distance,delta.Magnitude)
         local floor=Workspace:Raycast(origin,Vector3.new(0,-6,0),params)
-        if not floor or floor.Normal.Y<.8 or math.abs(floor.Position.Y-(root.Position.Y-3))>1.5 then return false end
+        if not floor or floor.Normal.Y<.8 or math.abs(floor.Position.Y-(root.Position.Y-standingOffset))>1.5 then return false end
     end
     return true
 end
@@ -4525,7 +4514,7 @@ function farm.movementTarget(route,root)
         local candidate=route.points[i]
         local delta=Vector3.new(candidate.Position.X-root.Position.X,0,candidate.Position.Z-root.Position.Z)
         local dot=base.Unit.X*delta.Unit.X+base.Unit.Z*delta.Unit.Z
-        if delta.Magnitude>12 or math.abs(candidate.Position.Y-target.Y)>1 or candidate.Action==Enum.PathWaypointAction.Jump or delta.Magnitude<.1 or dot<.98 then break end
+        if delta.Magnitude>20 or math.abs(candidate.Position.Y-target.Y)>1 or candidate.Action==Enum.PathWaypointAction.Jump or delta.Magnitude<.1 or dot<.98 then break end
         target=candidate.Position
     end
     if target~=point.Position and farm.clearGroundSegment(root,target) then return target end
@@ -4544,24 +4533,43 @@ function farm.motionTick(humanoid,root)
     local route=farm.route
     local values=child(LocalPlayer,"PlayerValues")
     local stamina,maximum=readValue(values,"Stamina"),readValue(values,"StaminaMax")
+    if not finite(maximum) or maximum<=0 then
+        if os.clock()>=(farm.staminaMaxAt or 0) then
+            farm.staminaMaxAt=os.clock()+.5
+            local ok,value=pcall(function() return gameModule("CharacterManager"):GetValue("MaxStamina",LocalPlayer) end)
+            farm.staminaMaximum=ok and finite(value) and value>0 and value or nil
+        end
+        maximum=farm.staminaMaximum
+    end
     local ratio=finite(stamina) and finite(maximum) and maximum>0 and stamina/maximum or 0
-    if ratio<=.3 then farm.staminaRest=true elseif ratio>=.6 then farm.staminaRest=false end
+    if ratio<=.2 then farm.staminaRest=true elseif ratio>=.45 then farm.staminaRest=false end
     local wanted=false
-    if route and farm.walkPoint and not UIS:GetFocusedTextBox() and not guiService.MenuIsOpen and not farm.retreat and not farm.exitWalking and not farm.climbDirection and not farm.ladder and not farm.roofReached
-        and not farm.staminaRest and ratio>.3 and not runtime.consumableBusy and not runtime.refillBusy and not runtime.action and not reloadState.key
+    if route and farm.walkPoint and not UIS:GetFocusedTextBox() and not guiService.MenuIsOpen and not farm.retreat and not farm.exitWalking
+        and not (farm.boxPosition and farm.boxPosition.phase=="mounting")
+        and not farm.staminaRest and ratio>.2 and not runtime.consumableBusy and not runtime.refillBusy and not runtime.action and not reloadState.key
         and farm.grounded(humanoid,root) then
         local remaining=(Vector3.new(route.goal.X,0,route.goal.Z)-Vector3.new(root.Position.X,0,root.Position.Z)).Magnitude
         local ahead=(farm.walkPoint-root.Position).Magnitude
-        local armed=LocalPlayer.Character:FindFirstChildOfClass("Tool")
-        if remaining>14 and ahead>7 and (not armed or child(child(LocalPlayer,"PlayerPerks"),"RunGun")) then
+        if remaining>8 and ahead>4 then
             if os.clock()>=(farm.clearAt or 0) then
                 farm.clearAt=os.clock()+.15;farm.sprintClear=farm.clearGroundSegment(root,farm.walkPoint)
             end
-            wanted=farm.sprintClear==true
+            wanted=farm.sprintClear==true and not farm.sprintThreat(root)
         end
     end
     farm.sprint(wanted)
     if not wanted and not farm.sprintHeld then farm.motionStatus=farm.retreat and "Backing up and replanning" or (farm.staminaRest and "Walking: preserving stamina" or "Walking / precise approach") end
+end
+function farm.sprintThreat(root)
+    if os.clock()>=(farm.sprintThreatAt or 0) then
+        farm.sprintThreatAt=os.clock()+.25;farm.sprintThreatPresent=false
+        for _,zombie in ipairs(zombiesFolder:GetChildren()) do
+            local humanoid=zombie:FindFirstChildOfClass("Humanoid")
+            local body=child(zombie,"HumanoidRootPart") or child(zombie,"Torso") or child(zombie,"UpperTorso") or child(zombie,"Head")
+            if humanoid and humanoid.Health>0 and body and (body.Position-root.Position).Magnitude<40 then farm.sprintThreatPresent=true;break end
+        end
+    end
+    return farm.sprintThreatPresent
 end
 function farm.backoff(root,point,goal)
     local away=Vector3.new(root.Position.X-point.X,0,root.Position.Z-point.Z)
@@ -4610,7 +4618,7 @@ connect(RunService.Heartbeat,function()
     if not e.Autofarm then return end
     pcall(function()
         local wave=readValue(child(storage(),"Values"),"LocalWave") or 0
-        local priority=farm.healthDue() and "Wave 28 health" or (farm.healingDue() and "Wave 21 healing" or "Normal upgrades")
+        local priority=farm.healthDue() and "Wave 28 health" or (farm.healingDue() and "Post-Handling healing" or "Normal upgrades")
         local purchase=farm.purchaseBudget
         local nextPurchase=purchase and (tostring(purchase.item).." ($"..math.ceil(purchase.cost)..")") or "Waiting for purchase selection"
         local text="Step: "..farm.webhookStep().."\nPurchase: "..nextPurchase.."\n"..farm.purchaseSummary().."\nPriority: "..priority.."\nNext drinks: "..farm.nextDrinkSummary(wave,game:GetService("Lighting"):GetMinutesAfterMidnight()).."\nMovement: "..(farm.motionStatus or "Idle")
@@ -4662,12 +4670,12 @@ function farm.voteStatus()
         return "Ready-up: local vote recorded; counted votes "..tostring(count or "unknown")
     end
     if readValue(LocalPlayer,"Voted")~=false then return "Ready-up: player vote state unavailable" end
-    if farm.recovering then return "Ready-up: held while returning from spawn to roof" end
+    if farm.recovering then return "Ready-up: held while returning from spawn to Ammo Box" end
     if state.skipLastWave==wave and state.skipLastError then return "Ready-up request failed: "..state.skipLastError end
     if state.jobs["Farm skip"] then return "Ready-up: vote dispatch queued/in flight" end
     if state.skipLastWave==wave and state.skipLastResult=="not acknowledged" then return "Ready-up: game did not acknowledge vote; retrying" end
-    if farm.roofReached or (finite(wave) and wave>5) then return "Ready-up: eligible; automatic vote scheduled" end
-    if wave==5 then return "Ready-up: holding wave 5 until first rooftop arrival" end
+    if farm.positionReached or (finite(wave) and wave>5) then return "Ready-up: eligible; automatic vote scheduled" end
+    if wave==5 then return "Ready-up: holding wave 5 until first Ammo Box arrival" end
     return "Ready-up: early-wave sequence controls this vote"
 end
 function farm.voteMonitor()
@@ -4708,8 +4716,9 @@ function farm.deathSample(humanoid)
         map=farm.mapName(),step=farm.stage,health=humanoid and humanoid.Health,
         position=vector(root and root.Position),velocity=vector(root and root.AssemblyLinearVelocity),
         floor=humanoid and tostring(humanoid.FloorMaterial),state=humanoid and tostring(humanoid:GetState()),
-        recovering=farm.recovering,ladder=farm.ladder and farm.ladder.phase,moving=farm.moving==true,
-        drink=runtime.consumables.lastItem,
+        recovering=farm.recovering,positionPhase=farm.boxPosition and farm.boxPosition.phase,moving=farm.moving==true,
+        drink=runtime.consumables.lastItem,target=runtime.targetName,targetTier=runtime.targetTier,
+        nearbyBlocked=runtime.targetBlocked,lastShotRedirectAge=runtime.lastRedirect and os.clock()-runtime.lastRedirect,
         exit=farm.exitTransit and farm.exitTransit.which,nativeDamageCounter=farm.diagnostics.damageValue}
     if root then
         local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
