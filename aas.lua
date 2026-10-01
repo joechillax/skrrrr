@@ -1,4 +1,4 @@
--- JoesAAS 4.5 | standalone source | September 2026
+-- JoesAAS 4.6 | standalone source | September 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -421,6 +421,7 @@ return function(A)
     end
     function A.finishStartup()
         A.setRunning(true)
+        if A.flushJoinDiagnostics then A.flushJoinDiagnostics(true) end
     end
     function A.save()
         if type(writefile)~='function' or type(readfile)~='function' or type(makefolder)~='function' then
@@ -1205,7 +1206,7 @@ return function(A)
                         context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
                 end
                 local ctrl=A.client('TeleportController')
-                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='4.5',reason=message,
+                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='4.6',reason=message,
                     context=A.player:GetAttribute('VisibilityContext'),room=state[keyField]==key and state.Room,
                     serverEnemies=state[keyField]==key and state.EnemyCount,anchored=root and root.Anchored,
                     loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
@@ -1325,14 +1326,14 @@ return function(A)
         end
         dirty=true
     end
-    function A.flushJoinDiagnostics()
-        if not dirty then return true end
-        if type(writefile)~='function' then A.status['Join diagnostics']='File writing unavailable'; return false end
+    function A.flushJoinDiagnostics(force)
+        if not dirty and not force then return true end
+        if type(writefile)~='function' then A.status['Join diagnostics']='File writing unavailable: '..path; return false end
         local ctrl=A.client('TeleportController')
         local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
         local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
         local activityJob=A.tasks.Activities
-        local snapshot={schema=1,version='4.5',userId=A.player.UserId,gameId=game.GameId,
+        local snapshot={schema=1,version='4.6',userId=A.player.UserId,gameId=game.GameId,
             savedAt=os.time(),context=A.player:GetAttribute('VisibilityContext'),running=A.running,
             activities=A.status.Activities,error=A.status['Activity error'],events=events,openings=openings,
             coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
@@ -1341,14 +1342,20 @@ return function(A)
         for _,key in ipairs({'towerAutoJoin','towerSelection','trialAutoJoin','trialJoinSelection','dungeonAutoJoin',
             'dungeonSelection','gateAutoJoin','gateSelection','gateRanks','raidAutoJoin','raidSelection',
             'defenseAutoJoin','defenseSelection','bossRushAutoJoin','bossRushSelection'}) do snapshot.settings[key]=A.settings[key] end
-        local ok,err=pcall(function() writefile(path,A.S.HTTP:JSONEncode(snapshot)) end)
-        A.status['Join diagnostics']=ok and 'Recording: join-diagnostics.json' or ('Save failed: '..tostring(err))
+        local ok,err=pcall(function()
+            if type(makefolder)=='function' then pcall(makefolder,'JoesAAS'); pcall(makefolder,A.folder) end
+            local encoded=A.S.HTTP:JSONEncode(snapshot)
+            writefile(path,encoded)
+            if type(readfile)=='function' then assert(readfile(path)==encoded,'Diagnostic read-back failed') end
+        end)
+        A.status['Join diagnostics']=ok and ('Saved: '..path) or ('Save failed: '..path..' - '..tostring(err))
         if ok then dirty=false end
         return ok
     end
     A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),function() A.joinTrace('context',{}) end)
     A.job('Join diagnostics',5,A.flushJoinDiagnostics,true)
     A.joinTrace('script started',{})
+    A.flushJoinDiagnostics(true)
 end
 
 end)()(A);
@@ -2039,7 +2046,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='4.5',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='4.6',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2293,6 +2300,7 @@ return function(A)
     note('Farm','Trial priority','Insane > Hard > Medium > Easy among selected trials currently open. An active trial always finishes first.')
     status('Modes','Activities')
     status('Modes','Activity error'); status('Modes','Join diagnostics')
+    button('Modes','Save join diagnostics now',function() A.flushJoinDiagnostics(true) end)
     note('Modes','Raid / Defense','Raid starts YOUR OWN run only; never joins other raids. Defense starts or joins an available run. Normal entry costs apply; errors appear above.')
     note('Modes','Activity priority','Tower > Time Trials > Dungeon > Gate > Raid / Defense > Boss Rush > mob farming. Tower, Trial and Dungeon runs finish or fail before switching. Gate can yield to a higher-priority mode. Raid wins a tie with Defense; an active run keeps its place.')
     note('Modes','Transfers','Tower, Trials and Dungeons use direct native entry. Gate and lower modes wait for normal exit. Gate and Tower stay at their join position.')
