@@ -3247,7 +3247,18 @@ function state.actions()
     if e.MeleeAura and os.clock()>=(state.meleeAt or 0) then state.meleeAt=os.clock()+.05;state.melee() end
 end
 
-local function availableMoney() return math.max(0,(readValue(LocalPlayer,"ReplicatedMoney") or 0)-e.MoneyReserve) end
+function state.purchaseReserve(maintenance)
+    local reserve=e.MoneyReserve
+    if e.Autofarm and not maintenance then
+        local wave=readValue(child(storage(),"Values"),"LocalWave") or 0
+        local floor=wave>=30 and 40000 or (wave>=25 and 35000 or (wave>=20 and 20000 or 0))
+        reserve=math.max(reserve,floor)
+    end
+    return reserve
+end
+local function availableMoney(maintenance)
+    return math.max(0,(readValue(LocalPlayer,"ReplicatedMoney") or 0)-state.purchaseReserve(maintenance))
+end
 function state.upgradeTool(name,upgradeName,farmOwned)
     if not farmOwned and (e.Autofarm or (e.AutoC96 and name=="C96")) then return false end
     local _,tools=ownedTools();local tool=tools[name]
@@ -3325,14 +3336,14 @@ function state.repair(name)
         local time=game:GetService("Lighting"):GetMinutesAfterMidnight()
         if time<360 or time>=1080 then return false end
         local amount
-        amount,cost=gameModule("Utility"):GetStructureRepairInfo(name,availableMoney())
+        amount,cost=gameModule("Utility"):GetStructureRepairInfo(name,availableMoney(true))
         if type(amount)~="number" or amount<=0 then return false end
     end
-    if type(cost)~="number" or cost>availableMoney() then return false end
+    if type(cost)~="number" or cost>availableMoney(true) then return false end
     -- RepairStructure computes against the full balance. Do not let a partial repair cross the reserve.
     if name~="Armour" then
         local _,fullCost=gameModule("Utility"):GetStructureRepairInfo(name,readValue(LocalPlayer,"ReplicatedMoney") or 0)
-        if type(fullCost)~="number" or fullCost>availableMoney() then return false end
+        if type(fullCost)~="number" or fullCost>availableMoney(true) then return false end
     end
     if name=="Armour" then
         if os.clock()<(state.armourRetryAt or 0) then return false end
@@ -3520,9 +3531,10 @@ function farm.request(object,cost,event,...)
     local cash=readValue(LocalPlayer,"ReplicatedMoney")
     if not finite(cash) then farm.status("Waiting for numeric ReplicatedMoney; balance unavailable.");return false end
     local budget=availableMoney()
-    farm.purchaseBudget={item=object.Name,cost=cost,cash=cash,reserve=e.MoneyReserve,available=budget,at=os.clock()}
+    local reserve=state.purchaseReserve()
+    farm.purchaseBudget={item=object.Name,cost=cost,cash=cash,reserve=reserve,available=budget,at=os.clock()}
     if cost>budget then
-        farm.status("Saving for "..object.Name..": cost "..math.ceil(cost)..", cash "..math.floor(cash)..", reserve "..tostring(e.MoneyReserve)..", available "..math.floor(budget));return false
+        farm.status("Saving for "..object.Name..": cost "..math.ceil(cost)..", cash "..math.floor(cash)..", reserve "..tostring(reserve)..", available "..math.floor(budget));return false
     end
     local _,humanoid=alive()
     if not humanoid then farm.waitStatus("living character before purchase");return false end
@@ -3538,6 +3550,12 @@ function farm.request(object,cost,event,...)
         if farm.healthDue() then
             if not (args[1]=="Health" and (event=="BuyPlayerUpgrade" or (event=="UpgradeStructurePlayer" and (args[2]=="Health" or args[2]=="HealthRegen")))) then farm.inFlight=false;return end
         elseif farm.healingDue() and not ((event=="UpgradeWeapon" or event=="BuyHealing") and farm.healingItem(args[1])) then farm.inFlight=false;return end
+        -- A queued job must respect a newly reached wave floor or maintenance spending.
+        if cost>availableMoney() then
+            observation.state="Waiting for purchase budget";farm.inFlight=false
+            farm.status("Purchase held: "..object.Name.."; reserve "..tostring(state.purchaseReserve()))
+            return
+        end
         local ok,result=pcall(function()
             if event=="BuyHealing" then
                 farm.healingBuyAt=os.clock()+3
@@ -4175,19 +4193,33 @@ connect(RunService.Heartbeat,runtime.instantConsumableMonitor)
 table.insert(runtime.connections,{Disconnect=function() runtime.cancelInstantConsumables() end})
 
 -- One activation per drink per night slot; routing does not own the clock.
+function farm.tripleDrinkWave(wave)
+    return finite(wave) and wave>0 and wave%5==0
+end
+function farm.drinkEligible(wave,minimumWave)
+    return finite(wave) and (wave>=minimumWave or farm.tripleDrinkWave(wave))
+end
+function farm.drinkSlots(wave)
+    if farm.tripleDrinkWave(wave) then
+        return {{key="evening",at="18:15",minutes=1095},{key="midnight",at="00:05",minutes=5},{key="late",at="00:40",minutes=40}}
+    end
+    return {{key="evening",at="18:15",minutes=1095},{key="midnight",at="00:10",minutes=10}}
+end
+function farm.drinkTimes(wave)
+    return farm.tripleDrinkWave(wave) and "18:15 / 00:05 / 00:40" or "18:15 / 00:10"
+end
 function farm.drinkSchedule(wave,minutes,map,minimumWave)
     local clock=farm.drinkClock
-    if not clock or clock.map~=map or wave<clock.wave then
+    if not clock or clock.map~=map or wave~=clock.wave then
         clock={map=map,wave=wave,slots={}};farm.drinkClock=clock
     end
-    clock.wave=wave
-    if wave<(minimumWave or 15) then return clock end
-    if minutes>=1080 then
-        if clock.night~=wave then clock.night=wave;clock.slots={} end
-        if minutes>=1095 and not clock.slots.evening then clock.slots.evening={at="18:15",items={}} end
-    elseif minutes<360 then
-        if not clock.night then clock.night=wave end
-        if minutes>=10 and not clock.slots.midnight then clock.slots.midnight={at="00:10",items={}} end
+    if not farm.drinkEligible(wave,minimumWave or 15) then return clock end
+    for _,definition in ipairs(farm.drinkSlots(wave)) do
+        local due=definition.key=="evening" and minutes>=definition.minutes
+            or definition.key~="evening" and minutes<360 and minutes>=definition.minutes
+        if due and not clock.slots[definition.key] then
+            clock.slots[definition.key]={at=definition.at,items={}}
+        end
     end
     return clock
 end
@@ -4217,17 +4249,17 @@ function farm.drinkTick()
     if not finite(wave) then return end
     local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
     local clock=farm.drinkSchedule(wave,minutes,child(Workspace,"Map"),minimumWave)
-    if wave<minimumWave then return end
+    if not farm.drinkEligible(wave,minimumWave) then return end
     if minutes>=360 and minutes<1080 then
-        farm.drinkMessage="Drinks: next night at 18:15 and 00:10.";return
+        farm.drinkMessage="Drinks: wave "..wave.." schedule "..farm.drinkTimes(wave)..".";return
     end
     local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
     if not humanoid or not root or runtime.consumableBusy or runtime.refillBusy or runtime.action then return end
     local c=runtime.consumables;c.itemAt=c.itemAt or {}
     if os.clock()<(c.drinkAt or 0) then return end
     local slot;local entries={}
-    for _,key in ipairs({"evening","midnight"}) do
-        local candidate=clock.slots[key]
+    for _,definition in ipairs(farm.drinkSlots(wave)) do
+        local candidate=clock.slots[definition.key]
         if candidate then
             for _,item in ipairs(farm.drinkItems) do
                 local entry=candidate.items[item.name] or {state="pending",retryAt=0};candidate.items[item.name]=entry
@@ -4250,8 +4282,8 @@ function farm.drinkTick()
         local t=game:GetService("Lighting"):GetMinutesAfterMidnight()
         local active,currentMinimum,currentOwner=farm.drinkPolicy()
         local currentWave=readValue(values,"LocalWave")
-        return active and currentOwner==owner and finite(currentWave) and currentWave>=currentMinimum and farm.drinkClock==clock
-            and (clock.slots.evening==slot or clock.slots.midnight==slot) and (t>=1080 or t<360)
+        return active and currentOwner==owner and currentWave==clock.wave and farm.drinkEligible(currentWave,currentMinimum) and farm.drinkClock==clock
+            and (clock.slots.evening==slot or clock.slots.midnight==slot or clock.slots.late==slot) and (t>=1080 or t<360)
             and (readValue(values,"LocalLives") or 1)>0 and child(Workspace,"Map")==clock.map
             and (readValue(values,"VotingTime") or 0)<=0
     end,function(entry,status,reason)
@@ -4273,11 +4305,11 @@ function farm.drinkTick()
         end
     end
 end
-farm.drinkLabel=runtime.label(farmGroup,"Drinks: immediate backpack use at 18:15 and 00:10 from wave 15; charge confirmation required.",true)
+farm.drinkLabel=runtime.label(farmGroup,"Drinks: 18:15 / 00:10 from wave 15. Every 5th wave (including 5 and 10): 18:15 / 00:05 / 00:40. Uses owned drinks; charge confirmation required.",true)
 function farm.addNightDrinkControls(group)
     group:AddDivider()
-    control(group,"AutoNightDrinks","Auto use drinks at 18:15 / 00:10")
-    runtime.label(group,"Uses all four owned drinks immediately from your backpack every night. No equip or animation wait. Autofarm uses the same schedule from wave 15; shared tracking prevents duplicate activations.",true)
+    control(group,"AutoNightDrinks","Auto use nightly drinks")
+    runtime.label(group,"All four owned drinks: 18:15 / 00:10 normally; 18:15 / 00:05 / 00:40 on waves divisible by 5. Immediate backpack use. Autofarm starts regular nights at wave 15 and also handles waves 5 and 10. Shared tracking prevents duplicate activations.",true)
     farm.nightDrinkLabel=runtime.label(group,"Nightly drinks: off",true)
 end
 farm.addNightDrinkControls(healing)
@@ -4288,7 +4320,7 @@ function farm.showDrinks()
         if ok and result~=false then farm.drinkDisplayed=message end
     end
     local status=not e.AutoNightDrinks and "Nightly drinks: off" or
-        (e.Autofarm and "Nightly drinks: autofarm controls the wave 15+ schedule." or (message or "Nightly drinks: waiting for 18:15 / 00:10."))
+        (e.Autofarm and "Nightly drinks: autofarm controls the shared schedule." or (message or "Nightly drinks: waiting for scheduled night slots."))
     if farm.nightDrinkLabel and status~=farm.nightDrinkDisplayed then
         local ok,result=pcall(function() return farm.nightDrinkLabel:SetText(status) end)
         if ok and result~=false then farm.nightDrinkDisplayed=status end
@@ -4597,18 +4629,27 @@ function farm.purchaseSummary()
     return p.state..": "..tostring(p.item or p.name)
 end
 function farm.nextDrinkSummary(wave,minutes)
-    if wave<15 then return "Wave 15 at 18:15" end
+    if not farm.drinkEligible(wave,15) then
+        return "Wave "..math.min(15,(math.floor(wave/5)+1)*5).." at 18:15"
+    end
     if minutes>=360 and minutes<1080 then return "18:15" end
     local clock=farm.drinkClock
-    if clock then
-        for _,slot in pairs(clock.slots) do
-            for _,item in ipairs(farm.drinkItems) do
-                local entry=slot.items[item.name]
-                if not entry or entry.state=="pending" then return slot.at.." batch pending" end
+    local definitions=farm.drinkSlots(wave)
+    if clock and clock.wave==wave then
+        for _,definition in ipairs(definitions) do
+            local slot=clock.slots[definition.key]
+            if slot then
+                for _,item in ipairs(farm.drinkItems) do
+                    local entry=slot.items[item.name]
+                    if not entry or entry.state=="pending" or entry.state=="inflight" then return slot.at.." batch pending" end
+                end
             end
         end
     end
-    if minutes>=1095 or minutes<10 then return "00:10" end
+    for _,definition in ipairs(definitions) do
+        if (minutes>=1080 and (definition.key~="evening" or minutes<definition.minutes))
+            or (minutes<360 and definition.key~="evening" and minutes<definition.minutes) then return definition.at end
+    end
     return "18:15"
 end
 farm.detailLabel=runtime.label(farmGroup,"",true)
@@ -4621,7 +4662,7 @@ connect(RunService.Heartbeat,function()
         local priority=farm.healthDue() and "Wave 28 health" or (farm.healingDue() and "Post-Handling healing" or "Normal upgrades")
         local purchase=farm.purchaseBudget
         local nextPurchase=purchase and (tostring(purchase.item).." ($"..math.ceil(purchase.cost)..")") or "Waiting for purchase selection"
-        local text="Step: "..farm.webhookStep().."\nPurchase: "..nextPurchase.."\n"..farm.purchaseSummary().."\nPriority: "..priority.."\nNext drinks: "..farm.nextDrinkSummary(wave,game:GetService("Lighting"):GetMinutesAfterMidnight()).."\nMovement: "..(farm.motionStatus or "Idle")
+        local text="Step: "..farm.webhookStep().."\nPurchase: "..nextPurchase.."\n"..farm.purchaseSummary().."\nCash reserve: $"..state.purchaseReserve().."\nPriority: "..priority.."\nNext drinks: "..farm.nextDrinkSummary(wave,game:GetService("Lighting"):GetMinutesAfterMidnight()).."\nMovement: "..(farm.motionStatus or "Idle")
         if farm.detailDisplayed~=text then
             local result=farm.detailLabel:SetText(text)
             if result~=false then farm.detailDisplayed=text end
