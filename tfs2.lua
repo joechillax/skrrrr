@@ -4926,7 +4926,7 @@ function farm.wave30ResetWindow()
     local values=child(storage(),"Values")
     if readValue(values,"LocalWave")~=30 or (readValue(values,"LocalLives") or 1)<=0 or (readValue(values,"VotingTime") or 0)>0 then return false end
     local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
-    return finite(minutes) and minutes>=240 and minutes<360
+    return finite(minutes) and minutes>=270 and minutes<360
 end
 function farm.confirmWave30Death(attempt)
     if attempt.confirmed then return end
@@ -4960,7 +4960,7 @@ function farm.wave30ResetTick()
     attempt={character=character,humanoid=humanoid,at=os.clock(),phase="queued"}
     farm.resetAttempt=attempt;farm.resetCount=(farm.resetCount or 0)+1
     farm.cancelWalk();releaseHeld()
-    farm.resetMessage="Wave 30 reset queued at 04:00 or later; attempt "..farm.resetCount.."."
+    farm.resetMessage="Wave 30 reset queued at 04:30 or later; attempt "..farm.resetCount.."."
     task.spawn(function()
         if farm.resetAttempt~=attempt or farm.runId~=run or LocalPlayer.Character~=character or child(Workspace,"Map")~=map
             or not farm.wave30ResetWindow() or farm.recovering or humanoid.Health<=0 then
@@ -4984,15 +4984,15 @@ function farm.wave30ResetStatus()
     if (readValue(values,"LocalLives") or 1)<=0 then return "Wave 30 reset: run ended; waiting for next map." end
     if wave==30 then
         if farm.resetMessage then return farm.resetMessage end
-        return farm.wave30VoteHeld() and "Wave 30: farming until 04:00; advancing vote held." or "Wave 30: ready to start night; reset scheduled for 04:00."
+        return farm.wave30VoteHeld() and "Wave 30: farming until 04:30; advancing vote held." or "Wave 30: ready to start night; reset scheduled for 04:30."
     end
     if finite(wave) and wave>30 then
         return farm.recovering and "Wave 30 reset window passed; recovering before normal auto-skip resumes."
             or "Wave 30 reset window passed; normal auto-skip resumed."
     end
-    return "Wave 30 reset: scheduled for 04:00; repeat after Ammo Box recovery."
+    return "Wave 30 reset: scheduled for 04:30; repeat after Ammo Box recovery."
 end
-farm.resetLabel=runtime.label(farmGroup,"Wave 30 reset: scheduled for 04:00",true)
+farm.resetLabel=runtime.label(farmGroup,"Wave 30 reset: scheduled for 04:30",true)
 connect(RunService.Heartbeat,function()
     if os.clock()<(farm.resetTickAt or 0) then return end
     farm.resetTickAt=os.clock()+.1
