@@ -3652,7 +3652,7 @@ function farm.inRegion(root,region)
 end
 function farm.cancelWalk()
     if farm.stopSprint then farm.stopSprint() end
-    farm.retreat=nil;farm.sprintClear=false;farm.clearAt=0
+    farm.retreat=nil;farm.sprintClear=false;farm.clearAt=0;farm.clearPoint=nil;farm.lastGroundAt=nil
     if farm.route and farm.route.blocked then farm.route.blocked:Disconnect() end
     if farm.route and farm.route.path then pcall(function() farm.route.path:Destroy() end) end
     farm.epoch=farm.epoch+1;farm.route=nil;farm.pathBusy=false;farm.climbDirection=nil
@@ -3674,24 +3674,25 @@ function farm.walk(goal,message,tolerance)
     local route=farm.route
     if route and (route.goal-goal).Magnitude>4 then farm.cancelWalk();route=nil end
     if route then
-        local point=route.points[route.index]
-        while point and (distance(root.Position,point.Position)<1.25 or farm.passedWaypoint(route,root)) and math.abs(root.Position.Y-point.Position.Y)<6 do
-            route.index=route.index+1;point=route.points[route.index];route.progressAt=os.clock();route.best=nil
-        end
+        local point=farm.steerRoute(humanoid,root)
         if not point then farm.cancelWalk();farm.pathAt=0;return false end
-        local remaining=distance(root.Position,point.Position)
-        if not route.best or remaining<route.best-.25 then route.best=remaining;route.progressAt=os.clock() end
         if route.obstructed or os.clock()-route.progressAt>2 then
+            if route.direct then farm.forcePathUntil=os.clock()+3 end
             farm.cancelWalk();farm.pathAt=os.clock()+.25
             farm.backoff(root,point.Position,goal)
             farm.status("Route obstructed or stalled; recalculating around obstacles.");return false
         end
-        if point.Action==Enum.PathWaypointAction.Jump then humanoid.Jump=true;farm.jumpUntil=os.clock()+.25 end
-        farm.walkPoint=farm.movementTarget(route,root)
-        if route.sentIndex~=route.index then humanoid:MoveTo(point.Position);route.sentIndex=route.index end
         return false
     end
     if farm.pathBusy or os.clock()<(farm.pathAt or 0) then return false end
+    -- Start immediately when the whole ground corridor is clear. Paths remain
+    -- the fallback for doors, corners, uneven terrain and jump approaches.
+    if not farm.exitWalking and not farm.retreat and os.clock()>=(farm.forcePathUntil or 0)
+        and farm.grounded(humanoid,root) and farm.clearGroundSegment(root,goal) then
+        farm.route={points={{Position=goal,Action=Enum.PathWaypointAction.Walk}},index=1,goal=goal,progressAt=os.clock(),direct=true}
+        farm.steerRoute(humanoid,root)
+        return false
+    end
     farm.pathBusy=true;farm.pathAt=os.clock()+3;local epoch=farm.epoch
     task.spawn(function()
         local created
@@ -3708,6 +3709,7 @@ function farm.walk(goal,message,tolerance)
             if path.Blocked then route.blocked=path.Blocked:Connect(function(index)
                 if farm.route==route and index>=route.index then route.obstructed=true end
             end) end
+            farm.steerRoute(humanoid,root)
         else dispose();farm.status("No walkable path: "..message..". Waiting; no teleport fallback.") end
     end)
     return false
@@ -3936,7 +3938,7 @@ function farm.begin()
     farm.healthDone=false
     farm.wave30NightReached=false;farm.resetAttempt=nil;farm.resetMessage=nil;farm.resetCount=0
     farm.forwardDone=false;farm.forwardGoal=nil;farm.forwardScanAt=0
-    farm.pathAt=0;farm.fault=nil;farm.exitTransit=nil;farm.exitWalking=nil
+    farm.pathAt=0;farm.forcePathUntil=0;farm.fault=nil;farm.exitTransit=nil;farm.exitWalking=nil
     farm.savedTrigger=config.Triggerbot;triggerToggle:SetValue(false)
     for _,key in ipairs(conflicts) do if e[key] then e[key]=false;if ui[key] then ui[key]:SetValue(false) end end end
     farm.status("Starting ordered C96 autofarm.")
@@ -4098,6 +4100,7 @@ if RunService.BindToRenderStep then
         if runtime.active and (e.Autofarm or e.AutoLeaveSpawn) and (not e.Autofarm or farm.supported()) then
             local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
             if humanoid and root then
+                if farm.route and not farm.retreat and farm.steerRoute then farm.steerRoute(humanoid,root) end
                 if farm.motionTick then farm.motionTick(humanoid,root) end
                 local direction=farm.climbDirection
                 if farm.walkPoint then
@@ -4494,8 +4497,20 @@ end
 function farm.sprint(wanted)
     if not wanted then farm.stopSprint();return end
     if farm.sprintHeld then
-        if farm.sprintHeld.toggle and farm.nativeSprinting()==false and os.clock()-farm.sprintHeld.at>.75 then
-            farm.stopSprint();farm.sprintRetryAt=os.clock()+1
+        local held=farm.sprintHeld
+        local character=LocalPlayer.Character;local root=child(character,"HumanoidRootPart")
+        local velocity=root and root.AssemblyLinearVelocity
+        -- Native sprint may turn off while velocity is momentarily zero. Do
+        -- not unstow/re-equip and restart the whole sprint at each waypoint.
+        if farm.nativeSprinting()==false and velocity and Vector3.new(velocity.X,0,velocity.Z).Magnitude>1
+            and os.clock()>=(held.retryAt or held.at+2) then
+            held.retryAt=os.clock()+2
+            local ok=pcall(function()
+                if not held.toggle then farm.sprintKey(held.key,false) end
+                farm.sprintKey(held.key,true)
+                if held.toggle then farm.sprintKey(held.key,false) end
+            end)
+            if not ok then farm.stopSprint();farm.sprintRetryAt=os.clock()+2 end
         end
         return
     end
@@ -4534,13 +4549,20 @@ function farm.clearGroundSegment(root,destination)
     local sideways=Vector3.new(-delta.Unit.Z,0,delta.Unit.X)*1.5
     local _,humanoid=alive()
     local standingOffset=root.Size and humanoid and farm.rootOffset(LocalPlayer.Character,humanoid,root) or 3
+    local endFloor=Workspace:Raycast(Vector3.new(destination.X,math.max(root.Position.Y,destination.Y)+3,destination.Z),Vector3.new(0,-12,0),params)
+    if not endFloor or endFloor.Normal.Y<.8 then return false end
+    local corridor=delta+Vector3.new(0,endFloor.Position.Y+standingOffset-root.Position.Y,0)
     for _,offset in ipairs({Vector3.new(0,0,0),sideways,sideways*-1}) do
-        if Workspace:Raycast(root.Position+offset,delta,params) then return false end
+        if Workspace:Raycast(root.Position+offset,corridor,params) then return false end
     end
+    local previousFloor
     for distance=0,delta.Magnitude+2,2 do
-        local origin=root.Position+delta.Unit*math.min(distance,delta.Magnitude)
+        local origin=root.Position+corridor*(math.min(distance,delta.Magnitude)/delta.Magnitude)
         local floor=Workspace:Raycast(origin,Vector3.new(0,-6,0),params)
-        if not floor or floor.Normal.Y<.8 or math.abs(floor.Position.Y-(root.Position.Y-standingOffset))>1.5 then return false end
+        if not floor or floor.Normal.Y<.8 then return false end
+        local expected=previousFloor or (root.Position.Y-standingOffset)
+        if math.abs(floor.Position.Y-expected)>1.5 then return false end
+        previousFloor=floor.Position.Y
     end
     return true
 end
@@ -4553,7 +4575,7 @@ function farm.movementTarget(route,root)
         local candidate=route.points[i]
         local delta=Vector3.new(candidate.Position.X-root.Position.X,0,candidate.Position.Z-root.Position.Z)
         local dot=base.Unit.X*delta.Unit.X+base.Unit.Z*delta.Unit.Z
-        if delta.Magnitude>20 or math.abs(candidate.Position.Y-target.Y)>1 or candidate.Action==Enum.PathWaypointAction.Jump or delta.Magnitude<.1 or dot<.98 then break end
+        if delta.Magnitude>32 or math.abs(candidate.Position.Y-target.Y)>1 or candidate.Action==Enum.PathWaypointAction.Jump or delta.Magnitude<.1 or dot<.98 then break end
         target=candidate.Position
     end
     if target~=point.Position and farm.clearGroundSegment(root,target) then return target end
@@ -4566,7 +4588,42 @@ function farm.passedWaypoint(route,root)
     local offset=Vector3.new(root.Position.X-point.Position.X,0,root.Position.Z-point.Position.Z)
     if delta.Magnitude<.1 then return false end
     local along=offset.X*delta.Unit.X+offset.Z*delta.Unit.Z
-    return along>0 and along<=delta.Magnitude+1.25 and (offset-delta.Unit*along).Magnitude<1.25
+    local limit=delta.Magnitude+1.25
+    if route.sentPoint then
+        local aimed=Vector3.new(route.sentPoint.X-point.Position.X,0,route.sentPoint.Z-point.Position.Z)
+        if aimed.Magnitude>.1 and aimed.Unit.X*delta.Unit.X+aimed.Unit.Z*delta.Unit.Z>.98 then
+            limit=math.max(limit,aimed.X*delta.Unit.X+aimed.Z*delta.Unit.Z+1.25)
+        end
+    end
+    return along>0 and along<=limit and (offset-delta.Unit*along).Magnitude<1.25
+end
+function farm.steerRoute(humanoid,root)
+    local route=farm.route
+    if not route or route.obstructed then return route and route.points[route.index] end
+    local function horizontal(point) return Vector3.new(point.X-root.Position.X,0,point.Z-root.Position.Z).Magnitude end
+    local point=route.points[route.index]
+    -- Advance every render frame instead of waiting for the purchase/state
+    -- tick. Keep the final target until the grounded arrival check completes.
+    while point and route.index<#route.points and (horizontal(point.Position)<1.25 or farm.passedWaypoint(route,root))
+        and math.abs(root.Position.Y-point.Position.Y)<6
+        and (point.Action~=Enum.PathWaypointAction.Jump or humanoid.FloorMaterial==Enum.Material.Air) do
+        route.index=route.index+1;point=route.points[route.index];route.best=nil;route.progressAt=os.clock()
+    end
+    if not point then return nil end
+    local remaining=horizontal(point.Position)
+    if not route.best or remaining<route.best-.25 then route.best=remaining;route.progressAt=os.clock() end
+    if point.Action==Enum.PathWaypointAction.Jump and remaining<3.5 then humanoid.Jump=true;farm.jumpUntil=os.clock()+.25 end
+    if route.targetIndex~=route.index or not route.targetRoot or (root.Position-route.targetRoot).Magnitude>=2
+        or os.clock()>=(route.targetAt or 0) then
+        farm.walkPoint=farm.movementTarget(route,root)
+        route.targetIndex=route.index;route.targetRoot=root.Position;route.targetAt=os.clock()+.12
+    end
+    -- Native MoveTo and render steering must agree; a short intermediate
+    -- MoveTo would brake while render steering is trying to keep sprinting.
+    if farm.walkPoint and (not route.sentPoint or (route.sentPoint-farm.walkPoint).Magnitude>.1) then
+        humanoid:MoveTo(farm.walkPoint);route.sentPoint=farm.walkPoint
+    end
+    return point
 end
 function farm.motionTick(humanoid,root)
     local route=farm.route
@@ -4583,14 +4640,18 @@ function farm.motionTick(humanoid,root)
     local ratio=finite(stamina) and finite(maximum) and maximum>0 and stamina/maximum or 0
     if ratio<=.2 then farm.staminaRest=true elseif ratio>=.45 then farm.staminaRest=false end
     local wanted=false
+    if humanoid.FloorMaterial~=nil and humanoid.FloorMaterial~=Enum.Material.Air then farm.lastGroundAt=os.clock() end
+    local onGround=farm.lastGroundAt and os.clock()-farm.lastGroundAt<.2
+    local point=route and route.points and route.points[route.index]
     if route and farm.walkPoint and not UIS:GetFocusedTextBox() and not guiService.MenuIsOpen and not farm.retreat and not farm.exitWalking
         and not (farm.boxPosition and farm.boxPosition.phase=="mounting")
         and not farm.staminaRest and ratio>.2 and not runtime.consumableBusy and not runtime.refillBusy and not runtime.action and not reloadState.key
-        and farm.grounded(humanoid,root) then
+        and onGround and not (point and point.Action==Enum.PathWaypointAction.Jump) then
         local remaining=(Vector3.new(route.goal.X,0,route.goal.Z)-Vector3.new(root.Position.X,0,root.Position.Z)).Magnitude
-        local ahead=(farm.walkPoint-root.Position).Magnitude
-        if remaining>8 and ahead>4 then
-            if os.clock()>=(farm.clearAt or 0) then
+        local ahead=Vector3.new(farm.walkPoint.X-root.Position.X,0,farm.walkPoint.Z-root.Position.Z).Magnitude
+        if remaining>6 and ahead>(farm.sprintHeld and 2 or 5) then
+            if os.clock()>=(farm.clearAt or 0) or not farm.clearPoint or (farm.clearPoint-farm.walkPoint).Magnitude>.1 then
+                farm.clearPoint=farm.walkPoint
                 farm.clearAt=os.clock()+.15;farm.sprintClear=farm.clearGroundSegment(root,farm.walkPoint)
             end
             wanted=farm.sprintClear==true and not farm.sprintThreat(root)
