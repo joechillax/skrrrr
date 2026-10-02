@@ -1,0 +1,1110 @@
+-- Periastron farm: one-file UI, recorder, and replay. Run in the main-game client.
+-- Auto skip follows its toggle while the panel is open. F8 stops recording/replay.
+
+local function launchReplay()
+-- Periastron TD client macro, based on the supplied 2026-10-02 dump.
+-- Run once in the main-game client after loading. F8 stops; rerunning replaces it.
+-- Plays completed recordings only. Coordinates and action order come from them.
+local CONFIG = {
+    Difficulty = "Medium",
+    SpeedIndex = 3, -- In this dump: 1 = 1x, 2 = 1.5x, 3 = 2x (Speed pass)
+    AutoRetry = true,
+    AutoReady = true,
+    AutoSkip = true,
+    Tick = 0.2,
+    ActionInterval = 2,
+    PlacementTimeout = 4,
+    AttemptsPerPosition = 2,
+    InitialPlacementWait = 5, -- ready anyway if money/cards/positions block placement
+    RetryDelay = 4,
+    RetryInterval = 5,
+}
+
+local env = (getgenv and getgenv()) or _G
+if env.PeriastronAutofarm and env.PeriastronAutofarm.Stop then
+    env.PeriastronAutofarm.Stop()
+end
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+assert(player, "Run this in the game client")
+local RS = game:GetService("ReplicatedStorage")
+local shared = RS:WaitForChild("Shared", 30)
+assert(shared, "Shared folder missing; run in the main game")
+local Me = require(shared.Vendor.Me).new()
+local SharedConfig = require(shared.Config.SharedConfig)
+local reliable = shared.Vendor.Warp.Index.Event.Reliable
+-- Warp.Client does a nested require from a game ModuleScript. Some scripting
+-- environments reject that after loading the client factory themselves. Keep
+-- the require in this script, reuse the game's cache, and call events directly.
+local createClientEvent
+local function eventFor(name)
+    assert(reliable:GetAttribute(name), "Missing event: " .. name)
+    local event = Me.Events[name]
+    if not event then
+        if not createClientEvent then
+            createClientEvent = require(shared.Vendor.Warp.Index.Client.Index)
+            assert(type(createClientEvent) == "function", "Warp client factory unavailable")
+        end
+        event = createClientEvent(name)
+        Me.Events[name] = event
+    end
+    return event
+end
+local gui = player:WaitForChild("PlayerGui", 30)
+local macro = {Running = true, Status = "Loading", Placed = 0, Rounds = 0}
+env.PeriastronAutofarm = macro
+function macro.SetOptions(options)
+    if options.Difficulty ~= nil then
+        assert(type(options.Difficulty) == "string", "Invalid mode")
+        CONFIG.Difficulty = options.Difficulty
+    end
+    if options.SpeedIndex ~= nil then
+        assert(SharedConfig.SpeedConfig.IsValid(options.SpeedIndex), "Invalid speed option")
+        CONFIG.SpeedIndex = options.SpeedIndex
+    end
+    if options.AutoRetry ~= nil then CONFIG.AutoRetry = options.AutoRetry == true end
+    if options.AutoReady ~= nil then CONFIG.AutoReady = options.AutoReady == true end
+    if options.AutoSkip ~= nil then CONFIG.AutoSkip = options.AutoSkip == true end
+end
+if type(env.PeriastronUIOptions) == "table" then macro.SetOptions(env.PeriastronUIOptions) end
+local subscriptions, nativeConnections = {}, {}
+function macro.Stop()
+    macro.Running = false
+    macro.Status = "Stopped"
+    -- Warp Connect returns a string key, not an RBXScriptConnection.
+    for _, subscription in ipairs(subscriptions) do
+        pcall(function() subscription.event:Disconnect(subscription.key) end)
+    end
+    for _, connection in ipairs(nativeConnections) do connection:Disconnect() end
+    subscriptions, nativeConnections = {}, {}
+end
+local function status(message)
+    if macro.Status ~= message then
+        macro.Status = message
+        print("[PeriastronAutofarm] " .. message)
+    end
+end
+local function controller(name) return Me:Get(name) end
+local function listen(name, callback)
+    local event = eventFor(name)
+    local key = event:Connect(function(...)
+        if macro.Running then callback(...) end
+    end)
+    table.insert(subscriptions, {event = event, key = key})
+end
+local function fire(name, ...)
+    if not macro.Running then return end
+    eventFor(name):Fire(true, ...)
+end
+local function visible(object)
+    if not object then return false end
+    local current = object
+    while current and current ~= gui do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("ScreenGui") and not current.Enabled then return false end
+        current = current.Parent
+    end
+    return current == gui
+end
+
+local cash, pending, roundStartedAt, endedAt, intermission
+local retryState, retryAttempts = nil, 0
+local previousResultShowing = false
+local skipState, lastSkipToken, skipVoted = nil, nil, false
+local uiSkip = env.PeriastronFarmUI and env.PeriastronFarmUI.AutoSkip
+local ownsSkip = not (uiSkip and uiSkip.Running)
+macro.SkipVotes = 0
+macro.SkipSupported = reliable:GetAttribute("VoteSkip") ~= nil and reliable:GetAttribute("SkipState") ~= nil
+    and reliable:GetAttribute("RequestSkipState") ~= nil
+local positionIndex, actionIndex, attempts, generation = 1, 1, 0, 0
+local placedByIndex, upgradesById = {}, {}
+local placements, replaySteps = {}, {}
+local function loadRecording()
+    local recording = env.PeriastronReplay
+    if not recording and isfile and readfile and isfile("periastron-replay.json") then
+        local ok, value = pcall(function()
+            return game:GetService("HttpService"):JSONDecode(readfile("periastron-replay.json"))
+        end)
+        assert(ok, "Could not read periastron-replay.json: " .. tostring(value))
+        recording = value
+    end
+    assert(type(recording) == "table", "No recorded macro loaded; select a saved macro or record and save a round first")
+    assert(recording.Version == 1 and recording.Complete == true, "Recording is not complete; finish and save a manual round first")
+    assert(type(recording.Placements) == "table" and #recording.Placements > 0, "Recording has no placements")
+    assert(type(recording.Steps) == "table" and #recording.Steps > 0, "Recording has no steps")
+    local loadedPlacements = {}
+    for index, item in ipairs(recording.Placements) do
+        assert(SharedConfig.UnitStats[item.Unit] and type(item.CFrame) == "table" and #item.CFrame == 12, "Invalid recorded placement")
+        loadedPlacements[index] = {Unit = item.Unit, CF = CFrame.new(table.unpack(item.CFrame))}
+    end
+    local seen = {}
+    for _, step in ipairs(recording.Steps) do
+        assert(step.Kind == "Place" or step.Kind == "Upgrade", "Invalid recorded action")
+        assert(loadedPlacements[step.Placement], "Invalid recorded target")
+        if step.Kind == "Place" then
+            assert(not seen[step.Placement], "Duplicate recorded placement")
+            seen[step.Placement] = true
+        else
+            assert(seen[step.Placement] and type(step.Level) == "number" and step.Level >= 1
+                and step.Level <= SharedConfig.UnitUpgradeConfig.MaxUpgrades, "Invalid recorded upgrade")
+        end
+    end
+    placements, replaySteps = loadedPlacements, recording.Steps
+    print("[PeriastronAutofarm] Using recorded macro: " .. #replaySteps .. " actions")
+end
+local last = {}
+local function due(name, interval)
+    local now = os.clock()
+    if last[name] and now - last[name] < interval then return false end
+    last[name] = now
+    return true
+end
+local function reset()
+    generation = generation + 1
+    cash, pending, roundStartedAt, endedAt, intermission = nil, nil, nil, nil, nil
+    positionIndex, actionIndex, attempts, macro.Placed, last = 1, 1, 0, 0, {}
+    placedByIndex, upgradesById = {}, {}
+    macro.Cash, macro.Step = nil, 1
+    retryState, retryAttempts = nil, 0
+    macro.RetryAttempts = 0
+    skipState, lastSkipToken, skipVoted = nil, nil, false
+    fire("RequestCash")
+    fire("RequestCardCounts")
+    fire("RequestGameSpeed")
+    if ownsSkip and macro.SkipSupported then fire("RequestSkipState") end
+end
+local function ended()
+    if not endedAt then macro.Rounds = macro.Rounds + 1 end
+    endedAt = endedAt or os.clock()
+    pending = nil
+end
+local function seedExistingPositions()
+    for _, model in ipairs(workspace:GetChildren()) do
+        local id = model:GetAttribute("UnitID")
+        if model:IsA("Model") and model:GetAttribute("Owned") == true and id then
+            local nearest, distance = nil, 0.75
+            for index, placement in ipairs(placements) do
+                local delta = (model:GetPivot().Position - placement.CF.Position).Magnitude
+                if model.Name == placement.Unit and delta < distance then
+                    nearest, distance = index, delta
+                end
+            end
+            if nearest then
+                placedByIndex[nearest] = id
+                upgradesById[id] = model:GetAttribute("Upgrades") or 0
+            end
+        end
+    end
+end
+local function playUpgrade(step)
+    local target = step.Placement
+    local id = placedByIndex[target]
+    assert(id, "Upgrade target placement missing: " .. tostring(target))
+    local name = placements[target].Unit
+    local desired = step.Level
+    local level = upgradesById[id] or 0
+    if level >= desired then actionIndex = actionIndex + 1; return end
+    assert(not SharedConfig.UnitUpgradeConfig:IsMaxed(level), "Upgrade target is already maxed")
+    local cost = SharedConfig.UnitUpgradeConfig:GetCost(name, level)
+    if type(cash) ~= "number" or cash < cost then
+        status("Waiting for upgrade cash: " .. name .. " costs " .. tostring(cost)); return
+    end
+    if not due("upgrade", CONFIG.ActionInterval) then return end
+    pending = {kind = "upgrade", id = id, desired = desired, sentAt = os.clock(), generation = generation}
+    status("Upgrading " .. name .. " at placement " .. target)
+    fire("UpgradeUnit", id)
+end
+local function tick()
+    macro.Cash, macro.Step, macro.TotalSteps = cash, actionIndex, #replaySteps
+    local result = controller("ResultController")
+    local resultShowing = result and result.showing == true or false
+    -- RoundRestarted and the game's Hide callback are delivered separately.
+    -- A still-visible result panel must not mark the new round ended again.
+    if resultShowing and not previousResultShowing then ended() end
+    previousResultShowing = resultShowing
+    if endedAt then
+        if not CONFIG.AutoRetry then status("Round ended; auto replay is off"); return end
+        local tutorial = controller("TutorialStepController")
+        if tutorial and tutorial.IsTutorial and tutorial:IsTutorial() then
+            status("Replay is unavailable during the tutorial"); return
+        end
+        local remaining = CONFIG.RetryDelay - (os.clock() - endedAt)
+        if remaining > 0 then
+            status("Round ended; retry in " .. math.ceil(remaining) .. "s"); return
+        end
+        local votes = retryState or (result and result.playAgainState)
+        if votes and type(votes.votes) == "number" and type(votes.total) == "number"
+            and votes.total > 0 and votes.votes >= votes.total then
+            status("All retry votes ready; waiting for round restart"); return
+        end
+        -- VotePlayAgain is the same action used by the game's click handler.
+        -- Send it after a confirmed round end; animated GUI state is not a gate.
+        if due("retry", CONFIG.RetryInterval) then
+            retryAttempts = retryAttempts + 1
+            macro.RetryAttempts = retryAttempts
+            status("Retry requested (attempt " .. retryAttempts .. "); waiting for server")
+            fire("VotePlayAgain")
+        end
+        return
+    end
+
+    local difficulty = controller("DifficultyController")
+    if difficulty and visible(difficulty.board) then
+        local modeButton = difficulty.Buttons and difficulty.Buttons[CONFIG.Difficulty]
+        if difficulty.Buttons and not modeButton then
+            status("Selected mode is unavailable: " .. CONFIG.Difficulty); return
+        end
+        if SharedConfig.DifficultyUnlockConfig and difficulty.stats then
+            if not SharedConfig.DifficultyUnlockConfig.isUnlocked(CONFIG.Difficulty, difficulty:stats()) then
+                status("Selected mode is locked: " .. CONFIG.Difficulty); return
+            end
+        end
+        status("Selecting " .. CONFIG.Difficulty)
+        if due("difficulty", CONFIG.ActionInterval) then
+            fire("SelectDifficulty", CONFIG.Difficulty)
+        end
+        return
+    end
+    if not difficulty or not difficulty.HotbarWanted then
+        status("Waiting for difficulty selection")
+        return
+    end
+    if ownsSkip then
+        local skipController = controller("SkipPromptController")
+        local offer = skipState or (skipController and skipController.State)
+        if not offer or offer.active ~= true then
+            skipVoted, lastSkipToken = false, nil
+            macro.SkipStatus = "Waiting for skip offer"
+        elseif CONFIG.AutoSkip and macro.SkipSupported then
+            if not skipVoted or offer.token ~= lastSkipToken then
+                skipVoted, lastSkipToken = true, offer.token
+                macro.SkipVotes = macro.SkipVotes + 1
+                macro.SkipStatus = "Voted to skip"
+                fire("VoteSkip", true)
+            end
+        end
+    else
+        macro.SkipStatus, macro.SkipVotes, macro.SkipSupported = uiSkip.Status, uiSkip.Votes, uiSkip.Supported
+    end
+    roundStartedAt = roundStartedAt or os.clock()
+    local speed = controller("SpeedController")
+    if speed and due("speed", CONFIG.ActionInterval) then
+        local index = CONFIG.SpeedIndex
+        while index > 1 and not speed:isUnlocked(index) do index = index - 1 end
+        if speed.Index ~= index then fire("SetGameSpeed", index) end
+        macro.SpeedIndex = index
+    end
+
+    local ready = controller("ReadyController")
+    local readyActive = intermission and intermission.active == true
+    if intermission == nil then readyActive = ready and visible(ready.button) end
+    if CONFIG.AutoReady and readyActive and not (intermission and intermission.isReady) then
+        if macro.Placed > 0 or os.clock() - roundStartedAt >= CONFIG.InitialPlacementWait then
+            if due("ready", CONFIG.ActionInterval) then fire("ReadyWave") end
+        end
+    end
+
+    if pending then
+        if os.clock() - pending.sentAt < CONFIG.PlacementTimeout then
+            status(pending.kind == "upgrade" and "Waiting for upgrade confirmation" or "Waiting for placement confirmation")
+            return
+        end
+        local kind = pending.kind
+        pending = nil
+        attempts = attempts + 1
+        -- Refresh after timeout; never assume a cash deduction means placement succeeded.
+        cash = nil
+        fire("RequestCash")
+        fire("RequestCardCounts")
+        assert(attempts < CONFIG.AttemptsPerPosition,
+            kind .. " not confirmed after " .. attempts .. " attempts at placement " .. positionIndex)
+        return
+    end
+    local step = replaySteps[actionIndex]
+    if not step then status("Recording complete; waiting for round end"); return end
+    if step.Kind == "Upgrade" then playUpgrade(step); return end
+    positionIndex = step.Placement
+    if placedByIndex[positionIndex] then actionIndex = actionIndex + 1; return end
+    local placement = placements[positionIndex]
+    local selectedUnit = placement.Unit
+    assert(SharedConfig.UnitStats[selectedUnit], "Unknown tower: " .. tostring(selectedUnit))
+    local card = controller("CardController")
+    local count = card and card.CardCounts and card.CardCounts[selectedUnit]
+    if type(count) ~= "number" or count <= 0 then status("Waiting for " .. selectedUnit .. " cards"); return end
+    if type(cash) ~= "number" then status("Waiting for cash update"); return end
+    local weather = controller("WeatherController")
+    local cost = SharedConfig.UnitUpgradeConfig:GetPlaceCost(selectedUnit, weather and weather:GetCurrent() or nil)
+    if cash < cost then status("Waiting for cash: " .. tostring(cash) .. "/" .. tostring(cost)); return end
+    if not due("place", CONFIG.ActionInterval) then return end
+    pending = {kind = "place", unit = selectedUnit, cf = placement.CF, sentAt = os.clock(), generation = generation}
+    status("Placing " .. selectedUnit .. " at position " .. positionIndex)
+    fire("PlaceUnit", selectedUnit, pending.cf)
+end
+
+local function run()
+    if not macro.Running then return end
+    assert(SharedConfig.SpeedConfig.IsValid(CONFIG.SpeedIndex), "Invalid speed index")
+    loadRecording()
+    local deadline = os.clock() + 30
+    while macro.Running and os.clock() < deadline do
+        if controller("CardController") and controller("SpeedController") and controller("DifficultyController") then break end
+        task.wait(CONFIG.Tick)
+    end
+    if not macro.Running then return end
+    assert(controller("CardController") and controller("SpeedController") and controller("DifficultyController"), "Game controllers did not load")
+    listen("UpdateCash", function(value) if type(value) == "number" then cash, macro.Cash = value, value end end)
+    listen("WaveIntermission", function(state) intermission = state end)
+    listen("GameOver", ended)
+    listen("Win", ended)
+    listen("RoundReward", ended)
+    listen("PlayAgainState", function(state)
+        if type(state) == "table" then retryState = state end
+    end)
+    if ownsSkip and macro.SkipSupported then
+        listen("SkipState", function(state) if type(state) == "table" then skipState = state end end)
+    end
+    listen("RoundRestarted", function()
+        reset()
+    end)
+    listen("ReplicateUnit", function(name, cf, owner, id, level)
+        if not pending or pending.kind ~= "place" or pending.generation ~= generation or endedAt then return end
+        if owner ~= player.UserId or name ~= pending.unit or not id or typeof(cf) ~= "CFrame" then return end
+        if (cf.Position - pending.cf.Position).Magnitude > 0.3 then return end
+        placedByIndex[positionIndex] = id
+        upgradesById[id] = level or 0
+        macro.Placed = macro.Placed + 1
+        actionIndex, attempts, pending = actionIndex + 1, 0, nil
+        -- Obtain a fresh balance before the next placement, independent of event order.
+        cash = nil
+        fire("RequestCash")
+        fire("RequestCardCounts")
+    end)
+    listen("UnitUpgraded", function(id, level)
+        upgradesById[id] = level
+        if pending and pending.kind == "upgrade" and pending.generation == generation and pending.id == id then
+            if level >= pending.desired then
+                pending, attempts, cash = nil, 0, nil
+                actionIndex = actionIndex + 1
+                fire("RequestCash")
+            end
+        end
+    end)
+    local input = game:GetService("UserInputService")
+    table.insert(nativeConnections, input.InputBegan:Connect(function(key, processed)
+        if not processed and key.KeyCode == Enum.KeyCode.F8 then macro.Stop() end
+    end))
+    reset()
+    seedExistingPositions()
+    while macro.Running do tick(); task.wait(CONFIG.Tick) end
+end
+task.spawn(function()
+    local ok, message = xpcall(run, debug.traceback)
+    if not ok then
+        macro.Stop()
+        macro.Status = "Error: " .. tostring(message)
+        warn("[PeriastronAutofarm] " .. macro.Status)
+    end
+end)
+
+return env.PeriastronAutofarm
+end
+
+local function launchRecorder()
+-- Run BEFORE placing the first tower in a fresh round, then play one round manually.
+-- Saves reusable placement/upgrade targets. F7 finishes early; F8 cancels capture.
+local env = (getgenv and getgenv()) or _G
+if env.PeriastronAutofarm and env.PeriastronAutofarm.Stop then env.PeriastronAutofarm.Stop() end
+if env.PeriastronRecorder and env.PeriastronRecorder.Stop then env.PeriastronRecorder.Stop() end
+local player = game:GetService("Players").LocalPlayer
+assert(player, "Run the recorder in the game client")
+local shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared", 30)
+assert(shared, "Run in the main game")
+local Me = require(shared.Vendor.Me).new()
+local reliable = shared.Vendor.Warp.Index.Event.Reliable
+-- Require from this script rather than Warp.Client's game ModuleScript context.
+-- Reuse cached events so the recorder shares the game's existing network state.
+local createClientEvent
+local function eventFor(name)
+    assert(reliable:GetAttribute(name), "Missing event: " .. name)
+    local event = Me.Events[name]
+    if not event then
+        if not createClientEvent then
+            createClientEvent = require(shared.Vendor.Warp.Index.Client.Index)
+            assert(type(createClientEvent) == "function", "Warp client factory unavailable")
+        end
+        event = createClientEvent(name)
+        Me.Events[name] = event
+    end
+    return event
+end
+local recorder = {Running = true, Status = "Recording"}
+env.PeriastronRecorder = recorder
+local profileName = env.PeriastronRecordingName
+local profileOptions = {}
+for key, value in pairs(env.PeriastronUIOptions or {}) do profileOptions[key] = value end
+local subscriptions, inputConnection = {}, nil
+local recording, byID, levels, accepting
+local function begin()
+    recording = {Version = 1, Complete = false, Placements = {}, Steps = {}, ProfileName = profileName}
+    byID, levels, accepting = {}, {}, true
+    env.PeriastronReplay = recording
+    recorder.Status = "Recording manual placements and upgrades"
+    print("[PeriastronRecorder] Recording. Play your round manually; F7 saves early.")
+end
+function recorder.Stop()
+    recorder.Running = false
+    for _, item in ipairs(subscriptions) do pcall(function() item.event:Disconnect(item.key) end) end
+    subscriptions = {}
+    if inputConnection then inputConnection:Disconnect(); inputConnection = nil end
+end
+local function finish()
+    if not recorder.Running or not accepting or recording.Complete then return end
+    if #recording.Placements == 0 then
+        warn("[PeriastronRecorder] No placements captured; nothing saved")
+        return
+    end
+    recording.Complete = true
+    env.PeriastronReplay = recording
+    local savedProfile, saveLocation
+    if profileName and type(env.PeriastronProfileSaver) == "function" then
+        local ok, name, location = pcall(env.PeriastronProfileSaver, profileName, recording, profileOptions)
+        if ok then savedProfile, saveLocation = name, location; recording.ProfileName = name
+        else saveLocation = "save failed; recording kept in memory: " .. tostring(name) end
+    end
+    local json = game:GetService("HttpService"):JSONEncode(recording)
+    if not profileName and writefile then
+        local ok, err = pcall(writefile, "periastron-replay.json", json)
+        if ok then print("[PeriastronRecorder] Saved periastron-replay.json in your scripting environment's workspace")
+        else warn("[PeriastronRecorder] File save failed: " .. tostring(err)) end
+    end
+    print("[PeriastronRecorder] JSON backup: " .. json)
+    if savedProfile then recorder.Status = "Saved " .. savedProfile .. " (" .. saveLocation .. ")"
+    elseif profileName then recorder.Status = saveLocation or "Recording complete; save it as a profile in the UI"
+    else recorder.Status = "Saved " .. #recording.Steps .. " actions; run periastron-autofarm.lua" end
+    print("[PeriastronRecorder] " .. recorder.Status)
+    recorder.Stop()
+end
+recorder.Finish = finish
+local function listen(name, callback)
+    local event = eventFor(name)
+    local key = event:Connect(function(...)
+        if not recorder.Running then return end
+        local ok, err = xpcall(callback, debug.traceback, ...)
+        if not ok then
+            recorder.Status = "Error: " .. tostring(err)
+            warn("[PeriastronRecorder] " .. recorder.Status)
+            recorder.Stop()
+        end
+    end)
+    table.insert(subscriptions, {event = event, key = key})
+end
+begin()
+for _, model in ipairs(workspace:GetChildren()) do
+    if model:IsA("Model") and model:GetAttribute("Owned") == true and model:GetAttribute("UnitID") then
+        accepting = false
+        recorder.Status = "Waiting for a fresh round; current round already has towers"
+        print("[PeriastronRecorder] " .. recorder.Status)
+        break
+    end
+end
+listen("RoundRestarted", begin)
+listen("ReplicateUnit", function(name, cf, owner, id, level)
+    if not accepting or recording.Complete or owner ~= player.UserId or not id or byID[id] then return end
+    assert(typeof(cf) == "CFrame", "Placement response did not contain a CFrame")
+    local index = #recording.Placements + 1
+    byID[id], levels[id] = index, level or 0
+    table.insert(recording.Placements, {Unit = name, CFrame = {cf:GetComponents()}})
+    table.insert(recording.Steps, {Kind = "Place", Placement = index})
+    -- Ordinarily newly placed towers are level zero; preserve a nonzero level if supplied.
+    for upgrade = 1, level or 0 do table.insert(recording.Steps, {Kind = "Upgrade", Placement = index, Level = upgrade}) end
+    print("[PeriastronRecorder] Placement " .. index .. ": " .. name)
+end)
+listen("UnitUpgraded", function(id, level)
+    if not accepting or recording.Complete or not byID[id] or type(level) ~= "number" then return end
+    for upgrade = (levels[id] or 0) + 1, level do
+        table.insert(recording.Steps, {Kind = "Upgrade", Placement = byID[id], Level = upgrade})
+    end
+    levels[id] = math.max(levels[id] or 0, level)
+    print("[PeriastronRecorder] Upgrade placement " .. byID[id] .. " to level " .. level)
+end)
+-- These actions are outside the requested placement/upgrade strategy. Reject a
+-- recording containing removals so replay cannot silently diverge after a sale.
+listen("RemoveUnit", function(id)
+    if accepting and byID[id] and not recording.Complete then
+        recording.Complete = false
+        recorder.Status = "A recorded tower was removed; record a fresh round without selling towers"
+        warn("[PeriastronRecorder] " .. recorder.Status)
+        recorder.Stop()
+    end
+end)
+listen("RoundReward", finish)
+inputConnection = game:GetService("UserInputService").InputBegan:Connect(function(key, processed)
+    if processed then return end
+    if key.KeyCode == Enum.KeyCode.F7 then finish()
+    elseif key.KeyCode == Enum.KeyCode.F8 then recorder.Status = "Cancelled"; recorder.Stop() end
+end)
+
+return env.PeriastronRecorder
+end
+
+-- A single JSON library avoids using user-supplied profile names as file paths.
+local function openProfileStore(env)
+    local path = "periastron-profiles.json"
+    local http = game:GetService("HttpService")
+    local store = {Error = nil, FileBlocked = false}
+    local function validRecording(data)
+        return type(data) == "table" and data.Version == 1 and data.Complete == true
+            and type(data.Placements) == "table" and #data.Placements > 0
+            and type(data.Steps) == "table" and #data.Steps > 0
+    end
+    local function validateLibrary(data)
+        assert(type(data) == "table" and data.Version == 1 and type(data.Profiles) == "table", "Invalid profile library")
+        for name, profile in pairs(data.Profiles) do
+            assert(type(name) == "string" and type(profile) == "table" and validRecording(profile.Recording), "Invalid saved profile")
+        end
+        return data
+    end
+    local data = env.PeriastronProfiles
+    if not data and isfile and readfile and isfile(path) then
+        local ok, value = pcall(function() return validateLibrary(http:JSONDecode(readfile(path))) end)
+        if ok then data = value
+        else store.Error = "Profile library could not be loaded: " .. tostring(value); store.FileBlocked = true end
+    end
+    if data then
+        local ok, value = pcall(validateLibrary, data)
+        if not ok then store.Error = tostring(value); store.FileBlocked = true; data = nil end
+    end
+    store.Data = data or {Version = 1, Profiles = {}}
+    env.PeriastronProfiles = store.Data
+    function store.Names()
+        local names = {}
+        for name in pairs(store.Data.Profiles) do table.insert(names, name) end
+        table.sort(names, function(a, b) return a:lower() < b:lower() end)
+        return names
+    end
+    function store.Save(name, recording, options)
+        assert(validRecording(recording), "Finish recording before saving a profile")
+        assert(type(name) == "string", "Enter a macro name")
+        name = name:match("^%s*(.-)%s*$")
+        assert(#name > 0 and #name <= 60, "Use a macro name between 1 and 60 characters")
+        local original, suffix = name, 2
+        while store.Data.Profiles[name] and store.Data.Profiles[name].Recording ~= recording do
+            name = original .. " (" .. suffix .. ")"; suffix = suffix + 1
+        end
+        local savedOptions = {}
+        for _, key in ipairs({"Difficulty", "SpeedIndex", "AutoRetry", "AutoReady", "AutoSkip"}) do
+            if options and options[key] ~= nil then savedOptions[key] = options[key] end
+        end
+        local function copy(value, seen)
+            if type(value) ~= "table" then return value end
+            seen = seen or {}
+            if seen[value] then return seen[value] end
+            local clone = {}; seen[value] = clone
+            for key, item in pairs(value) do clone[key] = copy(item, seen) end
+            return clone
+        end
+        local previous = store.Data.Profiles[name]
+        local savedRecording = copy(recording)
+        savedRecording.ProfileName = name
+        store.Data.Profiles[name] = {Recording = savedRecording, Options = savedOptions}
+        -- Encode before mutating the file; a failed save keeps the complete plan in memory.
+        local ok, encoded = pcall(function() return http:JSONEncode(store.Data) end)
+        if not ok then
+            store.Data.Profiles[name] = previous
+            error("Could not encode profile library: " .. tostring(encoded))
+        end
+        env.PeriastronCurrentProfile = name
+        env.PeriastronReplay = savedRecording
+        if store.FileBlocked then return name, "session only; existing library needs repair" end
+        if not writefile then return name, "session only; file saving unavailable" end
+        local saved, err = pcall(writefile, path, encoded)
+        if not saved then return name, "session only; file save failed: " .. tostring(err) end
+        return name, "saved to disk"
+    end
+    function store.Load(name)
+        local profile = store.Data.Profiles[name]
+        assert(profile and validRecording(profile.Recording), "Saved macro not found")
+        env.PeriastronReplay, env.PeriastronCurrentProfile = profile.Recording, name
+        return profile.Recording, profile.Options or {}
+    end
+    function store.ImportLegacy(current, options)
+        local recording = current
+        if not validRecording(recording) and isfile and readfile and isfile("periastron-replay.json") then
+            local ok, value = pcall(function() return http:JSONDecode(readfile("periastron-replay.json")) end)
+            if ok and validRecording(value) then recording = value end
+        end
+        assert(validRecording(recording), "No complete old recording found")
+        for name, profile in pairs(store.Data.Profiles) do
+            if profile.Recording == recording then return name, "already in library" end
+        end
+        return store.Save("Imported recording", recording, options)
+    end
+    return store
+end
+
+-- Auto skip belongs to the panel session, independently of recording/playback.
+local function openAlwaysSkip(settings, getFramework)
+    local service = {Running = true, Supported = nil, Votes = 0, Status = "Waiting for game"}
+    local subscriptions, framework, reliable, createEvent, clientModule = {}, nil, nil, nil, nil
+    local initialized, enabled, state, voted, lastToken = false, false, nil, false, nil
+    local retryAt = 0
+    local function eventFor(name)
+        local event = framework.Events[name]
+        if not event then
+            createEvent = createEvent or require(clientModule)
+            event = createEvent(name)
+            framework.Events[name] = event
+        end
+        return event
+    end
+    local function disconnect()
+        for _, item in ipairs(subscriptions) do pcall(function() item.event:Disconnect(item.key) end) end
+        subscriptions = {}
+    end
+    local function listen(name, callback)
+        local event = eventFor(name)
+        table.insert(subscriptions, {event = event, key = event:Connect(callback)})
+    end
+    local function receive(value)
+        if type(value) ~= "table" then return end
+        state = value
+        if state.active ~= true then voted, lastToken = false, nil end
+        service.Update()
+    end
+    local function update()
+        if not initialized then
+            framework = getFramework()
+            if not framework then service.Status = "Waiting for game"; return end
+            local shared = game:GetService("ReplicatedStorage"):FindFirstChild("Shared")
+            reliable = shared.Vendor.Warp.Index.Event.Reliable
+            clientModule = shared.Vendor.Warp.Index.Client.Index
+            service.Supported = reliable:GetAttribute("VoteSkip") ~= nil
+                and reliable:GetAttribute("SkipState") ~= nil and reliable:GetAttribute("RequestSkipState") ~= nil
+            if not service.Supported then service.Status = "Unavailable"; return end
+            disconnect()
+            listen("SkipState", receive)
+            if reliable:GetAttribute("RoundRestarted") then
+                listen("RoundRestarted", function()
+                    -- The controller may briefly retain the previous round's offer.
+                    state, voted, lastToken, enabled = {active = false}, false, nil, false
+                    service.Update()
+                end)
+            end
+            initialized = true
+        end
+        local wasEnabled = enabled
+        enabled = settings.AutoSkip == true
+        if enabled and not wasEnabled then eventFor("RequestSkipState"):Fire(true) end
+        local skipController = framework:Get("SkipPromptController")
+        local offer = state or (skipController and skipController.State)
+        if not offer or offer.active ~= true then
+            voted, lastToken = false, nil
+            service.Status = enabled and "Waiting for skip offer" or "Off"
+        elseif not enabled then
+            service.Status = "Off"
+        elseif voted and offer.token == lastToken then
+            service.Status = "Voted to skip"
+        else
+            -- Mark before firing: server acknowledgements may arrive immediately.
+            voted, lastToken = true, offer.token
+            eventFor("VoteSkip"):Fire(true, true)
+            service.Votes = service.Votes + 1
+            service.Status = "Voted to skip"
+        end
+    end
+    function service.Update()
+        if not service.Running or os.clock() < retryAt then return end
+        local ok, err = pcall(update)
+        if not ok then
+            service.Error = tostring(err)
+            service.Status = "Error: " .. service.Error
+            retryAt = os.clock() + 5
+        else service.Error = nil end
+    end
+    function service.Stop()
+        service.Running = false
+        disconnect()
+    end
+    return service
+end
+
+-- Native in-game controls; the replay and recorder are embedded above this panel.
+local env = (getgenv and getgenv()) or _G
+if env.PeriastronFarmUI and env.PeriastronFarmUI.Destroy then env.PeriastronFarmUI.Destroy() end
+if env.PeriastronAutofarm and env.PeriastronAutofarm.Stop then env.PeriastronAutofarm.Stop() end
+if env.PeriastronRecorder and env.PeriastronRecorder.Stop then env.PeriastronRecorder.Stop() end
+local player = game:GetService("Players").LocalPlayer
+assert(player, "Open this UI in the main-game client")
+local playerGui = player:WaitForChild("PlayerGui", 30)
+local input = game:GetService("UserInputService")
+local runService = game:GetService("RunService")
+local settings = env.PeriastronUIOptions or {Difficulty = "Medium", SpeedIndex = 3, AutoRetry = true, AutoReady = true, AutoSkip = true}
+if settings.AutoSkip == nil then settings.AutoSkip = true end
+env.PeriastronUIOptions = settings
+local store = openProfileStore(env)
+env.PeriastronProfileSaver = store.Save
+local currentProfile = env.PeriastronCurrentProfile
+local UI = {Running = true, Status = "Choose Record round to capture your strategy, or load a saved recording."}
+env.PeriastronFarmUI = UI
+local connections, active, minimized = {}, nil, false
+local framework, config
+local function gameModules()
+    if framework then return true end
+    local ok = pcall(function()
+        local shared = game:GetService("ReplicatedStorage"):FindFirstChild("Shared")
+        assert(shared, "Main-game modules are not loaded")
+        framework = require(shared.Vendor.Me).new()
+        config = require(shared.Config.SharedConfig)
+    end)
+    return ok
+end
+local function controller(name)
+    if not gameModules() then return nil end
+    return framework:Get(name)
+end
+local autoSkip = openAlwaysSkip(settings, function()
+    if gameModules() then return framework end
+end)
+UI.AutoSkip = autoSkip
+local colors = {
+    Background = Color3.fromRGB(15, 20, 31), Panel = Color3.fromRGB(24, 32, 46),
+    Border = Color3.fromRGB(48, 61, 80), Text = Color3.fromRGB(237, 242, 249),
+    Muted = Color3.fromRGB(151, 168, 191), Accent = Color3.fromRGB(68, 213, 170),
+    Ink = Color3.fromRGB(9, 32, 26), Red = Color3.fromRGB(242, 130, 132),
+}
+local function make(class, parent, props)
+    local item = Instance.new(class)
+    for key, value in pairs(props or {}) do item[key] = value end
+    item.Parent = parent
+    return item
+end
+local function corner(item, radius) make("UICorner", item, {CornerRadius = UDim.new(0, radius or 8)}) end
+local function connect(signal, callback)
+    table.insert(connections, signal:Connect(callback))
+end
+local old = playerGui:FindFirstChild("PeriastronFarmPanel")
+if old then old:Destroy() end
+local screen = make("ScreenGui", playerGui, {
+    Name = "PeriastronFarmPanel", ResetOnSpawn = false, DisplayOrder = 10000,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+local root = make("Frame", screen, {
+    Name = "Panel", Size = UDim2.fromOffset(390, 724), Position = UDim2.new(0, 24, 0.5, 0),
+    AnchorPoint = Vector2.new(0, 0.5),
+    BackgroundColor3 = colors.Background, BorderSizePixel = 0,
+})
+corner(root, 14)
+make("UIStroke", root, {Color = colors.Border, Thickness = 1})
+local scale = make("UIScale", root, {Scale = 1})
+local header = make("Frame", root, {Name = "DragHeader", Size = UDim2.new(1, 0, 0, 64), BackgroundTransparency = 1, Active = true})
+local function label(parent, name, text, x, y, w, h, size, color)
+    return make("TextLabel", parent, {
+        Name = name, Text = text, Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, h),
+        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = size or 13,
+        TextColor3 = color or colors.Text, TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Center,
+    })
+end
+label(header, "Title", "Periastron farm", 18, 12, 270, 25, 20)
+label(header, "Subtitle", "Record once. Replay each round.", 18, 39, 310, 18, 12, colors.Muted)
+local body = make("Frame", root, {Name = "Controls", Position = UDim2.fromOffset(0, 64), Size = UDim2.new(1, 0, 1, -64), BackgroundTransparency = 1})
+local function button(parent, name, text, x, y, w, h, accent)
+    local item = make("TextButton", parent, {
+        Name = name, Text = text, Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, h),
+        BackgroundColor3 = accent and colors.Accent or colors.Panel, BorderSizePixel = 0,
+        Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = accent and colors.Ink or colors.Text,
+        AutoButtonColor = true,
+    })
+    corner(item, 8)
+    return item
+end
+local minimize = button(header, "Minimize", "-", 312, 13, 26, 26)
+local close = button(header, "Close", "x", 346, 13, 26, 26)
+label(body, "ModeLabel", "MODE", 16, 14, 200, 18, 11, colors.Muted)
+local modeButton = button(body, "ModeSelect", "Medium  v", 16, 37, 358, 34)
+label(body, "SpeedLabel", "SPEED BOOST", 16, 85, 200, 18, 11, colors.Muted)
+local speedButtons = {}
+local speedNames = {"1x", "1.5x", "2x"}
+for index, name in ipairs(speedNames) do
+    speedButtons[index] = button(body, "Speed" .. index, name, 16 + (index - 1) * 122, 108, 114, 34)
+end
+local retryButton = button(body, "AutoReplay", "Auto replay: ON", 16, 158, 175, 30)
+local readyButton = button(body, "AutoReady", "Ready waves: ON", 199, 158, 175, 30)
+local skipButton = button(body, "AutoSkip", "Auto skip: ON", 16, 194, 358, 30)
+label(body, "ProfileLabel", "SAVED MACRO FOR THIS MAP", 16, 233, 358, 18, 11, colors.Muted)
+local profileButton = button(body, "ProfileSelect", "Choose saved macro  v", 16, 255, 358, 32)
+local nameBox = make("TextBox", body, {
+    Name = "ProfileName", Text = currentProfile or "My macro", PlaceholderText = "Macro name, e.g. Forest Medium",
+    Position = UDim2.fromOffset(16, 297), Size = UDim2.fromOffset(240, 32),
+    BackgroundColor3 = colors.Panel, BorderSizePixel = 0, TextColor3 = colors.Text,
+    PlaceholderColor3 = colors.Muted, Font = Enum.Font.Gotham, TextSize = 12, ClearTextOnFocus = false,
+})
+corner(nameBox)
+local saveProfileButton = button(body, "SaveProfile", "Save as", 264, 297, 110, 32)
+local planCard = make("Frame", body, {
+    Name = "RecordingCard", Position = UDim2.fromOffset(16, 342), Size = UDim2.fromOffset(358, 68),
+    BackgroundColor3 = colors.Panel, BorderSizePixel = 0,
+})
+corner(planCard)
+local planLabel = label(planCard, "RecordingTitle", "No recorded macro", 12, 9, 235, 22, 13)
+local planHelp = label(planCard, "RecordingHelp", "Select a saved macro or record a round.", 12, 35, 334, 24, 11, colors.Muted)
+planHelp.TextWrapped = true
+local loadButton = button(planCard, "LoadSaved", "Import old", 253, 8, 94, 25)
+loadButton.TextSize = 11
+local recordButton = button(body, "RecordRound", "Record round", 16, 422, 175, 36)
+local saveButton = button(body, "SaveRecording", "Finish & save", 199, 422, 175, 36)
+local startButton = button(body, "StartReplay", "Start replay", 16, 468, 175, 40, true)
+local stopButton = button(body, "Stop", "Stop", 199, 468, 175, 40)
+stopButton.TextColor3 = colors.Red
+local statusCard = make("Frame", body, {
+    Name = "StatusCard", Position = UDim2.fromOffset(16, 526), Size = UDim2.fromOffset(358, 54),
+    BackgroundColor3 = colors.Panel, BorderSizePixel = 0,
+})
+corner(statusCard)
+local statusLabel = label(statusCard, "Status", UI.Status, 12, 5, 334, 44, 12)
+statusLabel.TextWrapped = true
+local statsLabel = label(body, "Progress", "Idle", 16, 586, 358, 20, 11, colors.Muted)
+local actualSpeed = label(body, "ActiveSpeed", "Speed: waiting for game", 16, 608, 358, 20, 11, colors.Muted)
+label(body, "Help", "Stop/F8 stops macros. Auto skip follows its toggle.", 16, 631, 358, 18, 10, colors.Muted)
+local profileMenu = make("ScrollingFrame", body, {
+    Name = "ProfileMenu", Position = UDim2.fromOffset(16, 291), Size = UDim2.fromOffset(358, 40),
+    CanvasSize = UDim2.fromOffset(0, 0), ScrollBarThickness = 4, BackgroundColor3 = colors.Panel,
+    BorderSizePixel = 0, Visible = false, ZIndex = 30,
+})
+corner(profileMenu)
+local menu = make("Frame", body, {
+    Name = "ModeMenu", Position = UDim2.fromOffset(16, 76), Size = UDim2.fromOffset(358, 160),
+    BackgroundColor3 = colors.Panel, BorderSizePixel = 0, Visible = false, ZIndex = 20,
+})
+corner(menu)
+make("UIStroke", menu, {Color = colors.Border, Thickness = 1})
+local modeConnections = {}
+local profileConnections = {}
+local function applySettings()
+    if env.PeriastronAutofarm and env.PeriastronAutofarm.Running then
+        env.PeriastronAutofarm.SetOptions(settings)
+    end
+    autoSkip.Update()
+end
+local function setMessage(text) UI.Status = text; statusLabel.Text = text end
+local function stopWorkers()
+    if env.PeriastronAutofarm and env.PeriastronAutofarm.Stop then env.PeriastronAutofarm.Stop() end
+    if env.PeriastronRecorder and env.PeriastronRecorder.Stop then env.PeriastronRecorder.Stop() end
+    active = nil
+end
+function UI.Destroy()
+    UI.Running = false
+    autoSkip.Stop()
+    stopWorkers()
+    for _, item in ipairs(connections) do item:Disconnect() end
+    for _, item in ipairs(modeConnections) do item:Disconnect() end
+    for _, item in ipairs(profileConnections) do item:Disconnect() end
+    screen:Destroy()
+end
+local function busy()
+    return (env.PeriastronAutofarm and env.PeriastronAutofarm.Running)
+        or (env.PeriastronRecorder and env.PeriastronRecorder.Running)
+end
+local function selectProfile(name)
+    local _, options = store.Load(name)
+    currentProfile = name
+    nameBox.Text = name
+    for _, key in ipairs({"Difficulty", "SpeedIndex", "AutoRetry", "AutoReady", "AutoSkip"}) do
+        if options[key] ~= nil then settings[key] = options[key] end
+    end
+    profileMenu.Visible = false
+    setMessage("Loaded " .. name .. ". Use it on the matching map, then Start replay.")
+end
+local function importOld(quiet)
+    local ok, name, location = pcall(store.ImportLegacy, quiet and env.PeriastronReplay or nil, settings)
+    if ok then selectProfile(name); if not quiet then setMessage("Imported " .. name .. " (" .. location .. ")") end
+    elseif not quiet then setMessage(tostring(name)) end
+    return ok
+end
+local function rebuildProfiles()
+    for _, item in ipairs(profileConnections) do item:Disconnect() end
+    profileConnections = {}
+    for _, item in ipairs(profileMenu:GetChildren()) do if item:IsA("TextButton") then item:Destroy() end end
+    local names = store.Names()
+    profileMenu.Size = UDim2.fromOffset(358, math.min(224, math.max(39, #names * 31 + 8)))
+    profileMenu.CanvasSize = UDim2.fromOffset(0, #names * 31 + 8)
+    if #names == 0 then
+        local item = button(profileMenu, "NoProfiles", "No saved macros yet", 6, 4, 346, 29)
+        item.ZIndex = 31
+    end
+    for index, name in ipairs(names) do
+        local item = button(profileMenu, "Profile_" .. name, name, 6, 4 + (index - 1) * 31, 346, 29)
+        item.ZIndex = 31
+        table.insert(profileConnections, item.Activated:Connect(function()
+            if busy() then setMessage("Stop replay or finish recording before changing macros."); return end
+            local ok, err = pcall(selectProfile, name)
+            if not ok then setMessage(tostring(err)) end
+        end))
+    end
+end
+local function rebuildModes()
+    for _, item in ipairs(modeConnections) do item:Disconnect() end
+    modeConnections = {}
+    for _, item in ipairs(menu:GetChildren()) do if item:IsA("TextButton") then item:Destroy() end end
+    local difficulty = controller("DifficultyController")
+    local names = {}
+    local preferred = {"Medium", "Easy", "Hard", "Impossible", "Nightmare"}
+    if difficulty and difficulty.Buttons and next(difficulty.Buttons) then
+        for _, name in ipairs(preferred) do if difficulty.Buttons[name] then table.insert(names, name) end end
+        for name in pairs(difficulty.Buttons) do if not table.find(names, name) then table.insert(names, name) end end
+    else names = {"Medium", "Hard", "Impossible", "Nightmare"} end
+    menu.Size = UDim2.fromOffset(358, 8 + #names * 31)
+    for index, name in ipairs(names) do
+        local locked = config and config.DifficultyUnlockConfig and difficulty and difficulty.stats
+            and not config.DifficultyUnlockConfig.isUnlocked(name, difficulty:stats())
+        local option = button(menu, "Mode_" .. name, name .. (locked and " (locked)" or ""), 6, 4 + (index - 1) * 31, 346, 29)
+        option.ZIndex = 21
+        if locked then option.TextColor3 = colors.Muted end
+        table.insert(modeConnections, option.Activated:Connect(function()
+            if locked then setMessage("That mode is locked. Choose an unlocked mode."); return end
+            settings.Difficulty = name
+            menu.Visible = false
+            applySettings()
+        end))
+    end
+end
+connect(modeButton.Activated, function() profileMenu.Visible = false; rebuildModes(); menu.Visible = not menu.Visible end)
+connect(profileButton.Activated, function() menu.Visible = false; rebuildProfiles(); profileMenu.Visible = not profileMenu.Visible end)
+for index, item in ipairs(speedButtons) do
+    connect(item.Activated, function() settings.SpeedIndex = index; applySettings() end)
+end
+connect(retryButton.Activated, function() settings.AutoRetry = not settings.AutoRetry; applySettings() end)
+connect(readyButton.Activated, function() settings.AutoReady = not settings.AutoReady; applySettings() end)
+connect(skipButton.Activated, function() settings.AutoSkip = not settings.AutoSkip; applySettings() end)
+connect(loadButton.Activated, function()
+    if busy() then setMessage("Stop recording or replay before importing."); return end
+    importOld(false)
+end)
+connect(saveProfileButton.Activated, function()
+    if busy() then setMessage("Stop replay or finish recording before using Save as."); return end
+    local ok, name, location = pcall(store.Save, nameBox.Text, env.PeriastronReplay, settings)
+    if ok then currentProfile = name; nameBox.Text = name; setMessage("Saved " .. name .. " (" .. location .. ")")
+    else setMessage(tostring(name)) end
+end)
+connect(recordButton.Activated, function()
+    local name = nameBox.Text:match("^%s*(.-)%s*$")
+    if #name == 0 or #name > 60 then setMessage("Enter a macro name between 1 and 60 characters."); return end
+    stopWorkers()
+    menu.Visible, profileMenu.Visible = false, false
+    env.PeriastronRecordingName = name
+    local ok, err = pcall(launchRecorder)
+    if ok then active = "record"; setMessage("Recording " .. name .. ". Play manually, then Finish & save.")
+    else stopWorkers(); setMessage("Could not start recorder: " .. tostring(err)) end
+end)
+connect(saveButton.Activated, function()
+    local recorder = env.PeriastronRecorder
+    if not recorder or not recorder.Running then setMessage("Start Record round first, or use Save as for your current plan."); return end
+    local ok, err = pcall(recorder.Finish)
+    if not ok then setMessage("Could not save: " .. tostring(err)) end
+end)
+connect(startButton.Activated, function()
+    local recorder = env.PeriastronRecorder
+    if recorder and recorder.Running then setMessage("Save your recording before starting replay."); return end
+    local recording = env.PeriastronReplay
+    if type(recording) ~= "table" or recording.Complete ~= true then
+        setMessage("Select a saved macro or record and save a round first."); return
+    end
+    stopWorkers()
+    menu.Visible, profileMenu.Visible = false, false
+    local ok, err = pcall(launchReplay)
+    if ok then active = "replay"; setMessage("Starting replay...")
+    else stopWorkers(); setMessage("Could not start replay: " .. tostring(err)) end
+end)
+connect(stopButton.Activated, function() stopWorkers(); setMessage("Macro stopped. Auto skip still follows its toggle.") end)
+connect(close.Activated, UI.Destroy)
+connect(minimize.Activated, function()
+    minimized = not minimized
+    body.Visible = not minimized
+    menu.Visible, profileMenu.Visible = false, false
+    root.Size = UDim2.fromOffset(390, minimized and 64 or 724)
+    minimize.Text = minimized and "+" or "-"
+end)
+local dragging, startPointer, startPosition, touchInput
+connect(header.InputBegan, function(key)
+    if key.UserInputType == Enum.UserInputType.MouseButton1 or key.UserInputType == Enum.UserInputType.Touch then
+        dragging, startPointer, startPosition = true, key.Position, root.Position
+        touchInput = key.UserInputType == Enum.UserInputType.Touch and key or nil
+    end
+end)
+connect(input.InputChanged, function(key)
+    if dragging and (key.UserInputType == Enum.UserInputType.MouseMovement or key == touchInput) then
+        local delta = key.Position - startPointer
+        root.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+    end
+end)
+connect(input.InputEnded, function(key)
+    if key.UserInputType == Enum.UserInputType.MouseButton1 or key == touchInput then dragging = false end
+end)
+connect(input.InputBegan, function(key, processed)
+    if not processed and key.KeyCode == Enum.KeyCode.F8 then stopWorkers(); setMessage("Macro stopped with F8. Auto skip follows its toggle.") end
+end)
+local elapsed = 1
+local function refresh()
+    autoSkip.Update()
+    modeButton.Text = settings.Difficulty .. "  v"
+    for index, item in ipairs(speedButtons) do
+        item.BackgroundColor3 = settings.SpeedIndex == index and colors.Accent or colors.Panel
+        item.TextColor3 = settings.SpeedIndex == index and colors.Ink or colors.Text
+    end
+    retryButton.Text = "Auto replay: " .. (settings.AutoRetry and "ON" or "OFF")
+    readyButton.Text = "Ready waves: " .. (settings.AutoReady and "ON" or "OFF")
+    skipButton.Text = "Auto skip: " .. (settings.AutoSkip and "ON" or "OFF")
+    if settings.AutoSkip then
+        if autoSkip.Error then skipButton.Text = "Auto skip: error"
+        elseif autoSkip.Supported == false then skipButton.Text = "Auto skip: unavailable"
+        elseif autoSkip.Status == "Voted to skip" then skipButton.Text = "Auto skip: ON - vote sent" end
+    end
+    if env.PeriastronCurrentProfile ~= currentProfile then
+        currentProfile = env.PeriastronCurrentProfile
+        if currentProfile then nameBox.Text = currentProfile end
+    end
+    profileButton.Text = (currentProfile or "Choose saved macro") .. "  v"
+    local recording = env.PeriastronReplay
+    if recording and recording.Complete then
+        planLabel.Text = "Saved: " .. #recording.Placements .. " towers / " .. #recording.Steps .. " actions"
+        planHelp.Text = "Ready to replay. Use the same map and deck."
+    elseif recording then
+        planLabel.Text = "Captured: " .. #(recording.Steps or {}) .. " actions"
+        planHelp.Text = "Finish a manual round, or press Finish & save."
+    else
+        planLabel.Text = "No recorded macro"
+        planHelp.Text = "Select a saved macro or record a round."
+    end
+    local worker = active == "record" and env.PeriastronRecorder or active == "replay" and env.PeriastronAutofarm
+    if worker then
+        statusLabel.Text = worker.Status
+        if active == "replay" then
+            statsLabel.Text = string.format("Cash: %s   Step: %d/%d   Rounds: %d", tostring(worker.Cash or "--"),
+                math.min(worker.Step or 0, worker.TotalSteps or 0), worker.TotalSteps or 0, worker.Rounds or 0)
+        else statsLabel.Text = "Play manually while recording. F7 saves early." end
+        if not worker.Running then UI.Status = worker.Status; active = nil end
+    else statusLabel.Text = UI.Status; statsLabel.Text = "Idle - no replay or recording is running" end
+    local speed = controller("SpeedController")
+    if speed then
+        local passLocked = settings.SpeedIndex == 3 and not speed:isUnlocked(3)
+        actualSpeed.Text = "Speed: " .. (speedNames[speed.Index] or "--") .. " active / " .. speedNames[settings.SpeedIndex]
+            .. (passLocked and " requested (Speed pass required)" or " selected")
+    end
+    local camera = workspace.CurrentCamera
+    if camera then
+        local viewport = camera.ViewportSize
+        scale.Scale = math.max(0.35, math.min(1, (viewport.X - 48) / 390, (viewport.Y - 48) / (minimized and 64 or 724)))
+    end
+end
+connect(runService.Heartbeat, function(dt)
+    if not UI.Running then return end
+    elapsed = elapsed + dt
+    if elapsed >= 0.25 then elapsed = 0; refresh() end
+end)
+local names = store.Names()
+if currentProfile and store.Data.Profiles[currentProfile] then selectProfile(currentProfile)
+elseif #names > 0 then selectProfile(names[1])
+else importOld(true) end
+if store.Error then setMessage(store.Error .. "; existing file will not be overwritten.") end
+refresh()
