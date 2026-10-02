@@ -53,6 +53,7 @@ end
 local gui = player:WaitForChild("PlayerGui", 30)
 local macro = {Running = true, Status = "Loading", Placed = 0, Rounds = 0}
 env.PeriastronAutofarm = macro
+local optionsChanged
 function macro.SetOptions(options)
     if options.Difficulty ~= nil then
         assert(type(options.Difficulty) == "string", "Invalid mode")
@@ -65,8 +66,11 @@ function macro.SetOptions(options)
     if options.AutoRetry ~= nil then CONFIG.AutoRetry = options.AutoRetry == true end
     if options.AutoReady ~= nil then CONFIG.AutoReady = options.AutoReady == true end
     if options.AutoSkip ~= nil then CONFIG.AutoSkip = options.AutoSkip == true end
+    macro.DesiredDifficulty = CONFIG.Difficulty
+    if optionsChanged then optionsChanged() end
 end
 if type(env.PeriastronUIOptions) == "table" then macro.SetOptions(env.PeriastronUIOptions) end
+macro.DesiredDifficulty = CONFIG.Difficulty
 local subscriptions, nativeConnections = {}, {}
 function macro.Stop()
     macro.Running = false
@@ -111,6 +115,7 @@ local cash, pending, roundStartedAt, endedAt, intermission
 local retryState, retryAttempts = nil, 0
 local previousResultShowing = false
 local skipState, lastSkipToken, skipVoted = nil, nil, false
+local difficultyState, voteDifficulty
 local uiSkip = env.PeriastronFarmUI and env.PeriastronFarmUI.AutoSkip
 local ownsSkip = not (uiSkip and uiSkip.Running)
 macro.SkipVotes = 0
@@ -168,6 +173,8 @@ local function reset()
     retryState, retryAttempts = nil, 0
     macro.RetryAttempts = 0
     skipState, lastSkipToken, skipVoted = nil, nil, false
+    difficultyState = nil
+    macro.RequestedDifficulty, macro.SelectedDifficulty, macro.LockedDifficulty, macro.DifficultyWarning = nil, nil, nil, nil
     fire("RequestCash")
     fire("RequestCardCounts")
     fire("RequestGameSpeed")
@@ -177,6 +184,45 @@ local function ended()
     if not endedAt then macro.Rounds = macro.Rounds + 1 end
     endedAt = endedAt or os.clock()
     pending = nil
+end
+local function lockedMode(value)
+    if type(value) == "string" then return value end
+    if type(value) == "table" then
+        local mode = value.locked or value.difficulty or value.mode
+        if type(mode) == "string" then return mode end
+    end
+end
+local function acceptLockedMode(value)
+    local mode = lockedMode(value)
+    if not mode then return end
+    macro.LockedDifficulty = mode
+    if macro.RequestedDifficulty and mode ~= macro.RequestedDifficulty then
+        macro.DifficultyWarning = "Server locked " .. mode .. "; voted " .. macro.RequestedDifficulty
+        print("[PeriastronAutofarm] " .. macro.DifficultyWarning)
+    else macro.DifficultyWarning = nil end
+end
+voteDifficulty = function()
+    local difficulty = controller("DifficultyController")
+    local mode = CONFIG.Difficulty
+    local modeButton = difficulty and difficulty.Buttons and difficulty.Buttons[mode]
+    if difficulty and difficulty.Buttons and not modeButton then status("Selected mode is unavailable: " .. mode); return end
+    if SharedConfig.DifficultyUnlockConfig and difficulty and difficulty.stats
+        and not SharedConfig.DifficultyUnlockConfig.isUnlocked(mode, difficulty:stats()) then
+        status("Selected mode is locked: " .. mode); return
+    end
+    if difficultyState and difficultyState.selected == mode then
+        status("Vote confirmed: " .. mode .. "; waiting for mode lock")
+        return
+    end
+    status("Selecting " .. mode)
+    if due("difficulty", CONFIG.ActionInterval) then
+        macro.RequestedDifficulty = mode
+        fire("SelectDifficulty", mode)
+    end
+end
+optionsChanged = function()
+    last.difficulty = nil -- A new selection must replace an earlier vote immediately.
+    if difficultyState and difficultyState.active == true then voteDifficulty() end
 end
 local function seedExistingPositions()
     for _, model in ipairs(workspace:GetChildren()) do
@@ -249,20 +295,10 @@ local function tick()
     end
 
     local difficulty = controller("DifficultyController")
-    if difficulty and visible(difficulty.board) then
-        local modeButton = difficulty.Buttons and difficulty.Buttons[CONFIG.Difficulty]
-        if difficulty.Buttons and not modeButton then
-            status("Selected mode is unavailable: " .. CONFIG.Difficulty); return
-        end
-        if SharedConfig.DifficultyUnlockConfig and difficulty.stats then
-            if not SharedConfig.DifficultyUnlockConfig.isUnlocked(CONFIG.Difficulty, difficulty:stats()) then
-                status("Selected mode is locked: " .. CONFIG.Difficulty); return
-            end
-        end
-        status("Selecting " .. CONFIG.Difficulty)
-        if due("difficulty", CONFIG.ActionInterval) then
-            fire("SelectDifficulty", CONFIG.Difficulty)
-        end
+    local choosing = difficultyState and difficultyState.active == true
+        or difficultyState == nil and difficulty and visible(difficulty.board)
+    if choosing then
+        voteDifficulty()
         return
     end
     if not difficulty or not difficulty.HotbarWanted then
@@ -360,6 +396,22 @@ local function run()
     listen("PlayAgainState", function(state)
         if type(state) == "table" then retryState = state end
     end)
+    if reliable:GetAttribute("DifficultySelection") then
+        listen("DifficultySelection", function(state)
+            if type(state) ~= "table" then return end
+            difficultyState = state
+            macro.SelectedDifficulty = state.selected
+            if state.locked ~= nil then acceptLockedMode(state.locked) end
+            -- Server state is available before UI animations/visibility settle.
+            if state.active == true then voteDifficulty() end
+        end)
+    end
+    if reliable:GetAttribute("DifficultyLocked") then
+        listen("DifficultyLocked", function(value)
+            difficultyState = {active = false, locked = value}
+            acceptLockedMode(value)
+        end)
+    end
     if ownsSkip and macro.SkipSupported then
         listen("SkipState", function(state) if type(state) == "table" then skipState = state end end)
     end
@@ -1009,6 +1061,14 @@ local function openResultReporter(env, settings, getFramework, getContext)
     state.Slot = slot
     local subscriptions, framework, factory, initialized = {}, nil, nil, false
     local round = state.Round
+    local awaitingMode = false
+    local function modeName(value)
+        if type(value) == "string" then return value end
+        if type(value) == "table" then
+            local name = value.locked or value.difficulty or value.mode
+            if type(name) == "string" then return name end
+        end
+    end
     local function persist()
         local ok = pcall(function()
             assert(not blockSave, "Existing results files are damaged; preserving them")
@@ -1032,10 +1092,11 @@ local function openResultReporter(env, settings, getFramework, getContext)
     local function context(kind, recording)
         local value = getContext() or {}
         local difficulty = framework and framework:Get("DifficultyController")
-        local mode = difficulty and type(difficulty.Locked) == "string" and difficulty.Locked or settings.Difficulty
+        local actual = not awaitingMode and difficulty and modeName(difficulty.Locked)
+        local mode = actual or (awaitingMode and "Unknown" or settings.Difficulty)
         return {Kind = kind or value.Kind or "Manual", Recording = recording or value.Recording,
             Recorder = env.PeriastronRecorder,
-            Name = value.Name, Mode = mode,
+            Name = value.Name, Mode = mode, RequestedMode = settings.Difficulty,
             AutoSkip = settings.AutoSkip == true}
     end
     function service.Begin(kind, recording)
@@ -1110,6 +1171,7 @@ local function openResultReporter(env, settings, getFramework, getContext)
         end
         field("Macro", name, false)
         field("Mode", mode); field("Run type", kind)
+        if round.RequestedMode ~= mode then field("Requested mode", round.RequestedMode) end
         if not round.Won then field("Lose at wave", (round.Wave or 0) > 0 and round.Wave or "Unknown") end
         field("Duration", string.format("%d:%02d", math.floor(duration / 60), duration % 60))
         field("Speed", round.Speed); field("Auto skip", round.AutoSkip and "ON" or "OFF")
@@ -1208,8 +1270,19 @@ local function openResultReporter(env, settings, getFramework, getContext)
             if not round then service.Begin() end
             round.Wave = math.max(round.Wave or 0, number)
         end, reliable, module)
+        local function confirmMode(value)
+            local mode = modeName(value)
+            if mode then
+                awaitingMode = false
+                if round and not round.Closed then round.Mode = mode end
+                service.ConfirmedMode = mode
+            end
+        end
+        listen("DifficultySelection", function(value)
+            if type(value) == "table" and value.locked ~= nil then confirmMode(value.locked) end
+        end, reliable, module)
         listen("DifficultyLocked", function(value)
-            if round and not round.Closed and type(value) == "string" then round.Mode = value end
+            confirmMode(value)
         end, reliable, module)
         listen("Win", function() result(true) end, reliable, module)
         listen("GameOver", function() result(false) end, reliable, module)
@@ -1219,6 +1292,8 @@ local function openResultReporter(env, settings, getFramework, getContext)
         listen("RoundRestarted", function()
             service.Flush()
             round, state.Round = nil, nil
+            awaitingMode = true -- DifficultyController.Locked can still belong to the last round.
+            service.ConfirmedMode = nil
             service.Begin()
         end, reliable, module)
         initialized = true
@@ -1353,7 +1428,7 @@ local function button(parent, name, text, x, y, w, h, accent)
 end
 local minimize = button(header, "Minimize", "-", 312, 13, 26, 26)
 local close = button(header, "Close", "x", 346, 13, 26, 26)
-label(body, "ModeLabel", "MODE", 16, 14, 200, 18, 11, colors.Muted)
+local modeLabel = label(body, "ModeLabel", "MODE", 16, 14, 358, 18, 11, colors.Muted)
 local modeButton = button(body, "ModeSelect", "Medium  v", 16, 37, 358, 34)
 label(body, "SpeedLabel", "SPEED BOOST", 16, 85, 200, 18, 11, colors.Muted)
 local speedButtons = {}
@@ -1423,6 +1498,7 @@ local function persistSettings()
     storageLabel.Text = "Files: Periastron Tower Defense" .. (saved and "" or " | settings session only")
 end
 local function applySettings()
+    env.PeriastronUIOptions = settings
     if env.PeriastronAutofarm and env.PeriastronAutofarm.Running then
         env.PeriastronAutofarm.SetOptions(settings)
     end
@@ -1584,6 +1660,7 @@ connect(startButton.Activated, function()
     end
     stopWorkers()
     menu.Visible, profileMenu.Visible = false, false
+    env.PeriastronUIOptions = settings
     local ok, err = pcall(launchReplay)
     if ok then
         active = "replay"
@@ -1627,6 +1704,10 @@ local function refresh()
     resultLabel.Text = results.Status .. (results.StorageWarning or "")
     storageLabel.Text = "Files: Periastron Tower Defense" .. (store.SettingsSaved and "" or " | settings session only")
     modeButton.Text = settings.Difficulty .. "  v"
+    local replay = env.PeriastronAutofarm
+    local mode = replay and replay.Running and replay.LockedDifficulty
+    modeLabel.Text = replay and replay.Running and replay.DifficultyWarning
+        or mode and ("MODE - SERVER: " .. mode) or "MODE - APPLIES AT NEXT VOTE"
     for index, item in ipairs(speedButtons) do
         item.BackgroundColor3 = settings.SpeedIndex == index and colors.Accent or colors.Panel
         item.TextColor3 = settings.SpeedIndex == index and colors.Ink or colors.Text
