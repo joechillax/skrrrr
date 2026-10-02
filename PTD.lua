@@ -547,42 +547,143 @@ end)
 return env.PeriastronRecorder
 end
 
--- A single JSON library avoids using user-supplied profile names as file paths.
+-- Individual files keep profile deletion independent of settings and other macros.
 local function openProfileStore(env)
-    local path = "periastron-profiles.json"
+    local root = "Periastron Tower Defense"
+    local directory = root .. "/Profiles"
+    local settingsPath, markerPath = root .. "/settings.json", root .. "/legacy-imported.json"
     local http = game:GetService("HttpService")
-    local store = {Error = nil, FileBlocked = false}
-    local function validRecording(data)
-        return type(data) == "table" and data.Version == 1 and data.Complete == true
-            and type(data.Placements) == "table" and #data.Placements > 0
-            and type(data.Steps) == "table" and #data.Steps > 0
+    local oldMemory, initialSelected = env.PeriastronProfiles, env.PeriastronCurrentProfile
+    local store = {Error = nil, SettingsBlocked = false, Files = {}, Text = {}, Session = {}}
+    store.Session = env.PeriastronSessionProfileNames or {}
+    env.PeriastronSessionProfileNames = store.Session
+    local optionKeys = {"Difficulty", "SpeedIndex", "AutoRetry", "AutoReady", "AutoSkip"}
+    local defaults = {Difficulty = "Medium", SpeedIndex = 3, AutoRetry = true, AutoReady = true, AutoSkip = true}
+    local disk = isfile and readfile and writefile and isfolder and makefolder and listfiles
+    local function note(message) store.Error = (store.Error and store.Error .. "; " or "") .. message end
+    local function copy(value)
+        if type(value) ~= "table" then return value end
+        local clone = {}
+        for key, item in pairs(value) do clone[key] = copy(item) end
+        return clone
     end
-    local function validateLibrary(data)
-        assert(type(data) == "table" and data.Version == 1 and type(data.Profiles) == "table", "Invalid profile library")
-        for name, profile in pairs(data.Profiles) do
-            assert(type(name) == "string" and type(profile) == "table" and validRecording(profile.Recording), "Invalid saved profile")
+    local function options(value, base)
+        local result = copy(base or defaults)
+        if type(value) ~= "table" then return result end
+        for _, key in ipairs(optionKeys) do
+            local item = value[key]
+            if key == "Difficulty" then
+                if type(item) == "string" and #item > 0 and #item <= 60 then result[key] = item end
+            elseif key == "SpeedIndex" then
+                if type(item) == "number" and item % 1 == 0 and item >= 1 and item <= 3 then result[key] = item end
+            elseif type(item) == "boolean" then result[key] = item end
         end
-        return data
+        return result
     end
-    local data = env.PeriastronProfiles
-    if not data and isfile and readfile and isfile(path) then
-        local ok, value = pcall(function() return validateLibrary(http:JSONDecode(readfile(path))) end)
-        if ok then data = value
-        else store.Error = "Profile library could not be loaded: " .. tostring(value); store.FileBlocked = true end
+    local function validRecording(value)
+        return type(value) == "table" and value.Version == 1 and value.Complete == true
+            and type(value.Placements) == "table" and #value.Placements > 0
+            and type(value.Steps) == "table" and #value.Steps > 0
     end
-    if data then
-        local ok, value = pcall(validateLibrary, data)
-        if not ok then store.Error = tostring(value); store.FileBlocked = true; data = nil end
+    local function readJSON(path) return http:JSONDecode(readfile(path)) end
+    if disk then
+        local ok, err = pcall(function()
+            if not isfolder(root) then makefolder(root) end
+            if not isfolder(directory) then makefolder(directory) end
+        end)
+        if not ok then disk = false; note("Save folder unavailable: " .. tostring(err)) end
     end
-    store.Data = data or {Version = 1, Profiles = {}}
+    store.DiskAvailable = disk and true or false
+    store.Settings = {Version = 1, Options = copy(defaults)}
+    if disk and isfile(settingsPath) then
+        local ok, value = pcall(function()
+            local decoded = readJSON(settingsPath)
+            assert(type(decoded) == "table" and decoded.Version == 1 and type(decoded.Options) == "table", "Invalid settings file")
+            return {Version = 1, Options = options(decoded.Options), SelectedProfile = decoded.SelectedProfile}
+        end)
+        if ok then store.Settings = value; store.HasSavedSettings = true
+        else store.SettingsBlocked = true; note("Settings could not be loaded: " .. tostring(value)) end
+    end
+    store.Data = {Version = 1, Profiles = {}}
+    if type(oldMemory) == "table" and type(oldMemory.Profiles) == "table" then
+        for name in pairs(store.Session) do store.Data.Profiles[name] = oldMemory.Profiles[name] end
+    end
+    if not disk and type(oldMemory) == "table" and type(oldMemory.Profiles) == "table" then
+        store.Data = oldMemory
+        for name in pairs(store.Data.Profiles) do store.Session[name] = true end
+    end
     env.PeriastronProfiles = store.Data
+    function store.LoadSettings(current)
+        return options(current, store.Settings.Options), store.Settings.SelectedProfile
+    end
+    function store.SaveSettings(value, selected)
+        store.SettingsSaved = false
+        store.Settings = {Version = 1, Options = options(value), SelectedProfile = selected}
+        if store.SettingsBlocked then return false, "session only; existing settings file needs repair" end
+        if not disk then return false, "session only; folder/file APIs unavailable" end
+        local ok, err = pcall(function() writefile(settingsPath, http:JSONEncode(store.Settings)) end)
+        store.SettingsSaved = ok
+        return ok, ok and "saved to disk" or "session only; settings save failed: " .. tostring(err)
+    end
+    function store.Refresh()
+        if not disk then return end
+        local ok, paths = pcall(listfiles, directory)
+        if not ok then return false, "Could not read profile folder: " .. tostring(paths) end
+        local profiles, files, texts = {}, {}, {}
+        for _, listed in ipairs(paths) do
+            local filename = listed:gsub("\\", "/"):match("([^/]+)$")
+            if filename and filename:lower():sub(-5) == ".json" then
+                local path = directory .. "/" .. filename
+                local loaded, profile, content = pcall(function()
+                    local text = readfile(path)
+                    local value = http:JSONDecode(text)
+                    assert(type(value) == "table" and value.Version == 1 and type(value.Name) == "string"
+                        and #value.Name > 0 and validRecording(value.Recording), "Invalid profile file")
+                    assert(not profiles[value.Name], "Duplicate profile name")
+                    value.Options = options(value.Options)
+                    value.Recording.ProfileName = value.Name
+                    return value, text
+                end)
+                if loaded then
+                    local name = profile.Name
+                    if store.Text[path] == content and store.Data.Profiles[name] then profile = store.Data.Profiles[name] end
+                    profiles[name], files[name], texts[path] = profile, path, content
+                else note("Skipped " .. filename .. ": " .. tostring(profile)) end
+            end
+        end
+        for name in pairs(store.Session) do
+            if store.Data.Profiles[name] then profiles[name] = store.Data.Profiles[name] end
+        end
+        store.Data.Profiles, store.Files, store.Text = profiles, files, texts
+        local selected = env.PeriastronCurrentProfile
+        if selected and not profiles[selected] then env.PeriastronCurrentProfile, env.PeriastronReplay = nil, nil end
+        return true
+    end
     function store.Names()
         local names = {}
         for name in pairs(store.Data.Profiles) do table.insert(names, name) end
         table.sort(names, function(a, b) return a:lower() < b:lower() end)
         return names
     end
-    function store.Save(name, recording, options)
+    local function fileFor(name)
+        if store.Files[name] then return store.Files[name] end
+        local stem = name:gsub('[<>:"/\\|?*%c]', "_"):gsub("[%. ]+$", "")
+        if #stem == 0 then stem = "Macro" end
+        local device = stem:match("^([^.]+)"):upper()
+        if device == "CON" or device == "PRN" or device == "AUX" or device == "NUL"
+            or device:match("^COM[1-9]$") or device:match("^LPT[1-9]$") then stem = "_" .. stem end
+        local candidate, suffix = directory .. "/" .. stem .. ".json", 2
+        local function occupied(path)
+            if isfile and isfile(path) then return true end
+            for _, existing in pairs(store.Files) do if existing:lower() == path:lower() then return true end end
+            return false
+        end
+        while occupied(candidate) do
+            candidate = directory .. "/" .. stem .. " (" .. suffix .. ").json"; suffix = suffix + 1
+        end
+        return candidate
+    end
+    function store.Save(name, recording, value, migrating)
         assert(validRecording(recording), "Finish recording before saving a profile")
         assert(type(name) == "string", "Enter a macro name")
         name = name:match("^%s*(.-)%s*$")
@@ -591,35 +692,22 @@ local function openProfileStore(env)
         while store.Data.Profiles[name] and store.Data.Profiles[name].Recording ~= recording do
             name = original .. " (" .. suffix .. ")"; suffix = suffix + 1
         end
-        local savedOptions = {}
-        for _, key in ipairs({"Difficulty", "SpeedIndex", "AutoRetry", "AutoReady", "AutoSkip"}) do
-            if options and options[key] ~= nil then savedOptions[key] = options[key] end
+        local saved = {Version = 1, Name = name, Recording = copy(recording), Options = options(value)}
+        saved.Recording.ProfileName = name
+        local encoded = http:JSONEncode(saved)
+        local path = fileFor(name)
+        store.Data.Profiles[name], store.Session[name] = saved, true
+        env.PeriastronReplay, env.PeriastronCurrentProfile = saved.Recording, name
+        local location = "session only; folder/file APIs unavailable"
+        if disk then
+            local ok, err = pcall(writefile, path, encoded)
+            if ok then
+                store.Files[name], store.Text[path], store.Session[name] = path, encoded, nil
+                location = "saved to " .. path
+            else location = "session only; profile save failed: " .. tostring(err) end
         end
-        local function copy(value, seen)
-            if type(value) ~= "table" then return value end
-            seen = seen or {}
-            if seen[value] then return seen[value] end
-            local clone = {}; seen[value] = clone
-            for key, item in pairs(value) do clone[key] = copy(item, seen) end
-            return clone
-        end
-        local previous = store.Data.Profiles[name]
-        local savedRecording = copy(recording)
-        savedRecording.ProfileName = name
-        store.Data.Profiles[name] = {Recording = savedRecording, Options = savedOptions}
-        -- Encode before mutating the file; a failed save keeps the complete plan in memory.
-        local ok, encoded = pcall(function() return http:JSONEncode(store.Data) end)
-        if not ok then
-            store.Data.Profiles[name] = previous
-            error("Could not encode profile library: " .. tostring(encoded))
-        end
-        env.PeriastronCurrentProfile = name
-        env.PeriastronReplay = savedRecording
-        if store.FileBlocked then return name, "session only; existing library needs repair" end
-        if not writefile then return name, "session only; file saving unavailable" end
-        local saved, err = pcall(writefile, path, encoded)
-        if not saved then return name, "session only; file save failed: " .. tostring(err) end
-        return name, "saved to disk"
+        if not migrating then store.SaveSettings(env.PeriastronUIOptions or value, name) end
+        return name, location
     end
     function store.Load(name)
         local profile = store.Data.Profiles[name]
@@ -627,17 +715,50 @@ local function openProfileStore(env)
         env.PeriastronReplay, env.PeriastronCurrentProfile = profile.Recording, name
         return profile.Recording, profile.Options or {}
     end
-    function store.ImportLegacy(current, options)
+    function store.ImportLegacy(current, value)
         local recording = current
         if not validRecording(recording) and isfile and readfile and isfile("periastron-replay.json") then
-            local ok, value = pcall(function() return http:JSONDecode(readfile("periastron-replay.json")) end)
-            if ok and validRecording(value) then recording = value end
+            local ok, decoded = pcall(readJSON, "periastron-replay.json")
+            if ok and validRecording(decoded) then recording = decoded end
         end
         assert(validRecording(recording), "No complete old recording found")
         for name, profile in pairs(store.Data.Profiles) do
-            if profile.Recording == recording then return name, "already in library" end
+            if profile.Recording == recording then return name, "already saved" end
         end
-        return store.Save("Imported recording", recording, options)
+        return store.Save("Imported recording", recording, value)
+    end
+    store.Refresh()
+    store.LegacyImported = disk and isfile(markerPath) or false
+    if disk and not store.LegacyImported then
+        local successful = true
+        local previous = initialSelected or store.Settings.SelectedProfile
+        local legacy = oldMemory
+        if isfile("periastron-profiles.json") then
+            local ok, value = pcall(readJSON, "periastron-profiles.json")
+            if ok and type(value) == "table" and type(value.Profiles) == "table" then legacy = value
+            else note("Old profile library could not be imported; original file retained") end
+        end
+        local function migrate(name, recording, value)
+            if store.Data.Profiles[name] then return end
+            local ok, savedName = pcall(store.Save, name, recording, value, true)
+            if not ok or store.Session[savedName] then successful = false; note("Could not migrate " .. tostring(name)) end
+        end
+        if type(legacy) == "table" and type(legacy.Profiles) == "table" then
+            for name, profile in pairs(legacy.Profiles) do
+                if type(profile) == "table" and validRecording(profile.Recording) then migrate(name, profile.Recording, profile.Options) end
+            end
+        end
+        if isfile("periastron-replay.json") and not store.Data.Profiles["Imported recording"] then
+            local ok, recording = pcall(readJSON, "periastron-replay.json")
+            if ok and validRecording(recording) then migrate("Imported recording", recording, env.PeriastronUIOptions)
+            else note("Old recording could not be imported; original file retained") end
+        end
+        env.PeriastronCurrentProfile = previous
+        if previous and store.Data.Profiles[previous] then env.PeriastronReplay = store.Data.Profiles[previous].Recording end
+        if successful then
+            local ok = pcall(writefile, markerPath, http:JSONEncode({Version = 1}))
+            store.LegacyImported = ok
+        end
     end
     return store
 end
@@ -738,12 +859,16 @@ assert(player, "Open this UI in the main-game client")
 local playerGui = player:WaitForChild("PlayerGui", 30)
 local input = game:GetService("UserInputService")
 local runService = game:GetService("RunService")
-local settings = env.PeriastronUIOptions or {Difficulty = "Medium", SpeedIndex = 3, AutoRetry = true, AutoReady = true, AutoSkip = true}
-if settings.AutoSkip == nil then settings.AutoSkip = true end
-env.PeriastronUIOptions = settings
+local hadSettings = env.PeriastronUIOptions ~= nil
 local store = openProfileStore(env)
+local settings, savedProfile = store.LoadSettings(env.PeriastronUIOptions)
+env.PeriastronUIOptions = settings
 env.PeriastronProfileSaver = store.Save
-local currentProfile = env.PeriastronCurrentProfile
+local currentProfile = env.PeriastronCurrentProfile or savedProfile
+if currentProfile and not store.Data.Profiles[currentProfile] then
+    if env.PeriastronReplay and env.PeriastronReplay.ProfileName == currentProfile then env.PeriastronReplay = nil end
+    currentProfile, env.PeriastronCurrentProfile = nil, nil
+end
 local UI = {Running = true, Status = "Choose Record round to capture your strategy, or load a saved recording."}
 env.PeriastronFarmUI = UI
 local connections, active, minimized = {}, nil, false
@@ -865,7 +990,7 @@ local statusLabel = label(statusCard, "Status", UI.Status, 12, 5, 334, 44, 12)
 statusLabel.TextWrapped = true
 local statsLabel = label(body, "Progress", "Idle", 16, 586, 358, 20, 11, colors.Muted)
 local actualSpeed = label(body, "ActiveSpeed", "Speed: waiting for game", 16, 608, 358, 20, 11, colors.Muted)
-label(body, "Help", "Stop/F8 stops macros. Auto skip follows its toggle.", 16, 631, 358, 18, 10, colors.Muted)
+local storageLabel = label(body, "Help", "Files: Periastron Tower Defense", 16, 631, 358, 18, 10, colors.Muted)
 local profileMenu = make("ScrollingFrame", body, {
     Name = "ProfileMenu", Position = UDim2.fromOffset(16, 291), Size = UDim2.fromOffset(358, 40),
     CanvasSize = UDim2.fromOffset(0, 0), ScrollBarThickness = 4, BackgroundColor3 = colors.Panel,
@@ -880,11 +1005,16 @@ corner(menu)
 make("UIStroke", menu, {Color = colors.Border, Thickness = 1})
 local modeConnections = {}
 local profileConnections = {}
+local function persistSettings()
+    local saved = store.SaveSettings(settings, currentProfile)
+    storageLabel.Text = "Files: Periastron Tower Defense" .. (saved and "" or " | settings session only")
+end
 local function applySettings()
     if env.PeriastronAutofarm and env.PeriastronAutofarm.Running then
         env.PeriastronAutofarm.SetOptions(settings)
     end
     autoSkip.Update()
+    persistSettings()
 end
 local function setMessage(text) UI.Status = text; statusLabel.Text = text end
 local function stopWorkers()
@@ -893,6 +1023,8 @@ local function stopWorkers()
     active = nil
 end
 function UI.Destroy()
+    currentProfile = env.PeriastronCurrentProfile
+    persistSettings()
     UI.Running = false
     autoSkip.Stop()
     stopWorkers()
@@ -905,13 +1037,17 @@ local function busy()
     return (env.PeriastronAutofarm and env.PeriastronAutofarm.Running)
         or (env.PeriastronRecorder and env.PeriastronRecorder.Running)
 end
-local function selectProfile(name)
+local function selectProfile(name, restoreOptions)
     local _, options = store.Load(name)
     currentProfile = name
     nameBox.Text = name
-    for _, key in ipairs({"Difficulty", "SpeedIndex", "AutoRetry", "AutoReady", "AutoSkip"}) do
-        if options[key] ~= nil then settings[key] = options[key] end
+    if restoreOptions ~= false then
+        for _, key in ipairs({"Difficulty", "SpeedIndex", "AutoRetry", "AutoReady", "AutoSkip"}) do
+            if options[key] ~= nil then settings[key] = options[key] end
+        end
     end
+    autoSkip.Update()
+    persistSettings()
     profileMenu.Visible = false
     setMessage("Loaded " .. name .. ". Use it on the matching map, then Start replay.")
 end
@@ -922,6 +1058,8 @@ local function importOld(quiet)
     return ok
 end
 local function rebuildProfiles()
+    local refreshed, err = store.Refresh()
+    if refreshed == false then setMessage(err) end
     for _, item in ipairs(profileConnections) do item:Disconnect() end
     profileConnections = {}
     for _, item in ipairs(profileMenu:GetChildren()) do if item:IsA("TextButton") then item:Destroy() end end
@@ -1005,6 +1143,7 @@ end)
 connect(startButton.Activated, function()
     local recorder = env.PeriastronRecorder
     if recorder and recorder.Running then setMessage("Save your recording before starting replay."); return end
+    store.Refresh()
     local recording = env.PeriastronReplay
     if type(recording) ~= "table" or recording.Complete ~= true then
         setMessage("Select a saved macro or record and save a round first."); return
@@ -1047,6 +1186,7 @@ end)
 local elapsed = 1
 local function refresh()
     autoSkip.Update()
+    storageLabel.Text = "Files: Periastron Tower Defense" .. (store.SettingsSaved and "" or " | settings session only")
     modeButton.Text = settings.Difficulty .. "  v"
     for index, item in ipairs(speedButtons) do
         item.BackgroundColor3 = settings.SpeedIndex == index and colors.Accent or colors.Panel
@@ -1103,8 +1243,10 @@ connect(runService.Heartbeat, function(dt)
     if elapsed >= 0.25 then elapsed = 0; refresh() end
 end)
 local names = store.Names()
-if currentProfile and store.Data.Profiles[currentProfile] then selectProfile(currentProfile)
-elseif #names > 0 then selectProfile(names[1])
-else importOld(true) end
+local restoreInitialOptions = not (store.HasSavedSettings or hadSettings)
+if currentProfile and store.Data.Profiles[currentProfile] then selectProfile(currentProfile, restoreInitialOptions)
+elseif #names > 0 then selectProfile(names[1], restoreInitialOptions)
+elseif not store.LegacyImported then importOld(true) end
+persistSettings()
 if store.Error then setMessage(store.Error .. "; existing file will not be overwritten.") end
 refresh()
