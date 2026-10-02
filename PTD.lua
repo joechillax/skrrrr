@@ -973,6 +973,277 @@ local function openAlwaysSkip(settings, getFramework)
     return service
 end
 
+-- Fixed destination. Results and delivery retries are independent of macro workers.
+local function openResultReporter(env, settings, getFramework, getContext)
+    local WEBHOOK = "https://discord.com/api/webhooks/1551830162650435584/V_EItPsWyCQDQgEvZlAGjaH4XoKXchAD6UbPwEiiJ6mPUmiU-2cOlioFzvPW79KlZGgu?wait=true"
+    local ROOT = "Periastron Tower Defense"
+    local executorHttp = http
+    local http = game:GetService("HttpService")
+    local service = {Running = true, Status = "Discord: waiting for a result"}
+    local state = env.PeriastronResultState
+    local slot, sequence, diskError, blockSave = 0, 0, false, false
+    if not state then
+        local best
+        for index, suffix in ipairs({"a", "b"}) do
+            local path = ROOT .. "/results-" .. suffix .. ".json"
+            if isfile and readfile then
+                local ok, data = pcall(function()
+                    if not isfile(path) then return end
+                    local value = http:JSONDecode(readfile(path))
+                    assert(type(value) == "table" and value.Version == 1 and type(value.Stats) == "table"
+                        and type(value.Outbox) == "table" and type(value.Sequence) == "number", "Invalid results file")
+                    return value
+                end)
+                if ok and data and (not best or data.Sequence > best.Sequence) then best, slot = data, index - 1
+                elseif not ok then diskError = true end
+            end
+        end
+        blockSave = diskError and not best
+        state = best or {Version = 1, Sequence = 0, Serial = 0, Stats = {}, Outbox = {}}
+        sequence = state.Sequence
+        -- Retry unsent transient failures after a fresh script session.
+        for _, item in ipairs(state.Outbox) do item.RetryAt = 0 end
+        env.PeriastronResultState = state
+    else slot, sequence, blockSave = state.Slot or 0, state.Sequence or 0, state.BlockSave == true end
+    state.BlockSave = blockSave
+    state.Slot = slot
+    local subscriptions, framework, factory, initialized = {}, nil, nil, false
+    local round = state.Round
+    local function persist()
+        local ok = pcall(function()
+            assert(not blockSave, "Existing results files are damaged; preserving them")
+            assert(writefile and readfile and isfolder and makefolder, "File APIs unavailable")
+            if not isfolder(ROOT) then makefolder(ROOT) end
+            slot, sequence = state.Slot or slot, state.Sequence or sequence
+            local nextSlot = 1 - slot
+            local path = ROOT .. (nextSlot == 0 and "/results-a.json" or "/results-b.json")
+            local data = {Version = 1, Sequence = sequence + 1, Serial = state.Serial, Stats = state.Stats, Outbox = state.Outbox}
+            local encoded = http:JSONEncode(data)
+            writefile(path, encoded)
+            assert(readfile(path) == encoded, "Results read-back failed")
+            slot, sequence = nextSlot, sequence + 1
+            state.Slot, state.Sequence = slot, sequence
+        end)
+        service.DiskSaved = ok
+        diskError = not ok
+        state.StorageError = diskError
+    end
+    local function clock() return os.clock() end
+    local function context(kind, recording)
+        local value = getContext() or {}
+        local difficulty = framework and framework:Get("DifficultyController")
+        local mode = difficulty and type(difficulty.Locked) == "string" and difficulty.Locked or settings.Difficulty
+        return {Kind = kind or value.Kind or "Manual", Recording = recording or value.Recording,
+            Recorder = env.PeriastronRecorder,
+            Name = value.Name, Mode = mode,
+            AutoSkip = settings.AutoSkip == true}
+    end
+    function service.Begin(kind, recording)
+        if round and round.Won ~= nil then service.Flush() end
+        local value = context(kind, recording)
+        if round and not round.Closed then
+            -- Starting another strategy halfway through a match cannot be a clean macro trial.
+            if round.Kind ~= value.Kind or round.Recording ~= value.Recording then round.Kind = "Mixed / manual finish" end
+            round.Recording, round.Name = value.Recording, value.Name
+            return
+        end
+        value.Started, value.Wave = clock(), 0
+        round, state.Round = value, value
+    end
+    function service.MarkStopped()
+        if round and not round.Closed and round.Won == nil and round.Kind == "Replay" then round.Kind = "Replay stopped / manual finish" end
+    end
+    local function waveFallback()
+        local ok, value = pcall(function()
+            local gui = game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
+            local interface = gui and gui:FindFirstChild("Interface")
+            local counter = interface and interface:FindFirstChild("WaveCounter")
+            local number = counter and counter:FindFirstChild("Number")
+            return number and tonumber(number.Text)
+        end)
+        return ok and value or nil
+    end
+    local function speed()
+        local controller = framework and framework:Get("SpeedController")
+        return ({"1x", "1.5x", "2x"})[controller and controller.Index] or "Unknown"
+    end
+    local function result(won, payload)
+        if round and round.Closed then return end
+        if not round then service.Begin("Manual") end
+        if type(won) ~= "boolean" then return end
+        if round.Won == nil then
+            round.Won, round.Ended, round.FlushAt = won, clock(), clock() + 0.75
+            round.Wave = math.max(round.Wave or 0, waveFallback() or 0)
+            round.Speed = speed()
+            local worker = env.PeriastronAutofarm
+            if round.Kind == "Replay" and worker then
+                if not worker.Running then round.Kind = "Replay stopped / manual finish" end
+                round.Actions = math.min(math.max(0, (worker.Step or 1) - 1), worker.TotalSteps or 0)
+                round.TotalActions = worker.TotalSteps
+            end
+        end
+        -- RoundReward is authoritative and supplies rewards after Win/GameOver.
+        if payload then round.Won, round.Rewards = won, payload.rewards end
+    end
+    local function truncate(value) return tostring(value or "Unknown"):sub(1, 900) end
+    function service.Flush()
+        if not round or round.Closed or round.Won == nil then return end
+        round.Closed = true -- Mark first: no duplicate result from another event/retry.
+        local recording = round.Recording
+        if round.Kind == "Recording" and round.Recorder and round.Recorder.Snapshot then
+            recording = round.Recorder.Snapshot() or recording
+        end
+        local name = recording and recording.ProfileName or round.Name or "No macro (manual)"
+        local duration = math.max(0, math.floor((round.Ended or clock()) - round.Started))
+        local kind, mode = round.Kind, round.Mode or "Unknown"
+        local key = http:JSONEncode({name, mode, kind, round.Speed, round.AutoSkip})
+        local stats = state.Stats[key]
+        if type(stats) ~= "table" or type(stats.Wins) ~= "number" or type(stats.Losses) ~= "number" then
+            stats = {Macro = name, Mode = mode, Kind = kind, Speed = round.Speed, AutoSkip = round.AutoSkip, Wins = 0, Losses = 0}
+            state.Stats[key] = stats
+        end
+        if round.Won then stats.Wins = stats.Wins + 1 else stats.Losses = stats.Losses + 1 end
+        local total = stats.Wins + stats.Losses
+        local fields = {}
+        local function field(title, value, inline)
+            table.insert(fields, {name = title, value = truncate(value), inline = inline ~= false})
+        end
+        field("Macro", name, false)
+        field("Mode", mode); field("Run type", kind)
+        if not round.Won then field("Lose at wave", (round.Wave or 0) > 0 and round.Wave or "Unknown") end
+        field("Duration", string.format("%d:%02d", math.floor(duration / 60), duration % 60))
+        field("Speed", round.Speed); field("Auto skip", round.AutoSkip and "ON" or "OFF")
+        field("Win rate", string.format("%.1f%% | %d wins / %d losses | %d matches", stats.Wins / total * 100, stats.Wins, stats.Losses, total), false)
+        if round.TotalActions then field("Macro actions completed", tostring(round.Actions) .. " / " .. round.TotalActions) end
+        if type(round.Rewards) == "table" then
+            local parts = {}
+            for _, entry in ipairs({{"coins", "coins"}, {"shards", "shards"}, {"xp", "XP"}}) do
+                local amount = round.Rewards[entry[1]]
+                if type(amount) == "number" then table.insert(parts, tostring(amount) .. " " .. entry[2]) end
+            end
+            if #parts > 0 then field("Rewards", table.concat(parts, " | "), false) end
+        end
+        state.Serial = (state.Serial or 0) + 1
+        local id = tostring(os.time()) .. "-" .. state.Serial .. "-" .. math.random(100000, 999999)
+        local item = {ID = id, Attempts = 0, RetryAt = 0, Payload = {
+            username = "Periastron results", allowed_mentions = {parse = {}},
+            embeds = {{title = round.Won and "WIN" or "LOSE", color = round.Won and 4511146 or 15885444,
+                fields = fields, timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+                footer = {text = "Win rate: same macro, mode, run type, speed & skip | Report " .. id}}},
+        }}
+        table.insert(state.Outbox, item)
+        service.LastResult = {Won = round.Won, Macro = name, Wave = round.Wave, WinRate = stats.Wins / total * 100}
+        service.Status = "Discord: result queued"
+        persist()
+    end
+    local function requestFunction()
+        return request or http_request or (syn and syn.request) or (type(executorHttp) == "table" and executorHttp.request)
+            or env.request or (type(env.http) == "table" and env.http.request)
+    end
+    local function deliver()
+        if state.Sending or clock() < (state.NextSendAt or 0) then return end
+        local send = requestFunction()
+        local chosen
+        for _, item in ipairs(state.Outbox) do
+            if not item.Failed and clock() >= (item.RetryAt or 0) then chosen = item; break end
+        end
+        if not chosen then
+            for _, item in ipairs(state.Outbox) do
+                if item.Failed then service.Status = "Discord: rejected report kept locally"; break end
+            end
+            return
+        end
+        if type(send) ~= "function" then service.Status = "Discord: queued (HTTP request API unavailable)"; return end
+        state.Sending = chosen.ID
+        -- Network work runs separately; it never waits in recording/replay or event callbacks.
+        task.spawn(function()
+            chosen.Attempts = (chosen.Attempts or 0) + 1
+            local ok, response = pcall(function()
+                return send({Url = WEBHOOK, Method = "POST", Headers = {["Content-Type"] = "application/json"},
+                    Body = http:JSONEncode(chosen.Payload)})
+            end)
+            local code = ok and type(response) == "table" and tonumber(response.StatusCode or response.Status)
+            if code and code >= 200 and code < 300 then
+                for index, item in ipairs(state.Outbox) do if item == chosen then table.remove(state.Outbox, index); break end end
+                service.Status = "Discord: result sent"
+            elseif code == 429 then
+                local retry = 5
+                pcall(function() retry = tonumber(http:JSONDecode(response.Body or "{}").retry_after) or retry end)
+                local headers = response.Headers or {}
+                retry = tonumber(headers["Retry-After"] or headers["retry-after"]) or retry
+                chosen.RetryAt = clock() + math.max(1, retry)
+                state.NextSendAt = chosen.RetryAt
+                service.Status = "Discord: rate limited; retry queued"
+            elseif code and code >= 400 and code < 500 then
+                chosen.Failed = true
+                service.Status = "Discord: rejected (HTTP " .. code .. "); result kept locally"
+            else
+                chosen.RetryAt = clock() + math.min(300, 5 * 2 ^ math.min(chosen.Attempts - 1, 6))
+                service.Status = "Discord: network/server error; retry queued"
+            end
+            persist()
+            state.Sending = nil
+        end)
+    end
+    local function listen(name, callback, reliable, module)
+        if not reliable:GetAttribute(name) then return end
+        local event = framework.Events[name]
+        if not event then factory = factory or require(module); event = factory(name); framework.Events[name] = event end
+        table.insert(subscriptions, {Event = event, Key = event:Connect(function(...)
+            local ok = pcall(callback, ...)
+            if not ok then service.Status = "Discord: reporter error; macro continues" end
+        end)})
+    end
+    local function initialize()
+        framework = getFramework()
+        if not framework then return end
+        -- A missing module during startup must not multiply successful earlier subscriptions.
+        for _, item in ipairs(subscriptions) do pcall(function() item.Event:Disconnect(item.Key) end) end
+        subscriptions = {}
+        local shared = game:GetService("ReplicatedStorage"):FindFirstChild("Shared")
+        local reliable, module = shared.Vendor.Warp.Index.Event.Reliable, shared.Vendor.Warp.Index.Client.Index
+        listen("SetWave", function(number)
+            if type(number) ~= "number" or number <= 0 then return end
+            if round and round.Closed then return end -- Only RoundRestarted opens the next match.
+            if not round then service.Begin() end
+            round.Wave = math.max(round.Wave or 0, number)
+        end, reliable, module)
+        listen("DifficultyLocked", function(value)
+            if round and not round.Closed and type(value) == "string" then round.Mode = value end
+        end, reliable, module)
+        listen("Win", function() result(true) end, reliable, module)
+        listen("GameOver", function() result(false) end, reliable, module)
+        listen("RoundReward", function(payload)
+            if type(payload) == "table" then result(payload.won, payload) end
+        end, reliable, module)
+        listen("RoundRestarted", function()
+            service.Flush()
+            round, state.Round = nil, nil
+            service.Begin()
+        end, reliable, module)
+        initialized = true
+    end
+    function service.Update()
+        if not service.Running then return end
+        local ok = pcall(function()
+            if not initialized then initialize() end
+            if round and round.Won ~= nil and not round.Closed and clock() >= round.FlushAt then service.Flush() end
+            deliver()
+        end)
+        if not ok then service.Status = "Discord: reporter error; macro continues" end
+        service.StorageWarning = (diskError or state.StorageError) and " | results session only" or ""
+    end
+    function service.Stop()
+        -- Report a confirmed result even if the panel closes during the reward animation.
+        service.Flush()
+        service.Running = false
+        for _, item in ipairs(subscriptions) do pcall(function() item.Event:Disconnect(item.Key) end) end
+        subscriptions = {}
+    end
+    service.Update()
+    return service
+end
+
 -- Native in-game controls; the replay and recorder are embedded above this panel.
 local env = (getgenv and getgenv()) or _G
 if env.PeriastronFarmUI and env.PeriastronFarmUI.Destroy then env.PeriastronFarmUI.Destroy() end
@@ -1015,6 +1286,19 @@ local autoSkip = openAlwaysSkip(settings, function()
     if gameModules() then return framework end
 end)
 UI.AutoSkip = autoSkip
+local results = openResultReporter(env, settings, function()
+    if gameModules() then return framework end
+end, function()
+    local replay = env.PeriastronAutofarm
+    local recorder = env.PeriastronRecorder
+    if replay and replay.Running then
+        return {Kind = "Replay", Recording = env.PeriastronReplay, Name = currentProfile}
+    elseif recorder and recorder.Running then
+        return {Kind = "Recording", Recording = recorder.Snapshot(), Name = env.PeriastronRecordingName}
+    end
+    return {Kind = "Manual", Name = "No macro (manual)"}
+end)
+UI.Results = results
 local colors = {
     Background = Color3.fromRGB(15, 20, 31), Panel = Color3.fromRGB(24, 32, 46),
     Border = Color3.fromRGB(48, 61, 80), Text = Color3.fromRGB(237, 242, 249),
@@ -1038,7 +1322,7 @@ local screen = make("ScreenGui", playerGui, {
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 })
 local root = make("Frame", screen, {
-    Name = "Panel", Size = UDim2.fromOffset(390, 724), Position = UDim2.new(0, 24, 0.5, 0),
+    Name = "Panel", Size = UDim2.fromOffset(390, 748), Position = UDim2.new(0, 24, 0.5, 0),
     AnchorPoint = Vector2.new(0, 0.5),
     BackgroundColor3 = colors.Background, BorderSizePixel = 0,
 })
@@ -1118,6 +1402,8 @@ statusLabel.TextWrapped = true
 local statsLabel = label(body, "Progress", "Idle", 16, 586, 358, 20, 11, colors.Muted)
 local actualSpeed = label(body, "ActiveSpeed", "Speed: waiting for game", 16, 608, 358, 20, 11, colors.Muted)
 local storageLabel = label(body, "Help", "Files: Periastron Tower Defense", 16, 631, 358, 18, 10, colors.Muted)
+local resultLabel = label(body, "ResultStatus", results.Status, 16, 652, 358, 28, 10, colors.Muted)
+resultLabel.TextWrapped = true
 local profileMenu = make("ScrollingFrame", body, {
     Name = "ProfileMenu", Position = UDim2.fromOffset(16, 291), Size = UDim2.fromOffset(358, 40),
     CanvasSize = UDim2.fromOffset(0, 0), ScrollBarThickness = 4, BackgroundColor3 = colors.Panel,
@@ -1145,6 +1431,7 @@ local function applySettings()
 end
 local function setMessage(text) UI.Status = text; statusLabel.Text = text end
 local function stopWorkers()
+    results.MarkStopped()
     if env.PeriastronAutofarm and env.PeriastronAutofarm.Stop then env.PeriastronAutofarm.Stop() end
     if env.PeriastronRecorder and env.PeriastronRecorder.Stop then env.PeriastronRecorder.Stop() end
     active = nil
@@ -1154,6 +1441,7 @@ function UI.Destroy()
     persistSettings()
     UI.Running = false
     autoSkip.Stop()
+    results.Stop()
     stopWorkers()
     for _, item in ipairs(connections) do item:Disconnect() end
     for _, item in ipairs(modeConnections) do item:Disconnect() end
@@ -1260,7 +1548,10 @@ connect(recordButton.Activated, function()
     menu.Visible, profileMenu.Visible = false, false
     env.PeriastronRecordingName = name
     local ok, err = pcall(launchRecorder)
-    if ok then active = "record"; setMessage("Recording " .. name .. ". Play manually, then Finish & save.")
+    if ok then
+        active = "record"
+        results.Begin("Recording", env.PeriastronRecorder.Snapshot())
+        setMessage("Recording " .. name .. ". Play manually, then Finish & save.")
     else stopWorkers(); setMessage("Could not start recorder: " .. tostring(err)) end
 end)
 connect(saveButton.Activated, function()
@@ -1294,7 +1585,10 @@ connect(startButton.Activated, function()
     stopWorkers()
     menu.Visible, profileMenu.Visible = false, false
     local ok, err = pcall(launchReplay)
-    if ok then active = "replay"; setMessage("Starting replay...")
+    if ok then
+        active = "replay"
+        results.Begin("Replay", recording)
+        setMessage("Starting replay...")
     else stopWorkers(); setMessage("Could not start replay: " .. tostring(err)) end
 end)
 connect(stopButton.Activated, function() stopWorkers(); setMessage("Macro stopped. Auto skip still follows its toggle.") end)
@@ -1303,7 +1597,7 @@ connect(minimize.Activated, function()
     minimized = not minimized
     body.Visible = not minimized
     menu.Visible, profileMenu.Visible = false, false
-    root.Size = UDim2.fromOffset(390, minimized and 64 or 724)
+    root.Size = UDim2.fromOffset(390, minimized and 64 or 748)
     minimize.Text = minimized and "+" or "-"
 end)
 local dragging, startPointer, startPosition, touchInput
@@ -1329,6 +1623,8 @@ end)
 local elapsed = 1
 local function refresh()
     autoSkip.Update()
+    results.Update()
+    resultLabel.Text = results.Status .. (results.StorageWarning or "")
     storageLabel.Text = "Files: Periastron Tower Defense" .. (store.SettingsSaved and "" or " | settings session only")
     modeButton.Text = settings.Difficulty .. "  v"
     for index, item in ipairs(speedButtons) do
@@ -1379,7 +1675,7 @@ local function refresh()
     local camera = workspace.CurrentCamera
     if camera then
         local viewport = camera.ViewportSize
-        scale.Scale = math.max(0.35, math.min(1, (viewport.X - 48) / 390, (viewport.Y - 48) / (minimized and 64 or 724)))
+        scale.Scale = math.max(0.35, math.min(1, (viewport.X - 48) / 390, (viewport.Y - 48) / (minimized and 64 or 748)))
     end
 end
 connect(runService.Heartbeat, function(dt)
