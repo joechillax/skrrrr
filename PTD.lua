@@ -442,45 +442,99 @@ env.PeriastronRecorder = recorder
 local profileName = env.PeriastronRecordingName
 local profileOptions = {}
 for key, value in pairs(env.PeriastronUIOptions or {}) do profileOptions[key] = value end
-local subscriptions, inputConnection = {}, nil
+local subscriptions, inputConnection, heartbeatConnection = {}, nil, nil
 local recording, byID, levels, accepting
+local finish, suppressOldResult, backupSlot = nil, false, 0
+local http = game:GetService("HttpService")
+local function resultShowing()
+    local result = Me:Get("ResultController")
+    if result and type(result.showing) == "boolean" then return result.showing end
+    local screen = player:WaitForChild("PlayerGui"):FindFirstChild("ResultScreen")
+    return screen and screen.Enabled == true or false
+end
+local function preserve()
+    if not recording then return end
+    recorder.Recording = recording
+    env.PeriastronRecoveryDraft = recording
+    env.PeriastronRecordingBackups = env.PeriastronRecordingBackups or {}
+    env.PeriastronRecordingBackups[recording.CaptureID] = recording
+end
+local function checkpoint()
+    preserve()
+    if not recording or #recording.Steps == 0 then return end
+    local ok, err = pcall(function()
+        assert(writefile and readfile and makefolder and isfolder, "Recording file APIs unavailable")
+        if not isfolder("Periastron Tower Defense") then makefolder("Periastron Tower Defense") end
+        if not isfolder("Periastron Tower Defense/Recovery") then makefolder("Periastron Tower Defense/Recovery") end
+        local nextSlot = 1 - backupSlot
+        local path = "Periastron Tower Defense/Recovery/" .. recording.CaptureID .. (nextSlot == 0 and "-a.json" or "-b.json")
+        local encoded = http:JSONEncode({Version = 1, Name = profileName or "Recorded macro", SavedAt = os.time(),
+            Recording = recording, Options = env.PeriastronUIOptions or profileOptions})
+        writefile(path, encoded)
+        assert(readfile(path) == encoded, "Recording backup read-back failed")
+        -- Keep retrying the failed slot; never overwrite the last verified slot.
+        backupSlot = nextSlot
+        recorder.BackupPath = path
+    end)
+    recorder.BackupError = not ok and tostring(err) or nil
+    return ok
+end
+function recorder.Snapshot() return recording end
 local function begin()
-    recording = {Version = 1, Complete = false, Placements = {}, Steps = {}, ProfileName = profileName}
+    -- A retry is evidence that the preceding round ended, not a reason to erase it.
+    if recording and accepting and #recording.Steps > 0 then finish(); return end
+    env.PeriastronCaptureSerial = (env.PeriastronCaptureSerial or 0) + 1
+    recording = {Version = 1, Complete = false, Placements = {}, Steps = {}, ProfileName = profileName,
+        RecordedAt = os.time(), CaptureSerial = env.PeriastronCaptureSerial,
+        CaptureID = tostring(os.time()) .. "-" .. env.PeriastronCaptureSerial .. "-" .. math.random(100000, 999999)}
     byID, levels, accepting = {}, {}, true
     env.PeriastronReplay = recording
+    preserve()
+    suppressOldResult = resultShowing()
     recorder.Status = "Recording manual placements and upgrades"
     print("[PeriastronRecorder] Recording. Play your round manually; F7 saves early.")
 end
 function recorder.Stop()
+    checkpoint()
     recorder.Running = false
     for _, item in ipairs(subscriptions) do pcall(function() item.event:Disconnect(item.key) end) end
     subscriptions = {}
     if inputConnection then inputConnection:Disconnect(); inputConnection = nil end
+    if heartbeatConnection then heartbeatConnection:Disconnect(); heartbeatConnection = nil end
 end
-local function finish()
-    if not recorder.Running or not accepting or recording.Complete then return end
+finish = function()
+    if not accepting or recorder.DiskSaved then return end
     if #recording.Placements == 0 then
         warn("[PeriastronRecorder] No placements captured; nothing saved")
         return
     end
     recording.Complete = true
+    checkpoint()
     env.PeriastronReplay = recording
     local savedProfile, saveLocation
     if profileName and type(env.PeriastronProfileSaver) == "function" then
-        local ok, name, location = pcall(env.PeriastronProfileSaver, profileName, recording, profileOptions)
-        if ok then savedProfile, saveLocation = name, location; recording.ProfileName = name
+        local ok, name, location, diskSaved = pcall(env.PeriastronProfileSaver, profileName, recording, env.PeriastronUIOptions or profileOptions)
+        if ok then
+            savedProfile, saveLocation = name, location
+            recording.ProfileName = name
+            recorder.DiskSaved = diskSaved == true
+            if env.PeriastronReplay and env.PeriastronReplay.CaptureID == recording.CaptureID then recording = env.PeriastronReplay end
         else saveLocation = "save failed; recording kept in memory: " .. tostring(name) end
     end
-    local json = game:GetService("HttpService"):JSONEncode(recording)
+    local json = http:JSONEncode(recording)
     if not profileName and writefile then
-        local ok, err = pcall(writefile, "periastron-replay.json", json)
-        if ok then print("[PeriastronRecorder] Saved periastron-replay.json in your scripting environment's workspace")
+        local ok, err = pcall(function()
+            writefile("periastron-replay.json", json)
+            assert(readfile and readfile("periastron-replay.json") == json, "Save read-back failed")
+        end)
+        recorder.DiskSaved = ok
+        if ok then print("[PeriastronRecorder] Saved and verified periastron-replay.json")
         else warn("[PeriastronRecorder] File save failed: " .. tostring(err)) end
     end
-    print("[PeriastronRecorder] JSON backup: " .. json)
-    if savedProfile then recorder.Status = "Saved " .. savedProfile .. " (" .. saveLocation .. ")"
+    if recorder.DiskSaved then recorder.Status = "Saved and verified " .. #recording.Steps .. " actions: " .. (savedProfile or "periastron-replay.json")
+    elseif savedProfile then recorder.Status = "NOT saved to profile file: " .. tostring(saveLocation) .. ". " .. #recording.Steps .. " actions retained; use Recover draft."
     elseif profileName then recorder.Status = saveLocation or "Recording complete; save it as a profile in the UI"
-    else recorder.Status = "Saved " .. #recording.Steps .. " actions; run periastron-autofarm.lua" end
+    else recorder.Status = "NOT saved to file; " .. #recording.Steps .. " actions retained in memory" end
     print("[PeriastronRecorder] " .. recorder.Status)
     recorder.Stop()
 end
@@ -517,6 +571,8 @@ listen("ReplicateUnit", function(name, cf, owner, id, level)
     table.insert(recording.Steps, {Kind = "Place", Placement = index})
     -- Ordinarily newly placed towers are level zero; preserve a nonzero level if supplied.
     for upgrade = 1, level or 0 do table.insert(recording.Steps, {Kind = "Upgrade", Placement = index, Level = upgrade}) end
+    checkpoint()
+    recorder.Status = "Recording " .. #recording.Steps .. " actions; " .. (recorder.BackupError and "backup failed: " .. recorder.BackupError or "draft backed up")
     print("[PeriastronRecorder] Placement " .. index .. ": " .. name)
 end)
 listen("UnitUpgraded", function(id, level)
@@ -525,19 +581,34 @@ listen("UnitUpgraded", function(id, level)
         table.insert(recording.Steps, {Kind = "Upgrade", Placement = byID[id], Level = upgrade})
     end
     levels[id] = math.max(levels[id] or 0, level)
+    checkpoint()
+    recorder.Status = "Recording " .. #recording.Steps .. " actions; " .. (recorder.BackupError and "backup failed: " .. recorder.BackupError or "draft backed up")
     print("[PeriastronRecorder] Upgrade placement " .. byID[id] .. " to level " .. level)
 end)
--- These actions are outside the requested placement/upgrade strategy. Reject a
--- recording containing removals so replay cannot silently diverge after a sale.
+-- RemoveUnit also occurs during round cleanup. Never erase/stop a draft on it.
 listen("RemoveUnit", function(id)
     if accepting and byID[id] and not recording.Complete then
-        recording.Complete = false
-        recorder.Status = "A recorded tower was removed; record a fresh round without selling towers"
-        warn("[PeriastronRecorder] " .. recorder.Status)
-        recorder.Stop()
+        recording.RemovalObserved = true
+        checkpoint()
+        recorder.Status = "Tower removed; draft retained while waiting for the match result"
     end
 end)
 listen("RoundReward", finish)
+for _, name in ipairs({"Win", "GameOver"}) do
+    if reliable:GetAttribute(name) then listen(name, function() finish() end) end
+end
+local runService = game:GetService("RunService")
+if runService and runService.Heartbeat then
+    heartbeatConnection = runService.Heartbeat:Connect(function()
+        if not recorder.Running or not accepting then return end
+        local showing = resultShowing()
+        if not showing then suppressOldResult = false end
+        if showing and not suppressOldResult and #recording.Steps > 0 then
+            local ok, err = pcall(finish)
+            if not ok then preserve(); recorder.Status = "Auto-save failed; draft retained: " .. tostring(err) end
+        end
+    end)
+end
 inputConnection = game:GetService("UserInputService").InputBegan:Connect(function(key, processed)
     if processed then return end
     if key.KeyCode == Enum.KeyCode.F7 then finish()
@@ -621,7 +692,11 @@ local function openProfileStore(env)
         store.Settings = {Version = 1, Options = options(value), SelectedProfile = selected}
         if store.SettingsBlocked then return false, "session only; existing settings file needs repair" end
         if not disk then return false, "session only; folder/file APIs unavailable" end
-        local ok, err = pcall(function() writefile(settingsPath, http:JSONEncode(store.Settings)) end)
+        local ok, err = pcall(function()
+            local encoded = http:JSONEncode(store.Settings)
+            writefile(settingsPath, encoded)
+            assert(readfile(settingsPath) == encoded, "Settings save read-back failed")
+        end)
         store.SettingsSaved = ok
         return ok, ok and "saved to disk" or "session only; settings save failed: " .. tostring(err)
     end
@@ -700,14 +775,17 @@ local function openProfileStore(env)
         env.PeriastronReplay, env.PeriastronCurrentProfile = saved.Recording, name
         local location = "session only; folder/file APIs unavailable"
         if disk then
-            local ok, err = pcall(writefile, path, encoded)
+            local ok, err = pcall(function()
+                writefile(path, encoded)
+                assert(readfile(path) == encoded, "Profile save read-back failed")
+            end)
             if ok then
                 store.Files[name], store.Text[path], store.Session[name] = path, encoded, nil
                 location = "saved to " .. path
             else location = "session only; profile save failed: " .. tostring(err) end
         end
         if not migrating then store.SaveSettings(env.PeriastronUIOptions or value, name) end
-        return name, location
+        return name, location, store.Session[name] == nil
     end
     function store.Load(name)
         local profile = store.Data.Profiles[name]
@@ -726,6 +804,52 @@ local function openProfileStore(env)
             if profile.Recording == recording then return name, "already saved" end
         end
         return store.Save("Imported recording", recording, value)
+    end
+    function store.CheckRecordingPersistence()
+        if not disk then return false, "Recording needs working folder, read, write, and list APIs" end
+        local ok, err = pcall(function()
+            local recovery = root .. "/Recovery"
+            if not isfolder(recovery) then makefolder(recovery) end
+            local path = recovery .. "/_write-check.json"
+            local encoded = http:JSONEncode({Version = 1, Probe = true})
+            writefile(path, encoded)
+            assert(readfile(path) == encoded, "Recording backup read-back failed")
+            if delfile then pcall(delfile, path) end
+        end)
+        return ok, not ok and tostring(err) or nil
+    end
+    function store.LoadDraft()
+        local best, stamp, serial = nil, -1, -1
+        local function consider(value)
+            if type(value) ~= "table" or value.Version ~= 1 or value.Invalid
+                or type(value.Placements) ~= "table" or #value.Placements == 0
+                or type(value.Steps) ~= "table" or #value.Steps == 0 then return end
+            local time, order = value.RecordedAt or 0, value.CaptureSerial or 0
+            if not best or time > stamp or (time == stamp and order > serial)
+                or (time == stamp and order == serial and #value.Steps > #best.Steps) then
+                best, stamp, serial = value, time, order
+            end
+        end
+        consider(env.PeriastronRecoveryDraft)
+        consider(env.PeriastronRecoveredRecording)
+        if env.PeriastronRecorder then consider(env.PeriastronRecorder.Recording) end
+        for _, value in pairs(env.PeriastronRecordingBackups or {}) do consider(value) end
+        if disk then
+            local ok, paths = pcall(listfiles, root .. "/Recovery")
+            if ok then
+                for _, listed in ipairs(paths) do
+                    local filename = listed:gsub("\\", "/"):match("([^/]+)$")
+                    if filename and filename:lower():sub(-5) == ".json" then
+                        local read, value = pcall(readJSON, root .. "/Recovery/" .. filename)
+                        if read and type(value) == "table" then consider(value.Recording) end
+                    end
+                end
+            end
+        end
+        assert(best, "No retained recording draft found")
+        local draft = copy(best)
+        draft.Complete = true
+        return draft
     end
     store.Refresh()
     store.LegacyImported = disk and isfile(markerPath) or false
@@ -976,6 +1100,9 @@ local planHelp = label(planCard, "RecordingHelp", "Select a saved macro or recor
 planHelp.TextWrapped = true
 local loadButton = button(planCard, "LoadSaved", "Import old", 253, 8, 94, 25)
 loadButton.TextSize = 11
+planHelp.Size = UDim2.fromOffset(235, 24)
+local recoverButton = button(planCard, "RecoverDraft", "Recover draft", 253, 35, 94, 25)
+recoverButton.TextSize = 11
 local recordButton = button(body, "RecordRound", "Record round", 16, 422, 175, 36)
 local saveButton = button(body, "SaveRecording", "Finish & save", 199, 422, 175, 36)
 local startButton = button(body, "StartReplay", "Start replay", 16, 468, 175, 40, true)
@@ -1120,13 +1247,15 @@ connect(loadButton.Activated, function()
 end)
 connect(saveProfileButton.Activated, function()
     if busy() then setMessage("Stop replay or finish recording before using Save as."); return end
-    local ok, name, location = pcall(store.Save, nameBox.Text, env.PeriastronReplay, settings)
-    if ok then currentProfile = name; nameBox.Text = name; setMessage("Saved " .. name .. " (" .. location .. ")")
+    local ok, name, location, verified = pcall(store.Save, nameBox.Text, env.PeriastronReplay, settings)
+    if ok then currentProfile = name; nameBox.Text = name; setMessage((verified and "Saved and verified " or "NOT saved to disk: ") .. name .. " (" .. location .. ")")
     else setMessage(tostring(name)) end
 end)
 connect(recordButton.Activated, function()
     local name = nameBox.Text:match("^%s*(.-)%s*$")
     if #name == 0 or #name > 60 then setMessage("Enter a macro name between 1 and 60 characters."); return end
+    local writable, reason = store.CheckRecordingPersistence()
+    if not writable then setMessage("Recording not started: " .. tostring(reason)); return end
     stopWorkers()
     menu.Visible, profileMenu.Visible = false, false
     env.PeriastronRecordingName = name
@@ -1136,9 +1265,23 @@ connect(recordButton.Activated, function()
 end)
 connect(saveButton.Activated, function()
     local recorder = env.PeriastronRecorder
-    if not recorder or not recorder.Running then setMessage("Start Record round first, or use Save as for your current plan."); return end
+    if not recorder or (not recorder.Running and (not recorder.Snapshot or not recorder.Snapshot())) then
+        setMessage("Start Record round first, or use Recover draft for a retained recording."); return
+    end
     local ok, err = pcall(recorder.Finish)
-    if not ok then setMessage("Could not save: " .. tostring(err)) end
+    if not ok then setMessage("Could not save; draft retained: " .. tostring(err))
+    else setMessage(recorder.Status) end
+end)
+connect(recoverButton.Activated, function()
+    if busy() then setMessage("Finish or stop the macro before recovering a draft."); return end
+    local ok, draft = pcall(store.LoadDraft)
+    if not ok then setMessage(tostring(draft)); return end
+    local saved, name, location, verified = pcall(store.Save, draft.ProfileName or "Recovered macro", draft, settings)
+    if saved then
+        currentProfile, nameBox.Text = name, name
+        setMessage((verified and "Recovered and verified " or "Recovered in memory; NOT saved to disk: ")
+            .. #draft.Steps .. " actions (" .. tostring(location) .. ")")
+    else setMessage("Recovery file save failed: " .. tostring(name)) end
 end)
 connect(startButton.Activated, function()
     local recorder = env.PeriastronRecorder
@@ -1207,8 +1350,10 @@ local function refresh()
     profileButton.Text = (currentProfile or "Choose saved macro") .. "  v"
     local recording = env.PeriastronReplay
     if recording and recording.Complete then
-        planLabel.Text = "Saved: " .. #recording.Placements .. " towers / " .. #recording.Steps .. " actions"
-        planHelp.Text = "Ready to replay. Use the same map and deck."
+        local profile = currentProfile and store.Data.Profiles[currentProfile]
+        local verified = profile and profile.Recording == recording and store.Files[currentProfile] and not store.Session[currentProfile]
+        planLabel.Text = (verified and "Saved: " or "Recorded: ") .. #recording.Placements .. " towers / " .. #recording.Steps .. " actions"
+        planHelp.Text = verified and "Ready to replay. Use the same map and deck." or "Kept in memory. Save as or Recover draft to save a file."
     elseif recording then
         planLabel.Text = "Captured: " .. #(recording.Steps or {}) .. " actions"
         planHelp.Text = "Finish a manual round, or press Finish & save."
