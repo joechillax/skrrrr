@@ -4379,7 +4379,7 @@ function farm.loadWebhook()
 end
 function farm.webhookStep()
     if farm.recovering then return "Returning to Ammo Box after respawn" end
-    if readValue(child(storage(),"Values"),"LocalWave")==30 and farm.resetAttempt and not farm.resetAttempt.confirmed then return "Wave 30 reset / awaiting death" end
+    if farm.wave30ResetWindow and farm.wave30ResetWindow() and farm.resetAttempt and not farm.resetAttempt.confirmed then return "Wave 30 reset / awaiting death" end
     if farm.healthDue() then return "Max Health / Health Regen" end
     if farm.healingDue() then return "Healing items and upgrades" end
     if farm.stage==5 then
@@ -4771,7 +4771,7 @@ function farm.voteStatus()
     if not farm.active then return "Ready-up: waiting for autofarm initialization" end
     if (readValue(values,"LocalLives") or 1)<=0 then return "Ready-up: run ended" end
     if (readValue(values,"VotingTime") or 0)>0 then return "Ready-up: map voting in progress" end
-    if farm.wave30VoteHeld and farm.wave30VoteHeld() then return "Ready-up: held for wave 30 reset; no vote to advance past night 30" end
+    if farm.wave30VoteHeld and farm.wave30VoteHeld() then return "Ready-up: held for wave 30 reset until dawn; resumes after Ammo Box recovery" end
     if readValue(values,"Vote")~=true then return "Ready-up: CLOSED by game (wave "..tostring(wave)..")" end
     if state.skipBusy then return "Ready-up: request pending for "..math.floor(os.clock()-(state.skipStartedAt or os.clock())).."s" end
     if readValue(LocalPlayer,"Voted")==true then
@@ -4918,8 +4918,12 @@ function farm.wave30VoteHeld()
     local wave=readValue(child(storage(),"Values"),"LocalWave")
     if not finite(wave) then return false end
     local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
-    if wave==30 and (minutes>=1080 or minutes<360) then farm.wave30NightReached=true end
-    return wave==30 and farm.wave30NightReached==true
+    if not finite(minutes) then return false end
+    local night=minutes>=1080 or minutes<360
+    if wave==30 and night then farm.wave30NightReached=true end
+    -- LocalWave can remain 30 while the next ready-up is open after dawn.
+    -- Hold only during the night; waiting for wave 31 would deadlock voting.
+    return wave==30 and night
 end
 function farm.wave30ResetWindow()
     if not runtime.active or not e.Autofarm or not farm.active or not farm.supported() then return false end
@@ -4983,6 +4987,11 @@ function farm.wave30ResetStatus()
     if not e.Autofarm or not farm.active then return "Wave 30 reset: off" end
     if (readValue(values,"LocalLives") or 1)<=0 then return "Wave 30 reset: run ended; waiting for next map." end
     if wave==30 then
+        local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
+        if farm.wave30NightReached and finite(minutes) and minutes>=360 and minutes<1080 then
+            return farm.recovering and "Wave 30 night ended; recovering to Ammo Box before auto-skip resumes."
+                or "Wave 30 night ended; normal auto-skip resumed."
+        end
         if farm.resetMessage then return farm.resetMessage end
         return farm.wave30VoteHeld() and "Wave 30: farming until 04:30; advancing vote held." or "Wave 30: ready to start night; reset scheduled for 04:30."
     end
