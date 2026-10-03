@@ -1,4 +1,4 @@
--- JoesAAS 5.3 | standalone source | October 2026
+-- JoesAAS 5.3.1 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -625,7 +625,7 @@ return function(A)
     A.sessionNamed={}
     function A.renameDiagnostics()
         local d=A.data() or {}; local stats=A.util('PetStatsUtil')
-        local report={version='5.3',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
+        local report={version='5.3.1',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
             inventoryEvents=A.renameInventoryEvents or 0,lastInventoryEvent=A.renameLastInventoryEvent}
         local named=type(d.NamedPets)=='table' and d.NamedPets or {}
         local sampled={}
@@ -1061,7 +1061,7 @@ return function(A)
                         context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
                 end
                 local ctrl=A.client('TeleportController')
-                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.3',reason=message,
+                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.3.1',reason=message,
                     context=A.player:GetAttribute('VisibilityContext'),room=state[keyField]==key and state.Room,
                     serverEnemies=state[keyField]==key and state.EnemyCount,anchored=root and root.Anchored,
                     loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
@@ -1189,7 +1189,7 @@ return function(A)
         local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
         local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
         local activityJob=A.tasks.Activities
-        local snapshot={schema=1,version='5.3',userId=A.player.UserId,gameId=game.GameId,
+        local snapshot={schema=1,version='5.3.1',userId=A.player.UserId,gameId=game.GameId,
             savedAt=os.time(),context=A.player:GetAttribute('VisibilityContext'),running=A.running,
             activities=A.status.Activities,error=A.status['Activity error'],events=events,openings=openings,
             coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
@@ -1756,8 +1756,7 @@ return function(A)
         Tower={bridge='Tower',folder='TowerArenas',key='TowerKey'},BossRush={bridge='BossRush',folder='BossRushArenas',key='RushKey'},
         TimeTrial={bridge='TimeTrial',folder='TimeTrialArenas',key='TrialKey'},Dungeon={bridge='Dungeon',folder='DungeonArenas',key='DungeonKey'}}
     local watch
-    local observed={'Wave','Room','Floor','EnemyCount','Alive','Phase','BossHealthReal','BossEnemyId','ShieldBoss',
-        'JoinTimeLeft','LandingTimeLeft','TimePaused'}
+    local observed={'Wave','Room','Floor','EnemyCount','Alive','Phase','ShieldBoss','JoinTimeLeft','LandingTimeLeft'}
     local function valid(n) return type(n)=='number' and n==n and math.abs(n)<math.huge end
     function A.stuckTimeout(mode)
         local key=(mode=='TimeTrial' or mode=='Dungeon') and 'trialDungeonStuckSeconds' or 'stuckSeconds'
@@ -1773,30 +1772,30 @@ return function(A)
         local mode,raw=A.activityContext()
         if not specs[mode] or type(raw)~='string' then watch=nil; return end
         if not watch or watch.context~=raw or watch.mode~=mode then
-            watch={mode=mode,context=raw,lastProgress=os.clock(),state={},health={},phase=nil,graceUntil=0}
+            watch={mode=mode,context=raw,lastProgress=os.clock(),state={},deaths={},phase=nil,graceUntil=0}
         end
         return watch
     end
     local function progress(w,reason)
         w.lastProgress=os.clock(); w.reason=reason
     end
-    local function health(value)
-        if value==nil then return end
-        local big=A.util('BigNum')
-        if big and type(big.Decode)=='function' and type(big.Compare)=='function' then
-            local ok,decoded=pcall(big.Decode,value)
-            if ok and decoded~=nil then return {value=A.Core.copy(decoded),big=true} end
+    local function isDead(enemy)
+        if enemy:GetAttribute('EnemyDead')==true then return true end
+        local real=enemy:GetAttribute('HealthReal')
+        if real~=nil then
+            local big=A.util('BigNum')
+            if big and type(big.Decode)=='function' and type(big.Compare)=='function' then
+                local ok,decoded=pcall(big.Decode,real)
+                if ok and decoded~=nil then
+                    local compared,result=pcall(big.Compare,decoded,0)
+                    if compared and type(result)=='number' then return result<=0 end
+                end
+            end
+            local n=tonumber(real)
+            if valid(n) then return n<=0 end
         end
-        local n=tonumber(value)
-        if valid(n) then return {value=n,big=false} end
-    end
-    local function lower(nextHealth,previous)
-        if not nextHealth or not previous or nextHealth.big~=previous.big then return false end
-        if nextHealth.big then
-            local ok,result=pcall(A.util('BigNum').Compare,nextHealth.value,previous.value)
-            return ok and result==-1
-        end
-        return nextHealth.value<previous.value
+        local human=enemy:FindFirstChildOfClass('Humanoid')
+        return human~=nil and valid(human.Health) and human.Health<=0
     end
     local function phaseGrace(w)
         local phase=w.state.Phase
@@ -1840,20 +1839,14 @@ return function(A)
         local nextState=packet.Full and {} or A.Core.copy(old)
         for _,field in ipairs(observed) do if packet[field]~=nil then nextState[field]=A.Core.copy(packet[field]) end end
         for _,field in ipairs(type(packet.Cleared)=='table' and packet.Cleared or {}) do nextState[field]=nil end
-        local advanced=false
         for _,field in ipairs({'Wave','Room','Floor'}) do
             local before,after=tonumber(old[field]),tonumber(nextState[field])
-            if after and (not before or after>before) then advanced=true; progress(w,field..' advanced') end
+            if after and (not before or after>before) then progress(w,field..' advanced') end
         end
-        if advanced then w.health={}; w.boss=nil; w.bossId=nil end
         for _,field in ipairs({'EnemyCount','Alive'}) do
             local before,after=tonumber(old[field]),tonumber(nextState[field])
             if before and after and after<before then progress(w,'Enemies defeated') end
         end
-        local boss=health(nextState.BossHealthReal)
-        local bossId=nextState.BossEnemyId
-        if bossId==w.bossId and lower(boss,w.boss) then progress(w,'Boss taking damage') end
-        if boss then w.boss=boss; w.bossId=bossId end
         local beforePhase=type(old.ShieldBoss)=='table' and old.ShieldBoss.Phase
         local afterPhase=type(nextState.ShieldBoss)=='table' and nextState.ShieldBoss.Phase
         if beforePhase and afterPhase and beforePhase~=afterPhase then progress(w,'Boss phase advanced') end
@@ -1867,7 +1860,7 @@ return function(A)
             if not w or specs[w.mode].bridge~=name then return end
             if name=='Raid' and w.mode=='MaxTac' and type(packet)=='table' and packet.AutoGateTransfer==true then return end
             if type(packet)=='table' and packet.InstanceKey and packet.InstanceKey~=w.context:match('^[^:]+:(.+)$') then return end
-            w.ended=true; w.health={}
+            w.ended=true; w.deaths={}
         end)
         if name~='Tower' then A.on(name..'MapReady',function(instance,detail)
             local w=current()
@@ -1878,7 +1871,7 @@ return function(A)
             end
             w.associated=true
             if room and (not tonumber(w.state.Room) or room>tonumber(w.state.Room)) then
-                w.state.Room=room; w.health={}; progress(w,'Room loaded')
+                w.state.Room=room; progress(w,'Room loaded')
             end
         end) end
     end
@@ -1901,7 +1894,7 @@ return function(A)
         local arena=arenaFor(w.mode,w.context)
         if arena and not w.key then w.key=arena:GetAttribute(specs[w.mode].key) end
         local enemies=arena and arena:FindFirstChild('Enemies')
-        local nextHealth={}
+        local nextDeaths={}
         local observer=A.client('EnemyController')
         for _,enemy in ipairs(enemies and enemies:GetChildren() or {}) do
             local context=enemy:GetAttribute('VisibilityContext')
@@ -1911,19 +1904,12 @@ return function(A)
                 visible=ok and value==true
             end
             if visible then
-                local h=health(enemy:GetAttribute('HealthReal'))
-                if not h then
-                    local human=enemy:FindFirstChildOfClass('Humanoid')
-                    h=human and health(human.Health)
-                end
-                local dead=enemy:GetAttribute('EnemyDead')==true
-                if dead then h={value=0,big=false,dead=true} end
-                local previous=w.health[enemy]
-                if (previous and dead and not previous.dead) or lower(h,previous) then progress(w,'Enemy taking damage') end
-                if h then nextHealth[enemy]=h end
+                local dead=isDead(enemy)
+                if dead and w.deaths[enemy]==false then progress(w,'Enemy defeated') end
+                nextDeaths[enemy]=dead
             end
         end
-        w.health=nextHealth
+        w.deaths=nextDeaths
         if os.clock()<w.graceUntil then
             A.status['Stuck recovery']=w.mode..' · normal run transition ('..math.ceil(w.graceUntil-os.clock())..'s)'; return
         end
@@ -2531,7 +2517,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.3',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.3.1',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2806,7 +2792,7 @@ return function(A)
     toggle('Modes','Auto leave stuck runs','autoLeaveStuck',function() A.coordinateActivities() end)
     input('Modes','Stuck timeout · other modes (seconds)','stuckSeconds',true,1,3600)
     input('Modes','Stuck timeout · Trial + Dungeon (seconds)','trialDungeonStuckSeconds',true,1,3600)
-    note('Modes','Stuck detection','Defaults: 10 seconds for MaxTac, Tower, Gate, Raid, Defense and Boss Rush; 20 seconds shared by Time Trials and Dungeon. Damage, defeated enemies and wave/room/floor progress reset the timer. Normal Tower join/choice timers and Gate ARISE delays are allowed first. Walking and countdown updates do not reset it. Normal world mob farming is unaffected. Failed modes wait 30 seconds before this script rejoins.')
+    note('Modes','Stuck detection','Defaults: 10 seconds for MaxTac, Tower, Gate, Raid, Defense and Boss Rush; 20 seconds shared by Time Trials and Dungeon. Kills, fewer remaining enemies, new waves/rooms/floors and run/boss phase changes reset the timer. Damage never resets it. Normal Tower join/choice timers and Gate ARISE delays are allowed first. Walking and countdown updates do not reset it. Normal world mob farming is unaffected. Failed modes wait 30 seconds before this script rejoins.')
     status('Modes','Stuck recovery')
     note('Modes','Transfers','MaxTac, Tower, Trials and Dungeons use direct native entry. Other destinations wait for normal exit. MaxTac, Gate and Tower stay at their join position.')
     note('Modes','Movement','Time Trials and Dungeons follow mobs with continuous anti-stuck steps. Tower opens your own tower. Turn off competing auto-join / movement in your other script to let this coordinator control switching.')
@@ -2880,7 +2866,7 @@ return function(A)
         local jobs,enabled={},{}
         for name,job in pairs(A.tasks) do jobs[name]={busy=job.busy,failures=job.failures,nextIn=math.max(0,job.next-os.clock())} end
         for key,value in pairs(A.settings) do if type(value)=='boolean' then enabled[key]=value end end
-        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.3',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
+        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.3.1',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
             running=A.running,
             worlds=#C.keys(A.catalog.worlds),enemies=#C.keys(A.catalog.enemies)}))
         assert(A.safeLoad(A.folder..'/diagnostics.json'),'Could not read back diagnostics file')
