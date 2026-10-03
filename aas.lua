@@ -1,4 +1,4 @@
--- JoesAAS 4.6 | standalone source | September 2026
+-- JoesAAS 4.7 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -803,7 +803,8 @@ return function(A)
     A.sessionNamed={}
     function A.renameDiagnostics()
         local d=A.data() or {}; local stats=A.util('PetStatsUtil')
-        local report={version='3.9',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={}}
+        local report={version='4.7',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
+            inventoryEvents=A.renameInventoryEvents or 0,lastInventoryEvent=A.renameLastInventoryEvent}
         local named=type(d.NamedPets)=='table' and d.NamedPets or {}
         local sampled={}
         for _,id in ipairs(C.keys(type(d.Pets)=='table' and d.Pets or {})) do
@@ -837,7 +838,7 @@ return function(A)
         A.status['Rename report']=ok and ('Saved '..A.folder..'/rename-diagnostics.json')
             or ('Could not save rename report: '..tostring(err))
     end
-    local pending,retries={},{}
+    local pending,retries,retryAfter={},{},{}
     A.renamePending=nil
     local function isConfirmed(id)
         local d=A.data()
@@ -848,6 +849,7 @@ return function(A)
             A.sessionNamed[id]=true; retries[id]=nil
             A.status.Rename='Named Astral: '..id
         else
+            if (retries[id] or 0)>=3 then retryAfter[id]=os.clock()+120 end
             A.status.Rename='Rename failed for '..id..': '..tostring(reason)
             A.log('Rename',A.status.Rename)
         end
@@ -875,7 +877,6 @@ return function(A)
             else A.status.Rename='Waiting for confirmation: '..id; return end
         end
         if not A.settings.rename then return end
-        if A.S.UIS:GetFocusedTextBox() then A.status.Rename='Finish editing before naming pets'; return end
         local cfg=A.config('NamedConfig'); local stats=A.util('PetStatsUtil')
         if type(d.Pets)~='table' then A.status.Rename='Pet inventory unavailable'; return end
         if not cfg or not stats or type(stats.GetRarity)~='function' then
@@ -888,11 +889,23 @@ return function(A)
         local valid,reason=cfg:Validate(name)
         if not valid then A.status.Rename=cfg:GetErrorMessage(reason); return end
         local skipped,total={},0
+        -- Removed pets must not leave session state or retry timers behind.
+        for petId in pairs(A.sessionNamed) do
+            if d.Pets[petId]==nil then A.sessionNamed[petId]=nil end
+        end
+        for petId in pairs(retries) do
+            if d.Pets[petId]==nil then retries[petId]=nil; retryAfter[petId]=nil; A.cooldowns['rename:'..petId]=nil end
+        end
         for _,petId in ipairs(C.keys(d.Pets)) do
             total=total+1
-            local canRename,skip=C.renameEligible(petId,d.Pets[petId],d.NamedPets or {},name,stats)
+            -- A partially replicated or malformed entry must not block the rest.
+            local checked,canRename,skip=pcall(C.renameEligible,petId,d.Pets[petId],d.NamedPets or {},name,stats)
+            if not checked then canRename=false; skip='eligibility unavailable; will recheck' end
+            if retryAfter[petId] and os.clock()>=retryAfter[petId] then
+                retries[petId]=nil; retryAfter[petId]=nil
+            end
             if A.sessionNamed[petId] then canRename=false; skip='renamed this session' end
-            if (retries[petId] or 0)>=3 then canRename=false; skip='3 unconfirmed attempts; use Retry' end
+            if (retries[petId] or 0)>=3 then canRename=false; skip='retry paused for 120s after 3 unconfirmed attempts' end
             if canRename then
                 local cost=cfg:GetCost('Pet','Astral'); local balance=A.balance(cfg.ItemId)
                 if type(cost)~='number' or cost<0 then A.status.Rename='Naming cost unavailable'; return end
@@ -919,7 +932,7 @@ return function(A)
     end
     function A.retryRenaming()
         if A.renamePending then return end
-        retries={}
+        retries={}; retryAfter={}
         A.status.Rename='Retry enabled; checking unnamed Astral pets'
     end
     A.job('Renaming',1,function()
@@ -928,6 +941,20 @@ return function(A)
         if not ok then A.status.Rename='Rename error: '..tostring(err); A.log('Rename',A.status.Rename) end
         if not A.renamePending and not tostring(A.status.Rename):find('^Named Astral:') then saveDiagnostic() end
     end)
+    -- Wake the existing serial worker when live replication adds/updates pets.
+    -- Keep polling as a fallback: no per-pet listeners or extra scan loops.
+    if A.container and type(A.container.OnChange)=='function' then
+        local function wake()
+            if not A.alive then return end
+            A.renameInventoryEvents=(A.renameInventoryEvents or 0)+1
+            A.renameLastInventoryEvent=os.clock()
+            A.tasks.Renaming.next=0
+        end
+        for _,field in ipairs({'Pets','NamedPets'}) do
+            local ok,connection=pcall(A.container.OnChange,A.container,{field},wake)
+            if ok and connection then A.connections[#A.connections+1]=connection end
+        end
+    end
 end
 
 end)()(A);
@@ -1206,7 +1233,7 @@ return function(A)
                         context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
                 end
                 local ctrl=A.client('TeleportController')
-                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='4.6',reason=message,
+                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='4.7',reason=message,
                     context=A.player:GetAttribute('VisibilityContext'),room=state[keyField]==key and state.Room,
                     serverEnemies=state[keyField]==key and state.EnemyCount,anchored=root and root.Anchored,
                     loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
@@ -1333,7 +1360,7 @@ return function(A)
         local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
         local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
         local activityJob=A.tasks.Activities
-        local snapshot={schema=1,version='4.6',userId=A.player.UserId,gameId=game.GameId,
+        local snapshot={schema=1,version='4.7',userId=A.player.UserId,gameId=game.GameId,
             savedAt=os.time(),context=A.player:GetAttribute('VisibilityContext'),running=A.running,
             activities=A.status.Activities,error=A.status['Activity error'],events=events,openings=openings,
             coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
@@ -2046,7 +2073,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='4.6',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='4.7',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2371,7 +2398,7 @@ return function(A)
         local jobs,enabled={},{}
         for name,job in pairs(A.tasks) do jobs[name]={busy=job.busy,failures=job.failures,nextIn=math.max(0,job.next-os.clock())} end
         for key,value in pairs(A.settings) do if type(value)=='boolean' then enabled[key]=value end end
-        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='3.9',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
+        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='4.7',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
             running=A.running,
             worlds=#C.keys(A.catalog.worlds),enemies=#C.keys(A.catalog.enemies)}))
         assert(A.safeLoad(A.folder..'/diagnostics.json'),'Could not read back diagnostics file')
