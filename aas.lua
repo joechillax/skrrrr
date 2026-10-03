@@ -1,6 +1,6 @@
--- JoesAAS 4.7 | standalone source | October 2026
+-- JoesAAS 5.2 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
--- Fluent UI from dawid-scripts/Fluent. Autoload is opt-in; each feature uses its own toggle.
+-- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 local previous = environment.JoesAAS or environment.AnimeSuite
 if previous and type(previous.stop) == "function" then pcall(previous.stop) end
@@ -13,6 +13,8 @@ environment.JoesAAS = A
 environment.AnimeSuite = A -- Compatibility with older running versions.
 A.Core = (function()
 local Core = {}
+Core.defaultPriority={'MaxTac','Tower','TimeTrial','Dungeon','Gate','Combat','BossRush'}
+Core.priorityLabels={MaxTac='MaxTac',Tower='Tower',TimeTrial='Time Trials',Dungeon='Dungeon',Gate='Gate',Combat='Raid / Defense',BossRush='Boss Rush'}
 function Core.copy(t)
     if type(t) ~= 'table' then return t end
     local out = {}; for k,v in pairs(t) do out[k] = Core.copy(v) end; return out
@@ -34,6 +36,34 @@ function Core.merge(defaults, saved)
         end
     end
     return result
+end
+function Core.singleSelection(selection)
+    local result={}
+    for _,key in ipairs(Core.keys(selection)) do
+        if type(key)=='string' and selection[key]==true then result[key]=true; break end
+    end
+    return result
+end
+function Core.equal(a,b)
+    if type(a)~=type(b) then return false end
+    if type(a)~='table' then return a==b end
+    for k,v in pairs(a) do if not Core.equal(v,b[k]) then return false end end
+    for k in pairs(b) do if a[k]==nil then return false end end
+    return true
+end
+function Core.priorityOrder(saved)
+    local result,seen={},{}
+    for _,key in ipairs(type(saved)=='table' and saved or {}) do
+        if Core.priorityLabels[key] and not seen[key] then result[#result+1]=key; seen[key]=true end
+    end
+    for _,key in ipairs(Core.defaultPriority) do if not seen[key] then result[#result+1]=key end end
+    return result
+end
+function Core.portalMode(key,cfg)
+    if cfg and cfg.GateOnly~=true then return nil end
+    if tostring(key):lower():find('maxtac',1,true)
+        or (cfg and (tostring(cfg.AchievementModeKey):find('^MaxTacCall') or tostring(cfg.Name):lower():find('maxtac',1,true))) then return 'MaxTac' end
+    return 'Gate'
 end
 function Core.renameEligible(id,pet,named,target,petStats)
     if type(id)~='string' or type(pet)~='table' then return false,'unexpected inventory format' end
@@ -89,218 +119,6 @@ end
 return Core
 
 end)()
-A.GuildCore = (function()
-local G={pollSeconds=30,maxObservedInterval=45,autosaveSeconds=90,heartbeatSeconds=20,historyLimit=128,cphSettlingSeconds=120}
-local function finite(v) return type(v)=='number' and v==v and math.abs(v)<math.huge end
-local function iso(t) return os.date('!%Y-%m-%dT%H:%M:%SZ',t) end
-function G.append(owner,key,event)
-    local list=owner[key] or {}; owner[key]=list
-    if #list>=G.historyLimit then table.remove(list,1); owner[key..'Dropped']=(owner[key..'Dropped'] or 0)+1 end
-    list[#list+1]=event
-end
-function G.migrate(s)
-    if s.schemaVersion==1 then
-        s.legacyWallElapsedSeconds=s.totalElapsedSeconds
-        s.activeTrackingSeconds=s.observedSeconds
-        s.runtimeMigration='Legacy file had no runtime clock; retained observed seconds as a conservative active-runtime baseline.'
-        s.schemaVersion=2
-    end
-    if s.schemaVersion==2 then
-        for _,m in pairs(s.members) do
-            m.cphContribution=0; m.cphOnlineSeconds=0; m.cphReadyAt=false; m.cphMeasurementStartedAt=false
-        end
-        s.cphMigration='Original totals retained. Matched CpH measurements start after upgrading; old gains cannot be assigned to live intervals.'
-        s.cphMethod='cphContribution / (cphOnlineSeconds / 3600); excluded contribution remains included in Gained.'
-        s.efficiencyCaveat='CpH is a sampled live estimate after 120-second settling periods; delayed server updates may still affect attribution.'
-        s.schemaVersion=3
-    end
-    s.recoveries=s.recoveries or {}
-    for _,key in ipairs({'gaps','recoveries'}) do
-        while #s[key]>G.historyLimit do table.remove(s[key],1); s[key..'Dropped']=(s[key..'Dropped'] or 0)+1 end
-    end
-    for _,m in pairs(s.members) do
-        for _,key in ipairs({'membershipEvents','counterDecreases'}) do
-            while #m[key]>G.historyLimit do table.remove(m[key],1); m[key..'Dropped']=(m[key..'Dropped'] or 0)+1 end
-        end
-    end
-    return s
-end
-function G.id(v)
-    local n=tonumber(v)
-    if not n or not finite(n) or n<=0 or n%1~=0 then return nil end
-    return string.format('%.0f',n)
-end
-function G.roster(payload,guildId,selfId)
-    if type(payload)~='table' or payload.Live==true or G.id(payload.Id)~=G.id(guildId)
-        or type(payload.Members)~='table' then return nil,'Waiting for a complete roster for your guild' end
-    local out={}; local count=0
-    for _,row in pairs(payload.Members) do
-        if type(row)~='table' then return nil,'Invalid roster member' end
-        local id=G.id(row.Id); local week=tonumber(row.Week)
-        if not id or out[id] or not finite(week) or week<0 then return nil,'Incomplete or duplicate roster data' end
-        local username=type(row.Name)=='string' and row.Name or ('User '..id)
-        out[id]={userId=tonumber(id),username=username,
-            displayName=type(row.DisplayName)=='string' and row.DisplayName or username,
-            displayNameSource=type(row.DisplayName)=='string' and 'roster' or 'usernameFallback',
-            contribution=week,online=row.Online==true,
-            presenceKnown=type(row.Online)=='boolean',serverLastSeen=tonumber(row.Seen) or 0}
-        count=count+1
-    end
-    if count==0 or not out[G.id(selfId)] then return nil,'Roster does not include this account; session preserved' end
-    return out
-end
-local function member(row,t)
-    return {userId=row.userId,username=row.username,displayName=row.displayName,displayNameSource=row.displayNameSource,
-        firstDetectedAt=t,firstDetectedAtISO=iso(t),lastDetectedAt=t,lastContributionAt=t,
-        startingContribution=row.contribution,finalContribution=row.contribution,contributionGained=0,
-        cphContribution=0,cphOnlineSeconds=0,cphReadyAt=t+G.cphSettlingSeconds,cphMeasurementStartedAt=t,
-        onlineSeconds=0,onlineMinutes=0,onlineHours=0,observedSeconds=0,
-        onlineStatus='unknown',lastKnownOnline=false,lastSeenOnlineAt=false,serverLastSeen=row.serverLastSeen,
-        inGuild=true,departedAt=false,membershipEvents={{at=t,event='firstDetected'}},
-        counterDecreases={},contributionComparable=true,contributionPerHour=false}
-end
-function G.new(rows,guildId,ownerId,gameId,t,sessionId,generation)
-    local s={schemaVersion=3,sessionId=sessionId,generation=generation or 1,revision=0,
-        activeTrackingSeconds=0,lastSessionStartedAt=t,lastHeartbeatAt=false,recoveries={},
-        ownerUserId=ownerId,gameId=gameId,guildId=tonumber(guildId),active=true,
-        startedAt=t,startedAtISO=iso(t),endedAt=false,endedAtISO=false,lastSavedAt=false,
-        lastObservedAt=false,totalElapsedSeconds=0,observedSeconds=0,unobservedSeconds=0,
-        trackedMemberCount=0,members={},gaps={},finalSnapshotStatus='notStopped',
-        contributionSource='Guild roster Members[].Week',
-        onlineTimeMethod='Sampled presence: credit only intervals <=45 seconds with online at both endpoints; never bridge a reload or observation gap.',
-        efficiencyCaveat='Gained includes the full period. CpH uses only matched live online intervals after a 120-second settling period. Server batching can still affect attribution.',
-        cphMethod='cphContribution / (cphOnlineSeconds / 3600); gap, settling, unknown/offline presence and final-snapshot deltas are excluded only from CpH, never from Gained.'}
-    for id,row in pairs(rows) do s.members[id]=member(row,t) end
-    return s
-end
-function G.metrics(s,t)
-    local ending=s.active and t or s.endedAt
-    s.wallElapsedSeconds=math.max(0,(tonumber(ending) or t)-s.startedAt)
-    s.totalElapsedSeconds=s.activeTrackingSeconds or s.observedSeconds
-    s.activeTrackingHours=s.totalElapsedSeconds/3600
-    s.totalElapsedHours=s.totalElapsedSeconds/3600
-    s.totalElapsedMinutes=s.totalElapsedSeconds/60
-    s.observedHours=s.observedSeconds/3600
-    s.unobservedSeconds=math.max(0,s.wallElapsedSeconds-s.observedSeconds)
-    s.unobservedActiveSeconds=math.max(0,s.totalElapsedSeconds-s.observedSeconds)
-    s.unobservedHours=s.unobservedSeconds/3600
-    local count=0
-    for _,m in pairs(s.members) do
-        count=count+1
-        m.onlineMinutes=m.onlineSeconds/60; m.onlineHours=m.onlineSeconds/3600
-        m.contributionGained=m.finalContribution-m.startingContribution
-        m.cphOnlineHours=m.cphOnlineSeconds/3600
-        m.contributionPerHour=m.cphOnlineSeconds>0 and m.contributionComparable
-            and m.cphContribution/m.cphOnlineHours or false
-        m.contributionExcludedFromCph=m.contributionGained-m.cphContribution
-        m.cphCoverageOfOnlineTime=m.onlineSeconds>0 and math.min(1,m.cphOnlineSeconds/m.onlineSeconds) or 0
-        m.cphSampleSufficient=m.cphOnlineSeconds>=300
-        local memberEnd=m.inGuild and (tonumber(ending) or t) or (tonumber(m.departedAt) or m.lastDetectedAt)
-        m.observationSpanSeconds=math.max(0,memberEnd-m.firstDetectedAt)
-        m.unobservedSeconds=math.max(0,m.observationSpanSeconds-m.observedSeconds)
-        m.efficiencyReliable=m.cphSampleSufficient and m.contributionComparable and m.unobservedSeconds==0
-    end
-    s.trackedMemberCount=count
-end
-function G.sample(s,rows,t,previous)
-    local interval=previous and t-previous.at or 0
-    local continuous=previous~=nil and interval>=0 and interval<=G.maxObservedInterval
-    if continuous then s.observedSeconds=s.observedSeconds+interval
-    elseif s.lastObservedAt and t>s.lastObservedAt then
-        G.append(s,'gaps',{from=s.lastObservedAt,to=t,seconds=t-s.lastObservedAt,reason='No continuous observation'})
-    end
-    local changedMembers=false
-    for id,row in pairs(rows) do
-        local m=s.members[id]
-        if not m then m=member(row,t); s.members[id]=m; changedMembers=true end
-        if not m.inGuild then
-            G.append(m,'membershipEvents',{at=t,event='returned'}); changedMembers=true
-        end
-        if m.username~=row.username or m.displayName~=row.displayName then changedMembers=true end
-        if m.finalContribution~=row.contribution or m.onlineStatus~=(row.presenceKnown and (row.online and 'online' or 'offline') or 'unknown') then changedMembers=true end
-        m.username=row.username; m.displayName=row.displayName; m.displayNameSource=row.displayNameSource
-        local prior=continuous and previous.rows[id]
-        local matched=prior and interval>0 and prior.presenceKnown and row.presenceKnown and prior.online and row.online
-        local delta=row.contribution-m.finalContribution
-        if not m.cphMeasurementStartedAt then m.cphMeasurementStartedAt=t end
-        if not matched or delta<0 then
-            m.cphReadyAt=t+G.cphSettlingSeconds
-        elseif m.contributionComparable and prior.contribution==m.finalContribution
-            and previous.at>=(tonumber(m.cphReadyAt) or (t+G.cphSettlingSeconds)) then
-            m.cphContribution=m.cphContribution+delta
-            m.cphOnlineSeconds=m.cphOnlineSeconds+interval
-        end
-        if prior then
-            if prior.presenceKnown and row.presenceKnown then m.observedSeconds=m.observedSeconds+interval end
-            if prior.presenceKnown and row.presenceKnown and prior.online and row.online then m.onlineSeconds=m.onlineSeconds+interval end
-        end
-        if row.contribution<m.finalContribution then
-            G.append(m,'counterDecreases',{at=t,before=m.finalContribution,after=row.contribution,
-                possibleWeeklyReset=true})
-            m.contributionComparable=false
-        end
-        m.finalContribution=row.contribution; m.lastContributionAt=t
-        m.lastDetectedAt=t; m.inGuild=true; m.departedAt=false
-        m.onlineStatus=row.presenceKnown and (row.online and 'online' or 'offline') or 'unknown'
-        m.lastKnownOnline=row.online; m.serverLastSeen=row.serverLastSeen
-        if row.presenceKnown and row.online then m.lastSeenOnlineAt=t end
-    end
-    for id,m in pairs(s.members) do
-        if not rows[id] and m.inGuild then
-            m.inGuild=false; m.departedAt=t; m.onlineStatus='unknown'
-            G.append(m,'membershipEvents',{at=t,event='noLongerInRoster'}); changedMembers=true
-        end
-    end
-    s.lastObservedAt=t; G.metrics(s,t)
-    return {at=t,rows=rows},changedMembers
-end
-function G.stop(s,t)
-    s.active=false; s.endedAt=t; s.endedAtISO=iso(t)
-    s.finalSnapshotStatus='pending'; G.metrics(s,t)
-end
-function G.finalSnapshot(s,rows,receivedAt)
-    -- Stopping freezes time/membership. Only existing members get a fresh final counter.
-    for id,m in pairs(s.members) do
-        local row=rows[id]
-        if row then
-            if row.contribution<m.finalContribution then
-                G.append(m,'counterDecreases',{at=receivedAt,before=m.finalContribution,after=row.contribution,possibleWeeklyReset=true})
-                m.contributionComparable=false
-            end
-            m.finalContribution=row.contribution; m.lastContributionAt=receivedAt
-        end
-    end
-    s.finalSnapshotStatus='received'; s.finalSnapshotReceivedAt=receivedAt
-    G.metrics(s,s.endedAt)
-end
-function G.valid(s,ownerId,gameId)
-    if type(s)~='table' or (s.schemaVersion~=1 and s.schemaVersion~=2 and s.schemaVersion~=3) or s.ownerUserId~=ownerId or s.gameId~=gameId
-        or not G.id(s.guildId) or type(s.sessionId)~='string' or type(s.active)~='boolean'
-        or not finite(s.startedAt) or type(s.startedAtISO)~='string'
-        or not finite(s.generation) or s.generation<1 or not finite(s.revision) or s.revision<0
-        or type(s.members)~='table' or type(s.gaps)~='table' or not finite(s.observedSeconds)
-        or s.observedSeconds<0 or (s.lastObservedAt~=false and not finite(s.lastObservedAt))
-        or (s.lastSavedAt~=false and not finite(s.lastSavedAt))
-        or (not s.active and not finite(s.endedAt)) then return false end
-    if s.schemaVersion>=2 and (not finite(s.activeTrackingSeconds) or s.activeTrackingSeconds<0
-        or type(s.recoveries)~='table') then return false end
-    for id,m in pairs(s.members) do
-        if type(m)~='table' or G.id(m.userId)~=id or type(m.username)~='string' or type(m.displayName)~='string'
-            or type(m.onlineStatus)~='string' or type(m.inGuild)~='boolean' or type(m.contributionComparable)~='boolean'
-            or not finite(m.startingContribution) or not finite(m.finalContribution)
-            or not finite(m.onlineSeconds) or m.onlineSeconds<0 or not finite(m.observedSeconds) or m.observedSeconds<0
-            or not finite(m.firstDetectedAt) or not finite(m.lastDetectedAt)
-            or type(m.membershipEvents)~='table' or type(m.counterDecreases)~='table' then return false end
-        if s.schemaVersion==3 and (not finite(m.cphContribution) or m.cphContribution<0
-            or not finite(m.cphOnlineSeconds) or m.cphOnlineSeconds<0
-            or (m.cphReadyAt~=false and not finite(m.cphReadyAt))
-            or (m.cphMeasurementStartedAt~=false and not finite(m.cphMeasurementStartedAt))) then return false end
-    end
-    return true
-end
-return G
-
-end)()
 local bootOK, bootError = pcall(function()
 
 -- ===== runtime =====
@@ -313,21 +131,21 @@ return function(A)
     A.player=A.S.Players.LocalPlayer
     A.logs={}; A.status={}; A.connections={}; A.tasks={}; A.cache={}; A.cooldowns={}
     A.alive=true; A.running=false; A.epoch=0; A.started=os.clock()
-    A.defaults={version=3,world='0',mobsByWorld={},target='Nearest',farm=false,trialFollow=false,trialAutoJoin=false,trialJoinSelection={},
+    A.defaults={version=4,priority=Core.copy(Core.defaultPriority),world='0',mobsByWorld={},target='Nearest',farm=false,trialFollow=false,trialAutoJoin=false,trialJoinSelection={},
         towerAutoJoin=false,towerSelection={},raidAutoJoin=false,raidSelection={},defenseAutoJoin=false,defenseSelection={},
-        gateAutoJoin=false,gateSelection={},gateRanks={S=true,A=true,B=true,C=true,D=true,E=true},dungeonAutoJoin=false,dungeonSelection={},bossRushAutoJoin=false,bossRushSelection={},
+        gateAutoJoin=false,gateSelection={},gateRanks={S=true,A=true,B=true,C=true,D=true,E=true},
+        maxTacAutoJoin=false,maxTacSelection={},maxTacRanks={Low=true,Medium=true,High=true,Extreme=true,Psycho=true},
+        dungeonAutoJoin=false,dungeonSelection={},bossRushAutoJoin=false,bossRushSelection={},
         rename=false,petName='',webhook=false,webhookURL='',pingId='',ping=false,sendDisconnect=true,
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
-        blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false}
+        blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false,ripperdocAuto=false,ripperdocSlots={}}
     A.legacyFolder='AnimeSuite_'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.folder='JoesAAS/'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.file=A.folder..'/settings.json'
     function A.log(kind,text)
         text=tostring(text)
-        if A.settings and A.settings.webhookURL~='' then
-            text=text:gsub('https://[^%s]+/api/webhooks/[^%s]+','[webhook redacted]')
-        end
+        text=text:gsub('https://[^%s]+/api/webhooks/[^%s]+','[webhook redacted]')
         local line=os.date('%H:%M:%S')..' ['..kind..'] '..text
         A.logs[#A.logs+1]=line; if #A.logs>150 then table.remove(A.logs,1) end
         print('[JoesAAS] '..line)
@@ -353,7 +171,7 @@ return function(A)
         s.distance=math.clamp(s.distance,2,20)
         if not Core.contains({'Nearest','Highest HP','Lowest HP'},s.target) then s.target='Nearest' end
         if not Core.contains({'Walk','Teleport'},s.moveStyle) then s.moveStyle='Walk' end
-        for _,k in ipairs({'webhookEvents','pingEvents','trialJoinSelection','towerSelection','raidSelection','defenseSelection','dungeonSelection','gateSelection','gateRanks','bossRushSelection'}) do
+        for _,k in ipairs({'webhookEvents','pingEvents','trialJoinSelection','towerSelection','raidSelection','defenseSelection','dungeonSelection','gateSelection','gateRanks','maxTacSelection','maxTacRanks','bossRushSelection','ripperdocSlots'}) do
             for id,v in pairs(s[k]) do if type(id)~='string' or type(v)~='boolean' then s[k][id]=nil end end
         end
         for world,selection in pairs(s.mobsByWorld) do
@@ -361,100 +179,113 @@ return function(A)
                 for id,value in pairs(selection) do if type(id)~='string' or type(value)~='boolean' then selection[id]=nil end end
             end
         end
-        s.version=3; return s
+        s.raidSelection=Core.singleSelection(s.raidSelection)
+        s.defenseSelection=Core.singleSelection(s.defenseSelection)
+        if s.raidAutoJoin and s.defenseAutoJoin then s.defenseAutoJoin=false end
+        -- Separate the previous combined Gate / MaxTac profile.
+        local movedMaxTac=false
+        for key,value in pairs(Core.copy(s.gateSelection)) do
+            if Core.portalMode(key)=='MaxTac' then
+                movedMaxTac=true
+                if s.maxTacSelection[key]==nil then s.maxTacSelection[key]=value end
+                if value and s.gateAutoJoin and (not saved or saved.maxTacAutoJoin==nil) then s.maxTacAutoJoin=true end
+                s.gateSelection[key]=nil
+            end
+        end
+        if movedMaxTac then
+            local remaining=false
+            for _,selected in pairs(s.gateSelection) do if selected then remaining=true; break end end
+            if not remaining then s.gateAutoJoin=false end
+        end
+        for _,rank in ipairs({'Low','Medium','High','Extreme','Psycho'}) do
+            if type(saved)=='table' and type(saved.gateRanks)=='table' and type(saved.gateRanks[rank])=='boolean'
+                and saved.maxTacRanks==nil then s.maxTacRanks[rank]=saved.gateRanks[rank] end
+            s.gateRanks[rank]=nil
+        end
+        for rank in pairs(s.maxTacRanks) do if A.defaults.maxTacRanks[rank]==nil then s.maxTacRanks[rank]=nil end end
+        s.priority=Core.priorityOrder(s.priority)
+        s.version=4; return s
     end
-    -- Copy once before reading settings/session state; never overwrite a new-folder file.
+    function A.setCombatEnabled(mode,value)
+        local own=mode=='Raid' and 'raidAutoJoin' or 'defenseAutoJoin'
+        local other=mode=='Raid' and 'defenseAutoJoin' or 'raidAutoJoin'
+        A.settings[own]=value==true
+        if value then A.settings[other]=false end
+        if A.settingsChanged then A.settingsChanged() end
+        if A.refreshUI then A.refreshUI() end
+        if A.coordinateActivities then A.coordinateActivities() end
+    end
+    -- Copy previous settings once; never overwrite a new-folder file.
     if type(makefolder)=='function' and type(readfile)=='function' and type(writefile)=='function' then
         pcall(makefolder,'JoesAAS'); pcall(makefolder,A.folder)
         if not A.safeLoad(A.folder..'/migration.json') then
-            local function copyLegacy(name,transform)
+            local function copyLegacy(name)
                 local destination=A.folder..'/'..name
                 if pcall(readfile,destination) then return end
                 local ok,bytes=pcall(readfile,A.legacyFolder..'/'..name)
                 if not ok then return end
-                if transform then bytes=transform(bytes) end
                 writefile(destination,bytes)
                 assert(readfile(destination)==bytes,'Migration read-back failed: '..name)
             end
             local ok,err=pcall(function()
-                for _,name in ipairs({'autoload.json','settings.json','settings.json.bak',
-                    'guild-weekly-tracking.json','guild-weekly-tracking.json.bak','guild-weekly-tracking.json.tmp',
-                    'guild-heartbeat.json','guild-heartbeat.json.bak'}) do copyLegacy(name) end
-                copyLegacy('outbox.json',function(bytes)
-                    local queue=A.S.HTTP:JSONDecode(bytes)
-                    for _,entry in ipairs(queue) do
-                        local file=entry.attachment
-                        if type(file)=='table' and type(file.path)=='string' then
-                            local name=file.path:sub(#A.legacyFolder+2)
-                            if file.path:sub(1,#A.legacyFolder+1)==A.legacyFolder..'/'
-                                and name:match('^guild%-export%-[%w%-]+%.json$') then
-                                copyLegacy(name); file.path=A.folder..'/'..name
-                            end
-                        end
-                    end
-                    return A.S.HTTP:JSONEncode(queue)
-                end)
+                for _,name in ipairs({'settings.json','settings.json.bak'}) do copyLegacy(name) end
                 writefile(A.folder..'/migration.json',A.S.HTTP:JSONEncode({complete=true}))
             end)
             assert(ok,'Could not preserve previous saves: '..tostring(err)..'. Old files are untouched; rerun to retry.')
         end
     end
-    A.autoloadFile=A.folder..'/autoload.json'
-    A.autoloadEnabled=(A.safeLoad(A.autoloadFile) or {}).enabled==true
-    local saved=A.autoloadEnabled and (A.safeLoad(A.file) or A.safeLoad(A.file..'.bak')) or nil
-    A.autoloadApplied=saved~=nil
+    local saved=A.safeLoad(A.file..'.tmp') or A.safeLoad(A.file) or A.safeLoad(A.file..'.bak')
     A.settings=A.validate(saved)
-    function A.setAutoload(enabled)
-        if type(writefile)~='function' or type(readfile)~='function' or type(makefolder)~='function' then
-            A.status.Settings='File APIs unavailable; cannot set autoload.'
-            A.log('Settings',A.status.Settings); return false
-        end
-        local ok,err=pcall(function()
-            pcall(makefolder,A.folder)
-            writefile(A.autoloadFile,A.S.HTTP:JSONEncode({enabled=enabled==true}))
-            assert((A.safeLoad(A.autoloadFile) or {}).enabled==(enabled==true),'Autoload read-back failed')
-        end)
-        if ok then A.autoloadEnabled=enabled==true end
-        A.status.Settings=ok and (enabled and 'Autoload enabled for saved settings.' or 'Autoload disabled.') or tostring(err)
-        A.log('Settings',A.status.Settings)
-        return ok
+    local lastSaved,saveDue,saveRetry,saveBusy,saveReady,nextCheck=nil,nil,0,false,false,0
+    local function settingsSnapshot()
+        local snapshot=Core.copy(A.settings)
+        if not snapshot.saveSecrets then snapshot.webhookURL='' end
+        return snapshot
     end
     function A.finishStartup()
+        saveReady=true; A.saveSettings(true)
         A.setRunning(true)
         if A.flushJoinDiagnostics then A.flushJoinDiagnostics(true) end
     end
-    function A.save()
+    function A.saveSettings(force)
+        if not saveReady or saveBusy then return false end
+        local snapshot=settingsSnapshot()
+        if Core.equal(snapshot,lastSaved) then saveDue=nil; return true end
+        if not force and os.clock()<saveRetry then return false end
         if type(writefile)~='function' or type(readfile)~='function' or type(makefolder)~='function' then
-            A.status.Settings='File APIs unavailable; settings are session-only.'
-            A.log('Settings',A.status.Settings); return false
+            A.status.Settings='Autosave unavailable: executor file APIs missing; settings are session-only.'
+            saveRetry=os.clock()+30; return false
         end
-        local snapshot=Core.copy(A.settings)
-        if not snapshot.saveSecrets then snapshot.webhookURL='' end
+        saveBusy=true
         local ok,err=pcall(function()
             pcall(makefolder,A.folder)
             local encoded=A.S.HTTP:JSONEncode(snapshot)
-            -- Validate the complete new value before touching either saved copy.
-            A.S.HTTP:JSONDecode(encoded)
+            local staged=A.file..'.tmp'
+            writefile(staged,encoded)
+            assert(Core.equal(A.safeLoad(staged),snapshot),'Staged settings read-back failed')
             local prior=A.safeLoad(A.file)
             if prior then
                 if not snapshot.saveSecrets then prior.webhookURL='' end
                 writefile(A.file..'.bak',A.S.HTTP:JSONEncode(prior))
             end
             writefile(A.file,encoded)
-            assert(A.safeLoad(A.file),'read-back failed')
+            assert(Core.equal(A.safeLoad(A.file),snapshot),'Settings read-back failed')
+            -- A valid staged file recovers a save interrupted before the main write.
+            if type(delfile)=='function' then pcall(delfile,staged) else pcall(writefile,staged,'') end
         end)
-        A.status.Settings=ok and 'Saved settings.' or ('Save failed: '..tostring(err))
-        A.log('Settings',A.status.Settings)
+        saveBusy=false
+        if ok then
+            lastSaved=snapshot; saveDue=nil; saveRetry=0
+            A.status.Settings='Settings saved automatically; restored next execution.'
+        else
+            saveRetry=os.clock()+10; A.status.Settings='Autosave failed; retrying: '..tostring(err)
+            A.log('Settings',A.status.Settings)
+        end
         return ok
     end
-    function A.load()
-        local saved=A.safeLoad(A.file) or A.safeLoad(A.file..'.bak')
-        if not saved then A.status.Settings='No valid settings file.'; A.log('Settings',A.status.Settings); return end
-        A.setRunning(false); A.settings=A.validate(saved)
-        if A.render then A.render(false) end
-        if A.refreshUI then A.refreshUI() end
-        A.setRunning(true)
-        A.status.Settings='Loaded settings; enabled features are active.'; A.log('Settings',A.status.Settings)
+    function A.settingsChanged(delay)
+        if not saveReady or not A.alive or A.stopping then return end
+        if delay and delay>0 then saveDue=os.clock()+delay else A.saveSettings() end
     end
     function A.module(kind,name)
         local key=kind..':'..name
@@ -477,6 +308,14 @@ return function(A)
     end
     function A.number(value)
         if type(value)=='number' then return value==value and value or 0 end
+        local big=A.util('BigNum')
+        if big and type(big.ToFiniteNumber)=='function' then
+            local ok,n=pcall(function()
+                local parsed=big.TryFrom and big.TryFrom(value) or (big.Decode and big.Decode(value))
+                return parsed and big.ToFiniteNumber(parsed)
+            end)
+            if ok and type(n)=='number' and n==n then return n end
+        end
         local p=A.util('NumberParser'); return p and p.Parse(value) or tonumber(value) or 0
     end
     function A.balance(key)
@@ -515,6 +354,8 @@ return function(A)
         A.running=value; A.epoch=A.epoch+1
         A.status.Gameplay=value and 'Ready: each feature uses its own toggle' or 'Stopped or disconnected; rerun after reconnecting'
         if not value then
+            A.saveSettings(true)
+            if A.stopFarmMovement then A.stopFarmMovement() end
             if A.stopTrialMovement then A.stopTrialMovement() end
             if A.stopDungeonMovement then A.stopDungeonMovement() end
             if A.watchTarget then A.watchTarget(nil) end
@@ -526,8 +367,8 @@ return function(A)
     end
     function A.stop()
         if not A.alive then return end
+        A.stopping=true
         if A.flushJoinDiagnostics then A.flushJoinDiagnostics() end
-        if A.guildCheckpoint then A.guildCheckpoint('unload') end
         A.setRunning(false); if A.render then A.render(false) end
         if A.cleanupTrialMovement then A.cleanupTrialMovement() end
         if A.cleanupDungeonMovement then A.cleanupDungeonMovement() end
@@ -573,6 +414,13 @@ return function(A)
     local package=A.module('Packages','DataContainer')
     assert(package and package.New,'PlayerData interface unavailable')
     A.container=package.New('PlayerData')
+    A.job('Settings autosave',0.2,function()
+        local now=os.clock()
+        if saveDue then
+            if now<saveDue or now<saveRetry then return end
+        elseif now<nextCheck or now<saveRetry then return end
+        nextCheck=now+2; A.saveSettings()
+    end,true)
     A.job('Connection cleanup',60,function()
         local live={}
         for _,c in ipairs(A.connections) do
@@ -589,7 +437,13 @@ end)()(A);
 -- ===== notifications =====
 (function()
 return function(A)
-    A.outbox=A.safeLoad(A.folder..'/outbox.json') or {}
+    A.outbox={}
+    for _,entry in ipairs(A.safeLoad(A.folder..'/outbox.json') or {}) do
+        if type(entry)=='table' and not entry.attachment and A.settings.webhookEvents[entry.kind]~=nil then
+            A.outbox[#A.outbox+1]=entry
+            if #A.outbox>=50 then break end
+        end
+    end
     A.httpRequest=(type(request)=='function' and request) or (type(http_request)=='function' and http_request)
         or (type(http)=='table' and type(http.request)=='function' and http.request)
         or (type(syn)=='table' and type(syn.request)=='function' and syn.request)
@@ -608,18 +462,18 @@ return function(A)
         end
         return false
     end
-    function A.http(options)
+    function A.http(options,completeOnStop)
         if not A.httpRequest then return false,'HTTP request API unavailable' end
         if transport.busy then return false,'HTTP already in flight' end
         options.Timeout=15
         A.httpBusy=true; transport.busy=true; local response
         task.spawn(function() response=table.pack(pcall(A.httpRequest,options)); A.httpBusy=false; transport.busy=false end)
         local deadline=os.clock()+15
-        while A.alive and not response and os.clock()<deadline do task.wait(0.05) end
+        while (A.alive or completeOnStop) and not response and os.clock()<deadline do task.wait(0.05) end
         if not response then return false,'HTTP timed out; waiting for transport to recover' end
         return table.unpack(response,1,response.n)
     end
-    function A.notify(kind,message,force,attachment)
+    function A.notify(kind,message,force)
         local s=A.settings
         if not s.webhook then A.status.Webhook='Webhook disabled: enable it in this tab'; return end
         if not force and s.webhookEvents[kind]==false then return end
@@ -629,26 +483,12 @@ return function(A)
             and not s.webhookURL:match('^https://discordapp%.com/api/webhooks/%d+/[%w_%-]+') then
             A.status.Webhook='Enter a Discord webhook URL'; return
         end
-        if attachment then
-            for _,entry in ipairs(A.outbox) do
-                if entry.attachment and entry.attachment.key==attachment.key then
-                    if persist() then return entry end
-                    return
-                end
-            end
-        end
-        if #A.outbox>=50 then
-            local discard
-            for i,entry in ipairs(A.outbox) do if not entry.attachment then discard=i; break end end
-            if not discard then A.status.Webhook='Upload queue full; local exports retained'; return end
-            table.remove(A.outbox,discard)
-        end
+        if #A.outbox>=50 then table.remove(A.outbox,1) end
         local ping=s.ping and kind~='Test' and s.pingEvents[kind]~=false and s.pingId:match('^%d+$') and s.pingId or nil
         A.outbox[#A.outbox+1]={kind=kind,message=tostring(message):sub(1,1500),time=os.time(),attempt=0,
-            target=fingerprint(s.webhookURL),ping=ping,attachment=attachment}
-        local saved=persist(); A.webhookNext=kind=='Disconnect' and 0 or A.webhookNext
+            target=fingerprint(s.webhookURL),ping=ping}
+        persist(); A.webhookNext=kind=='Disconnect' and 0 or A.webhookNext
         A.status.Webhook='Queued '..kind..' ('..#A.outbox..' waiting)'
-        if attachment and not saved then return end
         return A.outbox[#A.outbox]
     end
     A.job('Webhook delivery',1,function()
@@ -666,24 +506,6 @@ return function(A)
         local mentions='"allowed_mentions":{"parse":[],"users":'
             ..(entry.ping and ('['..A.S.HTTP:JSONEncode(entry.ping)..']') or '[]')..'}'
         data=data:sub(1,-2)..','..mentions..'}'
-        if entry.attachment then
-            local file=entry.attachment
-            local valid=type(file.path)=='string' and file.path:sub(1,#A.folder+14)==A.folder..'/guild-export-'
-                and not file.path:find('..',1,true) and type(file.name)=='string' and file.name:match('^[%w_%-%.]+%.json$')
-            local readOK,bytes=false,nil
-            if valid and type(readfile)=='function' then readOK,bytes=pcall(readfile,file.path) end
-            if not readOK or type(bytes)~='string' then
-                A.status['Guild upload']='Upload failed: saved attachment unavailable; main JSON retained'
-                if A.guildExportFailed then A.guildExportFailed(file.key) end
-                A.log('Webhook',A.status['Guild upload']); table.remove(A.outbox,1); persist(); return
-            end
-            local boundary='AnimeSuite'..tostring(os.time())..tostring(math.random(100000,999999))
-            while bytes:find(boundary,1,true) do boundary=boundary..'x' end
-            contentType='multipart/form-data; boundary='..boundary
-            data='--'..boundary..'\r\nContent-Disposition: form-data; name="payload_json"\r\nContent-Type: application/json\r\n\r\n'
-                ..data..'\r\n--'..boundary..'\r\nContent-Disposition: form-data; name="files[0]"; filename="'..file.name
-                ..'"\r\nContent-Type: application/json\r\n\r\n'..bytes..'\r\n--'..boundary..'--\r\n'
-        end
         local url=A.settings.webhookURL:gsub('([?&])wait=[^&]*','%1wait=true')
         if not url:find('wait=',1,true) then url=url..(url:find('?',1,true) and '&' or '?')..'wait=true' end
         local ok,response=A.http({Url=url,Method='POST',Headers={['Content-Type']=contentType},Body=data})
@@ -716,10 +538,6 @@ return function(A)
         if type(writefile)=='function' then
             pcall(function() writefile(A.folder..'/webhook-diagnostics.json',A.S.HTTP:JSONEncode(A.webhookDiagnostic)) end)
         end
-        if entry.attachment then A.status['Guild upload']=A.status.Webhook..' (local JSON retained)' end
-        if entry.attachment and (action=='stop' or (action~='done' and entry.attempt>=8 and status~=429)) then
-            if A.guildExportFailed then A.guildExportFailed(entry.attachment.key) end
-        end
         persist()
     end,true)
     local sent=false
@@ -734,7 +552,6 @@ return function(A)
         if not sent and A.isDisconnectMessage(message) then
             sent=true; A.notify('Disconnect','Client connection/error message: '..tostring(message))
             A.status.Gameplay='Disconnected: rerun the script after reconnecting'
-            if A.guildCheckpoint then A.guildCheckpoint('disconnect') end
             A.setRunning(false)
             if A.runJob and A.tasks['Webhook delivery'] then A.runJob(A.tasks['Webhook delivery']) end
         end
@@ -753,7 +570,7 @@ return function(A)
     end
     A.status.Disconnect=connected and 'Error-message listener connected' or 'Error-message signals unavailable in this executor'
     A.job('Disconnect fallback',2,function()
-        if not sent and ((A.settings.webhook and A.settings.sendDisconnect) or (A.guildSession and A.guildSession.active)) then
+        if not sent and (A.settings.webhook and A.settings.sendDisconnect) then
             local readOK,message=pcall(function() return A.S.Gui:GetErrorMessage() end)
             if readOK and type(message)=='string' and message~='' then disconnected(message) end
         end
@@ -803,7 +620,7 @@ return function(A)
     A.sessionNamed={}
     function A.renameDiagnostics()
         local d=A.data() or {}; local stats=A.util('PetStatsUtil')
-        local report={version='4.7',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
+        local report={version='5.2',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
             inventoryEvents=A.renameInventoryEvents or 0,lastInventoryEvent=A.renameLastInventoryEvent}
         local named=type(d.NamedPets)=='table' and d.NamedPets or {}
         local sampled={}
@@ -848,6 +665,7 @@ return function(A)
         if success then
             A.sessionNamed[id]=true; retries[id]=nil
             A.status.Rename='Named Astral: '..id
+            if A.settings.webhook then A.notify('Inventory','Renamed an unnamed Astral pet: '..id) end
         else
             if (retries[id] or 0)>=3 then retryAfter[id]=os.clock()+120 end
             A.status.Rename='Rename failed for '..id..': '..tostring(reason)
@@ -891,7 +709,7 @@ return function(A)
         local skipped,total={},0
         -- Removed pets must not leave session state or retry timers behind.
         for petId in pairs(A.sessionNamed) do
-            if d.Pets[petId]==nil then A.sessionNamed[petId]=nil end
+            if d.Pets[petId]==nil then A.sessionNamed[petId]=nil; A.cooldowns['rename:'..petId]=nil end
         end
         for petId in pairs(retries) do
             if d.Pets[petId]==nil then retries[petId]=nil; retryAfter[petId]=nil; A.cooldowns['rename:'..petId]=nil end
@@ -963,6 +781,10 @@ end)()(A);
 (function()
 return function(A)
     local C=A.Core
+    local movingHuman
+    function A.stopFarmMovement()
+        if movingHuman then pcall(function() movingHuman:Move(Vector3.zero) end); movingHuman=nil end
+    end
     function A.inMode()
         local ctrl=A.client('TeleportController')
         return (ctrl and ctrl:IsInGamemode()) or false
@@ -1078,6 +900,7 @@ return function(A)
         if not hrp or not hum or hum.Health<=0 then A.status.Farm='Waiting for respawn'; return end
         if not A.settings.farm or (A.activityBlocksFarm and A.activityBlocksFarm()) or A.inMode() or (A.trialContext and A.trialContext()) then
             A.watchTarget(nil)
+            A.stopFarmMovement()
             if A.rangeOwned then A.fire('RangeToggle',false); A.rangeOwned=false; hum:Move(Vector3.zero) end
             return
         end
@@ -1102,7 +925,7 @@ return function(A)
         local destination=chosen.part.Position+Vector3.new(0,0,A.settings.distance)
         if chosen.distance>A.settings.distance+2 then
             if A.settings.moveStyle=='Teleport' then hrp.CFrame=CFrame.new(destination,chosen.part.Position)
-            else hum:MoveTo(destination) end
+            else movingHuman=hum; hum:MoveTo(destination) end
         end
         -- The game's range system owns damage validation; no fabricated damage/hits.
         local d=A.data()
@@ -1233,7 +1056,7 @@ return function(A)
                         context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
                 end
                 local ctrl=A.client('TeleportController')
-                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='4.7',reason=message,
+                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.2',reason=message,
                     context=A.player:GetAttribute('VisibilityContext'),room=state[keyField]==key and state.Room,
                     serverEnemies=state[keyField]==key and state.EnemyCount,anchored=root and root.Anchored,
                     loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
@@ -1360,14 +1183,14 @@ return function(A)
         local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
         local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
         local activityJob=A.tasks.Activities
-        local snapshot={schema=1,version='4.7',userId=A.player.UserId,gameId=game.GameId,
+        local snapshot={schema=1,version='5.2',userId=A.player.UserId,gameId=game.GameId,
             savedAt=os.time(),context=A.player:GetAttribute('VisibilityContext'),running=A.running,
             activities=A.status.Activities,error=A.status['Activity error'],events=events,openings=openings,
             coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
             gameState=stateOK and gameState or {error=tostring(gameState):sub(1,240)},
             eventError=A.status.Event,activityJobFailures=activityJob and activityJob.failures,settings={}}
         for _,key in ipairs({'towerAutoJoin','towerSelection','trialAutoJoin','trialJoinSelection','dungeonAutoJoin',
-            'dungeonSelection','gateAutoJoin','gateSelection','gateRanks','raidAutoJoin','raidSelection',
+            'dungeonSelection','gateAutoJoin','gateSelection','gateRanks','maxTacAutoJoin','maxTacSelection','maxTacRanks','priority','raidAutoJoin','raidSelection',
             'defenseAutoJoin','defenseSelection','bossRushAutoJoin','bossRushSelection'}) do snapshot.settings[key]=A.settings[key] end
         local ok,err=pcall(function()
             if type(makefolder)=='function' then pcall(makefolder,'JoesAAS'); pcall(makefolder,A.folder) end
@@ -1391,51 +1214,100 @@ end)()(A);
 (function()
 return function(A)
     local definitions={
-        Tower={rank=400,config='TowerConfig',method='GetAllTowers',toggle='towerAutoJoin',selection='towerSelection'},
-        TimeTrial={rank=300,config='TimeTrialConfig',method='GetAllTrials',toggle='trialAutoJoin',selection='trialJoinSelection'},
-        Gate={rank=225,config='RaidConfig',method='GetAllRaids',toggle='gateAutoJoin',selection='gateSelection'},
-        Raid={rank=200,config='RaidConfig',method='GetAllRaids',toggle='raidAutoJoin',selection='raidSelection'},
-        Defense={rank=200,config='DefenseConfig',method='GetAllDefenses',toggle='defenseAutoJoin',selection='defenseSelection'},
-        Dungeon={rank=250,config='DungeonConfig',method='GetAllDungeons',toggle='dungeonAutoJoin',selection='dungeonSelection'},
-        BossRush={rank=100,config='BossRushConfig',method='GetAllRushes',toggle='bossRushAutoJoin',selection='bossRushSelection'}
+        MaxTac={config='RaidConfig',method='GetAllRaids',toggle='maxTacAutoJoin',selection='maxTacSelection',ranks='maxTacRanks'},
+        Tower={config='TowerConfig',method='GetAllTowers',toggle='towerAutoJoin',selection='towerSelection'},
+        TimeTrial={config='TimeTrialConfig',method='GetAllTrials',toggle='trialAutoJoin',selection='trialJoinSelection'},
+        Gate={config='RaidConfig',method='GetAllRaids',toggle='gateAutoJoin',selection='gateSelection',ranks='gateRanks'},
+        Raid={config='RaidConfig',method='GetAllRaids',toggle='raidAutoJoin',selection='raidSelection'},
+        Defense={config='DefenseConfig',method='GetAllDefenses',toggle='defenseAutoJoin',selection='defenseSelection'},
+        Dungeon={config='DungeonConfig',method='GetAllDungeons',toggle='dungeonAutoJoin',selection='dungeonSelection'},
+        BossRush={config='BossRushConfig',method='GetAllRushes',toggle='bossRushAutoJoin',selection='bossRushSelection'}
     }
-    local order={'Tower','TimeTrial','Dungeon','Gate','Raid','Defense','BossRush'}
-    local protected={Tower=true,TimeTrial=true,Dungeon=true}
+    local order={'MaxTac','Tower','TimeTrial','Dungeon','Gate','Raid','Defense','BossRush'}
+    local protected={MaxTac=true,Tower=true,TimeTrial=true,Dungeon=true}
     local available,backoff={},{}
     local pending,leaving,locked,returning,waitingReason
+    local leaveAt,leaveAttempts=0,0
     local raidInstance,raidKey
     for _,mode in ipairs(order) do available[mode]={} end
+    function A.activityOrder()
+        local result={}
+        for _,mode in ipairs(A.Core.priorityOrder(A.settings.priority)) do
+            if mode=='Combat' then result[#result+1]='Raid'; result[#result+1]='Defense'
+            else result[#result+1]=mode end
+        end
+        return result
+    end
+    local function priority(mode)
+        mode=(mode=='Raid' or mode=='Defense') and 'Combat' or mode
+        for i,key in ipairs(A.Core.priorityOrder(A.settings.priority)) do if key==mode then return 8-i end end
+        return 0
+    end
+    function A.priorityText()
+        local labels={}
+        for _,key in ipairs(A.Core.priorityOrder(A.settings.priority)) do labels[#labels+1]=A.Core.priorityLabels[key] end
+        return table.concat(labels,' > ')..' > Mob Autofarm'
+    end
+    function A.moveActivityPriority(mode,delta)
+        local list=A.Core.priorityOrder(A.settings.priority)
+        for i,key in ipairs(list) do
+            if key==mode then
+                local destination=math.clamp(i+delta,1,#list)
+                list[i],list[destination]=list[destination],list[i]; break
+            end
+        end
+        A.settings.priority=list; A.settingsChanged()
+        if A.refreshUI then A.refreshUI() end
+        A.coordinateActivities()
+    end
+    function A.resetActivityPriority()
+        A.settings.priority=A.Core.copy(A.Core.defaultPriority); A.settingsChanged()
+        if A.refreshUI then A.refreshUI() end
+        A.coordinateActivities()
+    end
     function A.activityChoices(mode)
         local def=definitions[mode]; if not def then return {} end
         local cfg=A.config(def.config)
         local choices=cfg and type(cfg[def.method])=='function' and cfg[def.method](cfg) or {}
-        if mode=='Gate' or mode=='Raid' then
+        if mode=='Gate' or mode=='MaxTac' or mode=='Raid' then
             local filtered={}
             for key,value in pairs(choices) do
-                if (value.GateOnly==true)==(mode=='Gate') then filtered[key]=value end
+                if (mode=='Raid' and value.GateOnly~=true) or A.Core.portalMode(key,value)==mode then filtered[key]=value end
             end
             return filtered
         end
         return choices
     end
-    local rankOrder={'S','A','B','C','D','E'}
-    local rankWeight={S=6,A=5,B=4,C=3,D=2,E=1}
-    function A.gateRankRows()
+    local rankOrders={Gate={'S','A','B','C','D','E'},MaxTac={'Low','Medium','High','Extreme','Psycho'}}
+    local rankWeight={S=6,A=5,B=4,C=3,D=2,E=1,Low=5,Medium=4,High=3,Extreme=2,Psycho=1}
+    local function rankRows(mode)
         local present={}; local rows={}
-        for _,cfg in pairs(A.activityChoices('Gate')) do
+        for _,cfg in pairs(A.activityChoices(mode)) do
             for _,rank in ipairs(type(cfg.GateRanks)=='table' and cfg.GateRanks or {}) do
                 if type(rank)=='table' and type(rank.Rank)=='string' then present[rank.Rank]=true end
             end
         end
-        for _,rank in ipairs(rankOrder) do if present[rank] then rows[#rows+1]={key=rank,label=rank} end end
+        for _,rank in ipairs(rankOrders[mode]) do if present[rank] then rows[#rows+1]={key=rank,label=rank} end end
         return rows
+    end
+    function A.gateRankRows() return rankRows('Gate') end
+    function A.maxTacRankRows() return rankRows('MaxTac') end
+    local function portalRank(mode,key,p)
+        local cfg=A.activityChoices(mode)[key]
+        if not cfg then return nil end
+        for _,entry in ipairs(type(cfg.GateRanks)=='table' and cfg.GateRanks or {}) do
+            local rank=type(entry)=='table' and entry.Rank
+            if type(rank)=='string' and rankWeight[rank] and (p.GateRank==rank
+                or (type(p.Name)=='string' and p.Name:match('Rank%s+([%a]+)')==rank)
+                or (type(p.Title)=='string' and p.Title:match('Rank%s+([%a]+)')==rank)) then return rank end
+        end
     end
     local function candidateKeys(mode,choices)
         if mode=='TimeTrial' then return A.Core.activityKeys(choices,mode) end
         local keys=A.Core.keys(choices)
-        if mode=='Gate' then
+        if mode=='Gate' or mode=='MaxTac' then
             table.sort(keys,function(a,b)
-                local left=available.Gate[a]; local right=available.Gate[b]
+                local left=available[mode][a]; local right=available[mode][b]
                 local x=left and rankWeight[left.rank] or 0; local y=right and rankWeight[right.rank] or 0
                 if x~=y then return x>y end
                 return a<b
@@ -1464,7 +1336,17 @@ return function(A)
             local instance=raw:match('^Raid:(.+)$')
             local key=instance==raidInstance and raidKey or instance
             local cfg=A.config('RaidConfig'); local entries=cfg and cfg:GetAllRaids() or {}
-            if entries[key] and entries[key].GateOnly==true then mode='Gate' end
+            if instance and not entries[key] then
+                local arenas=workspace:FindFirstChild('RaidArenas')
+                local arena=arenas and arenas:FindFirstChild(instance)
+                local observed=arena and arena:GetAttribute('RaidKey')
+                local base=instance:match('^([^_]+)_')
+                if type(observed)=='string' and entries[observed] then key=observed
+                elseif base and entries[base] then key=base end
+                if entries[key] then raidInstance=instance; raidKey=key end
+            end
+            if entries[key] and entries[key].GateOnly==true then mode=A.Core.portalMode(key,entries[key])
+            elseif pending and (pending.mode=='Gate' or pending.mode=='MaxTac') and raw~=pending.fromContext then mode=pending.mode end
         end
         return mode~='World' and mode or nil,raw
     end
@@ -1474,7 +1356,7 @@ return function(A)
     end
     local function selectCandidate()
         waitingReason=nil
-        for _,mode in ipairs(order) do
+        for _,mode in ipairs(A.activityOrder()) do
             local choices=A.settings[definitions[mode].toggle] and A.activityChoices(mode) or {}
             for _,key in ipairs(candidateKeys(mode,choices)) do
                 if enabled(mode,key) and (backoff[mode..':'..key] or 0)<=os.clock() then
@@ -1484,10 +1366,10 @@ return function(A)
                         local tower=choices[key]
                         if cfg and cfg.Enabled~=false and util and d and A.unlocked(tower.WorldId)
                             and util.GetCooldownRemaining(d,tower)<=0 then return mode,key,{} end
-                    elseif mode=='Gate' then
+                    elseif mode=='Gate' or mode=='MaxTac' then
                         if entry and entry.deadline>os.clock() then
-                            if not entry.rank then waitingReason='Gate rank not provided; waiting for a ranked announcement'
-                            elseif A.settings.gateRanks[entry.rank] then return mode,key,entry end
+                            if not entry.rank then waitingReason=mode..' rank not provided; waiting for a ranked announcement'
+                            elseif A.settings[definitions[mode].ranks][entry.rank] then return mode,key,entry end
                         end
                     elseif mode~='Raid' and entry and entry.deadline>os.clock() then return mode,key,entry
                     elseif mode=='Raid' or mode=='Defense' then
@@ -1510,6 +1392,8 @@ return function(A)
     local function status(text) A.status.Activities=text; A.status['Trial join']=text; A.joinTrace('status',{reason=text}) end
     local function suspendFarm()
         A.watchTarget(nil)
+        A.stopFarmMovement()
+        if A.rangeOwned then A.fire('RangeToggle',false); A.rangeOwned=false end
         local c=A.player.Character; local h=c and c:FindFirstChildOfClass('Humanoid')
         if h then h:Move(Vector3.zero) end
     end
@@ -1518,9 +1402,9 @@ return function(A)
         return mode~=nil or pending~=nil or leaving~=nil or locked~=nil or returning~=nil
     end
     local function sendRequest(mode,key,entry)
-        if mode=='Gate' then return A.fire('RaidGateTeleport',key) end
+        if mode=='Gate' or mode=='MaxTac' then return A.fire('RaidGateTeleport',key) end
         if mode=='Tower' then return A.fire('TowerJoin',{TowerKey=key}) end
-        if mode=='Raid' then return A.fire('RaidJoin','Create',key,true) end
+        if mode=='Raid' or (mode=='Defense' and entry.action=='Create') then return A.fire(mode..'Join','Create',key,true) end
         if mode=='BossRush' then return A.fire('BossRushJoin','Join',key,entry.modeId or 'V1',true) end
         return A.fire(mode..'Join',entry.action or 'Join',key)
     end
@@ -1532,6 +1416,7 @@ return function(A)
     end
     function A.coordinateActivities()
         if not A.alive or not A.running then return end
+        if A.settings.raidAutoJoin and A.settings.defenseAutoJoin then A.settings.defenseAutoJoin=false end
         local current,raw=context()
         local ctrl=A.client('TeleportController')
         local loading=ctrl and ctrl:IsLoading()
@@ -1541,7 +1426,7 @@ return function(A)
         end
         if pending and not pending.accepted and not loading and not protected[current] then
             local nextMode=selectCandidate()
-            if nextMode and definitions[nextMode].rank>definitions[pending.mode].rank then pending=nil end
+            if nextMode and priority(nextMode)>priority(pending.mode) then pending=nil end
         end
         if pending then
             if current==pending.mode then
@@ -1551,7 +1436,7 @@ return function(A)
                 local entry=available[pending.mode][pending.key]
                 local scheduled=pending.mode~='Raid' and pending.mode~='Tower' and pending.mode~='Defense'
                 if not enabled(pending.mode,pending.key) or (scheduled and (not entry or entry.deadline<=os.clock()))
-                    or (pending.mode=='Gate' and (not entry or not entry.rank or not A.settings.gateRanks[entry.rank] or entry.rank~=pending.entry.rank)) then
+                    or (definitions[pending.mode].ranks and (not entry or not entry.rank or not A.settings[definitions[pending.mode].ranks][entry.rank] or entry.rank~=pending.entry.rank)) then
                     pending=nil
                 elseif not pending.accepted and os.clock()-pending.lastSent>=8 then
                     if pending.attempts<3 then
@@ -1570,23 +1455,34 @@ return function(A)
         if loading then status('Blocked by game loading'); return end
         local mode,key,entry=selectCandidate()
         if not mode then status(current and ('In '..current) or (waitingReason or 'Waiting for a selected activity')); return end
-        local direct=mode=='Tower' or mode=='TimeTrial' or mode=='Dungeon'
-        if leaving and not direct then status('Waiting for '..leaving..' exit confirmation'); return end
+        local direct=mode=='MaxTac' or mode=='Tower' or mode=='TimeTrial' or mode=='Dungeon'
+        if leaving and not direct then
+            if os.clock()-leaveAt>=5 then
+                if leaveAttempts<3 then
+                    leaveAttempts=leaveAttempts+1; leaveAt=os.clock()
+                    A.fire((leaving=='Gate' or leaving=='MaxTac') and 'RaidLeave' or leaving..'Leave')
+                else
+                    A.status['Activity error']='No '..leaving..' exit confirmation; retrying later'
+                    backoff[mode..':'..key]=os.clock()+30; leaving=nil; status(A.status['Activity error']); return
+                end
+            end
+            status('Waiting for '..leaving..' exit confirmation'); return
+        end
         if current then
             local def=definitions[current]
             if not def then status('Waiting for current mode to finish'); return end
             -- Finished protected runs may transfer next; unfinished ones stay locked above.
-            if returning~=current and definitions[mode].rank<=def.rank then status('Current '..current..' has equal/higher priority than '..mode); return end
+            if returning~=current and priority(mode)<=priority(current) then status('Current '..current..' has equal/higher priority than '..mode); return end
             if not direct then
                 if returning==current then status('Waiting for '..current..' return teleport'); return end
-                leaving=current; suspendFarm(); status('Leaving '..current..' for '..mode)
-                if not A.fire(current=='Gate' and 'RaidLeave' or current..'Leave') then leaving=nil; status('Leave bridge unavailable: '..current) end
+                leaving=current; leaveAt=os.clock(); leaveAttempts=1; suspendFarm(); status('Leaving '..current..' for '..mode)
+                if not A.fire((current=='Gate' or current=='MaxTac') and 'RaidLeave' or current..'Leave') then leaving=nil; status('Leave bridge unavailable: '..current) end
                 return
             end
         elseif returning then status('Waiting for '..returning..' return teleport'); return
         elseif A.inMode() then status('Waiting for current mode to finish'); return end
         if direct then leaving=nil end
-        pending={mode=mode,key=key,entry=entry,at=os.clock(),lastSent=os.clock(),attempts=1}
+        pending={mode=mode,key=key,entry=entry,at=os.clock(),lastSent=os.clock(),attempts=1,fromContext=raw}
         suspendFarm()
         status(current and ('Transferring '..current..' to '..mode..': '..key)
             or ((mode=='Raid' and 'Starting your own Raid: ' or ('Joining '..mode..': '))..key))
@@ -1597,7 +1493,7 @@ return function(A)
     A.tryTrialJoin=A.coordinateActivities
     for _,name in ipairs(order) do
         local mode=name
-        if mode~='Gate' then
+        if mode~='Gate' and mode~='MaxTac' then
         if mode~='Raid' then A.on(mode..'Announcement',function(p)
             if type(p)~='table' or p.NotifyKind~='GamemodeOpen' or p.GamemodeType~=mode or type(p.Key)~='string' then return end
             -- A raid gate announcement is a world gate teleport, not a joinable raid.
@@ -1611,9 +1507,17 @@ return function(A)
         A.on(mode..'Ended',function(_,packet)
             A.joinTrace('run ended',{mode=mode,autoRetry=type(packet)=='table' and packet.AutoRetry==true,timeTrialTransfer=type(packet)=='table' and packet.TimeTrialTransfer==true})
             local current=context()
-            local ended=mode=='Raid' and (current=='Gate' or locked=='Gate') and 'Gate' or mode
+            -- The native portal transfer can deliver the previous Raid's end
+            -- after MaxTac entry; that packet must not end the new locked run.
+            if mode=='Raid' and type(packet)=='table' and packet.AutoGateTransfer==true
+                and (current=='MaxTac' or locked=='MaxTac') then A.coordinateActivities(); return end
+            local ended=mode=='Raid' and ((current=='MaxTac' or locked=='MaxTac') and 'MaxTac'
+                or ((current=='Gate' or locked=='Gate') and 'Gate')) or mode
+            if (current==ended or locked==ended) and A.settings.webhook then
+                A.notify('Mode',ended..' run ended'..(type(packet)=='table' and packet.AutoRetry==true and ' (native auto retry)' or ''))
+            end
             if current==ended or locked==ended then locked=nil; returning=ended end
-            if pending and pending.mode==mode then pending=nil end
+            if pending and (pending.mode==mode or pending.mode==ended) then pending=nil end
             A.coordinateActivities()
         end)
         if mode~='Tower' then
@@ -1642,12 +1546,12 @@ return function(A)
         if type(p)~='table' or p.NotifyKind~='GamemodeOpen' or p.GateTeleport~=true or type(p.Key)~='string' then return end
         local duration=tonumber(p.ExpiresIn) or 60
         if duration<=0 or duration~=duration then return end
-        local rank=type(p.GateRank)=='string' and p.GateRank
-            or (type(p.Name)=='string' and p.Name:match('Rank%s+([A-Z]+)'))
-            or (type(p.Title)=='string' and p.Title:match('Rank%s+([A-Z]+)'))
-        if not rankWeight[rank] then rank=nil end
-        A.joinTrace('opening',{mode='Gate',key=p.Key,rank=rank,selected=enabled('Gate',p.Key) and rank~=nil and A.settings.gateRanks[rank]==true,duration=duration,source='bridge'})
-        available.Gate[p.Key]={deadline=os.clock()+math.min(duration,600),rank=rank}
+        local cfg=A.config('RaidConfig'); local entries=cfg and cfg:GetAllRaids() or {}
+        local mode=A.Core.portalMode(p.Key,entries[p.Key])
+        if mode~='Gate' and mode~='MaxTac' then return end
+        local rank=portalRank(mode,p.Key,p)
+        A.joinTrace('opening',{mode=mode,key=p.Key,rank=rank,selected=enabled(mode,p.Key) and rank~=nil and A.settings[definitions[mode].ranks][rank]==true,duration=duration,source='bridge'})
+        available[mode][p.Key]={deadline=os.clock()+math.min(duration,600),rank=rank}
         A.coordinateActivities()
     end)
     A.on('RaidMapReady',function(instance,key)
@@ -1682,9 +1586,10 @@ return function(A)
             status(A.status['Activity error'])
         end
     end)
-    local lastTrialSchedule
+    local lastTrialSchedule,hasTrialSchedule,trialScheduleOpen
     A.on('TimeTrialActiveStatus',function(_,p)
         if type(p)~='table' then return end
+        hasTrialSchedule=true; trialScheduleOpen=p.IsOpen==true
         local signature=tostring(p.IsOpen)..':'..table.concat(A.Core.keys(type(p.OpenTrialKeys)=='table' and p.OpenTrialKeys or {[p.OpenTrialKey or '']=true}),',')
         if signature~=lastTrialSchedule then A.joinTrace('Trial schedule',{mode='TimeTrial',key=p.OpenTrialKey,reason=signature}); lastTrialSchedule=signature end
         available.TimeTrial={}
@@ -1695,6 +1600,59 @@ return function(A)
             end
         end
         A.coordinateActivities()
+    end)
+    -- Native popup attributes provide recovery when injection happens after the
+    -- announcement. Read only the small notification containers, never the scene.
+    local observedRoots={}
+    local function readCard(card)
+        if not card:IsA('GuiObject') or card.Visible~=true or not card.Parent then return end
+        local setting=card:GetAttribute('GamemodePopupSettingKey')
+        if type(setting)~='string' then return end
+        local mode,key=setting:match('^([^:]+):(.+)$')
+        if mode=='Portal' or card:GetAttribute('GamemodePopupIsPortal')==true then
+            local cfg=A.config('RaidConfig'); local entries=cfg and cfg:GetAllRaids() or {}
+            mode=A.Core.portalMode(key,entries[key])
+        end
+        local modeId
+        if mode=='BossRush' then
+            local base,variant=key:match('^([^:]+):(.+)$')
+            if base then key=base; modeId=variant end
+        end
+        if not definitions[mode] or mode=='Raid' or not key or not enabled(mode,key) then return end
+        if mode=='TimeTrial' and hasTrialSchedule and not trialScheduleOpen then return end
+        local cfg=A.activityChoices(mode)[key]; if not cfg then return end
+        local ranked=definitions[mode].ranks~=nil
+        local rank=ranked and portalRank(mode,key,{GateRank=card:GetAttribute('GamemodePopupGateRank')}) or nil
+        if ranked and not rank then return end
+        local entry=available[mode][key]
+        if not entry or entry.deadline<=os.clock() or (ranked and not entry.rank) then
+            available[mode][key]={deadline=os.clock()+1,rank=rank,modeId=modeId,source='popup'}
+            A.joinTrace('opening',{mode=mode,key=key,rank=rank,selected=true,source='native popup'})
+        elseif entry.source=='popup' then entry.deadline=os.clock()+1; entry.rank=rank end
+    end
+    function A.refreshOpenCards()
+        local pg=A.player:FindFirstChildOfClass('PlayerGui'); if not pg then return end
+        local hud=pg:FindFirstChild('HUD'); local main=hud and hud:FindFirstChild('Main')
+        local overlay=pg:FindFirstChild('GamemodeNotifyOverlay')
+        local roots={}
+        for _,parent in ipairs({main or false,overlay or false}) do
+            local root=parent and parent:FindFirstChild('GamemodeNotify')
+            if root then roots[#roots+1]=root end
+        end
+        for _,root in ipairs(roots) do
+            if not observedRoots[root] and root.ChildAdded then
+                observedRoots[root]=true
+                A.connect(root.ChildAdded,function(card)
+                    readCard(card); A.coordinateActivities()
+                end)
+            end
+            if root.Visible~=false then for _,card in ipairs(root:GetChildren()) do readCard(card) end end
+        end
+    end
+    A.job('Opening recovery',0.5,function()
+        for _,mode in ipairs(order) do
+            if A.settings[definitions[mode].toggle] then A.refreshOpenCards(); A.coordinateActivities(); return end
+        end
     end)
     function A.joinSnapshot()
         local openings={}
@@ -1708,348 +1666,590 @@ return function(A)
             attempts=pending.attempts,age=os.clock()-pending.at},locked=locked,leaving=leaving,returning=returning,available=openings}
     end
     A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),A.coordinateActivities)
+    local lastNotifiedContext
+    A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),function()
+        local mode,raw=context()
+        if raw==lastNotifiedContext then return end
+        lastNotifiedContext=raw
+        if mode and definitions[mode] and A.settings.webhook then A.notify('Mode','Entered '..mode..': '..raw) end
+    end)
     A.job('Activities',0.2,A.coordinateActivities)
 end
 
 end)()(A);
 
--- ===== guild_clock =====
+-- ===== cyber =====
 (function()
 return function(A)
-    local G=A.GuildCore
-    local lastClock,lastBeat=nil,0
-    local suspended=false
-    A.guildHeartbeatFile=A.folder..'/guild-heartbeat.json'
+    local pending,nextAttempt=nil,0
+    function A.ripperdocRows()
+        local cfg=A.config('RipperdocConfig'); local rows={}
+        for _,slot in ipairs(cfg and cfg.SlotOrder or {}) do rows[#rows+1]={key=slot,label=slot} end
+        return rows
+    end
+    function A.openCyberSystem(kind)
+        local cfg=A.config(kind..'Config'); local ctrl=A.client('TeleportController')
+        if not cfg or cfg.Enabled~=true then A.status.Cyber='System unavailable'; return end
+        if not A.unlocked(cfg.WorldId) then A.status.Cyber='Unlock World '..tostring(cfg.WorldId)..' first'; return end
+        if not ctrl or type(ctrl.OpenRemoteSystem)~='function' then A.status.Cyber='Native menu unavailable'; return end
+        if ctrl:IsLoading() then A.status.Cyber='Waiting for game loading'; return end
+        ctrl:OpenRemoteSystem(cfg.WorldId,kind)
+    end
+    function A.cyberSummary()
+        local cfg=A.config('CyberdeckConfig'); local d=A.data()
+        if not cfg or cfg.Enabled~=true then return 'Cyberdeck unavailable in this game version' end
+        if not d then return 'Waiting for player data' end
+        local equipped={}
+        for _,key in ipairs(cfg:GetEquipped(d)) do
+            local item=cfg:GetQuickhack(key)
+            equipped[#equipped+1]=(item and item.Name or key)..' Lv.'..cfg:GetQuickhackLevel(d,key)
+        end
+        return 'Militech Convoy level: '..cfg:GetConvoyLevel(d)..' | Skill points: '..cfg:GetPoints(d)
+            ..'\nRAM: '..cfg:GetUsedRam(d)..' / '..cfg:GetMaxRam(d)
+            ..'\nEquipped: '..(#equipped>0 and table.concat(equipped,', ') or 'None')
+    end
+    A.job('Ripperdoc',1,function()
+        if not A.settings.ripperdocAuto and not pending then return end
+        local cfg=A.config('RipperdocConfig'); local d=A.data()
+        if not cfg or cfg.Enabled~=true or not d then return end
+        if pending then
+            if cfg:GetLevel(d,pending.slot)>pending.level then
+                A.status.Ripperdoc='Upgraded '..pending.slot..' to Lv.'..cfg:GetLevel(d,pending.slot)
+                if A.settings.webhook then A.notify('Progress',A.status.Ripperdoc) end
+                pending=nil
+            elseif os.clock()-pending.at<20 then
+                A.status.Ripperdoc='Waiting for '..pending.slot..' upgrade confirmation'; return
+            else
+                A.status.Ripperdoc='Upgrade unconfirmed; waiting 120s before retrying'
+                pending=nil; nextAttempt=os.clock()+120; return
+            end
+        end
+        if not A.settings.ripperdocAuto or os.clock()<nextAttempt then return end
+        if not A.unlocked(cfg.WorldId) then A.status.Ripperdoc='Unlock Night City first'; return end
+        local chosen,level,cost
+        for _,slot in ipairs(cfg.SlotOrder) do
+            if A.settings.ripperdocSlots[slot] then
+                local current=cfg:GetLevel(d,slot)
+                local amount=cfg:GetNextCost(slot,current)
+                if amount and cfg:IsSlotOpen(d,slot) then chosen=slot; level=current; cost=amount; break end
+            end
+        end
+        if not chosen then A.status.Ripperdoc='Select unfinished slots; later slots require the previous slot at max'; return end
+        if A.balance(cfg.CostItemId)<cost then
+            A.status.Ripperdoc='Need '..cost..' '..cfg.CostItemId..' for '..chosen; return
+        end
+        local fn=A.Library.Network.Functions:FindFirstChild('RipperdocUpgrade')
+        if not fn then A.status.Ripperdoc='RipperdocUpgrade unavailable'; return end
+        -- One normal, serial server request; never spend again before replication confirms.
+        pending={slot=chosen,level=level,at=os.clock()}; nextAttempt=os.clock()+2
+        A.status.Ripperdoc='Upgrading '..chosen
+        local ok,accepted,reason=pcall(fn.InvokeServer,fn,chosen)
+        if not A.alive then return end
+        if not ok or accepted~=true then
+            pending=nil; nextAttempt=os.clock()+30
+            A.status.Ripperdoc='Upgrade refused: '..tostring(ok and reason or accepted)
+        end
+    end)
+end
+
+end)()(A);
+
+-- ===== index_sources =====
+(function()
+return function(A)
+    local order={'Accessories','PetAccessories','Titans','Shadows','Swords','Primordials','Mounts'}
+    local configs={Accessories='AccessoryConfig',PetAccessories='PetAccessoryConfig',Titans='TitansConfig',
+        Shadows='ShadowsConfig',Swords='SwordConfig',Primordials='PrimordialsConfig',Mounts='MountConfig'}
+    local rewardCategories={Accessory='Accessories',Accesory='Accessories',PetAccessory='PetAccessories',Mount='Mounts'}
+    local accessoryRarities={Common=true,Uncommon=true,Rare=true,Epic=true,Legendary=true,Mythical=true,Secret=true,Divine=true,Limited=true}
     local function finite(n) return type(n)=='number' and n==n and n>=0 and n<math.huge end
-    function A.guildAccrue()
-        local now=os.clock(); local s=A.guildSession
-        if s and s.active and not suspended and lastClock then
-            local delta=now-lastClock
-            if delta>=0 and delta<=G.maxObservedInterval then
-                s.activeTrackingSeconds=s.activeTrackingSeconds+delta
-            elseif delta>G.maxObservedInterval then
-                s.runtimeStallSeconds=(s.runtimeStallSeconds or 0)+delta
-                if A.guildBreakObservation then A.guildBreakObservation() end
+    local function percent(n)
+        n=tonumber(n)
+        if not finite(n) then return 'Chance not published' end
+        if n==0 then return '0%' end
+        local text=string.format('%.10f',n):gsub('0+$',''):gsub('%.$','')
+        if tonumber(text)==0 then text=string.format('%.4g',n) end
+        return text..'%'
+    end
+    local function esc(text)
+        return tostring(text or ''):gsub('[%c]',' '):gsub('([\\`*_~|%[%]<>])','\\%1')
+    end
+    A.indexPercent=percent
+    A.indexEscape=esc
+
+    function A.indexSnapshot()
+        local data=A.data()
+        assert(type(data)=='table','Player data is not ready. Try again after the game loads.')
+        local collection=A.util('CollectionUtil')
+        assert(collection and type(collection.GetKeys)=='function' and type(collection.GetObtained)=='function',
+            'The game Index collection API is unavailable. No report was sent.')
+        local cache={}
+        local warnings={}
+        local function config(name,required)
+            if cache[name]==nil then
+                local ok,value=pcall(A.config,name)
+                cache[name]=ok and type(value)=='table' and value or false
+                if not cache[name] then warnings[#warnings+1]=name..' unavailable' end
+            end
+            if required then assert(cache[name],name..' is unavailable. No incomplete Index scan was sent.') end
+            return cache[name] or nil
+        end
+        local function all(name,getter,field)
+            local cfg=config(name)
+            if not cfg then return {} end
+            if type(cfg[getter])=='function' then
+                local ok,value=pcall(cfg[getter],cfg)
+                if ok and type(value)=='table' then return value end
+                warnings[#warnings+1]=name..'.'..getter..' failed'
+            end
+            return type(cfg[field])=='table' and cfg[field] or {}
+        end
+        local worlds=all('WorldConfig','GetAllWorlds','Worlds')
+        local enemies=all('EnemyConfig','GetAllEnemies','Enemies')
+        local raids=all('RaidConfig','GetAllRaids','Raids')
+        local defenses=all('DefenseConfig','GetAllDefenses','Defenses')
+        local trials=all('TimeTrialConfig','GetAllTrials','Trials')
+        local dungeons=all('DungeonConfig','GetAllDungeons','Dungeons')
+        local towers=all('TowerConfig','GetAllTowers','Towers')
+        local rushes=all('BossRushConfig','GetAllRushes','Rushes')
+        local resources=config('ResourcesConfig')
+        local function resource(id)
+            local item=resources and resources.Items and resources.Items[id]
+            return esc(item and item.Name or id or 'currency')
+        end
+        local function worldId(key,explicit)
+            local id=tonumber(explicit)
+            if id then return id end
+            for wid,w in pairs(worlds) do
+                for _,system in pairs(type(w.Systems)=='table' and w.Systems or {}) do
+                    if type(system)=='table' and system.Key==key then return tonumber(wid) end
+                end
+            end
+            return tonumber(tostring(key):match('^World(%d+)'))
+        end
+        local function location(id)
+            local w=id and (worlds[id] or worlds[tostring(id)])
+            return id and ('World '..tostring(id)..' — '..esc(w and w.Name or 'world name unavailable')) or 'Global'
+        end
+        local function enemyName(id)
+            return esc(type(enemies[id])=='table' and enemies[id].Name or id)
+        end
+        local function cost(value)
+            if type(value)~='table' or value.ItemId==nil then return '' end
+            return ' | Cost: '..esc(value.Amount or 1)..' '..resource(value.ItemId)
+        end
+        local result={at=os.time(),categories={},missing=0,total=0,unknown=0,warnings=warnings}
+        local targets={}
+        local count=0
+        local function yieldScan()
+            count=count+1
+            if count%40==0 then
+                task.wait()
+                assert(A.alive,'Index scan cancelled because JoesAAS was unloaded.')
             end
         end
-        lastClock=now
-    end
-    function A.guildRuntimeSeconds()
-        local s=A.guildSession; if not s then return 0 end
-        local delta=lastClock and os.clock()-lastClock or 0
-        if not s.active or suspended or delta<0 or delta>G.maxObservedInterval then delta=0 end
-        return s.activeTrackingSeconds+delta
-    end
-    function A.guildIsSuspended() return suspended end
-    function A.guildHeartbeat(force,reason)
-        local s=A.guildSession
-        if not s or not s.active or (suspended and not force) then return end
-        if not force and os.clock()-lastBeat<G.heartbeatSeconds then return end
-        A.guildAccrue(); lastBeat=os.clock()
-        local h={schemaVersion=1,sessionId=s.sessionId,generation=s.generation,ownerUserId=s.ownerUserId,
-            gameId=s.gameId,active=true,activeTrackingSeconds=s.activeTrackingSeconds,
-            lastHeartbeatAt=os.time(),lastFullSaveAt=s.lastSavedAt,exitReason=reason or false}
-        local ok,err=pcall(function()
-            local encoded=A.S.HTTP:JSONEncode(h)
-            for _,suffix in ipairs({'','.bak'}) do
-                writefile(A.guildHeartbeatFile..suffix,encoded)
-                local check=A.safeLoad(A.guildHeartbeatFile..suffix)
-                assert(check and check.sessionId==h.sessionId and check.lastHeartbeatAt==h.lastHeartbeatAt,'Heartbeat read-back failed')
+        for _,category in ipairs(order) do
+            local cfg=config(configs[category],true)
+            local keys=collection.GetKeys(category)
+            local obtained=collection.GetObtained(data,category)
+            assert(type(keys)=='table' and type(obtained)=='table','Invalid Index snapshot for '..category)
+            local group={key=category,name=category=='PetAccessories' and 'Pet Accessories' or category,total=0,items={}}
+            result.categories[#result.categories+1]=group
+            targets[category]={}
+            local seen={}
+            for _,key in ipairs(keys) do
+                if type(key)=='string' and not seen[key] then
+                    seen[key]=true
+                    local system,rarity=key:match('^(.-)::(.+)$')
+                    local item
+                    if category=='Titans' then item=cfg.Titans and cfg.Titans[system] and cfg.Titans[system].Items[rarity]
+                    elseif category=='Swords' then item=cfg.Swords and cfg.Swords[system] and cfg.Swords[system].Items[rarity]
+                    elseif category=='Shadows' then item=cfg:GetShadow(key)
+                    elseif category=='Primordials' then item=cfg.Demons and cfg.Demons[key]
+                    else item=cfg.Items and cfg.Items[key] end
+                    assert(type(item)=='table','Index metadata is missing for '..category..' / '..key)
+                    local include=(category~='Accessories' or accessoryRarities[item.Rarity]==true)
+                        and ((category~='Accessories' and category~='PetAccessories') or item.IndexDisabled~=true)
+                    if include then
+                        group.total=group.total+1
+                        if obtained[key]~=true then
+                            local name=item.Name or key
+                            if category=='Shadows' and item.Rank then name=name..' · Rank '..item.Rank end
+                            local entry={key=key,name=tostring(name),rarity=item.Rarity or rarity or 'Unknown',
+                                system=system,variant=rarity,metadata=item,sources={},sourceKeys={}}
+                            group.items[#group.items+1]=entry; targets[category][key]=entry
+                        end
+                    end
+                end
+                yieldScan()
             end
-        end)
-        if ok then s.lastHeartbeatAt=h.lastHeartbeatAt
-        else A.status['Guild storage']='HEARTBEAT SAVE FAILED: '..tostring(err); A.log('Guild',A.status['Guild storage']) end
-    end
-    function A.guildAttachClock(restored)
-        local s=A.guildSession; if not s then return end
-        G.migrate(s); lastClock=os.clock(); lastBeat=0; suspended=false
-        if restored and s.active then
-            local best
-            for _,suffix in ipairs({'','.bak'}) do
-                local h=A.safeLoad(A.guildHeartbeatFile..suffix)
-                if type(h)=='table' and h.schemaVersion==1 and h.sessionId==s.sessionId and h.generation==s.generation
-                    and h.ownerUserId==s.ownerUserId and h.gameId==s.gameId and h.active==true
-                    and finite(h.lastHeartbeatAt) and finite(h.activeTrackingSeconds)
-                    and (not best or h.lastHeartbeatAt>best.lastHeartbeatAt) then best=h end
-            end
-            local prior=tonumber(s.lastHeartbeatAt) or tonumber(s.lastSavedAt)
-            if best and best.lastHeartbeatAt>=(tonumber(s.lastSavedAt) or 0) then
-                s.activeTrackingSeconds=math.max(s.activeTrackingSeconds,best.activeTrackingSeconds)
-                prior=best.lastHeartbeatAt
-            end
-            if prior then
-                local r={lastHeartbeatAt=prior,resumedAt=os.time(),gapSeconds=math.max(0,os.time()-prior),
-                    previousLastSavedAt=s.lastSavedAt,exitReason=best and best.exitReason or false,
-                    note='Gap after last recorded heartbeat excluded; this does not establish an exact crash time.'}
-                G.append(s,'recoveries',r); s.pendingRecoveryNotice=r
-                A.log('Guild','Restored active runtime; gap after '..os.date('!%Y-%m-%d %H:%M:%S UTC',prior)..' excluded.')
+            result.total=result.total+group.total; result.missing=result.missing+#group.items
+        end
+        local function add(category,id,wid,text)
+            local item=targets[category] and targets[category][id]
+            if not item then return end
+            local line=location(wid)..'\n'..text
+            if not item.sourceKeys[line] then
+                item.sourceKeys[line]=true
+                item.sources[#item.sources+1]={world=wid or math.huge,text=line}
             end
         end
-        if s.active then s.lastSessionStartedAt=os.time() end
-        G.metrics(s,os.time())
-    end
-    function A.guildSuspend(reason)
-        local s=A.guildSession; if not s or not s.active or suspended then return end
-        A.guildAccrue(); suspended=true
-        if A.guildBreakObservation then A.guildBreakObservation() end
-        A.guildHeartbeat(true,reason); A.guildSave()
-    end
-    function A.guildResumeClock()
-        suspended=false; lastClock=os.clock()
-        if A.guildBreakObservation then A.guildBreakObservation() end
+        local function identify(id,kind)
+            if kind~=nil then return rewardCategories[kind] end
+            local match
+            for _,category in ipairs({'Accessories','PetAccessories','Mounts'}) do
+                local cfg=config(configs[category],true)
+                if cfg.Items and cfg.Items[id] then
+                    if match then return nil end -- A shared ID needs its explicit RewardType.
+                    match=category
+                end
+            end
+            return match
+        end
+        local function drops(values,wid,label,unit,extra)
+            for id,drop in pairs(type(values)=='table' and values or {}) do
+                if type(drop)=='table' then
+                    local itemId=drop.ItemId or drop.Id or id
+                    local category=identify(itemId,drop.RewardType or drop.Type)
+                    if category then
+                        add(category,itemId,wid,label..'\nBase chance: '..percent(drop.Chance)..' '..unit..(extra or ''))
+                    end
+                end
+                yieldScan()
+            end
+        end
+        for id,enemy in pairs(enemies) do
+            drops(enemy.Drops,tonumber(enemy.World),'Enemy: '..enemyName(id),'per kill')
+        end
+        local function modes(values,kind)
+            for key,mode in pairs(values) do
+                local wid=worldId(key,mode.WorldId)
+                local name=esc(mode.Name or key)
+                local label=kind..': '..name
+                local extra=cost(mode.Cost)
+                drops(mode.Drops,wid,label..' — all enemies','per kill',extra)
+                drops(mode.CompletionRewards,wid,label..' — completion reward','per completed run',extra)
+                local grouped={}
+                for id,enemy in pairs(type(mode.Enemies)=='table' and mode.Enemies or {}) do
+                    for itemId,drop in pairs(type(enemy.Drops)=='table' and enemy.Drops or {}) do
+                        if type(drop)=='table' then
+                            local category=identify(itemId,drop.RewardType or drop.Type)
+                            if category then
+                                local identity=category..'/'..itemId..'/'..tostring(drop.Chance)
+                                local entry=grouped[identity]
+                                if not entry then entry={category=category,id=itemId,chance=drop.Chance,enemies={}}; grouped[identity]=entry end
+                                entry.enemies[enemyName(id)]=true
+                            end
+                        end
+                        yieldScan()
+                    end
+                end
+                for _,entry in pairs(grouped) do
+                    add(entry.category,entry.id,wid,label..'\nEnemies: '..table.concat(A.Core.keys(entry.enemies),', ')
+                        ..'\nBase chance: '..percent(entry.chance)..' per kill'..extra)
+                end
+            end
+        end
+        modes(raids,'Raid / Gate'); modes(defenses,'Defense'); modes(trials,'Time Trial')
+        modes(dungeons,'Dungeon'); modes(towers,'Tower')
+        for key,rush in pairs(rushes) do
+            for _,mode in pairs(type(rush.Modes)=='table' and rush.Modes or {}) do
+                local wid=worldId(key,rush.WorldId)
+                local name='Boss Rush: '..esc(mode.Name or rush.Name or key)
+                drops(mode.BossDrops,wid,name..' — boss drops','per boss kill',cost(mode.Cost))
+                drops(mode.CompletionRewards,wid,name..' — completion reward','per completed run',cost(mode.Cost))
+            end
+        end
+        local function roll(category,cfg,systemKey,system,items)
+            local orderForRoll={}
+            for _,rarity in ipairs(cfg.Rarity_Order or {}) do
+                for _,item in pairs(items) do
+                    if item.Rarity==rarity then orderForRoll[#orderForRoll+1]=rarity; break end
+                end
+                if items[rarity] and not A.Core.contains(orderForRoll,rarity) then orderForRoll[#orderForRoll+1]=rarity end
+            end
+            local weights=cfg.Rarity_Weights or {}; local sum=0
+            for _,rarity in ipairs(orderForRoll) do sum=sum+math.max(0,tonumber(weights[rarity]) or 0) end
+            for id,item in pairs(items) do
+                local rarity=item.Rarity or id
+                local key=category=='Primordials' and id or systemKey..'::'..id
+                local probability=sum>0 and math.max(0,tonumber(weights[rarity]) or 0)/sum*100
+                    or (#orderForRoll>0 and 100/#orderForRoll or nil)
+                add(category,key,worldId(systemKey,system.WorldId),
+                    'Roll: '..esc(system.Name or category)..'\nBase chance: '..percent(probability)..' per roll'..cost(system.ItemCost))
+                yieldScan()
+            end
+        end
+        local titans=config('TitansConfig',true)
+        for key,system in pairs(titans.Titans or {}) do roll('Titans',titans,key,system,system.Items or {}) end
+        local swords=config('SwordConfig',true)
+        for key,system in pairs(swords.Swords or {}) do roll('Swords',swords,key,system,system.Items or {}) end
+        local primordials=config('PrimordialsConfig',true)
+        roll('Primordials',primordials,primordials.SystemKey or 'Primordials',primordials,primordials.Demons or {})
+        local shadows=config('ShadowsConfig',true)
+        for key,mode in pairs(raids) do
+            if type(mode.ShadowArise)=='table' then
+                for _,rank in ipairs(mode.GateRanks or {{Rank='Default'}}) do
+                    local bosses=rank.Bosses or mode.Bosses or {}; local bossTotal=0
+                    for _,boss in ipairs(bosses) do bossTotal=bossTotal+math.max(0,tonumber(boss.Weight) or 0) end
+                    local weights=rank.AriseVariantWeights or {}; local total=0
+                    for _,variant in ipairs(shadows.AriseVariants or {}) do
+                        total=total+math.max(0,tonumber(weights[variant.Rarity] or variant.Weight) or 0)
+                    end
+                    for _,boss in ipairs(bosses) do
+                        for _,variant in ipairs(shadows.AriseVariants or {}) do
+                            local variantChance=total>0 and math.max(0,tonumber(weights[variant.Rarity] or variant.Weight) or 0)/total*100 or nil
+                            add('Shadows',shadows:GetVariantShadowKey(boss.EnemyId,variant.Rarity),worldId(key,mode.WorldId),
+                                'Gate: '..esc(mode.Name or key)..' · Gate rank '..esc(rank.Rank)..'\nBoss: '..enemyName(boss.EnemyId)
+                                ..' | Spawn share: '..percent(bossTotal>0 and math.max(0,tonumber(boss.Weight) or 0)/bossTotal*100 or nil)
+                                ..'\nARISE success: '..percent(mode.ShadowArise.ChancePercent)..' per attempt; '
+                                ..esc(mode.ShadowArise.Chances or '?')..' attempts\nVariant chance after successful ARISE: '..percent(variantChance))
+                        end
+                    end
+                end
+            end
+        end
+        local bundles=config('DevProductConfig')
+        for key,bundle in pairs(bundles or {}) do
+            if type(bundle)=='table' then
+                for _,spec in ipairs({{'Accessories','AccessoryId'},{'PetAccessories','PetAccessoryId'},{'Mounts','MountId'}}) do
+                    for _,reward in pairs(type(bundle[spec[1]])=='table' and bundle[spec[1]] or {}) do
+                        add(spec[1],reward[spec[2]],nil,'Shop: '..esc(bundle.Name or key)
+                            ..'\nGuaranteed on purchase (no drop roll) | Price: '..esc(bundle.Price or '?')..' Robux'
+                            ..(bundle.TicketPrice and (' / '..esc(bundle.TicketPrice)..' paid tickets') or '')
+                            ..(bundle.GlobalMaxPurchases and (' | Limited stock: '..esc(bundle.GlobalMaxPurchases)) or ''))
+                    end
+                end
+            end
+        end
+        local passes=config('BattlepassConfig')
+        for key,pass in pairs(passes and passes.Passes or {}) do
+            for _,track in ipairs({'FreeRewards','PremiumRewards'}) do
+                for level,reward in ipairs(pass[track] or {}) do
+                    local category=rewardCategories[reward.Type]
+                    if category then add(category,reward.Id,worldId(key,pass.WorldId),
+                        'Battlepass: '..esc(pass.Name or key)..'\n'..(track=='FreeRewards' and 'Free' or 'Premium')
+                        ..' track · Level '..level..'\nGuaranteed when eligible reward is claimed (no drop roll)') end
+                end
+            end
+        end
+        local merchant=config('MerchantConfig')
+        for key,shop in pairs(merchant and merchant.Shops or {}) do
+            for _,product in ipairs(shop.Products or {}) do
+                local category=identify(product.ItemId,product.RewardType)
+                if category then add(category,product.ItemId,worldId(key,shop.WorldId),
+                    'Shop: '..esc(shop.Name or key)..' (when available)\nGuaranteed on purchase (no drop roll) | Cost: '
+                    ..esc(product.Price or '?')..' '..resource(shop.Currency and shop.Currency.ItemId)) end
+            end
+        end
+        for _,name in ipairs({'CorvoConfig','BallConfig'}) do
+            local cfg=config(name)
+            if cfg then
+                local label='Event: '..esc(cfg.Prompt and cfg.Prompt.ObjectText or name)..' — find it and claim the prompt'
+                for _,reward in ipairs(cfg.Rewards or {}) do
+                    local category=identify(reward.ItemId,reward.RewardType)
+                    if category then
+                        local pity=cfg.AccessoryPity
+                        add(category,reward.ItemId,tonumber(cfg.WorldId),label..'\nBase chance: '..percent(reward.Chance)..' per claim'
+                            ..(pity and pity.Enabled and pity.ItemId==reward.ItemId and (' | Configured pity: '..esc(pity.Threshold)..' claims') or ''))
+                    end
+                end
+            end
+        end
+        local medal=config('MedalConfig')
+        for _,reward in ipairs(medal and medal.Rewards or {}) do
+            local category=rewardCategories[reward.Type]
+            if category then add(category,reward.PetAccessoryId or reward.ItemId or reward.Id,nil,
+                'Medal rewards: link your Medal account, post an Anime Astral clip and play for '
+                ..esc((tonumber(medal.PlaytimeRequired) or 0)/60)..' minutes\nGuaranteed when eligible reward is claimed (no drop roll)'
+                ..(medal.Enabled==false and ' | Disabled in current config' or '')) end
+        end
+        for _,group in ipairs(result.categories) do
+            local names={}
+            for _,item in ipairs(group.items) do names[item.name]=(names[item.name] or 0)+1 end
+            for _,item in ipairs(group.items) do
+                if names[item.name]>1 and group.key=='Mounts' then
+                    local stats=A.Core.keys(item.metadata.Multiplier or {})
+                    item.name=item.name..' · '..(#stats>0 and table.concat(stats,' / ') or item.key)
+                end
+                if #item.sources==0 then
+                    result.unknown=result.unknown+1
+                    item.sources[1]={world=math.huge,text='Source and chance not published in the current client configs.\nThis entry is still in the game Index; availability cannot be verified.'}
+                end
+                table.sort(item.sources,function(a,b) if a.world==b.world then return a.text<b.text end return a.world<b.world end)
+                item.world=item.sources[1].world
+                item.metadata=nil; item.sourceKeys=nil
+            end
+            table.sort(group.items,function(a,b)
+                if a.world~=b.world then return a.world<b.world end
+                if a.name~=b.name then return a.name<b.name end
+                if a.rarity~=b.rarity then return a.rarity<b.rarity end
+                return a.key<b.key
+            end)
+        end
+        return result
     end
 end
 
 end)()(A);
 
--- ===== guild =====
+-- ===== index_report =====
 (function()
 return function(A)
-    local G,C=A.GuildCore,A.Core
-    A.guildFile=A.folder..'/guild-weekly-tracking.json'
-    local paths={A.guildFile,A.guildFile..'.bak',A.guildFile..'.tmp'}
-    local previous,pending,nextPoll=nil,nil,0
-    local saving=false
-    local function loadSession()
-        local best
-        for _,path in ipairs(paths) do
-            local s=A.safeLoad(path)
-            if G.valid(s,A.player.UserId,game.GameId) and (not best or s.generation>best.generation
-                or (s.generation==best.generation and s.revision>best.revision)) then best=s end
-        end
-        return best
+    -- This destination belongs only to the manual Index report button.
+    local destination='https://discord.com/api/webhooks/1556049988575035502/Mh4wKE7W2mnvtsgRt6UfPYaHRiwzFLhI-CkZ2YUYDk4gg1RjjiXEfye8mghrmVKxlrXC'
+    local env=(type(getgenv)=='function' and getgenv()) or _G
+    local state=env.JoesAASIndexDelivery
+    if type(state)~='table' or state.version~=1 then
+        state={version=1,pages={},cursor=1,next=0,attempt=0,busy=false,building=false}
+        env.JoesAASIndexDelivery=state
     end
-    A.guildSession=loadSession()
-    function A.guildBreakObservation() previous=nil; pending=nil end
-    A.guildAttachClock(true)
-    function A.guildSave(candidate)
-        if saving then return false end
-        if type(writefile)~='function' or type(readfile)~='function' or type(makefolder)~='function' then
-            A.status['Guild storage']='File APIs required; tracking cannot be persisted'; return false
+    local colors={Accessories=16763955,PetAccessories=12418047,Titans=16742972,Shadows=8282367,
+        Swords=5031394,Primordials=15755396,Mounts=6804333}
+    local function chunks(text,limit)
+        local out={}
+        while #text>limit do
+            local cut=limit
+            -- Byte budgets are conservative for Discord's character limits.
+            -- Never cut a UTF-8 code point or discard any source text.
+            while cut>0 and (text:byte(cut+1) or 0)>=128 and (text:byte(cut+1) or 0)<192 do cut=cut-1 end
+            local newline=text:sub(1,cut):match('.*()\n')
+            if newline and newline>cut/2 then cut=newline end
+            out[#out+1]=text:sub(1,cut)
+            text=text:sub(cut+1)
         end
-        local s=candidate or A.guildSession; if not s then return false end
-        if not candidate then A.guildAccrue() end
-        saving=true
-        local snapshot=C.copy(s); G.metrics(snapshot,os.time())
-        snapshot.revision=snapshot.revision+1; snapshot.lastSavedAt=os.time()
-        snapshot.lastSavedAtISO=os.date('!%Y-%m-%dT%H:%M:%SZ',snapshot.lastSavedAt)
-        local durable=false
-        local ok,err=pcall(function()
-            pcall(makefolder,A.folder)
-            local encoded=A.S.HTTP:JSONEncode(snapshot)
-            assert(G.valid(A.S.HTTP:JSONDecode(encoded),A.player.UserId,game.GameId),'Invalid tracking snapshot')
-            -- Stage and verify before replacing the primary; both backups retain recoverable data.
-            for _,path in ipairs({paths[3],paths[1],paths[2]}) do
-                writefile(path,encoded)
-                local saved=A.safeLoad(path)
-                assert(G.valid(saved,A.player.UserId,game.GameId) and saved.sessionId==snapshot.sessionId
-                    and saved.revision==snapshot.revision,'Read-back failed')
-                durable=true
+        if text~='' then out[#out+1]=text end
+        return out
+    end
+    local function label(value,limit)
+        return chunks(A.indexEscape(value),limit)[1] or 'Unnamed item'
+    end
+    function A.indexPages(snapshot)
+        assert(type(snapshot)=='table' and type(snapshot.categories)=='table','Invalid Index report snapshot')
+        local esc=A.indexEscape
+        local summary={}
+        for _,group in ipairs(snapshot.categories) do
+            summary[#summary+1]='**'..esc(group.name)..'** — '..#group.items..' missing / '..group.total..' total'
+        end
+        local description='**'..esc(A.player.Name)..'** · '..snapshot.missing..' missing entries\n\n'
+            ..table.concat(summary,'\n')..'\n\n'
+            ..'Chances are **base, unboosted** percentages. Luck, Drop bonuses and pity can change actual odds. '
+            ..'Shadow variant chances apply **after a successful ARISE**, separately from boss spawns.\n'
+            ..'Obtained entries follow the game Index inventory and collection history. **Pets are excluded.**'
+        if snapshot.unknown>0 then description=description..'\n**'..snapshot.unknown..' entries have unpublished source/chance details**; they are listed explicitly.' end
+        if snapshot.missing==0 then description=description..'\n\nAll seven requested collections are complete.' end
+        local pages={{title='JoesAAS · Missing Index',description=description,color=5031394}}
+        for _,group in ipairs(snapshot.categories) do
+            local page,size,categoryPages=nil,0,{}
+            local function newPage()
+                page={title='JoesAAS · '..group.name,description=#group.items..' missing entries · ordered by world',
+                    color=colors[group.key] or 5031394,fields={}}
+                size=#page.title+#page.description+180
+                pages[#pages+1]=page; categoryPages[#categoryPages+1]=page
             end
-        end)
-        saving=false
-        if durable then
-            s.revision=snapshot.revision; s.lastSavedAt=snapshot.lastSavedAt; s.lastSavedAtISO=snapshot.lastSavedAtISO
+            for _,item in ipairs(group.items) do
+                local sources={}
+                for i,source in ipairs(item.sources) do sources[#sources+1]='**Source '..i..'**\n'..source.text end
+                local text='**'..esc(item.rarity)..'**\n'..table.concat(sources,'\n\n')
+                local name=esc(item.name)
+                if #name>220 then text='**Full name:** '..name..'\n'..text; name=label(item.name,200) end
+                for part,value in ipairs(chunks(text,900)) do
+                    local fieldName=name..(part>1 and (' · continued '..part) or '')
+                    if not page or #page.fields>=8 or size+#fieldName+#value>5400 then newPage() end
+                    page.fields[#page.fields+1]={name=fieldName,value=value,inline=false}
+                    size=size+#fieldName+#value
+                end
+            end
+            for i,categoryPage in ipairs(categoryPages) do
+                categoryPage.description=categoryPage.description..' · category page '..i..'/'..#categoryPages
+            end
         end
-        if ok then
-            A.status['Guild storage']='Saved '..s.lastSavedAtISO
-        else A.status['Guild storage']=(durable and 'RECOVERY COPY SAVED; copy update failed: ' or 'SAVE FAILED: ')..tostring(err); A.log('Guild',A.status['Guild storage']) end
-        return durable
-    end
-    function A.guildQueueExport()
-        local s=A.guildSession
-        if not s or s.active or s.finalSnapshotStatus=='pending' then return end
-        if s.exportQueued then return end
-        local name='GuildTracking_'..os.date('!%Y-%m-%d',s.startedAt)..'.json'
-        local path=A.folder..'/guild-export-'..s.sessionId:gsub('[^%w%-_]','_')..'-'..s.generation..'.json'
-        local ok,err=pcall(function()
-            local snapshot=C.copy(s); G.metrics(snapshot,s.endedAt)
-            local encoded=A.S.HTTP:JSONEncode(snapshot)
-            writefile(path,encoded)
-            assert(readfile(path)==encoded,'Export read-back failed')
-        end)
-        if not ok then A.status['Guild upload']='Export failed: '..tostring(err); A.log('Guild',A.status['Guild upload']); return end
-        local message='Started: '..s.startedAtISO..'\nStopped: '..s.endedAtISO
-            ..'\nACTIVE tracking: '..string.format('%.2f hours',s.activeTrackingSeconds/3600)
-            ..'\nMembers: '..s.trackedMemberCount..'\nLast save: '..tostring(s.lastSavedAtISO)
-        local entry=A.notify('GuildExport',message,true,{path=path,name=name,key=s.sessionId..':'..s.generation})
-        if entry then s.exportQueued=true; A.guildSave(); A.status['Guild upload']='JSON upload queued'
-        else A.status['Guild upload']='JSON kept locally. Enable webhook and enter its URL, then press Stop Tracking to retry.' end
-    end
-    local snapshotBusy=false
-    function A.guildSendSnapshot()
-        local s=A.guildSession
-        if not s then A.status['Guild upload']='Start tracking before sending a snapshot'; return end
-        if snapshotBusy then return end
-        snapshotBusy=true
-        local ok,err=pcall(function()
-            assert(A.guildSave(),'Could not save tracker state; check storage status')
-            local snapshot=C.copy(s); local now=os.time(); G.metrics(snapshot,now)
-            snapshot.exportType='progressSnapshot'; snapshot.snapshotAt=now
-            snapshot.snapshotAtISO=os.date('!%Y-%m-%dT%H:%M:%SZ',now)
-            local key=s.sessionId..':'..s.generation..':snapshot:'..s.revision
-            local path=A.folder..'/guild-export-'..s.sessionId:gsub('[^%w%-_]','_')..'-'..s.generation..'-snapshot-'..s.revision..'.json'
-            local encoded=A.S.HTTP:JSONEncode(snapshot)
-            writefile(path,encoded); assert(readfile(path)==encoded,'Snapshot read-back failed')
-            local message='Progress snapshot — '..(s.active and 'tracking remains ON' or 'tracking is OFF')
-                ..'\nCaptured: '..snapshot.snapshotAtISO
-                ..'\nACTIVE tracking: '..string.format('%.2f hours',snapshot.activeTrackingSeconds/3600)
-                ..'\nMembers: '..snapshot.trackedMemberCount
-                ..'\nLast roster: '..(s.lastObservedAt and os.date('!%Y-%m-%dT%H:%M:%SZ',s.lastObservedAt) or 'unavailable')
-            local entry=A.notify('GuildSnapshot',message,true,{path=path,
-                name='GuildTracking_Progress_'..os.date('!%Y-%m-%d_%H-%M-%S',now)..'.json',key=key})
-            A.status['Guild upload']=entry and 'Progress JSON queued; tracking state unchanged'
-                or 'Snapshot saved locally. Enable webhook and enter its URL, then send again.'
-        end)
-        snapshotBusy=false
-        if not ok then A.status['Guild upload']='Snapshot failed: '..tostring(err); A.log('Guild',A.status['Guild upload']) end
-    end
-    function A.guildExportFailed(key)
-        local s=A.guildSession
-        if s and not s.active and key==s.sessionId..':'..s.generation then
-            s.exportQueued=false; s.exportRequested=false; A.guildSave()
+        if #(snapshot.warnings or {})>0 then
+            local warnings='Some source configs could not be read. Missing-entry counts still use the complete game Index.\n\n'
+                ..table.concat(snapshot.warnings,'\n')
+            for _,part in ipairs(chunks(warnings,3500)) do
+                pages[#pages+1]={title='JoesAAS · Source lookup warnings',description=part,color=16763955}
+            end
         end
-    end
-    local function currentGuild() return G.id((A.data() or {}).GuildId) end
-    local function sendRoster(kind)
-        local id=currentGuild()
-        if not id then A.status['Guild tracker']='Waiting for your guild/player data'; return false end
-        if kind~='start' and A.guildSession and id~=G.id(A.guildSession.guildId) then
-            previous=nil; A.status['Guild tracker']='Different guild detected; original session preserved'; return false
+        local reportID=os.date('!%Y%m%d-%H%M%S',snapshot.at)..'-'..tostring(math.floor(os.clock()*1000)%100000)
+        for i,page in ipairs(pages) do
+            page.footer={text='Report '..reportID..' · Part '..i..'/'..#pages..' · '..os.date('!%Y-%m-%d %H:%M UTC',snapshot.at)}
         end
-        if pending then return false end
-        if os.clock()<nextPoll and kind=='poll' then return false end
-        pending={kind=kind,guildId=id,deadline=os.clock()+12,requestedAt=os.time()}
-        nextPoll=os.clock()+G.pollSeconds
-        local bridge=A.bridge('GuildRosterRequest')
-        -- A read-only request; intentionally independent of the gameplay Automation toggle.
-        local ok=bridge and pcall(bridge.Fire,bridge)
-        if not ok then pending=nil; A.status['Guild tracker']='Guild roster request unavailable'; return false end
+        return pages
+    end
+    local function progress()
+        return math.max(0,state.cursor-1)..'/'..#state.pages..' pages'
+    end
+    local function setStatus(message)
+        state.status=message; A.status.Index=message
+    end
+    function A.sendIndexReport()
+        if state.building then setStatus('Scanning your Index; please wait'); return false end
+        if state.cursor<=#state.pages then
+            if state.blocked then
+                state.blocked=false; state.attempt=0; state.next=0
+                setStatus('Resuming report · '..progress())
+                return true
+            end
+            A.status.Index=state.status or ('Sending report · '..progress()); return false
+        end
+        if type(A.httpRequest)~='function' then setStatus('Executor HTTP request API unavailable; no report was sent'); return false end
+        state.building=true; setStatus('Scanning your Index and looking up sources…')
+        task.spawn(function()
+            local ok,pages=pcall(function() return A.indexPages(A.indexSnapshot()) end)
+            state.building=false
+            if not A.alive then return end
+            if not ok then
+                setStatus('Index scan failed: '..tostring(pages):gsub('https://[^%s]+/api/webhooks/[^%s]+','[webhook redacted]'))
+                A.log('Index',A.status.Index); return
+            end
+            state.pages=pages; state.cursor=1; state.next=0; state.attempt=0; state.blocked=false
+            setStatus('Sending report · '..progress())
+        end)
         return true
     end
-    function A.guildStart()
-        if pending then A.status['Guild tracker']='Waiting for the current roster request'; return end
-        if type(writefile)~='function' or type(readfile)~='function' or type(makefolder)~='function' then
-            A.status['Guild tracker']='Cannot start: persistent file APIs are missing'; return
+    A.status.Index=state.status or 'Ready · press the button to send your missing Index'
+    A.job('Index report delivery',0.2,function()
+        if state.building or state.busy then return end
+        if state.status then A.status.Index=state.status end
+        if state.blocked or state.cursor>#state.pages or os.clock()<state.next then return end
+        if env.AnimeSuiteHTTP and env.AnimeSuiteHTTP.busy then return end
+        local page=state.pages[state.cursor]
+        state.busy=true
+        local ok,response=pcall(function()
+            local body=A.S.HTTP:JSONEncode({username='JoesAAS Index',embeds={page}})
+            -- Roblox encodes an empty table as {}; Discord requires an array.
+            body=body:sub(1,-2)..',"allowed_mentions":{"parse":[]}}'
+            local sent,value=A.http({Url=destination..'?wait=true',Method='POST',
+                Headers={['Content-Type']='application/json'},Body=body},true)
+            return {sent=sent,value=value}
+        end)
+        state.busy=false
+        local result=ok and response.sent and type(response.value)=='table' and response.value or nil
+        local status=result and tonumber(result.StatusCode or result.Status) or 0
+        local parsed
+        if result then
+            local decoded,value=pcall(A.S.HTTP.JSONDecode,A.S.HTTP,result.Body or '')
+            if decoded and type(value)=='table' then parsed=value end
         end
-        A.status['Guild tracker']='Fetching a fresh baseline for the new session'
-        sendRoster('start')
-    end
-    function A.guildStop()
-        local s=A.guildSession
-        if not s then return end
-        if not s.active then s.exportRequested=true; A.guildQueueExport(); return end
-        A.guildAccrue()
-        s.exportRequested=true
-        pending=nil; G.stop(s,os.time()); previous=nil
-        A.guildSave(); A.status['Guild tracker']='Stopped; requesting final contribution snapshot'
-        if not sendRoster('stop') then s.finalSnapshotStatus='unavailable'; A.guildSave(); A.guildQueueExport() end
-    end
-    function A.guildRefresh()
-        if A.guildSession and A.guildSession.active then sendRoster('poll')
-        else A.status['Guild tracker']='Finished results are frozen. Start Tracking begins a new session.' end
-    end
-    A.on('GuildRosterResult',function(payload)
-        local request=pending
-        if not request then return end
-        local rows,err=G.roster(payload,request.guildId,A.player.UserId)
-        if not rows then
-            if type(payload)=='table' and payload.Live~=true then A.status['Guild tracker']=err end
-            return
-        end
-        if currentGuild()~=request.guildId then pending=nil; previous=nil; return end
-        if A.guildIsSuspended() and request.kind=='poll' then pending=nil; return end
-        A.guildAccrue()
-        pending=nil; local now=os.time(); local s=A.guildSession
-        if request.kind=='start' then
-            local guid
-            local ok,value=pcall(function() return A.S.HTTP:GenerateGUID(false) end)
-            guid=ok and value or (tostring(now)..'-'..tostring(math.random(100000,999999)))
-            local fresh=G.new(rows,request.guildId,A.player.UserId,game.GameId,now,guid,(s and s.generation or 0)+1)
-            local first=G.sample(fresh,rows,now,nil)
-            if not A.guildSave(fresh) then A.status['Guild tracker']='New session could not be fully saved; inspect Guild storage'; return end
-            A.guildSession=fresh; previous=first; s=fresh
-            A.guildAttachClock(false); A.guildHeartbeat(true)
-            A.status['Guild tracker']='Tracking started; existing contribution stored as the baseline'
-        elseif request.kind=='stop' then
-            if not s or s.active then return end
-            G.finalSnapshot(s,rows,now)
-            local saved=A.guildSave()
-            A.status['Guild tracker']=saved and 'Tracking stopped; final snapshot saved' or 'Tracking stopped; final save failed (see Guild storage)'
-            A.guildQueueExport()
-        elseif s and s.active and G.id(s.guildId)==request.guildId then
-            local changed
-            previous,changed=G.sample(s,rows,now,previous)
-            if changed then A.guildSave() end
-            A.status['Guild tracker']='Tracking '..s.trackedMemberCount..' members; presence is sampled'
-        end
-    end)
-    function A.guildCheckpoint(reason)
-        if reason then A.guildSuspend(reason); return end
-        if A.guildSession and A.guildSession.active then
-            previous=nil; pending=nil
-            A.guildHeartbeat(true); A.guildSave()
-        end
-    end
-    A.connect(A.player.OnTeleport,function(state)
-        if state==Enum.TeleportState.Started then A.guildSuspend('teleport')
-        elseif state==Enum.TeleportState.Failed then A.guildResumeClock() end
-    end)
-    A.connect(A.S.Players.PlayerRemoving,function(player) if player==A.player then A.guildSuspend('departure') end end)
-    A.job('Guild tracker',5,function()
-        local s=A.guildSession
-        if not A.alive then return end
-        A.guildAccrue()
-        if pending and os.clock()>pending.deadline then
-            local kind=pending.kind; pending=nil; previous=nil
-            A.status['Guild tracker']='Roster response timed out; no online time added for the gap'
-            if kind=='stop' and s then s.finalSnapshotStatus='unavailable'; A.guildSave(); A.guildQueueExport() end
-        end
-        if not s or not s.active or A.guildIsSuspended() then return end
-        if s.pendingRecoveryNotice then
-            local r=s.pendingRecoveryNotice
-            local entry=A.notify('Disconnect','Previous tracker last recorded heartbeat: '
-                ..os.date('!%Y-%m-%d %H:%M:%S UTC',r.lastHeartbeatAt)..'\nResumed: '
-                ..os.date('!%Y-%m-%d %H:%M:%S UTC',r.resumedAt)..'\nGap: '..r.gapSeconds
-                ..' seconds (not counted). Exact crash time/cause is unknown.',true)
-            if entry then s.pendingRecoveryNotice=false; A.guildSave() end
-        end
-        if s.lastObservedAt and os.time()-s.lastObservedAt>G.maxObservedInterval then
-            for _,m in pairs(s.members) do if m.inGuild then m.onlineStatus='unknown' end end
-        end
-        A.guildHeartbeat(false)
-        if not s.lastSavedAt or os.time()-s.lastSavedAt>=G.autosaveSeconds then A.guildSave() end
-        sendRoster('poll')
-    end,true)
-    if A.guildSession then
-        if A.guildSession.active then
-            for _,m in pairs(A.guildSession.members) do m.onlineStatus='unknown' end
-            A.status['Guild tracker']='Active saved session restored; waiting for a fresh roster'
+        state.attempt=state.attempt+1
+        local headers=result and type(result.Headers)=='table' and result.Headers or {}
+        local action,delay=A.Core.webhookRetry(status or 0,headers,parsed,state.attempt)
+        if action=='done' then
+            state.cursor=state.cursor+1; state.attempt=0; state.next=os.clock()+2
+            state.status=state.cursor>#state.pages and ('Report sent · '..progress()) or ('Sending report · '..progress())
+            if state.cursor>#state.pages then state.pages={}; state.cursor=1 end
+        elseif action=='stop' or (state.attempt>=8 and status~=429) then
+            state.blocked=true
+            state.status='Report paused · '..progress()..' · HTTP '..tostring(status)
+                ..' · press the button to retry the unsent pages'
         else
-            A.status['Guild tracker']='Finished session loaded; statistics remain frozen'
-            if A.guildSession.finalSnapshotStatus=='pending' then
-                A.guildSession.finalSnapshotStatus='unavailableAfterRestart'; A.guildSave()
-            end
-            if A.guildSession.exportRequested and not A.guildSession.exportQueued then A.guildQueueExport() end
+            state.next=os.clock()+delay
+            state.status='Sending report · '..progress()..' · retry in '..math.ceil(delay)..'s (HTTP '..tostring(status)..')'
         end
-    else A.status['Guild tracker']='No valid saved session; press Start Tracking when ready' end
-    local function duration(seconds) return string.format('%dh %dm',math.floor(seconds/3600),math.floor(seconds/60)%60) end
-    function A.guildSummary()
-        local s=A.guildSession
-        local text=s and s.active and 'TRACKING IS ON' or 'TRACKING IS OFF'
-        if s then
-            text=text..'\nTotal tracking time (active): '..duration(A.guildRuntimeSeconds())
-        end
-        local storage=A.status['Guild storage'] or ''
-        local tracker=A.status['Guild tracker'] or ''
-        if storage:find('FAILED',1,true) or storage:find('copy update failed',1,true) then
-            text=text..'\nSave problem: '..storage
-        elseif tracker:find('Cannot start:',1,true) then text=text..'\n'..tracker
-        elseif not s and pending then text=text..'\nStarting...'
-        elseif not s and tracker:find('timed out',1,true) then text=text..'\nCould not start. Press Start Tracking to retry.' end
-        if A.status['Guild upload'] then text=text..'\n'..A.status['Guild upload'] end
-        return text
-    end
+        A.status.Index=state.status
+        -- Do not log HTTP responses: an executor or Discord error can echo the secret URL.
+    end,true)
 end
 
 end)()(A);
@@ -2073,7 +2273,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='4.7',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.2',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2175,14 +2375,15 @@ return function(A)
         restore.Visible=false
     end
     local tabs={}
-    for _,name in ipairs({'Farm','Modes','Pets','Guild Tracker','Webhook','Settings'}) do
+    for _,name in ipairs({'Farm','Modes','Pets','Cyber','Index','Webhook','Settings'}) do
         tabs[name]=window:AddTab({Title=name,Icon=''})
     end
     local sync=true; local bindings={}; local statuses={}
-    local function guard(fn)
+    local function guard(fn,saveDelay)
         return function(...)
             if sync or not A.alive then return end
             local ok,why=pcall(fn,...)
+            if ok and A.alive then A.settingsChanged(saveDelay) end
             if not ok then A.log('UI',why); F:Notify({Title='JoesAAS',Content=tostring(why),Duration=6}) end
         end
     end
@@ -2218,7 +2419,7 @@ return function(A)
                 if not n or n~=n or n<0 or n==math.huge then return end
                 A.settings[key]=n
             else A.settings[key]=tostring(value):match('^%s*(.-)%s*$') end
-        end))
+        end,0.4))
         bindings[#bindings+1]=function()
             local value=tostring(A.settings[key]); if option.Value~=value then option:SetValue(value) end
         end
@@ -2310,7 +2511,9 @@ return function(A)
     end)
     choose('Farm','Target order','target',choices({'Nearest','Highest HP','Lowest HP'}))
     choose('Farm','Movement','moveStyle',choices({'Walk','Teleport'}))
-    toggle('Farm','Auto farm selected mobs','farm')
+    toggle('Farm','Auto farm selected mobs','farm',function(enabled)
+        if not enabled then A.stopFarmMovement(); A.watchTarget(nil) end
+    end)
     note('Farm','World handling','Joins through the normal world system before combat. Keeps one target until death or removal, then immediately picks across all selected mobs. Selections are saved separately per world.')
     status('Farm','Farm'); status('Farm','Discovery')
     toggle('Farm','Auto teleport to Trial / Dungeon mobs','trialFollow',function()
@@ -2329,24 +2532,42 @@ return function(A)
     status('Modes','Activity error'); status('Modes','Join diagnostics')
     button('Modes','Save join diagnostics now',function() A.flushJoinDiagnostics(true) end)
     note('Modes','Raid / Defense','Raid starts YOUR OWN run only; never joins other raids. Defense starts or joins an available run. Normal entry costs apply; errors appear above.')
-    note('Modes','Activity priority','Tower > Time Trials > Dungeon > Gate > Raid / Defense > Boss Rush > mob farming. Tower, Trial and Dungeon runs finish or fail before switching. Gate can yield to a higher-priority mode. Raid wins a tie with Defense; an active run keeps its place.')
-    note('Modes','Transfers','Tower, Trials and Dungeons use direct native entry. Gate and lower modes wait for normal exit. Gate and Tower stay at their join position.')
+    local priorityNote=note('Modes','Activity priority',A.priorityText())
+    statuses[#statuses+1]=function() priorityNote:SetDesc(A.priorityText()) end
+    local editingPriority='MaxTac'
+    dropdown('Modes','Activity to move in priority order','priorityEditor',function()
+        local rows={}
+        for _,key in ipairs(A.Core.priorityOrder(A.settings.priority)) do rows[#rows+1]={key=key,label=A.Core.priorityLabels[key]} end
+        return rows
+    end,function(key) return editingPriority==key end,function(key) editingPriority=key end)
+    button('Modes','Move selected activity higher',function() A.moveActivityPriority(editingPriority,-1) end)
+    button('Modes','Move selected activity lower',function() A.moveActivityPriority(editingPriority,1) end)
+    button('Modes','Reset activity priority',A.resetActivityPriority)
+    note('Modes','Run locks','MaxTac, Tower, Time Trials and Dungeon finish or fail before switching, even if you change priority or turn their auto join off. Mob Autofarm always comes last.')
+    note('Modes','Transfers','MaxTac, Tower, Trials and Dungeons use direct native entry. Other destinations wait for normal exit. MaxTac, Gate and Tower stay at their join position.')
     note('Modes','Movement','Time Trials and Dungeons follow mobs with continuous anti-stuck steps. Tower opens your own tower. Turn off competing auto-join / movement in your other script to let this coordinator control switching.')
-    for _,entry in ipairs({{'Tower','towerAutoJoin','towerSelection'},{'Dungeon','dungeonAutoJoin','dungeonSelection'},{'Gate','gateAutoJoin','gateSelection'},{'Raid','raidAutoJoin','raidSelection'},
+    for _,entry in ipairs({{'MaxTac','maxTacAutoJoin','maxTacSelection'},{'Tower','towerAutoJoin','towerSelection'},{'Dungeon','dungeonAutoJoin','dungeonSelection'},{'Gate','gateAutoJoin','gateSelection'},{'Raid','raidAutoJoin','raidSelection'},
         {'Defense','defenseAutoJoin','defenseSelection'},
         {'BossRush','bossRushAutoJoin','bossRushSelection'}}) do
         local mode,toggleKey,selectionKey=entry[1],entry[2],entry[3]
         dropdown('Modes',mode..' selection',selectionKey,function()
             return A.activityRows(mode)
         end,function(key) return A.settings[selectionKey][key]==true end,
-        function(selected) A.settings[selectionKey]=selected; A.coordinateActivities() end,true)
-        if mode=='Gate' then
-            dropdown('Modes','Gate ranks','gateRanks',A.gateRankRows,
-                function(key) return A.settings.gateRanks[key]==true end,
-                function(selected) A.settings.gateRanks=selected; A.coordinateActivities() end,true)
-            note('Modes','Gate rank priority','S > A > B > C > D > E among selected open Gates. Only ranks exposed by the game are listed.')
+        function(selected)
+            A.settings[selectionKey]=(mode=='Raid' or mode=='Defense') and {[selected]=true} or selected
+            A.coordinateActivities()
+        end,mode~='Raid' and mode~='Defense')
+        if mode=='Gate' or mode=='MaxTac' then
+            local ranksKey=mode=='Gate' and 'gateRanks' or 'maxTacRanks'
+            dropdown('Modes',mode=='Gate' and 'Gate ranks' or 'MaxTac threats',ranksKey,mode=='Gate' and A.gateRankRows or A.maxTacRankRows,
+                function(key) return A.settings[ranksKey][key]==true end,
+                function(selected) A.settings[ranksKey]=selected; A.coordinateActivities() end,true)
+            note('Modes',mode..' rank order',mode=='Gate' and 'S > A > B > C > D > E. Only declared ranks are listed.'
+                or 'Low → Medium → High → Extreme → Psycho. MaxTac stays at its join position and completes the run before switching.')
         end
-        toggle('Modes',mode=='Raid' and 'Auto start my own Raid' or ('Auto join '..mode),toggleKey,A.coordinateActivities)
+        toggle('Modes',mode=='Raid' and 'Auto start my own Raid' or ('Auto join '..mode),toggleKey,function(value)
+            if mode=='Raid' or mode=='Defense' then A.setCombatEnabled(mode,value) else A.coordinateActivities() end
+        end)
     end
     input('Pets','Name for unnamed Astral pets','petName')
     toggle('Pets','Auto rename Astral pets ONLY','rename')
@@ -2354,12 +2575,20 @@ return function(A)
     status('Pets','Rename')
     status('Pets','Rename report')
     button('Pets','Retry unconfirmed renames',A.retryRenaming)
-    button('Guild Tracker','Start Tracking',A.guildStart)
-    button('Guild Tracker','Stop Tracking',A.guildStop)
-    button('Guild Tracker','Send current JSON',A.guildSendSnapshot)
-    local guildSummary=note('Guild Tracker','Tracking status',A.guildSummary())
-    statuses[#statuses+1]=function() guildSummary:SetDesc(A.guildSummary()) end
-
+    local cyberSummary=note('Cyber','Night City',A.cyberSummary())
+    statuses[#statuses+1]=function() cyberSummary:SetDesc(A.cyberSummary()) end
+    button('Cyber','Open Cyberdeck',function() A.openCyberSystem('Cyberdeck') end)
+    button('Cyber','Open Ripperdoc',function() A.openCyberSystem('Ripperdoc') end)
+    dropdown('Cyber','Ripperdoc slots to upgrade','ripperdocSlots',A.ripperdocRows,
+        function(key) return A.settings.ripperdocSlots[key]==true end,
+        function(selected) A.settings.ripperdocSlots=selected end,true)
+    toggle('Cyber','Auto upgrade selected Ripperdoc slots','ripperdocAuto')
+    note('Cyber','Ripperdoc costs','Spends Eddies only when enabled, in the normal Head → Torso → Shoulder → Waist → Back order. Each previous slot must be maxed. Waits for the game to confirm every upgrade.')
+    status('Cyber','Ripperdoc'); status('Cyber','Cyber')
+    note('Index','Missing collections','Accessories, pet accessories, titans, shadows, swords, primordials and mounts. Checks the game Index, including its collection history. Pets are excluded.')
+    button('Index','Send missing index to Discord',A.sendIndexReport)
+    note('Index','Report details','Uses your fixed report webhook. Shows world, source and base chance on numbered category pages. Purchases and claims are marked guaranteed; unpublished details are marked unknown. Works independently of the other webhook settings.')
+    status('Index','Index')
     input('Webhook','Webhook URL','webhookURL'); input('Webhook','Discord user ID','pingId')
     toggle('Webhook','Enable webhook','webhook'); toggle('Webhook','Send disconnect notification','sendDisconnect')
     toggle('Webhook','Ping selected user','ping')
@@ -2367,25 +2596,14 @@ return function(A)
     multi('Webhook','Events to ping','pingEvents',choices({'Disconnect','Mode','Progress','Error','Inventory'}))
     toggle('Webhook','Save webhook URL locally with settings','saveSecrets')
     button('Webhook','Send test notification',function() A.notify('Test','Webhook test from JoesAAS',true) end)
-    note('Webhook','Disconnect / recovery','A hard crash stops the sender. Guild tracking records a local heartbeat and reports the interruption after you rerun the script. Stop Tracking sends its JSON attachment here. Save the URL with settings and enable autoload to restore it after rejoining.')
+    note('Webhook','Disconnect limits','Disconnect notices send while the executor can still run. A force-closed Roblox app cannot send a webhook. Settings restore automatically; enable local URL storage above to restore your webhook URL too.')
     status('Webhook','Webhook'); status('Webhook','Disconnect')
-    button('Settings','Save settings',function() A.save() end)
-    button('Settings','Load settings',function() A.load() end)
-    local auto=tabs.Settings:AddToggle('autoload',{Title='Autoload saved settings on launch',Default=A.autoloadEnabled})
-    auto:OnChanged(guard(function(value) A.setAutoload(value); A.refreshUI() end))
-    bindings[#bindings+1]=function()
-        if auto.Value~=A.autoloadEnabled then auto:SetValue(A.autoloadEnabled) end
-    end
-    note('Settings','Save / Load / Autoload','Save writes the current configuration. Autoload restores that saved configuration next launch. Save again after changing options. Loaded or autoloaded ON features run immediately. Each feature uses its own toggle.')
-    local savedStatus=note('Settings','Configuration','Ready')
-    statuses[#statuses+1]=function()
-        savedStatus:SetDesc('Autoload: '..(A.autoloadEnabled and 'enabled' or 'disabled'))
-    end
+    note('Settings','Automatic settings','Choices and toggles save automatically. Typing saves after a short pause. The next time you execute JoesAAS, it restores your settings and resumes enabled features. No Save, Load or Autoload buttons are needed.')
     toggle('Settings','Black screen / disable 3D rendering','blackScreen',function(value) if A.render then A.render(value) end end)
     note('Settings','Controls',touch and 'Tap JoesAAS to hide/show; drag it to reposition. Use each feature’s own toggle. RESTORE enables rendering. Landscape gives the menus more room.'
-        or 'Right Shift: minimize/show Fluent. F8: restore rendering. Rendering starts enabled.')
+        or 'Right Shift: minimize/show Fluent. F8: restore rendering.')
     note('Settings','Executor capabilities',
-        'Save/load: '..((type(writefile)=='function' and type(readfile)=='function' and type(makefolder)=='function') and 'available' or 'file APIs missing')
+        'Automatic settings: '..((type(writefile)=='function' and type(readfile)=='function' and type(makefolder)=='function') and 'available' or 'file APIs missing')
         ..' | Webhook HTTP: '..(A.httpRequest and 'available' or 'request API missing')
         ..'. Rendering availability is checked when you use it.')
     status('Settings','Settings')
@@ -2398,7 +2616,7 @@ return function(A)
         local jobs,enabled={},{}
         for name,job in pairs(A.tasks) do jobs[name]={busy=job.busy,failures=job.failures,nextIn=math.max(0,job.next-os.clock())} end
         for key,value in pairs(A.settings) do if type(value)=='boolean' then enabled[key]=value end end
-        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='4.7',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
+        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.2',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
             running=A.running,
             worlds=#C.keys(A.catalog.worlds),enemies=#C.keys(A.catalog.enemies)}))
         assert(A.safeLoad(A.folder..'/diagnostics.json'),'Could not read back diagnostics file')
@@ -2421,6 +2639,7 @@ return function(A)
         if A.touchControls then A.touchControls.RESTORE.Visible=disabled end
         A.status.Rendering=disabled and (ok and '3D rendering disabled' or 'Overlay only: rendering API unavailable') or 'Rendering enabled'
         if A.refreshUI then A.refreshUI() end
+        A.settingsChanged()
     end
     A.connect(black.Activated,function() A.render(false) end)
     A.connect(A.S.UIS.InputBegan,function(key) if key.KeyCode==Enum.KeyCode.F8 then A.render(false) end end)
@@ -2431,8 +2650,7 @@ return function(A)
         sync=false
         if not ok then A.log('UI',why) end
     end
-    A.settings.blackScreen=false
-    sync=false; A.refreshUI(); window:SelectTab(1)
+    sync=false; A.render(A.settings.blackScreen); A.refreshUI(); window:SelectTab(1)
     A.job('UI status',1,function()
         if F.Unloaded or not A.gui.Parent then A.stop(); return end
         for _,update in ipairs(statuses) do update() end
