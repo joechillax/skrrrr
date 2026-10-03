@@ -1,4 +1,4 @@
--- JoesAAS 5.2 | standalone source | October 2026
+-- JoesAAS 5.3 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -139,7 +139,8 @@ return function(A)
         rename=false,petName='',webhook=false,webhookURL='',pingId='',ping=false,sendDisconnect=true,
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
-        blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false,ripperdocAuto=false,ripperdocSlots={}}
+        blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false,ripperdocAuto=false,ripperdocSlots={},
+        autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20}
     A.legacyFolder='AnimeSuite_'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.folder='JoesAAS/'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.file=A.folder..'/settings.json'
@@ -169,6 +170,10 @@ return function(A)
         if type(saved)=='table' and saved.dungeonFollow==true then s.trialFollow=true end
         local n=tonumber(s.distance); s.distance=(n and n==n and n<math.huge) and n or 5
         s.distance=math.clamp(s.distance,2,20)
+        for _,key in ipairs({'stuckSeconds','trialDungeonStuckSeconds'}) do
+            local value=tonumber(s[key])
+            s[key]=(value and value==value and value<math.huge) and math.clamp(value,1,3600) or A.defaults[key]
+        end
         if not Core.contains({'Nearest','Highest HP','Lowest HP'},s.target) then s.target='Nearest' end
         if not Core.contains({'Walk','Teleport'},s.moveStyle) then s.moveStyle='Walk' end
         for _,k in ipairs({'webhookEvents','pingEvents','trialJoinSelection','towerSelection','raidSelection','defenseSelection','dungeonSelection','gateSelection','gateRanks','maxTacSelection','maxTacRanks','bossRushSelection','ripperdocSlots'}) do
@@ -620,7 +625,7 @@ return function(A)
     A.sessionNamed={}
     function A.renameDiagnostics()
         local d=A.data() or {}; local stats=A.util('PetStatsUtil')
-        local report={version='5.2',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
+        local report={version='5.3',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
             inventoryEvents=A.renameInventoryEvents or 0,lastInventoryEvent=A.renameLastInventoryEvent}
         local named=type(d.NamedPets)=='table' and d.NamedPets or {}
         local sampled={}
@@ -956,7 +961,7 @@ return function(A)
             movingHuman=nil; movementRoot=nil; movementKey=nil; anchor=nil
         end
         local function followMovement()
-            if not A.running or not A.settings[toggle] then stopMovement(); return end
+            if not A.running or not A.settings[toggle] or (A.activityExitPending and A.activityExitPending()) then stopMovement(); return end
             local key=getContext()
             if not key or endedKey==key then stopMovement(); return end
             local character=A.player.Character
@@ -1056,7 +1061,7 @@ return function(A)
                         context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
                 end
                 local ctrl=A.client('TeleportController')
-                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.2',reason=message,
+                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.3',reason=message,
                     context=A.player:GetAttribute('VisibilityContext'),room=state[keyField]==key and state.Room,
                     serverEnemies=state[keyField]==key and state.EnemyCount,anchored=root and root.Anchored,
                     loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
@@ -1071,6 +1076,7 @@ return function(A)
         end)
         A.job(label..' follow',0.2,function()
             if not A.settings[toggle] then target=nil; loadingSince=nil; stalledSince=nil; return end
+            if A.activityExitPending and A.activityExitPending() then target=nil; stopMovement(); return end
             local key=getContext()
             if key~=activeKey then activeKey=key; target=nil; loadingSince=nil; stalledSince=nil end
             if not key then A.status[label..' follow']='Waiting to enter a '..label; return end
@@ -1183,7 +1189,7 @@ return function(A)
         local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
         local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
         local activityJob=A.tasks.Activities
-        local snapshot={schema=1,version='5.2',userId=A.player.UserId,gameId=game.GameId,
+        local snapshot={schema=1,version='5.3',userId=A.player.UserId,gameId=game.GameId,
             savedAt=os.time(),context=A.player:GetAttribute('VisibilityContext'),running=A.running,
             activities=A.status.Activities,error=A.status['Activity error'],events=events,openings=openings,
             coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
@@ -1191,7 +1197,8 @@ return function(A)
             eventError=A.status.Event,activityJobFailures=activityJob and activityJob.failures,settings={}}
         for _,key in ipairs({'towerAutoJoin','towerSelection','trialAutoJoin','trialJoinSelection','dungeonAutoJoin',
             'dungeonSelection','gateAutoJoin','gateSelection','gateRanks','maxTacAutoJoin','maxTacSelection','maxTacRanks','priority','raidAutoJoin','raidSelection',
-            'defenseAutoJoin','defenseSelection','bossRushAutoJoin','bossRushSelection'}) do snapshot.settings[key]=A.settings[key] end
+            'defenseAutoJoin','defenseSelection','bossRushAutoJoin','bossRushSelection',
+            'autoLeaveStuck','stuckSeconds','trialDungeonStuckSeconds'}) do snapshot.settings[key]=A.settings[key] end
         local ok,err=pcall(function()
             if type(makefolder)=='function' then pcall(makefolder,'JoesAAS'); pcall(makefolder,A.folder) end
             local encoded=A.S.HTTP:JSONEncode(snapshot)
@@ -1226,7 +1233,9 @@ return function(A)
     local order={'MaxTac','Tower','TimeTrial','Dungeon','Gate','Raid','Defense','BossRush'}
     local protected={MaxTac=true,Tower=true,TimeTrial=true,Dungeon=true}
     local available,backoff={},{}
-    local pending,leaving,locked,returning,waitingReason
+    local pending,leaving,locked,returning,returningContext,waitingReason,stuckExit
+    local stuckBackoff={}
+    local stuckRetry
     local leaveAt,leaveAttempts=0,0
     local raidInstance,raidKey
     for _,mode in ipairs(order) do available[mode]={} end
@@ -1350,6 +1359,8 @@ return function(A)
         end
         return mode~='World' and mode or nil,raw
     end
+    A.activityContext=context
+    function A.activityExitPending() return stuckExit~=nil end
     local function enabled(mode,key)
         local def=definitions[mode]
         return A.settings[def.toggle] and A.settings[def.selection][key]==true
@@ -1357,7 +1368,7 @@ return function(A)
     local function selectCandidate()
         waitingReason=nil
         for _,mode in ipairs(A.activityOrder()) do
-            local choices=A.settings[definitions[mode].toggle] and A.activityChoices(mode) or {}
+            local choices=A.settings[definitions[mode].toggle] and (stuckBackoff[mode] or 0)<=os.clock() and A.activityChoices(mode) or {}
             for _,key in ipairs(candidateKeys(mode,choices)) do
                 if enabled(mode,key) and (backoff[mode..':'..key] or 0)<=os.clock() then
                     local entry=available[mode][key]
@@ -1399,7 +1410,21 @@ return function(A)
     end
     function A.activityBlocksFarm()
         local mode=context()
-        return mode~=nil or pending~=nil or leaving~=nil or locked~=nil or returning~=nil
+        return mode~=nil or pending~=nil or leaving~=nil or locked~=nil or returning~=nil or stuckExit~=nil
+    end
+    function A.requestStuckExit(mode,raw)
+        local current,contextRaw=context()
+        if not A.alive or not A.running or not A.settings.autoLeaveStuck or not definitions[mode]
+            or current~=mode or raw~=contextRaw or pending or leaving or returning or stuckExit
+            or (stuckRetry and stuckRetry.mode==mode and stuckRetry.context==raw and stuckRetry.untilTime>os.clock()) then return false end
+        stuckExit={mode=mode,context=raw,attempts=0,lastSent=-math.huge}
+        pending=nil; locked=nil
+        suspendFarm()
+        if A.stopTrialMovement then A.stopTrialMovement() end
+        if A.stopDungeonMovement then A.stopDungeonMovement() end
+        A.joinTrace('stuck timeout',{mode=mode,reason='No run or combat progress within configured timeout'})
+        A.coordinateActivities()
+        return true
     end
     local function sendRequest(mode,key,entry)
         if mode=='Gate' or mode=='MaxTac' then return A.fire('RaidGateTeleport',key) end
@@ -1420,6 +1445,36 @@ return function(A)
         local current,raw=context()
         local ctrl=A.client('TeleportController')
         local loading=ctrl and ctrl:IsLoading()
+        if stuckRetry and raw~=stuckRetry.context then stuckRetry=nil end
+        if returning and current and returningContext and raw~=returningContext then returning=nil; returningContext=nil end
+        if stuckExit and not A.settings.autoLeaveStuck then stuckExit=nil end
+        if stuckExit then
+            local exit=stuckExit
+            if current and raw~=exit.context then
+                -- A new instance or direct native transfer is already confirmed.
+                stuckBackoff[exit.mode]=os.clock()+30; stuckExit=nil
+            elseif not current and not A.inMode() and not loading then
+                stuckBackoff[exit.mode]=os.clock()+30; stuckExit=nil
+                locked=nil; returning=nil; leaving=nil
+            else
+                if raw==exit.context and os.clock()-exit.lastSent>=5 then
+                    if exit.attempts>=3 then
+                        stuckBackoff[exit.mode]=os.clock()+30; stuckExit=nil
+                        stuckRetry={mode=exit.mode,context=exit.context,untilTime=os.clock()+30}
+                        if protected[current] and returning~=current then locked=current end
+                        A.status['Activity error']='Stuck '..exit.mode..' exit not confirmed; retry in 30s'
+                        A.status['Stuck recovery']=A.status['Activity error']
+                        status(A.status['Activity error']); return
+                    end
+                    exit.attempts=exit.attempts+1; exit.lastSent=os.clock()
+                    local bridge=(exit.mode=='Gate' or exit.mode=='MaxTac') and 'RaidLeave' or exit.mode..'Leave'
+                    local sent=A.fire(bridge)
+                    A.joinTrace('stuck leave request',{mode=exit.mode,sent=sent,retry=exit.attempts>1})
+                    A.status['Stuck recovery']='Leaving stuck '..exit.mode..' · attempt '..exit.attempts..'/3'
+                end
+                status('Waiting for stuck '..exit.mode..' exit confirmation'); return
+            end
+        end
         if protected[current] and returning~=current then locked=current end
         if type(raw)=='string' and raw:match('^World:') and not A.inMode() and not loading then
             locked=nil; returning=nil; leaving=nil
@@ -1516,10 +1571,23 @@ return function(A)
             if (current==ended or locked==ended) and A.settings.webhook then
                 A.notify('Mode',ended..' run ended'..(type(packet)=='table' and packet.AutoRetry==true and ' (native auto retry)' or ''))
             end
-            if current==ended or locked==ended then locked=nil; returning=ended end
+            if current==ended or locked==ended then locked=nil; returning=ended; returningContext=select(2,context()) end
             if pending and (pending.mode==mode or pending.mode==ended) then pending=nil end
             A.coordinateActivities()
         end)
+        if mode=='TimeTrial' or mode=='Dungeon' then
+            A.on(mode..'MapReady',function(instance)
+                local current,raw=context()
+                -- These modes reuse their arena key across runs. A fresh map
+                -- after Ended confirms a new run even without a World context.
+                if current~=mode or returning~=mode or raw~=returningContext
+                    or instance~=raw:match('^[^:]+:(.+)$') then return end
+                if stuckExit then stuckBackoff[stuckExit.mode]=os.clock()+30; stuckExit=nil end
+                stuckRetry=nil; returning=nil; returningContext=nil; locked=mode
+                A.joinTrace('run restarted',{mode=mode,reason='Own map ready after run ended'})
+                A.coordinateActivities()
+            end)
+        end
         if mode~='Tower' then
             A.on(mode..'Join',function(accepted,reason)
                 A.joinTrace('server reply',{mode=mode,accepted=accepted==true,reason=tostring(reason)})
@@ -1663,7 +1731,9 @@ return function(A)
             end
         end
         return {pending=pending and {mode=pending.mode,key=pending.key,accepted=pending.accepted==true,
-            attempts=pending.attempts,age=os.clock()-pending.at},locked=locked,leaving=leaving,returning=returning,available=openings}
+            attempts=pending.attempts,age=os.clock()-pending.at},locked=locked,leaving=leaving,returning=returning,available=openings,
+            stuckExit=stuckExit and {mode=stuckExit.mode,context=stuckExit.context,attempts=stuckExit.attempts},
+            stuckRecovery=A.stuckSnapshot and A.stuckSnapshot() or nil}
     end
     A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),A.coordinateActivities)
     local lastNotifiedContext
@@ -1674,6 +1744,194 @@ return function(A)
         if mode and definitions[mode] and A.settings.webhook then A.notify('Mode','Entered '..mode..': '..raw) end
     end)
     A.job('Activities',0.2,A.coordinateActivities)
+end
+
+end)()(A);
+
+-- ===== stuck_recovery =====
+(function()
+return function(A)
+    local specs={MaxTac={bridge='Raid',folder='RaidArenas',key='RaidKey'},Gate={bridge='Raid',folder='RaidArenas',key='RaidKey'},
+        Raid={bridge='Raid',folder='RaidArenas',key='RaidKey'},Defense={bridge='Defense',folder='DefenseArenas',key='DefenseKey'},
+        Tower={bridge='Tower',folder='TowerArenas',key='TowerKey'},BossRush={bridge='BossRush',folder='BossRushArenas',key='RushKey'},
+        TimeTrial={bridge='TimeTrial',folder='TimeTrialArenas',key='TrialKey'},Dungeon={bridge='Dungeon',folder='DungeonArenas',key='DungeonKey'}}
+    local watch
+    local observed={'Wave','Room','Floor','EnemyCount','Alive','Phase','BossHealthReal','BossEnemyId','ShieldBoss',
+        'JoinTimeLeft','LandingTimeLeft','TimePaused'}
+    local function valid(n) return type(n)=='number' and n==n and math.abs(n)<math.huge end
+    function A.stuckTimeout(mode)
+        local key=(mode=='TimeTrial' or mode=='Dungeon') and 'trialDungeonStuckSeconds' or 'stuckSeconds'
+        local value=tonumber(A.settings[key])
+        return valid(value) and math.clamp(value,1,3600) or A.defaults[key]
+    end
+    local function arenaFor(mode,raw)
+        local arenas=workspace:FindFirstChild(specs[mode].folder)
+        return arenas and arenas:FindFirstChild(raw:match('^[^:]+:(.+)$'))
+    end
+    local function current()
+        if not A.alive or not A.running or not A.settings.autoLeaveStuck then watch=nil; return end
+        local mode,raw=A.activityContext()
+        if not specs[mode] or type(raw)~='string' then watch=nil; return end
+        if not watch or watch.context~=raw or watch.mode~=mode then
+            watch={mode=mode,context=raw,lastProgress=os.clock(),state={},health={},phase=nil,graceUntil=0}
+        end
+        return watch
+    end
+    local function progress(w,reason)
+        w.lastProgress=os.clock(); w.reason=reason
+    end
+    local function health(value)
+        if value==nil then return end
+        local big=A.util('BigNum')
+        if big and type(big.Decode)=='function' and type(big.Compare)=='function' then
+            local ok,decoded=pcall(big.Decode,value)
+            if ok and decoded~=nil then return {value=A.Core.copy(decoded),big=true} end
+        end
+        local n=tonumber(value)
+        if valid(n) then return {value=n,big=false} end
+    end
+    local function lower(nextHealth,previous)
+        if not nextHealth or not previous or nextHealth.big~=previous.big then return false end
+        if nextHealth.big then
+            local ok,result=pcall(A.util('BigNum').Compare,nextHealth.value,previous.value)
+            return ok and result==-1
+        end
+        return nextHealth.value<previous.value
+    end
+    local function phaseGrace(w)
+        local phase=w.state.Phase
+        if phase==w.phase then return end
+        if w.phase~=nil then progress(w,'Run phase advanced') end
+        w.phase=phase; w.graceUntil=0
+        if w.mode~='Tower' then return end
+        local cfg=A.config('TowerConfig') or {}
+        local entries=A.activityChoices('Tower')
+        local tower=entries[w.key] or {}
+        local seconds
+        if phase=='Joining' then seconds=tonumber(w.state.JoinTimeLeft) or tonumber(tower.JoinWindowSeconds) or 25
+        elseif phase=='Landing' then seconds=tonumber(w.state.LandingTimeLeft) or tonumber(cfg.LandingDecisionSeconds) or 20
+        elseif phase=='Rising' then seconds=tonumber(cfg.FloorTransitionSeconds) or 2 end
+        if valid(seconds) then w.graceUntil=os.clock()+math.clamp(seconds,0,60) end
+    end
+    local function gateGrace(w)
+        if w.mode~='Gate' or tonumber(w.state.EnemyCount)~=0 then return end
+        local mode=A.activityChoices('Gate')[w.key]
+        local wave=tonumber(w.state.Wave)
+        local every=mode and tonumber(mode.BossEvery)
+        if not wave or wave<=0 or not every or every<=0 or wave%every~=0 or w.ariseWave==wave then return end
+        w.ariseWave=wave
+        local delay=mode.ShadowArise and tonumber(mode.ShadowArise.WaveDelay)
+        if valid(delay) then w.graceUntil=math.max(w.graceUntil,os.clock()+math.clamp(delay,0,60)) end
+    end
+    local function receive(prefix,packet)
+        if type(packet)~='table' or packet.Refused then return end
+        local w=current()
+        if not w or specs[w.mode].bridge~=prefix or w.ended then return end
+        local instance=w.context:match('^[^:]+:(.+)$')
+        if packet.InstanceKey and packet.InstanceKey~=instance then return end
+        local key=packet[specs[w.mode].key]
+        if prefix=='TimeTrial' or prefix=='Dungeon' then
+            if key and key~=instance then return end
+        elseif key and w.key and key~=w.key then return end
+        -- Keyed/full packets establish ownership; ignore unassociated deltas.
+        if not w.associated and not packet.Full and not packet.InstanceKey and not key then return end
+        w.associated=true; if key then w.key=key end
+        local old=w.state
+        local nextState=packet.Full and {} or A.Core.copy(old)
+        for _,field in ipairs(observed) do if packet[field]~=nil then nextState[field]=A.Core.copy(packet[field]) end end
+        for _,field in ipairs(type(packet.Cleared)=='table' and packet.Cleared or {}) do nextState[field]=nil end
+        local advanced=false
+        for _,field in ipairs({'Wave','Room','Floor'}) do
+            local before,after=tonumber(old[field]),tonumber(nextState[field])
+            if after and (not before or after>before) then advanced=true; progress(w,field..' advanced') end
+        end
+        if advanced then w.health={}; w.boss=nil; w.bossId=nil end
+        for _,field in ipairs({'EnemyCount','Alive'}) do
+            local before,after=tonumber(old[field]),tonumber(nextState[field])
+            if before and after and after<before then progress(w,'Enemies defeated') end
+        end
+        local boss=health(nextState.BossHealthReal)
+        local bossId=nextState.BossEnemyId
+        if bossId==w.bossId and lower(boss,w.boss) then progress(w,'Boss taking damage') end
+        if boss then w.boss=boss; w.bossId=bossId end
+        local beforePhase=type(old.ShieldBoss)=='table' and old.ShieldBoss.Phase
+        local afterPhase=type(nextState.ShieldBoss)=='table' and nextState.ShieldBoss.Phase
+        if beforePhase and afterPhase and beforePhase~=afterPhase then progress(w,'Boss phase advanced') end
+        w.state=nextState; phaseGrace(w); gateGrace(w)
+    end
+    for _,prefix in ipairs({'Raid','Defense','Tower','TimeTrial','Dungeon','BossRush'}) do
+        local name=prefix
+        A.on(name..'State',function(packet) receive(name,packet) end)
+        A.on(name..'Ended',function(_,packet)
+            local w=current()
+            if not w or specs[w.mode].bridge~=name then return end
+            if name=='Raid' and w.mode=='MaxTac' and type(packet)=='table' and packet.AutoGateTransfer==true then return end
+            if type(packet)=='table' and packet.InstanceKey and packet.InstanceKey~=w.context:match('^[^:]+:(.+)$') then return end
+            w.ended=true; w.health={}
+        end)
+        if name~='Tower' then A.on(name..'MapReady',function(instance,detail)
+            local w=current()
+            if not w or specs[w.mode].bridge~=name or instance~=w.context:match('^[^:]+:(.+)$') then return end
+            local room=(name=='TimeTrial' or name=='Dungeon') and tonumber(detail)
+            if w.ended then
+                watch=nil; w=current()
+            end
+            w.associated=true
+            if room and (not tonumber(w.state.Room) or room>tonumber(w.state.Room)) then
+                w.state.Room=room; w.health={}; progress(w,'Room loaded')
+            end
+        end) end
+    end
+    A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),current)
+    function A.stuckSnapshot()
+        local w=watch
+        return w and {mode=w.mode,context=w.context,key=w.key,timeout=A.stuckTimeout(w.mode),
+            idle=math.max(0,os.clock()-math.max(w.lastProgress,w.graceUntil)),reason=w.reason,ended=w.ended==true} or {}
+    end
+    A.job('Stuck recovery',0.5,function()
+        local w=current()
+        if not A.settings.autoLeaveStuck then A.status['Stuck recovery']='Disabled'; return end
+        if not w then A.status['Stuck recovery']='Watching game modes · normal world farming is unaffected'; return end
+        if A.activityExitPending() then return end
+        local coordinator=A.joinSnapshot()
+        if w.ended or coordinator.returning then A.status['Stuck recovery']='Run ended; waiting for normal return'; return end
+        if coordinator.pending or coordinator.leaving then
+            progress(w,'Activity transfer pending'); A.status['Stuck recovery']='Waiting for activity transfer'; return
+        end
+        local arena=arenaFor(w.mode,w.context)
+        if arena and not w.key then w.key=arena:GetAttribute(specs[w.mode].key) end
+        local enemies=arena and arena:FindFirstChild('Enemies')
+        local nextHealth={}
+        local observer=A.client('EnemyController')
+        for _,enemy in ipairs(enemies and enemies:GetChildren() or {}) do
+            local context=enemy:GetAttribute('VisibilityContext')
+            local visible=enemy:GetAttribute('IsClientVisualClone')~=true and (context==nil or context=='' or context==w.context)
+            if visible and observer and type(observer.IsGamemodeEnemyVisibleLocally)=='function' then
+                local ok,value=pcall(observer.IsGamemodeEnemyVisibleLocally,observer,enemy)
+                visible=ok and value==true
+            end
+            if visible then
+                local h=health(enemy:GetAttribute('HealthReal'))
+                if not h then
+                    local human=enemy:FindFirstChildOfClass('Humanoid')
+                    h=human and health(human.Health)
+                end
+                local dead=enemy:GetAttribute('EnemyDead')==true
+                if dead then h={value=0,big=false,dead=true} end
+                local previous=w.health[enemy]
+                if (previous and dead and not previous.dead) or lower(h,previous) then progress(w,'Enemy taking damage') end
+                if h then nextHealth[enemy]=h end
+            end
+        end
+        w.health=nextHealth
+        if os.clock()<w.graceUntil then
+            A.status['Stuck recovery']=w.mode..' · normal run transition ('..math.ceil(w.graceUntil-os.clock())..'s)'; return
+        end
+        local idle=os.clock()-math.max(w.lastProgress,w.graceUntil)
+        local timeout=A.stuckTimeout(w.mode)
+        A.status['Stuck recovery']=w.mode..' · no progress '..string.format('%.1f',idle)..'/'..timeout..'s'
+        if idle>=timeout then A.requestStuckExit(w.mode,w.context) end
+    end)
 end
 
 end)()(A);
@@ -2273,7 +2531,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.2',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.3',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2411,12 +2669,13 @@ return function(A)
         end
         return option
     end
-    local function input(tab,title,key,numeric)
+    local function input(tab,title,key,numeric,minimum,maximum)
         local option=tabs[tab]:AddInput(key,{Title=title,Default=tostring(A.settings[key]),Numeric=numeric==true,Finished=false})
         option:OnChanged(guard(function(value)
             if numeric then
                 local n=tonumber(value)
                 if not n or n~=n or n<0 or n==math.huge then return end
+                if minimum then n=math.clamp(n,minimum,maximum) end
                 A.settings[key]=n
             else A.settings[key]=tostring(value):match('^%s*(.-)%s*$') end
         end,0.4))
@@ -2527,7 +2786,7 @@ return function(A)
     function(selected) A.settings.trialJoinSelection=selected end,true)
     toggle('Farm','Auto join selected trials when open','trialAutoJoin',function() A.tryTrialJoin() end)
     status('Farm','Trial join')
-    note('Farm','Trial priority','Insane > Hard > Medium > Easy among selected trials currently open. An active trial always finishes first.')
+    note('Farm','Trial priority','Insane > Hard > Medium > Easy among selected trials currently open. An active trial finishes first unless your stuck timeout is reached.')
     status('Modes','Activities')
     status('Modes','Activity error'); status('Modes','Join diagnostics')
     button('Modes','Save join diagnostics now',function() A.flushJoinDiagnostics(true) end)
@@ -2543,7 +2802,12 @@ return function(A)
     button('Modes','Move selected activity higher',function() A.moveActivityPriority(editingPriority,-1) end)
     button('Modes','Move selected activity lower',function() A.moveActivityPriority(editingPriority,1) end)
     button('Modes','Reset activity priority',A.resetActivityPriority)
-    note('Modes','Run locks','MaxTac, Tower, Time Trials and Dungeon finish or fail before switching, even if you change priority or turn their auto join off. Mob Autofarm always comes last.')
+    note('Modes','Run locks','MaxTac, Tower, Time Trials and Dungeon finish or fail before priority switching. Enabled stuck recovery can leave an unfinished run only after its no-progress timeout. Mob Autofarm always comes last.')
+    toggle('Modes','Auto leave stuck runs','autoLeaveStuck',function() A.coordinateActivities() end)
+    input('Modes','Stuck timeout · other modes (seconds)','stuckSeconds',true,1,3600)
+    input('Modes','Stuck timeout · Trial + Dungeon (seconds)','trialDungeonStuckSeconds',true,1,3600)
+    note('Modes','Stuck detection','Defaults: 10 seconds for MaxTac, Tower, Gate, Raid, Defense and Boss Rush; 20 seconds shared by Time Trials and Dungeon. Damage, defeated enemies and wave/room/floor progress reset the timer. Normal Tower join/choice timers and Gate ARISE delays are allowed first. Walking and countdown updates do not reset it. Normal world mob farming is unaffected. Failed modes wait 30 seconds before this script rejoins.')
+    status('Modes','Stuck recovery')
     note('Modes','Transfers','MaxTac, Tower, Trials and Dungeons use direct native entry. Other destinations wait for normal exit. MaxTac, Gate and Tower stay at their join position.')
     note('Modes','Movement','Time Trials and Dungeons follow mobs with continuous anti-stuck steps. Tower opens your own tower. Turn off competing auto-join / movement in your other script to let this coordinator control switching.')
     for _,entry in ipairs({{'MaxTac','maxTacAutoJoin','maxTacSelection'},{'Tower','towerAutoJoin','towerSelection'},{'Dungeon','dungeonAutoJoin','dungeonSelection'},{'Gate','gateAutoJoin','gateSelection'},{'Raid','raidAutoJoin','raidSelection'},
@@ -2563,7 +2827,7 @@ return function(A)
                 function(key) return A.settings[ranksKey][key]==true end,
                 function(selected) A.settings[ranksKey]=selected; A.coordinateActivities() end,true)
             note('Modes',mode..' rank order',mode=='Gate' and 'S > A > B > C > D > E. Only declared ranks are listed.'
-                or 'Low → Medium → High → Extreme → Psycho. MaxTac stays at its join position and completes the run before switching.')
+                or 'Low → Medium → High → Extreme → Psycho. MaxTac stays at its join position. Only enabled stuck recovery can leave a stalled unfinished run.')
         end
         toggle('Modes',mode=='Raid' and 'Auto start my own Raid' or ('Auto join '..mode),toggleKey,function(value)
             if mode=='Raid' or mode=='Defense' then A.setCombatEnabled(mode,value) else A.coordinateActivities() end
@@ -2616,7 +2880,7 @@ return function(A)
         local jobs,enabled={},{}
         for name,job in pairs(A.tasks) do jobs[name]={busy=job.busy,failures=job.failures,nextIn=math.max(0,job.next-os.clock())} end
         for key,value in pairs(A.settings) do if type(value)=='boolean' then enabled[key]=value end end
-        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.2',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
+        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.3',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
             running=A.running,
             worlds=#C.keys(A.catalog.worlds),enemies=#C.keys(A.catalog.enemies)}))
         assert(A.safeLoad(A.folder..'/diagnostics.json'),'Could not read back diagnostics file')
