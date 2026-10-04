@@ -114,8 +114,21 @@ local config = {
     IgnoreList = {}
 }
 -- Optional extensions: every automatic or resource-using feature starts disabled.
+function runtime.parseResetSettings(waveText,timeText)
+    local wave=type(waveText)=="string" and waveText:match("^%s*(%d+)%s*$")
+    wave=tonumber(wave)
+    if not wave or wave<1 or wave>10000 then return nil,"Reset wave must be a whole number from 1 to 10000." end
+    local hour,minute
+    if type(timeText)=="string" then hour,minute=timeText:match("^%s*(%d%d?):(%d%d)%s*$") end
+    hour,minute=tonumber(hour),tonumber(minute)
+    if not hour or not minute or hour>23 or minute>59 or (hour>=6 and hour<18) then
+        return nil,"Reset time must be H:MM during the night (18:00–05:59)."
+    end
+    return {wave=wave,minutes=hour*60+minute,time=string.format("%02d:%02d",hour,minute),key=wave..":"..(hour*60+minute)}
+end
 runtime.extraSpecs = {
     Autofarm={false}, AutoC96={false}, AutoLeaveSpawn={false}, AutoNightDrinks={false},
+    FarmResetWave={"30"}, FarmResetTime={"04:30"},
     AutoEquip={false}, EquipWeapon={""}, FireModeOverride={false}, FireMode={"FullAuto",{"Single","Burst","FullAuto"}},
     OverheatManagement={false}, ClosePriority={false}, CloseDistance={60,20,200}, SkipCloaked={false},
     MeleeAura={false}, UseKnife={true}, ThrowMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position"}}, LureMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position","Boss–Enemy Spawn"}},
@@ -220,6 +233,8 @@ function runtime.validateExtras(source)
         end
         clean[key]=value
     end
+    local reset,resetError=runtime.parseResetSettings(clean.FarmResetWave,clean.FarmResetTime)
+    assert(reset,resetError)
     return clean
 end
 
@@ -2401,7 +2416,7 @@ function state.vote()
     notice("Map vote requested: "..e.VoteMap)
 end
 function state.skip()
-    if e.Autofarm and state.farm and state.farm.wave30VoteHeld and state.farm.wave30VoteHeld() then return false end
+    if e.Autofarm and state.farm and state.farm.resetVoteHeld and state.farm.resetVoteHeld() then return false end
     local values=child(storage(),"Values")
     assert(readValue(values,"Vote")==true,"Skip voting is closed by the game")
     assert(readValue(LocalPlayer,"Voted")==false,"Already voted or vote state unavailable")
@@ -2579,7 +2594,7 @@ voting:AddButton({Text="Vote skip now",Func=function() job("Skip vote",3,state.s
 state.status=runtime.label(voting,"Ready",true)
 state.readyStatus=runtime.label(voting,"Ready-up waits for the game voting phase and the required player votes.",true)
 voting:AddButton({Text="Emergency stop (End)",Func=state.stop})
-local weapons=runtime.extensionTabs.Weapons:AddLeftGroupbox("Fire mode & input")
+local weapons=runtime.extensionTabs.Weapons:AddRightGroupbox("Fire mode & input")
 control(weapons,"HipFireADS","ADS state without zoom (experimental)")
 runtime.label(weapons,"Sets ADS state without changing the camera or zoom. Requires executor upvalue APIs and supported sights. Critical Aim upgrade must be owned; server bonus unverified. ADS restrictions may remain; scope charging is suppressed. Release manual ADS before enabling.",true)
 control(weapons,"OverheatManagement","Manage triggerbot heat")
@@ -3936,7 +3951,7 @@ function farm.begin()
     farm.positionReached=false;farm.recovering=nil;farm.lastWave=nil;farm.purchaseBudget=nil
     farm.healingDone=false;farm.healingBuyAt=0
     farm.healthDone=false
-    farm.wave30NightReached=false;farm.resetAttempt=nil;farm.resetMessage=nil;farm.resetCount=0
+    farm.resetNightReached=false;farm.resetAttempt=nil;farm.resetMessage=nil;farm.resetCount=0
     farm.forwardDone=false;farm.forwardGoal=nil;farm.forwardScanAt=0
     farm.pathAt=0;farm.forcePathUntil=0;farm.fault=nil;farm.exitTransit=nil;farm.exitWalking=nil
     farm.savedTrigger=config.Triggerbot;triggerToggle:SetValue(false)
@@ -3944,7 +3959,7 @@ function farm.begin()
     farm.status("Starting ordered C96 autofarm.")
 end
 function farm.stop()
-    farm.resetAttempt=nil;farm.resetMessage=nil;farm.wave30NightReached=false
+    farm.resetAttempt=nil;farm.resetMessage=nil;farm.resetNightReached=false
     if runtime.cancelInstantConsumables then runtime.cancelInstantConsumables("autofarm") end
     farm.runId=(farm.runId or 0)+1
     farm.cancelWalk()
@@ -3974,7 +3989,7 @@ function farm.resumeCharacter()
     triggerToggle:SetValue(false);releaseHeld()
 end
 function farm.ongoingSkip()
-    if farm.wave30VoteHeld and farm.wave30VoteHeld() then return end
+    if farm.resetVoteHeld and farm.resetVoteHeld() then return end
     local values=child(storage(),"Values")
     local currentWave=readValue(values,"LocalWave")
     if not e.Autofarm or (not farm.positionReached and not (finite(currentWave) and currentWave>5)) or farm.recovering then return end
@@ -3983,7 +3998,7 @@ function farm.ongoingSkip()
     local run,character,map,wave=farm.runId,LocalPlayer.Character,child(Workspace,"Map"),readValue(values,"LocalWave")
     job("Farm skip",3,function()
         if e.Autofarm and farm.active and (farm.positionReached or (finite(wave) and wave>5)) and not farm.recovering and farm.runId==run
-            and not (farm.wave30VoteHeld and farm.wave30VoteHeld())
+            and not (farm.resetVoteHeld and farm.resetVoteHeld())
             and LocalPlayer.Character==character and child(Workspace,"Map")==map
             and readValue(values,"LocalWave")==wave and (readValue(values,"LocalLives") or 1)>0
             and (readValue(values,"VotingTime") or 0)<=0 and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==false then state.skip() end
@@ -4031,7 +4046,7 @@ function farm.step()
             end
         end
     end
-    if farm.wave30ResetTick and farm.wave30ResetTick() then return end
+    if farm.resetTick and farm.resetTick() then return end
     -- Recovery holds ready-up until the character is securely back on the Ammo Box.
     if farm.recovering then
         if farm.recovering<=2 then
@@ -4379,7 +4394,7 @@ function farm.loadWebhook()
 end
 function farm.webhookStep()
     if farm.recovering then return "Returning to Ammo Box after respawn" end
-    if farm.wave30ResetWindow and farm.wave30ResetWindow() and farm.resetAttempt and not farm.resetAttempt.confirmed then return "Wave 30 reset / awaiting death" end
+    if farm.resetWindow and farm.resetWindow() and farm.resetAttempt and not farm.resetAttempt.confirmed then return "Wave "..farm.resetAttempt.wave.." reset / awaiting death" end
     if farm.healthDue() then return "Max Health / Health Regen" end
     if farm.healingDue() then return "Healing items and upgrades" end
     if farm.stage==5 then
@@ -4752,7 +4767,7 @@ function farm.reconcileVote()
     end
     local flag=child(LocalPlayer,"Voted")
     local count=readValue(values,"Voted")
-    if not e.Autofarm or not farm.active or (farm.wave30VoteHeld and farm.wave30VoteHeld()) or not open or (readValue(values,"VotingTime") or 0)>0
+    if not e.Autofarm or not farm.active or (farm.resetVoteHeld and farm.resetVoteHeld()) or not open or (readValue(values,"VotingTime") or 0)>0
         or not flag or flag.Value~=true or count~=0 or state.skipBusy then
         farm.voteMismatchAt=nil;return
     end
@@ -4771,7 +4786,7 @@ function farm.voteStatus()
     if not farm.active then return "Ready-up: waiting for autofarm initialization" end
     if (readValue(values,"LocalLives") or 1)<=0 then return "Ready-up: run ended" end
     if (readValue(values,"VotingTime") or 0)>0 then return "Ready-up: map voting in progress" end
-    if farm.wave30VoteHeld and farm.wave30VoteHeld() then return "Ready-up: held for wave 30 reset until dawn; resumes after Ammo Box recovery" end
+    if farm.resetVoteHeld and farm.resetVoteHeld() then return "Ready-up: held for wave "..farm.resetSettings().wave.." reset until dawn; resumes after Ammo Box recovery" end
     if readValue(values,"Vote")~=true then return "Ready-up: CLOSED by game (wave "..tostring(wave)..")" end
     if state.skipBusy then return "Ready-up: request pending for "..math.floor(os.clock()-(state.skipStartedAt or os.clock())).."s" end
     if readValue(LocalPlayer,"Voted")==true then
@@ -4848,7 +4863,7 @@ function farm.recordDeath(humanoid)
     local planned=farm.resetAttempt and farm.resetAttempt.humanoid==humanoid and farm.resetAttempt.invoked==true
     local record={previousHealth=d.lastPositive,serverCause="Not available in client dump",scheduledReset=planned or false,samples=history}
     table.insert(d.deaths,record);if #d.deaths>5 then table.remove(d.deaths,1) end
-    d.message="Last death: HP "..tostring(d.lastPositive or "?").." → 0. "..(planned and "Wave 30 reset was requested." or "Cause unconfirmed.")
+    d.message="Last death: HP "..tostring(d.lastPositive or "?").." → 0. "..(planned and "Scheduled reset was requested." or "Cause unconfirmed.")
     if type(writefile)=="function" then
         local saved=pcall(function() writefile("CombatAssistantDeaths.json",HttpService:JSONEncode({version=1,deaths=d.deaths})) end)
         d.message=d.message..(saved and " Diagnostic saved." or " Diagnostic remains in memory.")
@@ -4913,101 +4928,121 @@ table.insert(runtime.connections,{Disconnect=function()
 end})
 
 -- End-of-run character resets do not change the game clock or shop lives.
-function farm.wave30VoteHeld()
+function farm.resetSettings()
+    local settings,err=runtime.parseResetSettings(e.FarmResetWave,e.FarmResetTime)
+    local key=settings and settings.key or false
+    if farm.resetSettingsKey~=key then
+        farm.resetSettingsKey=key;farm.resetNightReached=false;farm.resetMessage=nil
+        if farm.resetAttempt and farm.resetAttempt.phase=="queued" then farm.resetAttempt=nil end
+    end
+    return settings,err
+end
+function farm.resetVoteHeld()
     if not e.Autofarm or not farm.active or not farm.supported() then return false end
     local wave=readValue(child(storage(),"Values"),"LocalWave")
     if not finite(wave) then return false end
     local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
     if not finite(minutes) then return false end
+    local settings=farm.resetSettings();if not settings then return false end
     local night=minutes>=1080 or minutes<360
-    if wave==30 and night then farm.wave30NightReached=true end
-    -- LocalWave can remain 30 while the next ready-up is open after dawn.
-    -- Hold only during the night; waiting for wave 31 would deadlock voting.
-    return wave==30 and night
+    if wave==settings.wave and night then farm.resetNightReached=settings.key end
+    -- The counter can remain on the reset wave when ready-up opens at dawn.
+    return wave==settings.wave and night
 end
-function farm.wave30ResetWindow()
+function farm.resetWindow()
     if not runtime.active or not e.Autofarm or not farm.active or not farm.supported() then return false end
     local values=child(storage(),"Values")
-    if readValue(values,"LocalWave")~=30 or (readValue(values,"LocalLives") or 1)<=0 or (readValue(values,"VotingTime") or 0)>0 then return false end
+    local settings=farm.resetSettings();if not settings then return false end
+    if readValue(values,"LocalWave")~=settings.wave or (readValue(values,"LocalLives") or 1)<=0 or (readValue(values,"VotingTime") or 0)>0 then return false end
     local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
-    return finite(minutes) and minutes>=270 and minutes<360
+    return finite(minutes) and (minutes>=1080 or minutes<360) and (minutes+360)%1440>=(settings.minutes+360)%1440
 end
 function farm.confirmWave30Death(attempt)
     if attempt.confirmed then return end
     attempt.confirmed=true;attempt.phase="death confirmed"
     -- Mark recovery even if this game's respawn reuses the same Character object.
     farm.resumeCharacter()
-    farm.resetMessage="Wave 30 reset: death confirmed; recovering to Ammo Box."
+    farm.resetMessage="Scheduled reset: death confirmed; recovering to Ammo Box."
 end
-function farm.wave30ResetTick()
+function farm.resetTick()
     if not runtime.active or not e.Autofarm or not farm.active or not farm.supported() then return false end
     local values=child(storage(),"Values")
     if (readValue(values,"VotingTime") or 0)>0 or (readValue(values,"LocalLives") or 1)<=0 then return false end
-    farm.wave30VoteHeld()
+    farm.resetVoteHeld()
     local character=LocalPlayer.Character
     local humanoid=character and character:FindFirstChildOfClass("Humanoid")
     local attempt=farm.resetAttempt
+    local settings=farm.resetSettings()
+    if attempt and attempt.phase=="queued" and (not settings or attempt.settingsKey~=settings.key or not farm.resetWindow()) then
+        farm.resetAttempt=nil;farm.resetMessage=nil;attempt=nil
+    end
     if attempt and attempt.character==character and attempt.humanoid==humanoid then
         if humanoid.Health<=0 then farm.confirmWave30Death(attempt);return true end
         if not attempt.confirmed then
             if attempt.phase=="queued" then return true end
-            farm.resetMessage=attempt.phase=="failed" and "Wave 30 reset failed; no repeated requests for this life."
-                or "Wave 30 reset: waiting for death confirmation"..(os.clock()-attempt.at>=8 and " (not confirmed; no duplicate request)." or ".")
+            farm.resetMessage=attempt.phase=="failed" and "Scheduled reset failed; no repeated requests for this life."
+                or "Scheduled reset: waiting for death confirmation"..(os.clock()-attempt.at>=8 and " (not confirmed; no duplicate request)." or ".")
             return false
         end
     end
-    if not farm.wave30ResetWindow() then return false end
-    if not humanoid or humanoid.Health<=0 then farm.resetMessage="Wave 30 reset: waiting for respawn.";return false end
-    if farm.recovering then farm.resetMessage="Wave 30 reset: recovering to Ammo Box before next reset.";return false end
-    if not farm.positionReached and farm.stage<6 then farm.resetMessage="Wave 30 reset: waiting for initial Ammo Box arrival.";return false end
+    if not farm.resetWindow() then return false end
+    if not humanoid or humanoid.Health<=0 then farm.resetMessage="Scheduled reset: waiting for respawn.";return false end
+    if farm.recovering then farm.resetMessage="Scheduled reset: recovering to Ammo Box before next reset.";return false end
+    if not farm.positionReached and farm.stage<6 then farm.resetMessage="Scheduled reset: waiting for initial Ammo Box arrival.";return false end
     local run,map=farm.runId,child(Workspace,"Map")
-    attempt={character=character,humanoid=humanoid,at=os.clock(),phase="queued"}
+    attempt={character=character,humanoid=humanoid,at=os.clock(),phase="queued",settingsKey=settings.key,wave=settings.wave,time=settings.time}
     farm.resetAttempt=attempt;farm.resetCount=(farm.resetCount or 0)+1
     farm.cancelWalk();releaseHeld()
-    farm.resetMessage="Wave 30 reset queued at 04:30 or later; attempt "..farm.resetCount.."."
+    farm.resetMessage="Wave "..settings.wave.." reset queued at "..settings.time.." or later; attempt "..farm.resetCount.."."
     task.spawn(function()
         if farm.resetAttempt~=attempt or farm.runId~=run or LocalPlayer.Character~=character or child(Workspace,"Map")~=map
-            or not farm.wave30ResetWindow() or farm.recovering or humanoid.Health<=0 then
-            if farm.resetAttempt==attempt then farm.resetAttempt=nil;farm.resetMessage="Wave 30 reset cancelled before dispatch." end
+            or not farm.resetWindow() or not farm.resetSettings() or farm.resetSettings().key~=attempt.settingsKey or farm.recovering or humanoid.Health<=0 then
+            if farm.resetAttempt==attempt then farm.resetAttempt=nil;farm.resetMessage="Scheduled reset cancelled before dispatch." end
             return
         end
         attempt.phase="requested";attempt.invoked=true
         -- One ordinary Humanoid death request per life; never forge remote names,
         -- life counts, teleport positions, or repeated joint-breaking calls.
         local ok=pcall(function() humanoid.Health=0 end)
-        if not ok then attempt.phase="failed";farm.resetMessage="Wave 30 reset failed; no repeated requests for this life."
+        if not ok then attempt.phase="failed";farm.resetMessage="Scheduled reset failed; no repeated requests for this life."
         elseif humanoid.Health<=0 then farm.confirmWave30Death(attempt)
-        else farm.resetMessage="Wave 30 reset: requested; waiting for death confirmation." end
+        else farm.resetMessage="Scheduled reset: requested; waiting for death confirmation." end
     end)
     return true
 end
-function farm.wave30ResetStatus()
+function farm.resetStatus()
     local values=child(storage(),"Values")
     local wave=readValue(values,"LocalWave")
-    if not e.Autofarm or not farm.active then return "Wave 30 reset: off" end
-    if (readValue(values,"LocalLives") or 1)<=0 then return "Wave 30 reset: run ended; waiting for next map." end
-    if wave==30 then
+    local settings,err=farm.resetSettings()
+    if not settings then return "Reset disabled: "..err end
+    local prefix="Wave "..settings.wave
+    if not e.Autofarm or not farm.active then return prefix.." reset at "..settings.time..": autofarm off" end
+    if (readValue(values,"LocalLives") or 1)<=0 then return "Scheduled reset: run ended; waiting for next map." end
+    if wave==settings.wave then
         local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
-        if farm.wave30NightReached and finite(minutes) and minutes>=360 and minutes<1080 then
-            return farm.recovering and "Wave 30 night ended; recovering to Ammo Box before auto-skip resumes."
-                or "Wave 30 night ended; normal auto-skip resumed."
+        if farm.resetNightReached==settings.key and finite(minutes) and minutes>=360 and minutes<1080 then
+            return farm.recovering and prefix.." night ended; recovering to Ammo Box before auto-skip resumes."
+                or prefix.." night ended; normal auto-skip resumed."
         end
         if farm.resetMessage then return farm.resetMessage end
-        return farm.wave30VoteHeld() and "Wave 30: farming until 04:30; advancing vote held." or "Wave 30: ready to start night; reset scheduled for 04:30."
+        return farm.resetVoteHeld() and prefix..": farming until "..settings.time.."; advancing vote held." or prefix..": ready to start night; reset scheduled for "..settings.time.."."
     end
-    if finite(wave) and wave>30 then
-        return farm.recovering and "Wave 30 reset window passed; recovering before normal auto-skip resumes."
-            or "Wave 30 reset window passed; normal auto-skip resumed."
+    if finite(wave) and wave>settings.wave then
+        return farm.recovering and "Reset wave passed; recovering before normal auto-skip resumes."
+            or "Reset wave passed; normal auto-skip resumed."
     end
-    return "Wave 30 reset: scheduled for 04:30; repeat after Ammo Box recovery."
+    return prefix.." reset: scheduled for "..settings.time.."; repeat after Ammo Box recovery."
 end
-farm.resetLabel=runtime.label(farmGroup,"Wave 30 reset: scheduled for 04:30",true)
+control(farmGroup,"FarmResetWave","Reset on wave")
+control(farmGroup,"FarmResetTime","Reset time (in-game H:MM)")
+runtime.label(farmGroup,"Press Enter to apply. Night times: 18:00–05:59. Repeats after Ammo Box recovery until dawn; saved with your Settings profile.",true)
+farm.resetLabel=runtime.label(farmGroup,farm.resetStatus(),true)
 connect(RunService.Heartbeat,function()
     if os.clock()<(farm.resetTickAt or 0) then return end
     farm.resetTickAt=os.clock()+.1
-    local ok=pcall(farm.wave30ResetTick)
-    if not ok then farm.resetMessage="Wave 30 reset check failed; will check again." end
-    local message=farm.wave30ResetStatus()
+    local ok=pcall(farm.resetTick)
+    if not ok then farm.resetMessage="Scheduled reset check failed; will check again." end
+    local message=farm.resetStatus()
     if message~=farm.resetDisplayed then
         local shown,result=pcall(function() return farm.resetLabel:SetText(message) end)
         if shown and result~=false then farm.resetDisplayed=message end
