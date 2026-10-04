@@ -45,11 +45,11 @@ local Settings = UI:AddLeftGroupbox('Menu / diagnostics')
 
 Aim:AddToggle('ASilent', {Text = 'Enable silent aim', Default = true})
 Aim:AddLabel('Activation'):AddKeyPicker('AAimKey', {Default = 'MB2', Mode = 'Always', Text = 'Silent aim'})
-Aim:AddSlider('AFOV', {Text = 'FOV radius (pixels)', Default = 54, Min = 10, Max = 700, Rounding = 0})
+Aim:AddSlider('AFOV', {Text = 'FOV radius (pixels)', Default = 30, Min = 10, Max = 700, Rounding = 0})
 Aim:AddSlider('AChance', {Text = 'Hit chance (%)', Default = 100, Min = 0, Max = 100, Rounding = 0})
 Aim:AddDropdown('APart', {Text = 'Aim part', Values = {'Head', 'Body'}, Default = 1})
 Aim:AddToggle('AHealthAim', {Text = 'HP-based head / torso selection', Default = true})
-Aim:AddLabel('Per shot: HP <= 100: 50% head / 50% torso. HP > 100: always head. Overrides Aim part.', true)
+Aim:AddLabel('Per shot: HP <= 100: 30% head / 70% torso. HP > 100: always head. Overrides Aim part.', true)
 Aim:AddToggle('AWalls', {Text = 'Visibility check', Default = true})
 Aim:AddToggle('ACircle', {Text = 'Show FOV circle', Default = true})
 Aim:AddLabel('Standard guns only; launchers are excluded.', true)
@@ -64,13 +64,12 @@ Filters:AddToggle('APlayers', {Text = 'Target players', Default = true})
 Filters:AddToggle('ABots', {Text = 'Target replacement bots', Default = true})
 Filters:AddToggle('ATeam', {Text = 'Team check', Default = true})
 Filters:AddSlider('ADistance', {Text = 'Max distance (studs)', Default = 1000, Min = 25, Max = 3000, Rounding = 0})
-ESP:AddToggle('AESP', {Text = 'Enable ESP', Default = false})
+ESP:AddToggle('AESP', {Text = 'Enable ESP (real players only)', Default = true})
 ESP:AddToggle('AHighlight', {Text = 'Highlights', Default = true})
-ESP:AddToggle('ANames', {Text = 'Names / bot label', Default = true})
+ESP:AddToggle('ANames', {Text = 'Player names', Default = true})
 ESP:AddToggle('AHealth', {Text = 'Health', Default = true})
 ESP:AddToggle('AESPDistance', {Text = 'Distance', Default = true})
 ESP:AddLabel('Player color'):AddColorPicker('APlayerColor', {Default = Color3.fromRGB(255, 100, 100)})
-ESP:AddLabel('Bot color'):AddColorPicker('ABotColor', {Default = Color3.fromRGB(255, 190, 60)})
 
 local Toggles, Options = env.Toggles, env.Options
 Settings:AddLabel('Menu key'):AddKeyPicker('AMenuKey', {Default = 'RightControl', NoUI = true, Text = 'Menu'})
@@ -150,6 +149,10 @@ local function record(entity)
     if not part then return end
     return {entity = entity, model = model, part = part, position = part.Position, distance = distance, bot = bot}
 end
+local function espRecord(entity)
+    local target = record(entity)
+    if target and not target.bot and target.entity.Instance:IsA('Player') then return target end
+end
 local function chooseShotTarget(target)
     local mode = Options.APart.Value
     if Toggles.AHealthAim.Value then
@@ -159,7 +162,7 @@ local function chooseShotTarget(target)
             health = humanoid and tonumber(humanoid.Health)
         end
         if health then
-            mode = health > 100 and 'Head' or (math.random(1, 2) == 1 and 'Head' or 'Body')
+            mode = health > 100 and 'Head' or (math.random(1, 100) <= 30 and 'Head' or 'Body')
         end
     end
     local part = aimPart(target.entity, target.model, mode)
@@ -347,7 +350,7 @@ local function updateESP()
     local me = localEntity()
     if Toggles.AESP.Value and me and me.World then
         for _, entity in pairs(worldEntities(me.World)) do
-            local target = record(entity)
+            local target = espRecord(entity)
             if target then
                 seen[entity] = true
                 local item = state.esp[entity]
@@ -374,7 +377,7 @@ local function updateESP()
                     item = {model = target.model, highlight = highlight, billboard = billboard, label = label}
                     state.esp[entity] = item
                 end
-                local color = target.bot and Options.ABotColor.Value or Options.APlayerColor.Value
+                local color = Options.APlayerColor.Value
                 item.highlight.Enabled = Toggles.AHighlight.Value
                 item.highlight.FillColor = color
                 item.highlight.OutlineColor = color
@@ -382,7 +385,7 @@ local function updateESP()
                 item.billboard.Adornee = target.model:FindFirstChild('Head', true) or target.part
                 local lines = {}
                 if Toggles.ANames.Value then
-                    table.insert(lines, (target.bot and '[BOT] ' or '') .. GameService.GetDisplayName(entity.Instance))
+                    table.insert(lines, GameService.GetDisplayName(entity.Instance))
                 end
                 local details = {}
                 if Toggles.AHealth.Value then
