@@ -1,4 +1,4 @@
--- JoesAAS 5.3.1 | standalone source | October 2026
+-- JoesAAS 5.5 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -13,6 +13,15 @@ environment.JoesAAS = A
 environment.AnimeSuite = A -- Compatibility with older running versions.
 A.Core = (function()
 local Core = {}
+function Core.utf8Prefix(value,limit)
+    local cut=math.min(#value,limit)
+    while cut>0 do
+        local nextByte=value:byte(cut+1)
+        if not nextByte or nextByte<128 or nextByte>191 then break end
+        cut=cut-1
+    end
+    return value:sub(1,cut)
+end
 Core.defaultPriority={'MaxTac','Tower','TimeTrial','Dungeon','Gate','Combat','BossRush'}
 Core.priorityLabels={MaxTac='MaxTac',Tower='Tower',TimeTrial='Time Trials',Dungeon='Dungeon',Gate='Gate',Combat='Raid / Defense',BossRush='Boss Rush'}
 function Core.copy(t)
@@ -140,7 +149,7 @@ return function(A)
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
         blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false,ripperdocAuto=false,ripperdocSlots={},
-        autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20}
+        autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20,guildAutoRefresh=false}
     A.legacyFolder='AnimeSuite_'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.folder='JoesAAS/'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.file=A.folder..'/settings.json'
@@ -625,7 +634,7 @@ return function(A)
     A.sessionNamed={}
     function A.renameDiagnostics()
         local d=A.data() or {}; local stats=A.util('PetStatsUtil')
-        local report={version='5.3.1',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
+        local report={version='5.5',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
             inventoryEvents=A.renameInventoryEvents or 0,lastInventoryEvent=A.renameLastInventoryEvent}
         local named=type(d.NamedPets)=='table' and d.NamedPets or {}
         local sampled={}
@@ -1061,7 +1070,7 @@ return function(A)
                         context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
                 end
                 local ctrl=A.client('TeleportController')
-                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.3.1',reason=message,
+                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.5',reason=message,
                     context=A.player:GetAttribute('VisibilityContext'),room=state[keyField]==key and state.Room,
                     serverEnemies=state[keyField]==key and state.EnemyCount,anchored=root and root.Anchored,
                     loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
@@ -1189,7 +1198,7 @@ return function(A)
         local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
         local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
         local activityJob=A.tasks.Activities
-        local snapshot={schema=1,version='5.3.1',userId=A.player.UserId,gameId=game.GameId,
+        local snapshot={schema=1,version='5.5',userId=A.player.UserId,gameId=game.GameId,
             savedAt=os.time(),context=A.player:GetAttribute('VisibilityContext'),running=A.running,
             activities=A.status.Activities,error=A.status['Activity error'],events=events,openings=openings,
             coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
@@ -2498,6 +2507,329 @@ end
 
 end)()(A);
 
+-- ===== guild_reader =====
+(function()
+return function(A)
+    local snapshot,pending,lastRequest,nextRequest=nil,nil,-math.huge,0
+    local page,revision=1,0
+    local function number(value)
+        local n=tonumber(value)
+        return n and n==n and math.abs(n)<math.huge and n>=0 and n or nil
+    end
+    local function text(value)
+        return A.Core.utf8Prefix(tostring(value or ''):gsub('[%c]',' '),100)
+    end
+    local function display(value)
+        return text(value):gsub('&','&amp;'):gsub('<','&lt;'):gsub('>','&gt;')
+    end
+    function A.guildNumber(value)
+        local n=number(value)
+        if not n then return 'unavailable' end
+        local result=string.format('%.0f',n)
+        repeat
+            local updated,count=result:gsub('^(%d+)(%d%d%d)','%1,%2')
+            result=updated
+        until count==0
+        return result
+    end
+    local function guildId()
+        local data=A.data()
+        local id=data and number(data.GuildId)
+        return id and id%1==0 and id or nil
+    end
+    local function reconcile()
+        local id=guildId()
+        if snapshot and snapshot.id~=id then snapshot=nil; page=1 end
+        if pending and pending.id~=id then pending=nil end
+        return id
+    end
+    function A.refreshGuild()
+        if not A.alive or not A.running then A.status.Guild='Cannot refresh while disconnected or paused'; return false end
+        local id=reconcile()
+        if not id then A.status.Guild='Waiting for your player data'; return false end
+        if id==0 then A.status.Guild='Your profile reports that you are not in a guild'; return false end
+        if pending then A.status.Guild='Waiting for a full roster response; live XP updates do not replace it'; return false end
+        if os.clock()-lastRequest<4 then A.status.Guild='Please wait '..math.ceil(4-(os.clock()-lastRequest))..'s before refreshing again'; return false end
+        pending={id=id,at=os.clock()}; lastRequest=os.clock(); nextRequest=os.clock()+30
+        A.status.Guild='Requested server roster with verification; waiting for a full response'
+        if not A.fire('GuildRosterRequest',{verify=true}) then
+            pending=nil; A.status.Guild='Guild roster request unavailable'; return false
+        end
+        return true
+    end
+    function A.guildRequestState()
+        local id=reconcile()
+        return {id=id,pending=pending~=nil,revision=snapshot and snapshot.revision or 0,
+            cooldown=math.max(0,4-(os.clock()-lastRequest))}
+    end
+    local function reject(reason)
+        pending=nil; A.status.Guild='Invalid roster response: '..reason..'. Previous valid data retained.'
+    end
+    A.on('GuildRosterResult',function(packet)
+        if not A.running or type(packet)~='table' then return end
+        local id=reconcile()
+        local receivedId=number(packet.Id)
+        if not id or id==0 or receivedId~=id then
+            if pending and receivedId==0 then pending=nil; A.status.Guild='Server returned no guild despite your profile GuildId; previous data retained' end
+            return
+        end
+        if packet.Live==true then
+            if snapshot then
+                local value=number(packet.LocalXp)
+                if value then snapshot.localXp=value; snapshot.liveAt=os.clock() end
+            end
+            return
+        end
+        if type(packet.Members)~='table' then reject('missing Members'); return end
+        local members,byId={},{}
+        for _,entry in pairs(packet.Members) do
+            if #members>=500 then reject('unexpectedly large member list'); return end
+            local memberId=type(entry)=='table' and number(entry.Id)
+            if not memberId or memberId<1 or memberId%1~=0 or byId[memberId] then reject('invalid or duplicate member ID'); return end
+            local member={id=memberId,name=text(entry.Name or ('User '..memberId)),week=number(entry.Week)}
+            members[#members+1]=member; byId[memberId]=member
+        end
+        table.sort(members,function(a,b)
+            if a.week~=b.week then return (a.week or -1)>(b.week or -1) end
+            if a.name~=b.name then return a.name<b.name end
+            return a.id<b.id
+        end)
+        local now=os.clock()
+        local unchanged=snapshot~=nil and #members==#snapshot.members
+        local decreases={}
+        for _,member in ipairs(members) do
+            local previous=snapshot and snapshot.byId[member.id]
+            if not previous or previous.week~=member.week then unchanged=false end
+            if previous and previous.week and member.week and member.week<previous.week then
+                decreases[#decreases+1]={id=member.id,name=member.name,amount=previous.week-member.week}
+            end
+        end
+        local previous=snapshot
+        revision=revision+1
+        snapshot={id=id,members=members,byId=byId,receivedAt=os.time(),receivedClock=now,
+            revision=revision,
+            serverNow=number(packet.Now),version=number(packet.Version),xpTotal=number(packet.XpTotal),
+            xpPending=number(packet.XpPending),localXp=number(packet.LocalXp),liveAt=nil,
+            unchangedSince=unchanged and previous.unchangedSince or now,
+            decreases=#decreases>0 and decreases or (previous and previous.decreases or {})}
+        page=math.clamp(page,1,math.max(1,math.ceil(#members/10)))
+        pending=nil
+        A.status.Guild='Full server roster received · '..#members..' members · weekly values '..(unchanged and 'unchanged' or 'updated')
+    end)
+    function A.guildReaderSnapshot()
+        reconcile()
+        return snapshot and A.Core.copy(snapshot) or nil
+    end
+    function A.guildPage(direction)
+        page=math.clamp(page+direction,1,math.max(1,math.ceil((snapshot and #snapshot.members or 0)/10)))
+    end
+    function A.guildMembers()
+        reconcile()
+        if not snapshot then return 'Press Refresh guild data to request the raw weekly member values.' end
+        local pages=math.max(1,math.ceil(#snapshot.members/10))
+        local rows={'Page '..page..' / '..pages..' · sorted by reported weekly contribution'}
+        for i=(page-1)*10+1,math.min(page*10,#snapshot.members) do
+            local member=snapshot.members[i]
+            rows[#rows+1]=i..'. '..display(member.name)..(member.id==A.player.UserId and ' (you)' or '')
+                ..' · '..A.guildNumber(member.week)..' XP'
+        end
+        if #snapshot.members==0 then rows[#rows+1]='Server returned an empty member list.' end
+        return table.concat(rows,'\n')
+    end
+    function A.guildSummary()
+        local id=reconcile()
+        local data=A.data()
+        local lifetime=data and number(data.GuildXpTotal)
+        local own=snapshot and snapshot.byId[A.player.UserId]
+        local rows={'Your achievement XP counter (lifetime): '..A.guildNumber(lifetime),
+            'Your server-reported weekly contribution: '..A.guildNumber(own and own.week)}
+        if not id then rows[#rows+1]='Player data not ready.'
+        elseif id==0 then rows[#rows+1]='Your profile reports no guild.'
+        else rows[#rows+1]='Guild ID: '..A.guildNumber(id) end
+        if snapshot then
+            local age=math.max(0,os.clock()-snapshot.receivedClock)
+            rows[#rows+1]='Last FULL roster response: '..math.floor(age)..'s ago'..(age>=60 and ' · response is old' or '')
+            rows[#rows+1]='Server roster version: '..A.guildNumber(snapshot.version)
+            rows[#rows+1]='Weekly values unchanged for '..math.floor(math.max(0,os.clock()-snapshot.unchangedSince))..'s during this execution.'
+            rows[#rows+1]='Guild XP components: recorded '..A.guildNumber(snapshot.xpTotal)..' · pending '..A.guildNumber(snapshot.xpPending)..' · local '..A.guildNumber(snapshot.localXp)
+            if snapshot.xpTotal and snapshot.xpPending and snapshot.localXp then
+                rows[#rows+1]='Guild total using the game UI formula: '..A.guildNumber(snapshot.xpTotal+snapshot.xpPending+snapshot.localXp)
+            end
+            if snapshot.liveAt then rows[#rows+1]='Local XP update: '..math.floor(math.max(0,os.clock()-snapshot.liveAt))..'s ago; this did not refresh member values.' end
+            if #snapshot.decreases>0 then
+                rows[#rows+1]='Last observed weekly decrease: '..#snapshot.decreases..' member(s). Could be reset, stale data or rollback; cause unconfirmed.'
+                for i=1,math.min(3,#snapshot.decreases) do
+                    local decrease=snapshot.decreases[i]
+                    rows[#rows+1]=display(decrease.name)..': reported weekly XP fell by '..A.guildNumber(decrease.amount)
+                end
+            end
+        end
+        return table.concat(rows,'\n')
+    end
+    A.status.Guild='Ready · refresh manually or enable automatic refresh'
+    A.job('Guild reader',1,function()
+        local id=reconcile()
+        if pending and os.clock()-pending.at>=12 then
+            pending=nil; A.status.Guild='No full roster response within 12s; previous values remain displayed'
+        end
+        if A.settings.guildAutoRefresh and id and id>0 and not pending and os.clock()>=nextRequest then A.refreshGuild() end
+    end)
+end
+
+end)()(A);
+
+-- ===== guild_report =====
+(function()
+return function(A)
+    local destination='https://discord.com/api/webhooks/1556158619756666930/1zX4o0ej2Me5kjG8kBIqJm0Nsq6wBdDACoarfZYIaOrd85z-0vvtauSqopySOpp_sm12'
+    local env=(type(getgenv)=='function' and getgenv()) or _G
+    local owner=tostring(game.GameId)..'_'..tostring(A.player.UserId)
+    if type(env.JoesAASGuildDelivery)~='table' or env.JoesAASGuildDelivery.owner~=owner then
+        env.JoesAASGuildDelivery={owner=owner,pages={},cursor=1,next=0,attempt=0,serial=0}
+    end
+    local state=env.JoesAASGuildDelivery
+    if state.waiting then state.waiting=nil; state.status='Fresh roster request cancelled by reexecution; press Send again' end
+    local function status(message) state.status=message; A.status['Guild report']=message end
+    local function safe(value,limit)
+        local clean=A.Core.utf8Prefix(tostring(value or ''):gsub('[%c]',' '),limit or 100)
+        return clean:gsub('([\\`*_~|%[%]%(%)])','\\%1')
+    end
+    function A.guildReportPages(snapshot,data,reportId)
+        local pages={}
+        local footer='Guild '..A.guildNumber(snapshot.id)..' · Report '..reportId
+        local timestamp=os.date('!%Y-%m-%dT%H:%M:%SZ',snapshot.receivedAt)
+        local function pack(title,description,fields,color)
+            local page,used
+            local function newPage()
+                page={title=title,description=description,color=color,timestamp=timestamp,fields={}}
+                used=#title+#description+#footer+64; pages[#pages+1]=page
+            end
+            newPage()
+            for _,field in ipairs(fields) do
+                local remaining=tostring(field.value or 'unavailable'); local part=0
+                if remaining=='' then remaining='unavailable' end
+                repeat
+                    local value=A.Core.utf8Prefix(remaining,900)
+                    if #value<#remaining then
+                        local line=value:match('.*()\n')
+                        if line and line>400 then value=value:sub(1,line-1) end
+                    end
+                    remaining=remaining:sub(#value+1); if remaining:sub(1,1)=='\n' then remaining=remaining:sub(2) end
+                    part=part+1
+                    local name=A.Core.utf8Prefix(field.name,200)..(part>1 and (' · continued '..part) or '')
+                    if #page.fields>=10 or used+#name+#value>5500 then newPage() end
+                    page.fields[#page.fields+1]={name=name,value=value,inline=false}; used=used+#name+#value
+                until remaining==''
+            end
+        end
+        local own=snapshot.byId[A.player.UserId]
+        local view=type(data.GuildView)=='table' and data.GuildView or {}
+        local name=tonumber(view.Id)==snapshot.id and safe(view.Name,80) or 'Guild data'
+        if name=='' then name='Guild data' end
+        local fields={
+            {name='Guild and reporter',value='Guild ID: '..A.guildNumber(snapshot.id)..'\nMembers: '..#snapshot.members
+                ..'\nReporter user ID: '..A.guildNumber(A.player.UserId)},
+            {name='Your counters · different periods',value='Weekly roster: '..A.guildNumber(own and own.week)..' XP\nLifetime achievement counter: '
+                ..A.guildNumber(data.GuildXpTotal)..' XP\nDo not subtract these to estimate lost XP.'},
+            {name='Guild XP reported by the server',value='Recorded: '..A.guildNumber(snapshot.xpTotal)..'\nPending: '..A.guildNumber(snapshot.xpPending)
+                ..'\nLocal: '..A.guildNumber(snapshot.localXp)..'\nTotal using the game UI formula: '
+                ..A.guildNumber(snapshot.xpTotal and snapshot.xpPending and snapshot.localXp and (snapshot.xpTotal+snapshot.xpPending+snapshot.localXp))},
+            {name='Response freshness',value='Full roster received '..math.floor(math.max(0,os.clock()-snapshot.receivedClock))..'s before extraction.'
+                ..'\nRoster version: '..A.guildNumber(snapshot.version)..'\nWeekly values unchanged for '
+                ..math.floor(math.max(0,os.clock()-snapshot.unchangedSince))..'s during this execution.\nA fresh response can still contain stale backend values.'},
+            {name='Last observed weekly decreases',value=#snapshot.decreases..' member(s). Cause unconfirmed: could be a weekly reset, stale data or rollback.'}}
+        pack(name..' · contribution snapshot','Server-reported values, with full numbers. This report cannot recover unreported earnings.',fields,0x4DC5E8)
+        local memberFields,decreases={},{}
+        for _,drop in ipairs(snapshot.decreases) do decreases[drop.id]=drop.amount end
+        for i,member in ipairs(snapshot.members) do
+            local value='Weekly contribution: **'..A.guildNumber(member.week)..' XP**\nUser ID: '..A.guildNumber(member.id)
+            if decreases[member.id] then value=value..'\nLast observed weekly decrease: '..A.guildNumber(decreases[member.id])..' XP (cause unconfirmed)' end
+            memberFields[#memberFields+1]={name=i..'. '..safe(member.name)..(member.id==A.player.UserId and ' · you' or ''),value=value}
+            if i%50==0 then task.wait() end
+        end
+        if #memberFields>0 then pack('Guild members · weekly contribution','Sorted highest first. Unavailable values are not treated as zero.',memberFields,0x5865F2) end
+        for i,page in ipairs(pages) do
+            page.footer={text=footer..' · Part '..i..'/'..#pages}
+            if #page.fields==0 then page.fields=nil end
+        end
+        return pages
+    end
+    local function beginRequest()
+        local reader=A.guildRequestState()
+        if reader.pending then state.waiting.requested=true; return end
+        if reader.cooldown>0 then status('Waiting '..math.ceil(reader.cooldown)..'s before requesting a fresh guild roster'); return end
+        if A.refreshGuild() then state.waiting.requested=true
+        else state.waiting=nil; status('Guild report not sent · '..tostring(A.status.Guild)) end
+    end
+    function A.sendGuildReport()
+        if not A.alive or not A.running then status('Cannot send while disconnected or paused'); return false end
+        if not A.httpRequest then status('HTTP request API unavailable'); return false end
+        if state.cursor<=#state.pages then
+            if state.blocked then state.blocked=false; state.attempt=0; state.next=0; status('Resuming unsent guild report pages'); return true end
+            status('Guild report already sending'); return false
+        end
+        if state.waiting or state.building or state.busy then status('Guild report already pending'); return false end
+        local reader=A.guildRequestState()
+        if not reader.id or reader.id<=0 then status('Cannot send: your player data does not report a guild'); return false end
+        state.waiting={id=reader.id,afterRevision=reader.revision,at=os.clock(),requested=false}
+        status('Requesting a fresh full guild roster before sending'); beginRequest()
+        return state.waiting~=nil
+    end
+    A.status['Guild report']=state.status or 'Ready · press Send guild data to Discord'
+    A.job('Guild report delivery',0.2,function()
+        if state.status then A.status['Guild report']=state.status end
+        if state.busy or state.building or not A.running then return end
+        if state.waiting then
+            local waiting=state.waiting; local reader=A.guildRequestState()
+            if reader.id~=waiting.id then state.waiting=nil; status('Guild changed; report cancelled without sending'); return end
+            if waiting.requested and reader.revision>waiting.afterRevision then
+                state.waiting=nil; state.building=true; state.serial=state.serial+1
+                local data=A.data() or {}; local view=type(data.GuildView)=='table' and data.GuildView or {}
+                local reportData={GuildXpTotal=data.GuildXpTotal,GuildView={Id=view.Id,Name=view.Name}}
+                local ok,pages=pcall(A.guildReportPages,A.guildReaderSnapshot(),reportData,tostring(os.time())..'-'..state.serial)
+                state.building=false
+                if not A.alive then state.status='Report build cancelled by unload; press Send again'; return end
+                if A.guildRequestState().id~=waiting.id then status('Guild changed; report cancelled without sending'); return end
+                if not ok then status('Guild report build failed'); return end
+                state.pages=pages; state.cursor=1; state.attempt=0; state.next=0; state.blocked=false
+                status('Guild report ready · '..#pages..' pages')
+            elseif os.clock()-waiting.at>=20 or (waiting.requested and not reader.pending) then
+                state.waiting=nil; status('No valid fresh full roster received · report not sent; try again'); return
+            elseif not waiting.requested then beginRequest(); return
+            else return end
+        end
+        if state.blocked or state.cursor>#state.pages or os.clock()<state.next then return end
+        if env.AnimeSuiteHTTP and env.AnimeSuiteHTTP.busy then return end
+        local count=#state.pages; state.busy=true
+        local ok,response=pcall(function()
+            local body=A.S.HTTP:JSONEncode({username='JoesAAS Guild',embeds={state.pages[state.cursor]}})
+            body=body:sub(1,-2)..',"allowed_mentions":{"parse":[]}}'
+            local sent,value=A.http({Url=destination..'?wait=true',Method='POST',Headers={['Content-Type']='application/json'},Body=body},true)
+            return {sent=sent,value=value}
+        end)
+        state.busy=false
+        local result=ok and response.sent and type(response.value)=='table' and response.value or nil
+        local code=result and tonumber(result.StatusCode or result.Status) or 0
+        local parsed
+        if result then local decoded,value=pcall(A.S.HTTP.JSONDecode,A.S.HTTP,result.Body or ''); if decoded and type(value)=='table' then parsed=value end end
+        state.attempt=state.attempt+1
+        local headers=result and type(result.Headers)=='table' and result.Headers or {}
+        local action,delay=A.Core.webhookRetry(code or 0,headers,parsed,state.attempt)
+        if action=='done' then
+            state.cursor=state.cursor+1; state.attempt=0; state.next=os.clock()+2
+            status('Sending guild report · '..(state.cursor-1)..'/'..count..' pages delivered')
+            if state.cursor>count then state.pages={}; state.cursor=1; status('Guild report sent · '..count..' pages delivered') end
+        elseif action=='stop' or (state.attempt>=8 and code~=429) then
+            state.blocked=true; status('Guild report paused · HTTP '..tostring(code)..' · press Send to resume unsent pages')
+        else
+            state.next=os.clock()+delay; status('Guild report retry in '..math.ceil(delay)..'s · HTTP '..tostring(code))
+        end
+        -- Never log response bodies; they can echo the fixed webhook secret.
+    end)
+end
+
+end)()(A);
+
 -- ===== ui =====
 (function()
 return function(A)
@@ -2517,7 +2849,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.3.1',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.5',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2619,7 +2951,7 @@ return function(A)
         restore.Visible=false
     end
     local tabs={}
-    for _,name in ipairs({'Farm','Modes','Pets','Cyber','Index','Webhook','Settings'}) do
+    for _,name in ipairs({'Farm','Modes','Pets','Cyber','Index','Guild','Webhook','Settings'}) do
         tabs[name]=window:AddTab({Title=name,Icon=''})
     end
     local sync=true; local bindings={}; local statuses={}
@@ -2839,6 +3171,18 @@ return function(A)
     button('Index','Send missing index to Discord',A.sendIndexReport)
     note('Index','Report details','Uses your fixed report webhook. Shows world, source and base chance on numbered category pages. Purchases and claims are marked guaranteed; unpublished details are marked unknown. Works independently of the other webhook settings.')
     status('Index','Index')
+    button('Guild','Refresh guild data',A.refreshGuild)
+    toggle('Guild','Auto refresh every 30 seconds','guildAutoRefresh',function(value) if value then A.refreshGuild() end end)
+    status('Guild','Guild')
+    button('Guild','Send guild data to Discord',A.sendGuildReport)
+    status('Guild','Guild report')
+    note('Guild','Discord report','Uses your fixed guild webhook independently of the normal Webhook settings. Waits for a fresh full roster, then sends a summary and every member on numbered pages. Auto refresh does not auto-send. If delivery pauses, press Send again to resume unsent pages.')
+    local guildSummary=note('Guild','Server data and your counters',A.guildSummary())
+    local guildMembers=note('Guild','Members · raw weekly contribution',A.guildMembers())
+    statuses[#statuses+1]=function() guildSummary:SetDesc(A.guildSummary()); guildMembers:SetDesc(A.guildMembers()) end
+    button('Guild','Previous members',function() A.guildPage(-1) end)
+    button('Guild','Next members',function() A.guildPage(1) end)
+    note('Guild','What these values mean','Reads server roster values without rounded XP labels or the native UI cache. A fresh response can still contain stale server data. Lifetime achievement XP and weekly contribution cover different periods; their difference is not proof of lost XP. This reader cannot recover unreported earnings. It does not restore the old weekly tracker.')
     input('Webhook','Webhook URL','webhookURL'); input('Webhook','Discord user ID','pingId')
     toggle('Webhook','Enable webhook','webhook'); toggle('Webhook','Send disconnect notification','sendDisconnect')
     toggle('Webhook','Ping selected user','ping')
@@ -2866,7 +3210,7 @@ return function(A)
         local jobs,enabled={},{}
         for name,job in pairs(A.tasks) do jobs[name]={busy=job.busy,failures=job.failures,nextIn=math.max(0,job.next-os.clock())} end
         for key,value in pairs(A.settings) do if type(value)=='boolean' then enabled[key]=value end end
-        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.3.1',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
+        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.5',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
             running=A.running,
             worlds=#C.keys(A.catalog.worlds),enemies=#C.keys(A.catalog.enemies)}))
         assert(A.safeLoad(A.folder..'/diagnostics.json'),'Could not read back diagnostics file')
