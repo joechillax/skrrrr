@@ -485,6 +485,15 @@ local function updatePickerCursor()
     end
 end
 RunService:BindToRenderStep("CombatAssistantPickerCursor", Enum.RenderPriority.Last.Value + 1, updatePickerCursor)
+-- Native weapon rays exclude cosmetic effects and the new client-side corpses.
+-- Keep these exclusions out of movement rays: corpse parts can still collide.
+function runtime.combatIgnore(ignored)
+    for _,name in ipairs({"IgnoreList","SafeIgnoreList"}) do
+        local folder=Workspace:FindFirstChild(name)
+        if folder and not table.find(ignored,folder) then table.insert(ignored,folder) end
+    end
+    return ignored
+end
 local visibilityParams = RaycastParams.new()
 visibilityParams.FilterType = Enum.RaycastFilterType.Exclude
 function runtime.zombiePart(part)
@@ -661,7 +670,7 @@ local function getTargetHead()
     for _, player in ipairs(Players:GetPlayers()) do
         if player.Character then table.insert(ignored, player.Character) end
     end
-    visibilityParams.FilterDescendantsInstances = ignored
+    visibilityParams.FilterDescendantsInstances = runtime.combatIgnore(ignored)
     local candidate
     for _, zombie in ipairs(zombiesFolder:GetChildren()) do
         if config.SuperPriorityList[zombie.Name] then runtime.superSeen = runtime.superSeen + 1 end
@@ -1083,16 +1092,46 @@ local function notifyTrigger(text)
     end)
 end
 
+function runtime.invalidateGunCallbacks()
+    runtime.callbackTool,runtime.callbackUntil,runtime.callbacks=nil,0,nil
+end
+function runtime.clearGunCallbackWatch()
+    local watch=runtime.callbackWatch
+    runtime.callbackWatch=nil
+    if watch then for _,connection in ipairs(watch.connections) do pcall(function() connection:Disconnect() end) end end
+end
+function runtime.watchGunCallbacks(tool)
+    local watch=runtime.callbackWatch
+    if watch and watch.tool==tool then return end
+    runtime.clearGunCallbackWatch()
+    runtime.invalidateGunCallbacks()
+    watch={tool=tool,character=LocalPlayer.Character,connections={}}
+    runtime.callbackWatch=watch
+    local function changed()
+        if not runtime.active or runtime.callbackWatch~=watch then return end
+        runtime.invalidateGunCallbacks()
+        if runtime.releaseGunInput then runtime.releaseGunInput() end
+    end
+    for _,signal in ipairs({tool.Equipped or false,tool.Unequipped or false,tool.AncestryChanged or false}) do
+        if signal and type(signal.Connect)=="function" then table.insert(watch.connections,signal:Connect(changed)) end
+    end
+end
+table.insert(runtime.connections,{Disconnect=function() runtime.clearGunCallbackWatch();runtime.invalidateGunCallbacks() end})
+
 -- Invoke only callbacks belonging to the equipped GunScript. Never fire a whole UI signal.
 function runtime.gunCallbacks()
     local tool=equippedGun()
-    if not tool or type(getconnections)~="function" or type(getfenv)~="function" then return end
+    if not tool then runtime.invalidateGunCallbacks();return end
+    if type(getconnections)~="function" or type(getfenv)~="function" then return end
     local gun=tool:FindFirstChild("GunScript")
     if not gun then return end
+    runtime.watchGunCallbacks(tool)
     local now=os.clock()
     if runtime.callbackTool==tool and runtime.callbackExperimental==runtime.extra.ExperimentalFire and now<(runtime.callbackUntil or 0) then return runtime.callbacks end
     runtime.callbackExperimental=runtime.extra.ExperimentalFire
-    runtime.callbackTool,runtime.callbackUntil,runtime.callbacks=tool,now+.5,nil
+    -- Equip callbacks may be installed just after the ancestry notification.
+    -- A missing pair must be retried promptly instead of cached for half a second.
+    runtime.callbackTool,runtime.callbackUntil,runtime.callbacks=tool,now+.05,nil
     local function find(signal)
         if not signal then return end
         local ok,connections=pcall(getconnections,signal)
@@ -1116,13 +1155,14 @@ function runtime.gunCallbacks()
         local up=attack and find(attack.InputEnded)
         if down and up then
             runtime.callbacks={down=down,up=up,reload=find(UIS.InputBegan),backend="Attack-button callbacks (experimental)"}
+            runtime.callbackUntil=now+.5
             return runtime.callbacks
         end
     end
     local ok,mouse=pcall(function() return LocalPlayer:GetMouse() end)
     if not ok then return end
     local down,up=find(mouse.Button1Down),find(mouse.Button1Up)
-    if down and up then runtime.callbacks={down=down,up=up,reload=find(UIS.InputBegan),backend="Gun mouse callbacks"} end
+    if down and up then runtime.callbacks={down=down,up=up,reload=find(UIS.InputBegan),backend="Gun mouse callbacks"};runtime.callbackUntil=now+.5 end
     return runtime.callbacks
 end
 
@@ -1188,6 +1228,7 @@ local function releaseHeld()
     retryInput(err)
     return false
 end
+runtime.releaseGunInput=releaseHeld
 
 local function setTriggerEnabled(value)
     if value and pointState.picking then finishPick() end
@@ -2968,7 +3009,7 @@ end
 function state.actionTargets(origin,range,melee)
     local params=RaycastParams.new()
     params.FilterType=Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances={LocalPlayer.Character,Workspace.CurrentCamera}
+    params.FilterDescendantsInstances=runtime.combatIgnore({LocalPlayer.Character,Workspace.CurrentCamera})
     local list={}
     for _,model in ipairs(zombiesFolder:GetChildren()) do
         local humanoid=model:FindFirstChildOfClass("Humanoid")
