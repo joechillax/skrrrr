@@ -193,23 +193,61 @@ local function visible(target, origin)
     local direction = target.position - origin
     return direction.Magnitude > 0.001 and workspace:Raycast(origin, direction, params) == nil
 end
+local function partFOVScore(part, camera, center)
+    -- Test projected hitbox overlap, rather than requiring its center inside FOV.
+    local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+    local half = part.Size / 2
+    for _, x in ipairs({-1, 1}) do
+        for _, y in ipairs({-1, 1}) do
+            for _, z in ipairs({-1, 1}) do
+                local point = part.CFrame:PointToWorldSpace(Vector3.new(half.X * x, half.Y * y, half.Z * z))
+                local screen = camera:WorldToViewportPoint(point)
+                if screen.Z > 0 then
+                    minX, minY = math.min(minX, screen.X), math.min(minY, screen.Y)
+                    maxX, maxY = math.max(maxX, screen.X), math.max(maxY, screen.Y)
+                end
+            end
+        end
+    end
+    minX, minY = math.max(minX, 0), math.max(minY, 0)
+    maxX, maxY = math.min(maxX, camera.ViewportSize.X), math.min(maxY, camera.ViewportSize.Y)
+    if minX > maxX or minY > maxY then return end
+    local closest = Vector2.new(math.clamp(center.X, minX, maxX), math.clamp(center.Y, minY, maxY))
+    return (closest - center).Magnitude
+end
+local function scanTarget(target, camera, center, origin)
+    local parts = {target.part}
+    -- A nearby torso can fill the FOV while the head's center is far above it.
+    local torso = aimPart(target.entity, target.model, 'Body')
+    if torso and torso ~= target.part then table.insert(parts, torso) end
+    local best, score = nil, math.huge
+    for _, part in ipairs(parts) do
+        local distance = partFOVScore(part, camera, center)
+        if distance and distance <= Options.AFOV.Value and distance < score then
+            local candidate = table.clone(target)
+            candidate.part, candidate.position = part, part.Position
+            if not Toggles.AWalls.Value or visible(candidate, origin) then
+                best, score = candidate, distance
+            end
+        end
+    end
+    return best, score
+end
 local function selectTarget()
     if not canFight() then return end
     local camera = workspace.CurrentCamera
     local center = camera.ViewportSize / 2
-    local best, bestScore = nil, Options.AFOV.Value
+    local best, bestScore = nil, math.huge
+    local origin = originalOriginGetter()
     for _, entity in pairs(worldEntities(localEntity().World)) do
         local target = record(entity)
         if target then
-            local screen, onScreen = camera:WorldToViewportPoint(target.position)
-            local score = (Vector2.new(screen.X, screen.Y) - center).Magnitude
-            if onScreen and screen.Z > 0 and score < bestScore then
-                local controller = EntityController.GetController(entity)
-                local vc = controller and controller.VisibleController
-                local displayed = vc and vc.CurrentVisible and vc.CurrentTransparency ~= 1
-                if displayed and (not Toggles.AWalls.Value or visible(target, camera.CFrame.Position)) then
-                    best, bestScore = target, score
-                end
+            local controller = EntityController.GetController(entity)
+            local vc = controller and controller.VisibleController
+            local displayed = vc and vc.CurrentVisible and vc.CurrentTransparency ~= 1
+            if displayed then
+                local candidate, score = scanTarget(target, camera, center, origin.Position)
+                if candidate and score < bestScore then best, bestScore = candidate, score end
             end
         end
     end
