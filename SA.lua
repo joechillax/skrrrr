@@ -78,7 +78,7 @@ local Status = Settings:AddLabel('Initializing...')
 
 local state = {alive = true, esp = {}, connections = {}, restores = {}, context = setmetatable({}, {__mode = 'k'})}
 local inputTag = 'ArcadeLinoriaTrigger'
-local triggerWeapon, triggerEntity, triggerSince
+local triggerWeapon, triggerEntity, triggerSince, requestedTriggerWeapon
 local originalLocalShoot = Shootable.LocalShoot
 local originalOriginGetter = CameraController.GetCombatOriginFn()
 local silentAvailable = false
@@ -171,6 +171,12 @@ local function chooseShotTarget(target)
     shotTarget.part, shotTarget.position = part, part.Position
     return shotTarget
 end
+local function passthroughShot(component, ...)
+    -- Auto-fire must not degrade to an unredirected crosshair shot.
+    if Toggles.AUseSilent.Value and (component.Holder == triggerWeapon
+        or component.Holder == requestedTriggerWeapon) then return false end
+    return originalLocalShoot(component, ...)
+end
 local function visible(target, origin)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
@@ -260,18 +266,18 @@ local function installSilent()
     local function shootWrapper(component, ...)
         if not state.alive or not Toggles.ASilent.Value or not Options.AAimKey:GetState()
             or Components.Launcher:from(component.Holder) then
-            return originalLocalShoot(component, ...)
+            return passthroughShot(component, ...)
         end
         local target = selectTarget()
         if not target or math.random() * 100 >= Options.AChance.Value then
-            return originalLocalShoot(component, ...)
+            return passthroughShot(component, ...)
         end
         -- Roll once per actual shot, keeping target scanning / trigger timing stable.
         target = chooseShotTarget(target)
-        if not target then return originalLocalShoot(component, ...) end
+        if not target then return passthroughShot(component, ...) end
         local origin = originalOriginGetter()
         if Toggles.AWalls.Value and not visible(target, origin.Position) then
-            return originalLocalShoot(component, ...)
+            return passthroughShot(component, ...)
         end
         local thread = coroutine.running()
         local previous = state.context[thread]
@@ -411,7 +417,7 @@ local function releaseTrigger()
 end
 local function resetTrigger()
     releaseTrigger()
-    triggerEntity, triggerSince = nil, nil
+    triggerEntity, triggerSince, requestedTriggerWeapon = nil, nil, nil
 end
 local function updateTrigger()
     if not Toggles.ATrigger.Value or not Options.ATriggerKey:GetState() or not canFight() then
@@ -447,7 +453,10 @@ local function updateTrigger()
     if triggerWeapon then return end
     if not weapon:CanActionNow(Components.Shootable.Action.Shoot) then return end
     -- Uses the normal action path so weapon timers, ammo and fire rates still apply.
-    if CombatController.PrimaryAction.Begin(inputTag) then
+    requestedTriggerWeapon = weapon
+    local started = CombatController.PrimaryAction.Begin(inputTag)
+    requestedTriggerWeapon = nil
+    if started then
         if shootable:IsFullAuto() then
             triggerWeapon = weapon
         else
@@ -487,21 +496,18 @@ Settings:AddButton({Text = 'Print entity counts', Func = function()
 end})
 Toggles.ATrigger:OnChanged(resetTrigger)
 
-local espElapsed, triggerElapsed = 0, 0
+local espElapsed = 0
 table.insert(state.connections, RunService.Heartbeat:Connect(function(dt)
     if not state.alive then return end
     circle.Visible = Toggles.ACircle.Value
     circle.Size = UDim2.fromOffset(Options.AFOV.Value * 2, Options.AFOV.Value * 2)
-    espElapsed, triggerElapsed = espElapsed + dt, triggerElapsed + dt
+    espElapsed = espElapsed + dt
     if espElapsed >= 0.1 then
         espElapsed = 0
         local ok, err = pcall(updateESP)
         if not ok then report(err) end
     end
-    if triggerElapsed >= 0.02 then
-        triggerElapsed = 0
-        local ok, err = pcall(updateTrigger)
-        if not ok then resetTrigger(); report(err) end
-    end
+    local ok, err = pcall(updateTrigger)
+    if not ok then resetTrigger(); report(err) end
 end))
 Library:Notify('Ready. FOV auto-fire enabled. Right Ctrl toggles the menu.', 5)
