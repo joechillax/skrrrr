@@ -1,4 +1,4 @@
--- JoesAAS 5.6 | standalone source | October 2026
+-- JoesAAS 5.7 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -140,7 +140,7 @@ return function(A)
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
         blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false,ripperdocAuto=false,ripperdocSlots={},
-        autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20}
+        autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20,fixerAutoClaim=false}
     A.legacyFolder='AnimeSuite_'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.folder='JoesAAS/'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.file=A.folder..'/settings.json'
@@ -625,7 +625,7 @@ return function(A)
     A.sessionNamed={}
     function A.renameDiagnostics()
         local d=A.data() or {}; local stats=A.util('PetStatsUtil')
-        local report={version='5.6',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
+        local report={version='5.7',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
             inventoryEvents=A.renameInventoryEvents or 0,lastInventoryEvent=A.renameLastInventoryEvent}
         local named=type(d.NamedPets)=='table' and d.NamedPets or {}
         local sampled={}
@@ -661,6 +661,7 @@ return function(A)
             or ('Could not save rename report: '..tostring(err))
     end
     local pending,retries,retryAfter={},{},{}
+    local nextRename=0
     A.renamePending=nil
     local function isConfirmed(id)
         local d=A.data()
@@ -735,7 +736,14 @@ return function(A)
                 if balance<cost then
                     A.status.Rename=string.format('Need %s %s per Astral; have %s',tostring(cost),cfg.ItemId,tostring(balance)); return
                 end
+                -- Live inventory events can wake this job faster than its normal interval.
+                -- The server limit is shared across pets, so throttle all naming requests.
+                if os.clock()<nextRename then
+                    A.tasks.Renaming.next=nextRename
+                    A.status.Rename='Waiting between naming requests'; return
+                end
                 if A.ready('rename:'..petId,25) then
+                    nextRename=os.clock()+1
                     -- Set pending before Fire: responses may arrive synchronously.
                     retries[petId]=(retries[petId] or 0)+1
                     pending[petId]=os.clock(); A.renamePending=petId
@@ -1061,7 +1069,7 @@ return function(A)
                         context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
                 end
                 local ctrl=A.client('TeleportController')
-                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.6',reason=message,
+                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.7',reason=message,
                     context=A.player:GetAttribute('VisibilityContext'),room=state[keyField]==key and state.Room,
                     serverEnemies=state[keyField]==key and state.EnemyCount,anchored=root and root.Anchored,
                     loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
@@ -1189,7 +1197,7 @@ return function(A)
         local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
         local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
         local activityJob=A.tasks.Activities
-        local snapshot={schema=1,version='5.6',userId=A.player.UserId,gameId=game.GameId,
+        local snapshot={schema=1,version='5.7',userId=A.player.UserId,gameId=game.GameId,
             savedAt=os.time(),context=A.player:GetAttribute('VisibilityContext'),running=A.running,
             activities=A.status.Activities,error=A.status['Activity error'],events=events,openings=openings,
             coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
@@ -1278,6 +1286,20 @@ return function(A)
         local def=definitions[mode]; if not def then return {} end
         local cfg=A.config(def.config)
         local choices=cfg and type(cfg[def.method])=='function' and cfg[def.method](cfg) or {}
+        if mode=='BossRush' then
+            local rows={}
+            for key,rush in pairs(choices) do
+                if type(rush.Modes)=='table' then
+                    for variant,entry in pairs(rush.Modes) do
+                        if (variant=='V1' or variant=='V2') and type(entry)=='table' then
+                            rows[key..':'..variant]={Name=entry.Name or rush.Name or key,WorldId=rush.WorldId,
+                                Cost=entry.Cost,RushKey=key,ModeId=variant,RequiresChallenge=entry.RequiresChallenge}
+                        end
+                    end
+                end
+            end
+            return rows
+        end
         if mode=='Gate' or mode=='MaxTac' or mode=='Raid' then
             local filtered={}
             for key,value in pairs(choices) do
@@ -1286,6 +1308,17 @@ return function(A)
             return filtered
         end
         return choices
+    end
+    -- Older profiles stored only the rush key. Keep the same V1 choice when declared.
+    local rushChoices=A.activityChoices('BossRush')
+    for key,selected in pairs(A.Core.copy(A.settings.bossRushSelection)) do
+        if selected and not rushChoices[key] then
+            local migrated=key..':V1'
+            if rushChoices[migrated] then
+                A.settings.bossRushSelection[key]=nil; A.settings.bossRushSelection[migrated]=true
+                A.settingsChanged()
+            end
+        end
     end
     local rankOrders={Gate={'S','A','B','C','D','E'},MaxTac={'Low','Medium','High','Extreme','Psycho'}}
     local rankWeight={S=6,A=5,B=4,C=3,D=2,E=1,Low=5,Medium=4,High=3,Extreme=2,Psycho=1}
@@ -1382,18 +1415,22 @@ return function(A)
                             if not entry.rank then waitingReason=mode..' rank not provided; waiting for a ranked announcement'
                             elseif A.settings[definitions[mode].ranks][entry.rank] then return mode,key,entry end
                         end
-                    elseif mode~='Raid' and entry and entry.deadline>os.clock() then return mode,key,entry
-                    elseif mode=='Raid' or mode=='Defense' then
+                    elseif mode~='Raid' and mode~='Defense' and mode~='BossRush' and entry and entry.deadline>os.clock() then return mode,key,entry
+                    elseif mode=='Raid' or mode=='Defense' or mode=='BossRush' then
                         local cfg=choices[key]
+                        local data=A.data()
+                        local progress=data and type(data.BossRushProgress)=='table' and data.BossRushProgress[cfg.RushKey]
                         if cfg.GateOnly then waitingReason=mode..': portal-only entry; own-run creation unavailable'
                         elseif cfg.WorldId and not A.unlocked(cfg.WorldId) then
                             waitingReason=mode..': unlock World '..tostring(cfg.WorldId)
-                        elseif not A.data() then waitingReason='Waiting for player data'
+                        elseif not data then waitingReason='Waiting for player data'
+                        elseif cfg.RequiresChallenge and (type(progress)~='table' or progress.ChallengeCompleted~=true) then
+                            waitingReason=mode..': complete the native Challenge first'
                         else
                             local cost=cfg.Cost
-                            if type(cost)=='table' and A.balance(cost.ItemId)<(tonumber(cost.Amount) or 0) then
-                                waitingReason=mode..': need '..tostring(cost.Amount)..' '..tostring(cost.ItemId)
-                            else return mode,key,{action='Create'} end
+                            if type(cost)=='table' and A.balance(cost.ItemId)<(tonumber(cost.Amount) or 1) then
+                                waitingReason=mode..': need '..tostring(cost.Amount or 1)..' '..tostring(cost.ItemId)
+                            else return mode,key,{action='Create',rushKey=cfg.RushKey or key,modeId=cfg.ModeId or 'V1'} end
                         end
                     end
                 end
@@ -1430,7 +1467,7 @@ return function(A)
         if mode=='Gate' or mode=='MaxTac' then return A.fire('RaidGateTeleport',key) end
         if mode=='Tower' then return A.fire('TowerJoin',{TowerKey=key}) end
         if mode=='Raid' or (mode=='Defense' and entry.action=='Create') then return A.fire(mode..'Join','Create',key,true) end
-        if mode=='BossRush' then return A.fire('BossRushJoin','Join',key,entry.modeId or 'V1',true) end
+        if mode=='BossRush' then return A.fire('BossRushJoin','Create',entry.rushKey or key,entry.modeId or 'V1') end
         return A.fire(mode..'Join',entry.action or 'Join',key)
     end
     local function sendJoin(mode,key,entry)
@@ -1489,7 +1526,7 @@ return function(A)
             elseif protected[current] and returning~=current then pending=nil
             elseif not loading and (not current or definitions[current]) then
                 local entry=available[pending.mode][pending.key]
-                local scheduled=pending.mode~='Raid' and pending.mode~='Tower' and pending.mode~='Defense'
+                local scheduled=pending.mode~='Tower' and pending.entry.action~='Create'
                 if not enabled(pending.mode,pending.key) or (scheduled and (not entry or entry.deadline<=os.clock()))
                     or (definitions[pending.mode].ranks and (not entry or not entry.rank or not A.settings[definitions[pending.mode].ranks][entry.rank] or entry.rank~=pending.entry.rank)) then
                     pending=nil
@@ -1681,10 +1718,10 @@ return function(A)
             local cfg=A.config('RaidConfig'); local entries=cfg and cfg:GetAllRaids() or {}
             mode=A.Core.portalMode(key,entries[key])
         end
-        local modeId
-        if mode=='BossRush' then
-            local base,variant=key:match('^([^:]+):(.+)$')
-            if base then key=base; modeId=variant end
+        local modeId=mode=='BossRush' and key:match('^[^:]+:(.+)$') or nil
+        if mode=='BossRush' and not modeId then
+            local base,variant=key:match('^(.*)_(%w+)$') -- Native Boss Rush setting-key format.
+            if base then key=base..':'..variant; modeId=variant end
         end
         if not definitions[mode] or mode=='Raid' or not key or not enabled(mode,key) then return end
         if mode=='TimeTrial' and hasTrialSchedule and not trialScheduleOpen then return end
@@ -1946,11 +1983,100 @@ return function(A)
         local equipped={}
         for _,key in ipairs(cfg:GetEquipped(d)) do
             local item=cfg:GetQuickhack(key)
+            local overclock=type(cfg.GetOverclocks)=='function' and cfg:GetOverclocks(d,key) or 0
             equipped[#equipped+1]=(item and item.Name or key)..' Lv.'..cfg:GetQuickhackLevel(d,key)
+                ..(overclock>0 and (' · OC '..overclock) or '')
         end
         return 'Militech Convoy level: '..cfg:GetConvoyLevel(d)..' | Skill points: '..cfg:GetPoints(d)
             ..'\nRAM: '..cfg:GetUsedRam(d)..' / '..cfg:GetMaxRam(d)
             ..'\nEquipped: '..(#equipped>0 and table.concat(equipped,', ') or 'None')
+            ..'\nOverclock Chips: '..A.balance('OverclockChip')
+    end
+    function A.fixerSummary()
+        local cfg=A.config('FixerGigConfig'); local d=A.data(); local util=A.util('FixerGigUtil')
+        if not cfg or cfg.Enabled~=true or not util then return 'Fixer Gigs unavailable' end
+        if not d then return 'Waiting for player data' end
+        local slots=type(d.FixerGigs)=='table' and tonumber(d.FixerGigs.Slots) or nil
+        local lines={'Active gigs: '..util.CountActive(d)..' / '..(slots or cfg:GetSlots(d))}
+        local now=os.time()
+        for i,gig in ipairs(util.GetBoard(d)) do
+            if type(gig)=='table' then
+                local duration=cfg.Durations and cfg.Durations[gig.Duration]
+                local label=duration and duration.Name or tostring(gig.Duration or 'Gig')
+                local remaining=type(gig.EndsAt)=='number' and math.max(0,gig.EndsAt-now) or nil
+                local state=type(gig.PetUid)~='string' and 'Available' or
+                    (util.IsReady(gig,now) and 'READY TO CLAIM' or
+                    (remaining and (math.floor(remaining/60)..'m '..math.floor(remaining%60)..'s remaining') or 'End time unavailable'))
+                lines[#lines+1]=i..'. '..label..' · '..tostring(gig.Name or 'Fixer gig')..' · '..state
+            end
+        end
+        return table.concat(lines,'\n')
+    end
+    function A.serverBoostSummary()
+        local cfg=A.config('ServerBoostConfig')
+        local folder=cfg and A.S.RS:FindFirstChild(cfg.StateFolderName)
+        if not folder then return 'Waiting for server boost state' end
+        local lines={}; local now=workspace:GetServerTimeNow()
+        for _,kind in ipairs(cfg.TypeOrder or {}) do
+            local owner=folder:GetAttribute(kind..'Owner')
+            local finish=tonumber(folder:GetAttribute(kind..'EndsAt')) or 0
+            local remaining=math.max(0,finish-now)
+            local entry=cfg.Types and cfg.Types[kind] or {}
+            local bonus=entry.Multiplier and ('x'..entry.Multiplier) or ('+'..tostring(entry.Bonus or 0))
+            lines[#lines+1]=kind..' '..bonus..' · '..(remaining>0 and type(owner)=='string' and owner~='' and
+                (math.ceil(remaining/60)..'m left · '..owner) or 'Inactive')
+        end
+        return table.concat(lines,'\n')
+    end
+    local gigPending,gigNext=nil,0
+    local function sameGig(gig,request)
+        return type(gig)=='table' and gig.Id==request.id and gig.PetUid==request.pet and gig.EndsAt==request.endsAt
+    end
+    A.job('Fixer gigs',5,function()
+        if not A.settings.fixerAutoClaim and not gigPending then return end
+        local cfg=A.config('FixerGigConfig'); local util=A.util('FixerGigUtil'); local d=A.data()
+        if not cfg or cfg.Enabled~=true or not util or not d then return end
+        -- An unavailable replication snapshot is not evidence of a successful claim.
+        if type(d.FixerGigs)~='table' or type(d.FixerGigs.Board)~='table' then
+            A.status['Fixer gigs']='Waiting for the gig board'; return
+        end
+        local board=util.GetBoard(d)
+        if gigPending then
+            if not sameGig(board[gigPending.index],gigPending) then
+                A.status['Fixer gigs']='Claimed completed gig '..gigPending.index
+                if A.settings.webhook then A.notify('Progress',A.status['Fixer gigs']) end
+                gigPending=nil
+            elseif os.clock()-gigPending.at<20 then
+                A.status['Fixer gigs']='Waiting for gig claim confirmation'; return
+            else
+                gigPending=nil; gigNext=os.clock()+120
+                A.status['Fixer gigs']='Gig claim unconfirmed; retrying after 120s'; return
+            end
+        end
+        if not A.settings.fixerAutoClaim or not A.alive or not A.running or os.clock()<gigNext then return end
+        if not A.unlocked(cfg.WorldId) then A.status['Fixer gigs']='Unlock Night City first'; return end
+        local ctrl=A.client('TeleportController')
+        if ctrl and ctrl:IsLoading() then A.status['Fixer gigs']='Waiting for game loading'; return end
+        local index,gig
+        for i,value in ipairs(board) do if util.IsReady(value,os.time()) then index=i; gig=value; break end end
+        if not index then A.status['Fixer gigs']='Waiting for completed gigs'; return end
+        local fn=A.Library.Network.Functions:FindFirstChild('FixerGigAction')
+        if not fn then A.status['Fixer gigs']='FixerGigAction unavailable'; return end
+        gigPending={index=index,id=gig.Id,pet=gig.PetUid,endsAt=gig.EndsAt,at=os.clock()}
+        gigNext=os.clock()+5
+        -- Exact native Claim payload. Never send pets, buy slots or finish gigs for Robux.
+        local ok,accepted,reason=pcall(fn.InvokeServer,fn,'Claim',index,nil)
+        if not A.alive then return end
+        if not ok or accepted~=true then
+            gigPending=nil; gigNext=os.clock()+30
+            A.status['Fixer gigs']='Claim refused: '..tostring(ok and reason or accepted)
+        end
+    end)
+    if A.container and type(A.container.OnChange)=='function' then
+        local ok,connection=pcall(A.container.OnChange,A.container,{'FixerGigs'},function()
+            if A.alive and A.settings.fixerAutoClaim then A.tasks['Fixer gigs'].next=0 end
+        end)
+        if ok and connection then A.connections[#A.connections+1]=connection end
     end
     A.job('Ripperdoc',1,function()
         if not A.settings.ripperdocAuto and not pending then return end
@@ -2050,6 +2176,11 @@ return function(A)
         end
         local worlds=all('WorldConfig','GetAllWorlds','Worlds')
         local enemies=all('EnemyConfig','GetAllEnemies','Enemies')
+        local spawnConfig=config('SpawnBossConfig')
+        local spawnEnemies={}
+        for _,boss in pairs(spawnConfig and type(spawnConfig.Bosses)=='table' and spawnConfig.Bosses or {}) do
+            if type(boss)=='table' and type(boss.EnemyId)=='string' then spawnEnemies[boss.EnemyId]=boss end
+        end
         local raids=all('RaidConfig','GetAllRaids','Raids')
         local defenses=all('DefenseConfig','GetAllDefenses','Defenses')
         local trials=all('TimeTrialConfig','GetAllTrials','Trials')
@@ -2163,7 +2294,11 @@ return function(A)
             end
         end
         for id,enemy in pairs(enemies) do
-            drops(enemy.Drops,tonumber(enemy.World),'Enemy: '..enemyName(id),'per kill')
+            local spawn=spawnEnemies[id]
+            local extra=spawn and ('\nSummon cost: '..tostring(spawn.CostAmount or 1)..' '..resource(spawn.CostItemId)
+                ..'\nLoot requires the game\'s participation threshold') or ''
+            drops(enemy.Drops,tonumber(spawn and spawn.WorldId or enemy.World),
+                (spawn and 'Spawn boss: ' or 'Enemy: ')..enemyName(id),'per kill',extra)
         end
         local function modes(values,kind)
             for key,mode in pairs(values) do
@@ -2517,7 +2652,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.6',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.7',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2815,10 +2950,11 @@ return function(A)
             note('Modes',mode..' rank order',mode=='Gate' and 'S > A > B > C > D > E. Only declared ranks are listed.'
                 or 'Low → Medium → High → Extreme → Psycho. MaxTac stays at its join position. Only enabled stuck recovery can leave a stalled unfinished run.')
         end
-        toggle('Modes',mode=='Raid' and 'Auto start my own Raid' or ('Auto join '..mode),toggleKey,function(value)
+        toggle('Modes',mode=='Raid' and 'Auto start my own Raid' or (mode=='BossRush' and 'Auto start my own Boss Rush' or ('Auto join '..mode)),toggleKey,function(value)
             if mode=='Raid' or mode=='Defense' then A.setCombatEnabled(mode,value) else A.coordinateActivities() end
         end)
     end
+    note('Modes','Boss Rush entry','Choose the exact variant, such as Cursed Rush or King of Curses. Creates your own run after checking the world unlock and key cost. Old base-only choices migrate to the declared V1 variant.')
     input('Pets','Name for unnamed Astral pets','petName')
     toggle('Pets','Auto rename Astral pets ONLY','rename')
     note('Pets','Astral naming','Only verified Astral rarity is eligible. Already named and percentage pets are skipped. Uses the normal Magicule cost. Check the status below for blockers.')
@@ -2835,6 +2971,13 @@ return function(A)
     toggle('Cyber','Auto upgrade selected Ripperdoc slots','ripperdocAuto')
     note('Cyber','Ripperdoc costs','Spends Eddies only when enabled, in the normal Head → Torso → Shoulder → Waist → Back order. Each previous slot must be maxed. Waits for the game to confirm every upgrade.')
     status('Cyber','Ripperdoc'); status('Cyber','Cyber')
+    button('Cyber','Open Fixer Gigs',function() A.openCyberSystem('FixerGig') end)
+    local fixerSummary=note('Cyber','Fixer Gigs',A.fixerSummary())
+    local serverBoosts=note('Cyber','Server boosts',A.serverBoostSummary())
+    statuses[#statuses+1]=function() fixerSummary:SetDesc(A.fixerSummary()); serverBoosts:SetDesc(A.serverBoostSummary()) end
+    toggle('Cyber','Auto claim completed Fixer Gigs','fixerAutoClaim')
+    status('Cyber','Fixer gigs')
+    note('Cyber','Gigs and Overclock','Pick your pet and start gigs in the native Fixer menu. Auto claim collects completed gigs only. Big Jobs can reward Overclock Chips. The native Cyberdeck handles Overclock upgrades; equipped quickhack OC levels and chip balance appear above.')
     note('Index','Missing collections','Accessories, pet accessories, titans, shadows, swords, primordials and mounts. Checks the game Index, including its collection history. Pets are excluded.')
     button('Index','Send missing index to Discord',A.sendIndexReport)
     note('Index','Report details','Uses your fixed report webhook. Shows world, source and base chance on numbered category pages. Purchases and claims are marked guaranteed; unpublished details are marked unknown. Works independently of the other webhook settings.')
@@ -2866,7 +3009,7 @@ return function(A)
         local jobs,enabled={},{}
         for name,job in pairs(A.tasks) do jobs[name]={busy=job.busy,failures=job.failures,nextIn=math.max(0,job.next-os.clock())} end
         for key,value in pairs(A.settings) do if type(value)=='boolean' then enabled[key]=value end end
-        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.6',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
+        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.7',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
             running=A.running,
             worlds=#C.keys(A.catalog.worlds),enemies=#C.keys(A.catalog.enemies)}))
         assert(A.safeLoad(A.folder..'/diagnostics.json'),'Could not read back diagnostics file')
