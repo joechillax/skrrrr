@@ -318,6 +318,7 @@ local scanWarned = false
 local function invalidateTarget()
     cachedTarget, cachedPosition, cachedAt = nil, nil, 0
     nextScan = 0
+    if runtime.clearFireTargetWatch then runtime.clearFireTargetWatch() end
     if runtime.clearFacingPose then runtime.clearFacingPose() end
 end
 local function validPoint(point)
@@ -710,7 +711,7 @@ local function getTargetHead()
         if config.SuperPriorityList[zombie.Name] then runtime.superSeen = runtime.superSeen + 1 end
         local protected,blockReason=protectedZombie(zombie)
         if config.IgnoreList[zombie.Name] then blockReason=blockReason or "Ignore list" end
-        if zombie:IsA("Model") and not protected and (not config.IgnoreList[zombie.Name] or runtime.closeZombie(zombie,root)) then
+        if zombie:IsA("Model") and zombie.Parent==zombiesFolder and not protected and (not config.IgnoreList[zombie.Name] or runtime.closeZombie(zombie,root)) then
             local humanoid = zombie:FindFirstChildOfClass("Humanoid")
             if humanoid and humanoid.Health > 0 then
                 local part, point,reason = exposedPoint({model = zombie}, origin, center, limit)
@@ -740,18 +741,50 @@ local function getTargetHead()
         return candidate.part, candidate.point
     end
 end
-connect(RunService.Heartbeat, function()
-    if pointState.picking or not (config.SilentAim or config.Triggerbot) then
-        invalidateTarget()
-        return
+function runtime.clearFireTargetWatch()
+    local watch=runtime.fireTargetWatch
+    runtime.fireTargetWatch=nil
+    if watch then for _,connection in ipairs(watch.connections) do pcall(function() connection:Disconnect() end) end end
+end
+function runtime.fireTargetModel()
+    local model=cachedTarget and cachedTarget.Parent
+    for _=1,8 do
+        if not model then return end
+        if model.Parent==zombiesFolder then return model end
+        model=model.Parent
     end
-    local now = os.clock()
-    if now < nextScan then return end
+end
+function runtime.watchFireTarget()
+    local model=config.Triggerbot and runtime.fireTargetModel()
+    local humanoid=model and model:FindFirstChildOfClass("Humanoid")
+    local watch=runtime.fireTargetWatch
+    if watch and watch.model==model and watch.humanoid==humanoid then return end
+    runtime.clearFireTargetWatch()
+    if not model or not humanoid then return end
+    watch={model=model,humanoid=humanoid,connections={}}
+    runtime.fireTargetWatch=watch
+    local function changed()
+        if not runtime.active or not config.Triggerbot or runtime.fireTargetWatch~=watch then return end
+        if humanoid.Health>0 and model.Parent==zombiesFolder then return end
+        -- Retarget on confirmed death/removal; keep full-auto held if another target is ready.
+        runtime.scanFireTarget(os.clock())
+        runtime.ensureFireTarget()
+    end
+    for _,signal in ipairs({humanoid.HealthChanged or false,humanoid.Died or false,model.AncestryChanged or false}) do
+        if signal and type(signal.Connect)=="function" then table.insert(watch.connections,signal:Connect(changed)) end
+    end
+end
+table.insert(runtime.connections,{Disconnect=function() runtime.clearFireTargetWatch() end})
+function runtime.scanFireTarget(now)
+    if runtime.scanningFireTarget then return end
+    runtime.scanningFireTarget=true
     nextScan = now + 1 / 30
     local ok, head, point = pcall(getTargetHead)
     cachedTarget = ok and head or nil
     cachedPosition = cachedTarget and point or nil
     cachedAt = now
+    runtime.scanningFireTarget=false
+    runtime.watchFireTarget()
     if not ok then
         nextScan = now + 1
         if not scanWarned then
@@ -761,6 +794,41 @@ connect(RunService.Heartbeat, function()
     else
         scanWarned = false
     end
+end
+function runtime.fireTargetValid()
+    if not cachedTarget or not cachedPosition or os.clock()-cachedAt>.15 then return false end
+    local model=runtime.fireTargetModel()
+    if not model or config.IgnoreList[model.Name] or protectedZombie(model) then return false end
+    local humanoid=model:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health<=0 then return false end
+    local tool,_,current=gunProfile()
+    local origin=getWeaponOrigin()
+    if not tool or not origin then return false end
+    local limit=config.RangeMode=="Manual" and config.ManualRange or detectedRange(tool,current)
+    if not withinRange(origin,cachedPosition,limit) then return false end
+    local clear,hit=clearPath(origin,cachedPosition,model)
+    return clear and not (hit and runtime.armouredPart(hit.Instance))
+end
+function runtime.ensureFireTarget()
+    if not config.Triggerbot then return cachedTarget end
+    local ok,valid=pcall(runtime.fireTargetValid)
+    if (not ok or not valid) and (cachedTarget or os.clock()>=nextScan) then
+        runtime.scanFireTarget(os.clock())
+        ok,valid=pcall(runtime.fireTargetValid)
+    end
+    if ok and valid then return cachedTarget end
+    cachedTarget,cachedPosition,cachedAt=nil,nil,0
+    runtime.clearFireTargetWatch()
+    if runtime.stopTargetFire then runtime.stopTargetFire() end
+end
+connect(RunService.Heartbeat, function()
+    if pointState.picking or not (config.SilentAim or config.Triggerbot) then
+        invalidateTarget()
+        return
+    end
+    local now = os.clock()
+    if now < nextScan then return end
+    runtime.scanFireTarget(now)
 end)
 
 -- Share the selected shot point with the game's normal arm-aim data. The
@@ -1028,6 +1096,7 @@ runtime.slot.handler = function(self, ...)
         local ray = original[1]
         if typeof(ray) ~= "Ray" or ray.Direction.Magnitude<=0.001 then return end
         local continuation=runtime.penetrationDirection(ray,original[2])
+        if config.Triggerbot and not continuation then runtime.ensureFireTarget() end
         local targetPosition = (config.SilentAim or config.Triggerbot) and os.clock()-cachedAt<=0.15 and cachedPosition or nil
         if not continuation and not targetPosition and config.NoSpread then
             -- Match GunScript's Mouse coordinates, not UIS screen coordinates or a saved FOV point.
@@ -1242,12 +1311,17 @@ local function releaseHeld()
     return false
 end
 runtime.releaseGunInput=releaseHeld
+function runtime.stopTargetFire()
+    if clickState.held and os.clock()>=clickState.retryReleaseAt then return releaseHeld() end
+    return not clickState.held
+end
 
 local function setTriggerEnabled(value)
     if value and pointState.picking then finishPick() end
     config.Triggerbot = value
     clickState.nextClick = os.clock() + 0.25
     if not value then
+        runtime.clearFireTargetWatch()
         releaseHeld()
     elseif not inputSupported and not runtime.gunCallbacks() then
         retryInput("Virtual input is unavailable in this client. Waiting without disabling the toggle.")
@@ -1443,6 +1517,7 @@ connect(RunService.Heartbeat, function()
         requestEmptyReload(activeTool, activeValues, now)
         return
     end
+    if config.Triggerbot and not pointState.picking then runtime.ensureFireTarget() end
     if clickState.held then
         local tool, mode, current = gunProfile()
         local point = getAimPoint()
@@ -1493,6 +1568,8 @@ connect(RunService.Heartbeat, function()
         clickState.autoHeld = config.AutoFireMode and (mode == "FullAuto" or mode == "Continuous")
         clickState.releaseAt = now + math.min(0.03, interval / 2)
         clickState.retryReleaseAt = 0
+        -- The native press may synchronously finish the last target.
+        runtime.ensureFireTarget()
     else
         if inputStage == "press" and duplicateButtonState(err) then
             -- Recover a rejected duplicate press by releasing first.
