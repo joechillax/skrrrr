@@ -114,6 +114,52 @@ local config = {
     IgnoreList = {}
 }
 -- Optional extensions: every automatic or resource-using feature starts disabled.
+-- Shared by live controls and profile validation; clocks are ordered across midnight.
+function runtime.parseDrinkTimes(text)
+    if type(text)~="string" or #text>100 or text:find("%c") then return nil,"Use comma-separated night times (H:MM)." end
+    text=text:match("^%s*(.-)%s*$")
+    if text=="" or text:lower()=="off" then return {},"off" end
+    local times,seen={},{}
+    for token in (text..","):gmatch("(.-),") do
+        local hour,minute=token:match("^%s*(%d%d?):(%d%d)%s*$")
+        hour,minute=tonumber(hour),tonumber(minute)
+        if not hour or not minute or hour>23 or minute>59 or (hour>=6 and hour<18) then
+            return nil,"Use night times from 18:00 to 05:59, separated by commas."
+        end
+        local value=hour*60+minute
+        if not seen[value] then
+            seen[value]=true
+            times[#times+1]={minutes=value,phase=(value+360)%1440,at=string.format("%02d:%02d",hour,minute)}
+        end
+        if #times>8 then return nil,"Use at most 8 drink times per night." end
+    end
+    table.sort(times,function(a,b) return a.phase<b.phase end)
+    local names={}
+    for index,entry in ipairs(times) do
+        entry.key=({"evening","midnight","late"})[index] or "slot"..index
+        names[index]=entry.at
+    end
+    return times,table.concat(names,", ")
+end
+function runtime.parseDrinkWave(text)
+    local wave=type(text)=="string" and tonumber(text:match("^%s*(%d+)%s*$"))
+    if not wave or wave<5 or wave>10000 or wave%5~=0 then return nil,"Wave must be a multiple of 5 from 5 to 10000." end
+    return tostring(wave)
+end
+function runtime.validateDrinkOverrides(source)
+    assert(type(source)=="table","Invalid drink wave schedules.")
+    local clean,count={},0
+    for wave,text in pairs(source) do
+        count=count+1
+        local key,err=runtime.parseDrinkWave(wave)
+        assert(count<=300 and key and key==wave,err or "Invalid drink wave schedule key.")
+        local times,normalized=runtime.parseDrinkTimes(text)
+        assert(times,normalized)
+        clean[key]=normalized
+    end
+    return clean
+end
+
 function runtime.parseResetSettings(waveText,timeText)
     local wave=type(waveText)=="string" and waveText:match("^%s*(%d+)%s*$")
     wave=tonumber(wave)
@@ -128,6 +174,8 @@ function runtime.parseResetSettings(waveText,timeText)
 end
 runtime.extraSpecs = {
     Autofarm={false}, AutoC96={false}, AutoLeaveSpawn={false}, AutoNightDrinks={false},
+    DrinkTimes={"18:15, 00:10"}, DrinkFiveTimes={"18:15, 00:05, 00:40"}, DrinkFirstTimes={"18:15"},
+    DrinkWaveSchedules={{}}, DrinkOnExpiry={false},
     FarmResetWave={"30"}, FarmResetTime={"04:30"},
     AutoEquip={false}, EquipWeapon={""}, FireModeOverride={false}, FireMode={"FullAuto",{"Single","Burst","FullAuto"}},
     OverheatManagement={false}, ClosePriority={false}, CloseDistance={60,20,200}, SkipCloaked={false},
@@ -222,7 +270,12 @@ function runtime.validateExtras(source)
             assert(#value<=100 and not value:find("%c"),"Invalid text: "..key)
             if type(spec[2])=="table" then assert(table.find(spec[2],value),"Invalid choice: "..key) end
         end
-        if type(value)=="table" then
+        if key=="DrinkTimes" or key=="DrinkFiveTimes" or key=="DrinkFirstTimes" then
+            local times,text=runtime.parseDrinkTimes(value);assert(times,text);value=text
+            if key=="DrinkFirstTimes" then assert(#times<=1,"Waves 1, 6, 11, ... allow one scheduled activation.") end
+        end
+        if key=="DrinkWaveSchedules" then value=runtime.validateDrinkOverrides(value)
+        elseif type(value)=="table" then
             local copy,count={},0
             for name,selected in pairs(value) do
                 count=count+1
@@ -1855,7 +1908,7 @@ function runtime.consumableContext(name)
     return tool, target, duration, amount, character, humanoid
 end
 function runtime.consumableResult(entry,status,reason)
-    runtime.consumables.message=entry.name..": "..(status=="consumed" and "charge used." or (reason or "Use unconfirmed."))
+    runtime.consumables.message=entry.name..": "..(status=="consumed" and "use confirmed." or (reason or "Use unconfirmed."))
 end
 function runtime.useDrinkBatch(indices)
     local c=runtime.consumables
@@ -1891,6 +1944,7 @@ runtime.label(menuGroup,"Show / hide: Right Ctrl", true)
 runtime.label(menuGroup,"Triggerbot: Delete", true)
 local function unloadAssistant()
     if not runtime.active then return true end
+    if runtime.extensions and runtime.extensions.stop then runtime.extensions.stop() end
     if runtime.cancelInstantConsumables and not runtime.cancelInstantConsumables() then
         return false
     end
@@ -1915,6 +1969,14 @@ local function unloadAssistant()
         reloadState.key = nil
     end
     if pointState.picking then finishPick() end
+    if runtime.extensions and runtime.extensions.farm then
+        local farm=runtime.extensions.farm
+        farm.cancelWalk()
+        if farm.sprintHeld then
+            notifyTrigger("Unload waiting for sprint-key release. Close menus/console, then try Unload again.")
+            return false
+        end
+    end
     runtime.active = false
     if runtime.extensions then runtime.extensions.cleanup() end
     if runtime.slot.current == runtime then
@@ -2118,6 +2180,7 @@ local function applyProfile(clean)
         runtime.extra[key]=value
     end
     runtime.loadingProfile=false
+    if runtime.refreshDrinkEditor then runtime.refreshDrinkEditor() end
     if runtime.extensions then runtime.extensions.refresh() end
     config.FOVColor = clean.FOVColor
     invalidateTarget()
@@ -2583,9 +2646,6 @@ function state.automation()
     if state.farm and (e.Autofarm or state.farm.active) then
         local ok,err=pcall(state.farm.step)
         if not ok then state.farm.lastError=tostring(err);state.farm.status("Autofarm error: "..tostring(err)) else state.farm.lastError=nil end
-        local drinksOK,drinksError=pcall(state.farm.drinkTick)
-        if not drinksOK then state.farm.drinkMessage="Drink scheduler: "..tostring(drinksError) end
-        state.farm.showDrinks()
         if e.Autofarm and state.farm.supported() and state.farm.stage>=3 and not state.farm.inFlight and not runtime.action and not state.farm.moving then
             runtime.refillStep()
             if state.farm.unlimitedOwned() then state.spending(true) end
@@ -2684,7 +2744,7 @@ runtime.label(priority,"Triggerbot always ignores FOV and uses built-in aim. Ran
 local actions=CombatTab:AddRightGroupbox("Melee")
 control(actions,"MeleeAura","Melee aura")
 control(actions,"UseKnife","Use knife with guns")
-runtime.label(actions,"Direct 360-degree requests within native range, including while reading game menus. Ignores gun target lists. Knife is a fallback, not a simultaneous second attack.",true)
+runtime.label(actions,"Direct melee sweep within native range, including behind teammates or other zombies and while reading menus. No visibility/FOV check. Server hit rules still apply. Knife is a fallback, not a simultaneous second attack.",true)
 local donation=automation:AddLeftGroupbox("Donations")
 control(donation,"AutoDonate","Auto donate")
 control(donation,"DonatePlayer","Recipient",{})
@@ -2958,10 +3018,29 @@ function state.shopUpgradeCost(upgrade,structure)
     assert(type(cost)=="number" and cost==cost and cost>=0 and cost<math.huge,"Invalid shop upgrade cost")
     return cost
 end
+function state.upgradeBlocked(kind,name,identity)
+    local faults=state[kind]
+    local fault=faults and faults[name]
+    local map=child(Workspace,"Map")
+    if type(fault)=="table" and ((identity and fault.identity~=identity) or (map and fault.map~=map)) then
+        faults[name]=nil;fault=nil
+    end
+    if fault then
+        notice("Upgrade paused for "..tostring(name)..": "..tostring(type(fault)=="table" and fault.reason or "earlier native update failed"))
+        return true
+    end
+    return false
+end
+function state.failUpgrade(kind,name,identity,reason)
+    state[kind]=state[kind] or {}
+    state[kind][name]={identity=identity,map=child(Workspace,"Map"),reason=tostring(reason)}
+    notice("Upgrade paused for "..tostring(name)..": "..tostring(reason)..". Partial local changes may exist; this data will not be applied again.")
+    if runtime.active then warn("[Combat Assistant] "..state.message) end
+end
 function state.upgradeShop(name,structure,owned,budget,selected)
-    if state.shopUpgradeFaults and state.shopUpgradeFaults[name] then return false end
     local folder=child(owned,"Upgrades")
     if not folder then return false end
+    if state.upgradeBlocked("shopUpgradeFaults",name,folder) then return false end
     local upgrades=folder:GetChildren()
     table.sort(upgrades,function(a,b) return a.Name<b.Name end)
     for _,upgrade in ipairs(upgrades) do
@@ -2973,20 +3052,22 @@ function state.upgradeShop(name,structure,owned,budget,selected)
                 local module=gameModule("ShopModule")
                 local epoch=state.epoch or 0
                 -- ShopGui increments this before updating effects; both structure and player upgrades use this remote.
-                upgrade.Value=upgrade.Value+1
-                local ok,err=pcall(module.UpgradeStructurePlayer,module,LocalPlayer,name,upgrade,cost)
+                local sent=false
+                local ok,err=pcall(function()
+                    upgrade.Value=upgrade.Value+1
+                    module:UpgradeStructurePlayer(LocalPlayer,name,upgrade,cost)
+                    if not runtime.active or (state.epoch or 0)~=epoch then error("Stopped after local effects changed, before dispatch") end
+                    LocalPlayer.ReplicatedMoney.Value=LocalPlayer.ReplicatedMoney.Value-cost
+                    event:FireServer(name,upgrade.Name)
+                    sent=true
+                end)
                 if not ok then
                     -- The native function may have changed some local effects before failing. Do not repeat it.
-                    state.shopUpgradeFaults=state.shopUpgradeFaults or {};state.shopUpgradeFaults[name]=true
-                    notice("Shop upgrades stopped for "..name..": "..tostring(err))
-                    warn("[Combat Assistant] "..state.message)
+                    state.failUpgrade("shopUpgradeFaults",name,folder,err)
                     return false
                 end
-                if not runtime.active or (state.epoch or 0)~=epoch then return false end
-                LocalPlayer.ReplicatedMoney.Value=LocalPlayer.ReplicatedMoney.Value-cost
-                event:FireServer(name,upgrade.Name)
                 notice("Shop upgrade requested: "..name.." / "..upgrade.Name)
-                return true
+                return sent
             end
         end
     end
@@ -3007,9 +3088,12 @@ function state.nativeCallback(signal,owner)
     end
 end
 function state.actionTargets(origin,range,melee)
-    local params=RaycastParams.new()
-    params.FilterType=Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances=runtime.combatIgnore({LocalPlayer.Character,Workspace.CurrentCamera})
+    local params
+    if not melee then
+        params=RaycastParams.new()
+        params.FilterType=Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances=runtime.combatIgnore({LocalPlayer.Character,Workspace.CurrentCamera})
+    end
     local list={}
     for _,model in ipairs(zombiesFolder:GetChildren()) do
         local humanoid=model:FindFirstChildOfClass("Humanoid")
@@ -3017,7 +3101,9 @@ function state.actionTargets(origin,range,melee)
         if humanoid and humanoid.Health>0 and part and part:IsA("BasePart") and not protectedZombie(model) and (melee or not config.IgnoreList[model.Name]) then
             local delta=part.Position-origin
             if delta.Magnitude<=range then
-                local hit=Workspace:Raycast(origin,delta,params)
+                -- Melee aura is a range sweep: allies, other zombies and camera
+                -- visibility must not remove candidates. Server hit rules still apply.
+                local hit=not melee and Workspace:Raycast(origin,delta,params)
                 if not hit or hit.Instance:IsDescendantOf(model) then table.insert(list,{model=model,part=part,distance=delta.Magnitude}) end
             end
         end
@@ -3321,6 +3407,7 @@ end
 function state.upgradeTool(name,upgradeName,farmOwned)
     if not farmOwned and (e.Autofarm or (e.AutoC96 and name=="C96")) then return false end
     local _,tools=ownedTools();local tool=tools[name]
+    if state.upgradeBlocked("weaponUpgradeFaults",name,tool) then return false end
     local upgrade=child(toolUpgrades(name),upgradeName)
     if not tool or not upgrade or upgrade.Value>=upgrade.MaxValue or not state.upgradeAllowed(toolUpgrades(name),upgrade) then return false end
     local backgear=child(child(LocalPlayer,"Backgear"),name)
@@ -3336,16 +3423,23 @@ function state.upgradeTool(name,upgradeName,farmOwned)
     local event=child(child(storage(),"RemoteEvents"),"UpgradeWeapon")
     assert(event and event:IsA("RemoteEvent"),"UpgradeWeapon unavailable")
     -- Match ShopGui.BuyUpgrade, including its local cache and upgrade level updates.
-    shopModule:UpgradeTool(LocalPlayer,tool,backgear,upgrade,effect)
-    LocalPlayer.ReplicatedMoney.Value=LocalPlayer.ReplicatedMoney.Value-cost
-    event:FireServer(name,upgradeName)
     local wasEquipped=tool.Parent==character
-    if wasEquipped then humanoid:UnequipTools() end
-    upgrade.Value=upgrade.Value+1
-    local price=child(child(tool,"OtherValues"),"PriceValue")
-    local backPrice=child(child(backgear,"OtherValues"),"PriceValue")
-    if price and backPrice and price.Value>=0 then price.Value=price.Value+cost;backPrice.Value=backPrice.Value+cost end
-    if wasEquipped and runtime.active and LocalPlayer.Character==character and not character:FindFirstChildOfClass("Tool") then humanoid:EquipTool(tool) end
+    local epoch=state.epoch or 0
+    local ok,err=pcall(function()
+        shopModule:UpgradeTool(LocalPlayer,tool,backgear,upgrade,effect)
+        if not runtime.active or (state.epoch or 0)~=epoch or LocalPlayer.Character~=character then error("Character or automation changed after local effects, before dispatch") end
+        LocalPlayer.ReplicatedMoney.Value=LocalPlayer.ReplicatedMoney.Value-cost
+        event:FireServer(name,upgradeName)
+        if wasEquipped then humanoid:UnequipTools() end
+        upgrade.Value=upgrade.Value+1
+        local price=child(child(tool,"OtherValues"),"PriceValue")
+        local backPrice=child(child(backgear,"OtherValues"),"PriceValue")
+        if price and backPrice and price.Value>=0 then price.Value=price.Value+cost;backPrice.Value=backPrice.Value+cost end
+    end)
+    if wasEquipped and runtime.active and LocalPlayer.Character==character and humanoid.Health>0 and not character:FindFirstChildOfClass("Tool") and tool.Parent==child(LocalPlayer,"Backpack") then
+        pcall(function() humanoid:EquipTool(tool) end)
+    end
+    if not ok then state.failUpgrade("weaponUpgradeFaults",name,tool,err);return false end
     notice("Upgrade requested: "..name.." / "..upgradeName)
     return true
 end
@@ -3506,6 +3600,7 @@ function farm.itemSequence(items,label)
     if not farm.confirmed() then return false end
     local _,tools=ownedTools()
     for _,item in ipairs(items) do
+        if state.upgradeBlocked("weaponUpgradeFaults",item.name,tools[item.name]) then farm.status(state.message);return false end
         if not tools[item.name] then
             if child(child(LocalPlayer,"Backgear"),item.name) then farm.waitStatus(item.name.." tool replication");return false end
             local price,reason=farm.healingBuyInfo(item.name)
@@ -3639,6 +3734,7 @@ function farm.upgradeC96(onlyUnlimited)
     if not farm.confirmed() then return false end
     local folder=toolUpgrades("C96");local _,tools=ownedTools();local tool=tools.C96
     local first=farm.unlimited()
+    if state.upgradeBlocked("weaponUpgradeFaults","C96",tool) then farm.status(state.message);return false end
     if not tool or not folder or not first then farm.status("Waiting for owned C96 and Unlimited Ammo upgrade data.");return false end
     local chosen
     if not farm.unlimitedOwned() then chosen=first
@@ -3682,7 +3778,8 @@ function farm.buy(name)
     return farm.request(flag,cost,structure and "BuyStructure" or "BuyPlayerUpgrade",name)
 end
 function farm.upgrades(name,selected,firstLevelOnly)
-    if state.shopUpgradeFaults and state.shopUpgradeFaults[name] then
+    local _,currentOwned=farm.shopData(name)
+    if state.upgradeBlocked("shopUpgradeFaults",name,child(currentOwned,"Upgrades")) then
         farm.status("Native upgrade failed for "..name.."; purchase paused to avoid repeating partial changes. Movement and ready-up continue.");return false
     end
     if not farm.confirmed() or not farm.buy(name) then return false end
@@ -4181,8 +4278,57 @@ runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps:
 -- All drinks and healing items share immediate backpack requests. Never equip,
 -- synthesize input, wait for animations, or take the gun/movement lock here.
 runtime.instantUses={}
+runtime.drinkEffectKeys={
+    ["Energy Drink"]={"CriticalDuration","StaminaDuration"},
+    ["Experimental Drink"]={"ExperimentalTime"},
+    ["Speed Drink"]={"BloxiadeTime"},
+    ["Deadeye Drink"]={"DeadeyeTime"}
+}
+runtime.drinkStatus={}
+function runtime.drinkNow() return type(tick)=="function" and tick() or os.clock() end
+function runtime.drinkEffect(name)
+    local keys=runtime.drinkEffectKeys[name]
+    if not keys then return nil end
+    if runtime.drinkStatusCharacter~=LocalPlayer.Character then
+        runtime.drinkStatus={};runtime.drinkStatusCharacter=LocalPlayer.Character
+    end
+    local status=_G.LocalStatus
+    if type(getrenv)=="function" then
+        local ok,env=pcall(getrenv)
+        if ok and env and env._G and type(env._G.LocalStatus)=="table" then status=env._G.LocalStatus end
+    end
+    local stamp,known=0,type(status)=="table"
+    for _,key in ipairs(keys) do
+        local value=type(status)=="table" and status[key]
+        if finite(value) then stamp=math.max(stamp,value) end
+        local observed=runtime.drinkStatus[key]
+        if observed and observed.character==LocalPlayer.Character then stamp=math.max(stamp,observed.stamp);known=true end
+    end
+    if known then return math.max(0,stamp-runtime.drinkNow()),stamp end
+end
+-- Read-only fallback for executors that do not expose the game's _G table.
+local statusEvent=child(child(storage(),"RemoteEvents"),"RemoteSetStatus")
+if statusEvent and statusEvent.OnClientEvent then
+    connect(statusEvent.OnClientEvent,function(name,seconds)
+        for _,keys in pairs(runtime.drinkEffectKeys) do
+            if table.find(keys,name) and finite(seconds) and seconds>=0 then
+                if runtime.drinkStatusCharacter~=LocalPlayer.Character then runtime.drinkStatus={} end
+                runtime.drinkStatusCharacter=LocalPlayer.Character
+                runtime.drinkStatus[name]={stamp=runtime.drinkNow()+seconds,character=LocalPlayer.Character};return
+            end
+        end
+    end)
+end
 function runtime.consumableAmount(name)
     return readValue(child(child(LocalPlayer,"Charges"),name),"Amount")
+end
+function runtime.instantUseConfirmed(entry)
+    local amount=runtime.consumableAmount(entry.name)
+    if finite(amount) and finite(entry.before) and amount<entry.before then return true end
+    local remaining,stamp=runtime.drinkEffect(entry.name)
+    -- PDW refills can hide the net charge decrease. A newly observed effect is
+    -- separate evidence; a returned request alone never confirms consumption.
+    return finite(remaining) and remaining>0 and finite(stamp) and stamp>(entry.effectBefore or 0)+.05
 end
 function runtime.finishInstantUse(job,status,reason)
     if job.reported then return end
@@ -4190,17 +4336,17 @@ function runtime.finishInstantUse(job,status,reason)
     if runtime.instantUses[job.entry.name]==job and (job.returned or not job.invoked) then
         runtime.instantUses[job.entry.name]=nil
     end
-    if job.done then job.done(job.entry,status,reason) end
+    local done=job.done;job.done=nil
+    if done then done(job.entry,status,reason) end
 end
 function runtime.instantConsumableMonitor()
     for name,job in pairs(runtime.instantUses) do
-        local amount=runtime.consumableAmount(name)
-        if finite(amount) and finite(job.entry.before) and amount<job.entry.before then
-            runtime.finishInstantUse(job,"consumed")
-        elseif not runtime.active or LocalPlayer.Character~=job.character or job.humanoid.Health<=0 then
+        if not runtime.active or LocalPlayer.Character~=job.character or job.humanoid.Health<=0 then
             runtime.finishInstantUse(job,job.invoked and "unknown" or "pending","Character changed before confirmation")
+        elseif runtime.instantUseConfirmed(job.entry) then
+            runtime.finishInstantUse(job,"consumed")
         elseif os.clock()>=job.deadline then
-            runtime.finishInstantUse(job,job.invoked and "unknown" or "pending","No charge decrease observed")
+            runtime.finishInstantUse(job,job.invoked and "unknown" or "pending","No charge decrease or new drink effect observed")
         end
         if job.reported and job.returned and runtime.instantUses[name]==job then runtime.instantUses[name]=nil end
     end
@@ -4230,24 +4376,27 @@ function runtime.instantConsumableBatch(entries,eligible,done,scope)
         local ok,tool,target,duration,amount,character,humanoid=pcall(runtime.consumableContext,entry.name)
         if supported and ok and not runtime.instantUses[entry.name] and os.clock()>=(c.itemAt[entry.name] or 0) then
             entry.before=amount
+            entry.character=character
+            local _,stamp=runtime.drinkEffect(entry.name);entry.effectBefore=stamp
             local job={entry=entry,tool=tool,target=target,character=character,humanoid=humanoid,
-                done=done,scope=scope,deadline=os.clock()+8}
+                done=done,eligible=eligible,scope=scope,deadline=os.clock()+8}
             runtime.instantUses[entry.name]=job;started=started+1
             c.itemAt[entry.name]=os.clock()+math.max(1,duration)
             task.spawn(function()
                 if job.cancelled or not runtime.active or runtime.instantUses[entry.name]~=job then return end
                 local valid,liveTool,liveTarget=pcall(runtime.consumableContext,entry.name)
-                if not valid or liveTool~=tool or liveTarget~=target or LocalPlayer.Character~=character or (eligible and not eligible(entry)) then
+                if not valid or liveTool~=tool or liveTarget~=target or LocalPlayer.Character~=character or (job.eligible and not job.eligible(entry)) then
                     runtime.finishInstantUse(job,"pending","Use cancelled before dispatch");return
                 end
+                job.eligible=nil
                 job.invoked=true;c.lastItem=entry.name
                 local success,response=pcall(function() return remote:InvokeServer(entry.name,target) end)
                 job.returned=true
-                local after=runtime.consumableAmount(entry.name)
-                if finite(after) and after<amount then runtime.finishInstantUse(job,"consumed")
+                if LocalPlayer.Character~=character or humanoid.Health<=0 then runtime.finishInstantUse(job,"unknown","Character changed before confirmation")
+                elseif runtime.instantUseConfirmed(entry) then runtime.finishInstantUse(job,"consumed")
                 elseif success and (response==false or response=="FAIL") then runtime.finishInstantUse(job,"pending","Game rejected use")
                 elseif not success then runtime.finishInstantUse(job,"unknown",tostring(response))
-                else c.message=entry.name..": request returned; awaiting charge confirmation." end
+                else c.message=entry.name..": request returned; awaiting charge/effect confirmation." end
                 if job.reported and runtime.instantUses[entry.name]==job then runtime.instantUses[entry.name]=nil end
             end)
         elseif done then
@@ -4259,53 +4408,102 @@ end
 connect(RunService.Heartbeat,runtime.instantConsumableMonitor)
 table.insert(runtime.connections,{Disconnect=function() runtime.cancelInstantConsumables() end})
 
--- One activation per drink per night slot; routing does not own the clock.
-function farm.tripleDrinkWave(wave)
+-- One shared scheduler for autofarm and standalone use. Movement and purchases
+-- never own this clock; only the current night's records are retained.
+function farm.milestoneDrinkWave(wave)
     return finite(wave) and wave>0 and wave%5==0
 end
 function farm.drinkEligible(wave,minimumWave)
-    return finite(wave) and (wave>=minimumWave or farm.tripleDrinkWave(wave))
+    return finite(wave) and wave>0 and (wave>=minimumWave or farm.milestoneDrinkWave(wave) or wave%5==1)
 end
 function farm.drinkSlots(wave)
-    if farm.tripleDrinkWave(wave) then
-        return {{key="evening",at="18:15",minutes=1095},{key="midnight",at="00:05",minutes=5},{key="late",at="00:40",minutes=40}}
+    local text
+    if finite(wave) and wave%5==1 then text=e.DrinkFirstTimes
+    elseif farm.milestoneDrinkWave(wave) then text=e.DrinkWaveSchedules[tostring(wave)] or e.DrinkFiveTimes
+    else text=e.DrinkTimes end
+    local cache=farm.drinkSettings
+    if not cache or cache.text~=text then
+        local slots=runtime.parseDrinkTimes(text)
+        cache={text=text,slots=slots or {}};farm.drinkSettings=cache
     end
-    return {{key="evening",at="18:15",minutes=1095},{key="midnight",at="00:10",minutes=10}}
+    return cache.slots
 end
 function farm.drinkTimes(wave)
-    return farm.tripleDrinkWave(wave) and "18:15 / 00:05 / 00:40" or "18:15 / 00:10"
+    local times={}
+    for _,slot in ipairs(farm.drinkSlots(wave)) do times[#times+1]=slot.at end
+    return #times>0 and table.concat(times," / ") or "off"
 end
 function farm.drinkSchedule(wave,minutes,map,minimumWave)
+    local night=minutes>=1080 or minutes<360
     local clock=farm.drinkClock
-    if not clock or clock.map~=map or wave~=clock.wave then
-        clock={map=map,wave=wave,slots={}};farm.drinkClock=clock
+    if not clock or clock.map~=map or wave~=clock.wave or (night and clock.wasDay) then
+        clock={map=map,wave=wave,history={},slots={},expiry={}};farm.drinkClock=clock
     end
-    if not farm.drinkEligible(wave,minimumWave or 15) then return clock end
+    clock.wasDay=not night
+    local slots={}
     for _,definition in ipairs(farm.drinkSlots(wave)) do
-        local due=definition.key=="evening" and minutes>=definition.minutes
-            or definition.key~="evening" and minutes<360 and minutes>=definition.minutes
-        if due and not clock.slots[definition.key] then
-            clock.slots[definition.key]={at=definition.at,items={}}
+        local due=night and farm.drinkEligible(wave,minimumWave or 15) and
+            ((minutes>=1080 and definition.minutes>=1080 and minutes>=definition.minutes)
+            or (minutes<360 and definition.minutes<360 and minutes>=definition.minutes))
+        local slot=clock.history[definition.at]
+        if due and not slot then
+            slot={at=definition.at,items={}};clock.history[definition.at]=slot
         end
+        if slot then slot.key=definition.key;slots[definition.key]=slot end
     end
+    clock.slots=slots
     return clock
 end
 function farm.drinkSummary(clock)
-    local consumed,pending,unknown=0,0,0
+    local consumed,pending,unknown,covered=0,0,0,0
     local reason
     for _,slot in pairs(clock.slots) do
         for _,item in ipairs(farm.drinkItems) do
             local entry=slot.items[item.name]
             if entry and entry.state=="consumed" then consumed=consumed+1
+            elseif entry and entry.state=="covered" then covered=covered+1
             elseif entry and entry.state=="unknown" then unknown=unknown+1
             else pending=pending+1;reason=reason or (entry and entry.reason and item.name..": "..entry.reason) end
         end
     end
-    return "Drinks: "..consumed.." consumed, "..pending.." pending, "..unknown.." unconfirmed."..(reason and " "..reason or "")
+    for name,entry in pairs(clock.expiry) do
+        if entry.state=="unknown" then unknown=unknown+1
+        elseif entry.state=="inflight" or (entry.state=="pending" and entry.reason) then
+            pending=pending+1;reason=reason or (name..": "..(entry.reason or "refresh requested"))
+        end
+    end
+    return "Drinks: "..consumed.." confirmed, "..pending.." pending, "..unknown.." unconfirmed."..
+        (covered>0 and " "..covered.." overlapping uses avoided." or "")..(reason and " "..reason or "")
 end
 function farm.drinkPolicy()
     if e.Autofarm then return farm.active and farm.supported(),15,"autofarm" end
     return e.AutoNightDrinks==true,1,"standalone"
+end
+function farm.resolveDrinkRecord(entry)
+    if entry.state=="unknown" and entry.character==LocalPlayer.Character and runtime.instantUseConfirmed(entry) then
+        entry.state="consumed";entry.reason=nil
+    end
+end
+function farm.drinkUncertain(clock,name)
+    for _,slot in pairs(clock.history) do
+        local entry=slot.items[name]
+        if entry then
+            farm.resolveDrinkRecord(entry)
+            if entry.character==LocalPlayer.Character and (entry.state=="unknown" or entry.state=="inflight") then return true end
+        end
+    end
+    local entry=clock.expiry[name]
+    if entry then farm.resolveDrinkRecord(entry);return entry.state=="unknown" or entry.state=="inflight" end
+end
+function farm.coverEarlierDrinks(clock,slot,name)
+    for _,definition in ipairs(farm.drinkSlots(clock.wave)) do
+        local earlier=clock.slots[definition.key]
+        if earlier==slot then break end
+        if earlier then
+            local record=earlier.items[name]
+            if not record or record.state=="pending" then earlier.items[name]={state="covered"} end
+        end
+    end
 end
 function farm.drinkTick()
     local enabled,minimumWave,owner=farm.drinkPolicy()
@@ -4313,7 +4511,7 @@ function farm.drinkTick()
     local values=child(storage(),"Values")
     if (readValue(values,"LocalLives") or 1)<=0 or (readValue(values,"VotingTime") or 0)>0 then return end
     local wave=readValue(values,"LocalWave")
-    if not finite(wave) then return end
+    if not finite(wave) or wave<1 then return end
     local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
     local clock=farm.drinkSchedule(wave,minutes,child(Workspace,"Map"),minimumWave)
     if not farm.drinkEligible(wave,minimumWave) then return end
@@ -4322,89 +4520,175 @@ function farm.drinkTick()
     end
     local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
     if not humanoid or not root or runtime.consumableBusy or runtime.refillBusy or runtime.action then return end
+    if clock.character~=character then clock.character=character;clock.expiry={} end
     local c=runtime.consumables;c.itemAt=c.itemAt or {}
     if os.clock()<(c.drinkAt or 0) then return end
-    local slot;local entries={}
-    for _,definition in ipairs(farm.drinkSlots(wave)) do
-        local candidate=clock.slots[definition.key]
-        if candidate then
-            for _,item in ipairs(farm.drinkItems) do
-                local entry=candidate.items[item.name] or {state="pending",retryAt=0};candidate.items[item.name]=entry
-                -- Late replication can resolve a previously uncertain use without another click.
-                local amount=runtime.consumableAmount(item.name)
-                if entry.state=="unknown" and finite(amount) and finite(entry.before) and amount<entry.before then entry.state="consumed";entry.reason=nil end
-                if entry.state=="pending" and os.clock()>=entry.retryAt and os.clock()>=(c.itemAt[item.name] or 0) then
-                    local ok,err=pcall(runtime.consumableContext,item.name)
-                    entry.retryAt=os.clock()+5
-                    if ok then table.insert(entries,{name=item.name,record=entry})
-                    else entry.reason=tostring(err) end
-                end
+    local expiry=e.DrinkOnExpiry and wave%5~=1
+    local definitions=farm.drinkSlots(wave)
+    local slot
+    -- If several slots elapsed while dead/paused, use the newest batch once.
+    -- Confirming it covers older pending batches instead of draining charges.
+    for index=#definitions,1,-1 do
+        local candidate=clock.slots[definitions[index].key]
+        if candidate then slot=candidate;break end
+    end
+    local entries={}
+    for _,item in ipairs(farm.drinkItems) do
+        local name=item.name
+        local remaining=runtime.drinkEffect(name)
+        local uncertain=farm.drinkUncertain(clock,name)
+        local record=slot and slot.items[name]
+        if slot and not record then record={name=name,state="pending",retryAt=0};slot.items[name]=record end
+        if record then farm.resolveDrinkRecord(record) end
+        if record and record.state=="pending" and expiry and finite(remaining) and remaining>0 then
+            record.state="covered";record.reason=nil;farm.coverEarlierDrinks(clock,slot,name)
+        end
+        local refresh=clock.expiry[name]
+        if expiry then
+            if not refresh then refresh={name=name,state="pending",retryAt=0};clock.expiry[name]=refresh end
+            farm.resolveDrinkRecord(refresh)
+            if finite(remaining) and remaining>0 then
+                refresh.observed=true
+                refresh.reason=nil
+                if refresh.state=="consumed" then refresh.state="pending" end
             end
-            if #entries>0 then slot=candidate;break end
+        end
+        local selected=record and record.state=="pending" and record or
+            (expiry and refresh.observed and remaining==0 and refresh.state=="pending" and refresh)
+        if selected and os.clock()>=(selected.retryAt or 0) and os.clock()>=(c.itemAt[name] or 0) and not uncertain then
+            local ok,err=pcall(runtime.consumableContext,name)
+            selected.retryAt=os.clock()+5
+            if ok then entries[#entries+1]={name=name,record=selected,slot=selected==record and slot or nil}
+            else selected.reason=tostring(err) end
         end
     end
-    if not slot then farm.drinkMessage=farm.drinkSummary(clock);return end
+    if #entries==0 then farm.drinkMessage=farm.drinkSummary(clock);return end
     for _,entry in ipairs(entries) do entry.record.owner=entry;entry.record.state="inflight" end
-    local started=runtime.instantConsumableBatch(entries,function()
+    local started=runtime.instantConsumableBatch(entries,function(entry)
         local t=game:GetService("Lighting"):GetMinutesAfterMidnight()
         local active,currentMinimum,currentOwner=farm.drinkPolicy()
         local currentWave=readValue(values,"LocalWave")
-        return active and currentOwner==owner and currentWave==clock.wave and farm.drinkEligible(currentWave,currentMinimum) and farm.drinkClock==clock
-            and (clock.slots.evening==slot or clock.slots.midnight==slot or clock.slots.late==slot) and (t>=1080 or t<360)
-            and (readValue(values,"LocalLives") or 1)>0 and child(Workspace,"Map")==clock.map
-            and (readValue(values,"VotingTime") or 0)<=0
+        if not (active and currentOwner==owner and currentWave==clock.wave and farm.drinkEligible(currentWave,currentMinimum)
+            and farm.drinkClock==clock and (t>=1080 or t<360) and (readValue(values,"LocalLives") or 1)>0
+            and child(Workspace,"Map")==clock.map and (readValue(values,"VotingTime") or 0)<=0) then return false end
+        if entry.slot then
+            local configured=false
+            for _,definition in ipairs(farm.drinkSlots(currentWave)) do if definition.at==entry.slot.at then configured=true;break end end
+            local remaining=runtime.drinkEffect(entry.name)
+            return configured and clock.slots[entry.slot.key]==entry.slot and not
+                (e.DrinkOnExpiry and currentWave%5~=1 and finite(remaining) and remaining>0)
+        end
+        local remaining=runtime.drinkEffect(entry.name)
+        return e.DrinkOnExpiry and currentWave%5~=1 and remaining==0
     end,function(entry,status,reason)
-        if entry.record.owner~=entry then return end
-        entry.record.owner=nil
-        entry.record.state=status;entry.record.reason=status~="consumed" and reason or nil
-        entry.record.before=entry.before
-        entry.record.attempts=(entry.record.attempts or 0)+1
-        entry.record.retryAt=os.clock()+math.min(60,5*entry.record.attempts)
-        c.itemAt[entry.name]=os.clock()+1
+        local record=entry.record
+        if record.owner~=entry then return end
+        record.owner=nil;record.state=status;record.reason=status~="consumed" and reason or nil
+        record.before=entry.before;record.effectBefore=entry.effectBefore;record.character=entry.character
+        if status=="consumed" then
+            record.attempts=0;record.retryAt=os.clock()+1
+            if entry.slot then farm.coverEarlierDrinks(clock,entry.slot,entry.name)
+            else record.observed=false end
+            local refresh=clock.expiry[entry.name]
+            local remaining=runtime.drinkEffect(entry.name)
+            if refresh and finite(remaining) and remaining>0 then
+                refresh.observed=true;refresh.reason=nil
+                if refresh.state=="consumed" then refresh.state="pending" end
+            end
+        else
+            record.attempts=(record.attempts or 0)+1;record.retryAt=os.clock()+math.min(60,5*record.attempts)
+        end
+        c.itemAt[entry.name]=math.max(c.itemAt[entry.name] or 0,os.clock()+1)
         farm.drinkMessage=farm.drinkSummary(clock)
     end,owner)
-    if started then
-        c.drinkAt=os.clock()+1
-        farm.drinkMessage=slot.at..": using "..#entries.." immediate backpack drink requests."
-    else
-        for _,entry in ipairs(entries) do
-            if entry.record.owner==entry then entry.record.owner=nil;entry.record.state="pending" end
-        end
-    end
+    if started then c.drinkAt=os.clock()+1
+    else for _,entry in ipairs(entries) do
+        if entry.record.owner==entry then entry.record.owner=nil;entry.record.state="pending" end
+    end end
 end
-farm.drinkLabel=runtime.label(farmGroup,"Drinks: 18:15 / 00:10 from wave 15. Every 5th wave (including 5 and 10): 18:15 / 00:05 / 00:40. Uses owned drinks; charge confirmation required.",true)
+farm.drinkLabel=runtime.label(farmGroup,"Drinks: shared schedule; customize in Automatic consumables.",true)
+function farm.scheduleInput(group,key,text)
+    local changing=false
+    ui[key]=addControl(group,"Input","Extra_"..key,{Text=text,Default=e[key],Finished=true,Callback=function(value)
+        if changing then return end
+        local times,normalized=runtime.parseDrinkTimes(value)
+        if times and (key~="DrinkFirstTimes" or #times<=1) then e[key]=normalized
+        else farm.drinkSettingsMessage=times and "Waves 1, 6, 11, ... allow one activation." or normalized end
+        changing=true;if ui[key] then ui[key]:SetValue(e[key]) end;changing=false
+    end})
+end
 function farm.addNightDrinkControls(group)
     group:AddDivider()
     control(group,"AutoNightDrinks","Auto use nightly drinks")
-    runtime.label(group,"All four owned drinks: 18:15 / 00:10 normally; 18:15 / 00:05 / 00:40 on waves divisible by 5. Immediate backpack use. Autofarm starts regular nights at wave 15 and also handles waves 5 and 10. Shared tracking prevents duplicate activations.",true)
+    farm.scheduleInput(group,"DrinkFirstTimes","Waves 1, 6, 11, ... (one batch)")
+    farm.scheduleInput(group,"DrinkTimes","Other ordinary waves: drink times")
+    farm.scheduleInput(group,"DrinkFiveTimes","Waves 5, 10, 15, ...: default times")
+    control(group,"DrinkOnExpiry","Reuse drinks when their effects expire")
+    runtime.label(group,"Comma-separated night times; Enter applies. 'off' disables a schedule. Expiry reuse adds uses only after an observed effect ends, except on waves 1, 6, 11, ... . Both modes share these settings and stay instant.",true)
+    local editor={wave="5",loading=false};farm.drinkEditor=editor
+    runtime.refreshDrinkEditor=function()
+        editor.loading=true
+        if editor.waveInput then editor.waveInput:SetValue(editor.wave) end
+        if editor.times then editor.times:SetValue(e.DrinkWaveSchedules[editor.wave] or "") end
+        editor.loading=false
+        farm.drinkSettingsMessage="Wave "..editor.wave..": "..(e.DrinkWaveSchedules[editor.wave] or "uses every-5-wave default")..". Save in Settings profile."
+    end
+    editor.waveInput=addControl(group,"Input","DrinkOverrideWave",{Text="Individual wave (5, 10, 15, ...)",Default="5",Finished=true,Callback=function(value)
+        if editor.loading then return end
+        local key,err=runtime.parseDrinkWave(value)
+        if key then editor.wave=key;runtime.refreshDrinkEditor()
+        else runtime.refreshDrinkEditor();farm.drinkSettingsMessage=err end
+    end})
+    editor.times=addControl(group,"Input","DrinkOverrideTimes",{Text="This wave's times (blank = default)",Default="",Finished=true,Callback=function(value)
+        if editor.loading then return end
+        local slots,normalized=runtime.parseDrinkTimes(value)
+        if not slots then runtime.refreshDrinkEditor();farm.drinkSettingsMessage=normalized;return end
+        local copy={};for key,times in pairs(e.DrinkWaveSchedules) do copy[key]=times end
+        if value:match("^%s*$") then copy[editor.wave]=nil else copy[editor.wave]=normalized end
+        e.DrinkWaveSchedules=copy
+        runtime.refreshDrinkEditor()
+    end})
+    runtime.refreshDrinkEditor()
+    farm.drinkSettingsLabel=runtime.label(group,"",true)
     farm.nightDrinkLabel=runtime.label(group,"Nightly drinks: off",true)
+    farm.drinkEffectsLabel=runtime.label(group,"",true)
 end
 farm.addNightDrinkControls(healing)
 function farm.showDrinks()
     local message=farm.drinkMessage
-    if message and message~=farm.drinkDisplayed then
-        local ok,result=pcall(function() return farm.drinkLabel:SetText(message) end)
-        if ok and result~=false then farm.drinkDisplayed=message end
-    end
     local status=not e.AutoNightDrinks and "Nightly drinks: off" or
-        (e.Autofarm and "Nightly drinks: autofarm controls the shared schedule." or (message or "Nightly drinks: waiting for scheduled night slots."))
-    if farm.nightDrinkLabel and status~=farm.nightDrinkDisplayed then
-        local ok,result=pcall(function() return farm.nightDrinkLabel:SetText(status) end)
-        if ok and result~=false then farm.nightDrinkDisplayed=status end
+        (e.Autofarm and "Nightly drinks: autofarm controls the shared schedule." or (message or "Nightly drinks: waiting for night."))
+    for _,entry in ipairs({{farm.drinkLabel,message,"drinkDisplayed"},{farm.nightDrinkLabel,status,"nightDrinkDisplayed"},
+        {farm.drinkSettingsLabel,farm.drinkSettingsMessage,"drinkSettingsDisplayed"}}) do
+        if entry[1] and entry[2] and farm[entry[3]]~=entry[2] then
+            local ok,result=pcall(entry[1].SetText,entry[1],entry[2]);if ok and result~=false then farm[entry[3]]=entry[2] end
+        end
+    end
+    if os.clock()<(farm.drinkEffectsAt or 0) then return end
+    farm.drinkEffectsAt=os.clock()+1
+    local lines={}
+    for _,item in ipairs(farm.drinkItems) do
+        local remaining=runtime.drinkEffect(item.name);local amount=runtime.consumableAmount(item.name)
+        lines[#lines+1]=item.name..": "..(finite(amount) and string.format("%.1f",amount).." charges" or "not owned")..
+            "; "..(finite(remaining) and (remaining>0 and math.ceil(remaining).."s active" or "inactive") or "timer unavailable")
+    end
+    local text=table.concat(lines,"\n")
+    if farm.drinkEffectsLabel and farm.drinkEffectsDisplayed~=text then
+        local ok,result=pcall(farm.drinkEffectsLabel.SetText,farm.drinkEffectsLabel,text)
+        if ok and result~=false then farm.drinkEffectsDisplayed=text end
     end
 end
--- Standalone use has its own timer and does not require the autofarm route.
 function farm.standaloneDrinkMonitor()
-    if not runtime.active then return end
-    if os.clock()<(farm.standaloneDrinkAt or 0) then return end
+    if not runtime.active or os.clock()<(farm.standaloneDrinkAt or 0) then return end
     farm.standaloneDrinkAt=os.clock()+.2
-    if not e.Autofarm and e.AutoNightDrinks then
+    if e.Autofarm or e.AutoNightDrinks then
         local ok,err=pcall(farm.drinkTick)
         if not ok then farm.drinkMessage="Drink scheduler: "..tostring(err) end
     end
     farm.showDrinks()
 end
 connect(RunService.Heartbeat,farm.standaloneDrinkMonitor)
+
 
 -- Separate local settings file; not included in shareable gameplay profiles.
 farm.webhook={enabled=false,url="",sent={}}
@@ -4756,11 +5040,14 @@ function farm.purchaseSummary()
 end
 function farm.nextDrinkSummary(wave,minutes)
     if not farm.drinkEligible(wave,15) then
-        return "Wave "..math.min(15,(math.floor(wave/5)+1)*5).." at 18:15"
+        local nextWave=math.min(15,(math.floor(wave/5)+1)*5)
+        local slots=farm.drinkSlots(nextWave)
+        return "Wave "..nextWave..(#slots>0 and " at "..slots[1].at or " schedule off")
     end
-    if minutes>=360 and minutes<1080 then return "18:15" end
-    local clock=farm.drinkClock
     local definitions=farm.drinkSlots(wave)
+    if #definitions==0 then return e.DrinkOnExpiry and wave%5~=1 and "Effect expiry" or "Schedule off" end
+    if minutes>=360 and minutes<1080 then return definitions[1].at end
+    local clock=farm.drinkClock
     if clock and clock.wave==wave then
         for _,definition in ipairs(definitions) do
             local slot=clock.slots[definition.key]
@@ -4773,10 +5060,10 @@ function farm.nextDrinkSummary(wave,minutes)
         end
     end
     for _,definition in ipairs(definitions) do
-        if (minutes>=1080 and (definition.key~="evening" or minutes<definition.minutes))
-            or (minutes<360 and definition.key~="evening" and minutes<definition.minutes) then return definition.at end
+        if (minutes>=1080 and (definition.minutes<360 or minutes<definition.minutes))
+            or (minutes<360 and definition.minutes<360 and minutes<definition.minutes) then return definition.at end
     end
-    return "18:15"
+    return e.DrinkOnExpiry and wave%5~=1 and "Effect expiry / next night" or "Next night"
 end
 farm.detailLabel=runtime.label(farmGroup,"",true)
 connect(RunService.Heartbeat,function()
