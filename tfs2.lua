@@ -95,10 +95,6 @@ local config = {
     NoRecoil = false,
     SilentAim = false,
     Triggerbot = false,
-    VisibleCheck = false, -- Optional camera visibility check.
-    BodyFallback = true,
-    IgnoreInvisibleParts = false,
-    WeaponClearance = true, -- Match the supplied GunScript head/camera origin.
     AutoFireMode = true,
     RangeCheck = true,
     RangeMode = "Automatic",
@@ -178,10 +174,10 @@ runtime.extraSpecs = {
     DrinkWaveSchedules={{}}, DrinkOnExpiry={false},
     FarmResetWave={"30"}, FarmResetTime={"04:30"},
     AutoEquip={false}, EquipWeapon={""}, FireModeOverride={false}, FireMode={"FullAuto",{"Single","Burst","FullAuto"}},
-    OverheatManagement={false}, ClosePriority={false}, CloseDistance={60,20,200}, SkipCloaked={false},
-    MeleeAura={false}, UseKnife={true}, ThrowMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position"}}, LureMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position","Boss–Enemy Spawn"}},
+    ClosePriority={false}, CloseDistance={60,20,200},
+    MeleeAura={false}, ThrowMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position"}}, LureMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position","Boss–Enemy Spawn"}},
     AutoDonate={false}, DonatePlayer={""}, DonateAmount={100,1,10000}, DonateInterval={10,1,60},
-    IgnoreEquippingTool={false}, AutoRefillAmmo={false}, ExperimentalFire={false}, AutoVote={false}, VoteMap={""}, AutoSkip={false}, 
+    AutoRefillAmmo={false}, AutoVote={false}, VoteMap={""}, AutoSkip={false}, 
     HipFireADS={false}, AutoShopMoney={false}, AutoPurchase={false}, Purchases={{}}, AutoRepair={false}, Repairs={{}},
     AutoReplenish={false}, Replenish={{}}, ActionInterval={3,.2,30}, MoneyReserve={0,0,100000},
     ZombieHighlights={false}, HighlightMode={"All",{"All","Priority only","Super priority only","Selected type"}},
@@ -189,7 +185,7 @@ runtime.extraSpecs = {
     TargetMarker={false}, TargetTracer={false}, ScavengerHighlights={false},
 
 }
-runtime.opDefinitions={{2,"Armour-Aware Aim Points"},{3,"Hot Harmony Heat Optimization"},{5,"Smarter Manual Throwable Placement","Predict throwable targets"},{6,"Hotkey Explosive-Can Detonation","Detonate owned can [J]"},{17,"Projectile Trajectory Override","Projectile velocity multiplier"}}
+runtime.opDefinitions={{5,"Smarter Manual Throwable Placement","Predict throwable targets"},{6,"Hotkey Explosive-Can Detonation","Detonate owned can [J]"},{17,"Projectile Trajectory Override","Projectile velocity multiplier"}}
 for _,entry in ipairs(runtime.opDefinitions) do runtime.extraSpecs["OP"..entry[1]]={false} end
 runtime.extraSpecs.OPPredictionSeconds={1,0,3}
 runtime.extraSpecs.ProjectileMultiplier={1.5,1,3}
@@ -417,7 +413,7 @@ local function gunProfile()
 end
 -- Use the gun range formula; unavailable modules leave the base range.
 function runtime.armouredPart(part)
-    local name=string.lower(part.Name)
+    local name=string.lower(part.Name or "")
     return name:find("armour",1,true)~=nil or name:find("armor",1,true)~=nil
         or name:find("shield",1,true)~=nil or name:find("helmet",1,true)~=nil or name=="stonearm"
 end
@@ -580,12 +576,7 @@ end
 local function clearPath(origin, point, model)
     local offset = point - origin
     if offset.Magnitude < 0.001 then return true end
-    local result
-    if config.IgnoreInvisibleParts then
-        result = runtime.traceVisible(origin, offset, visibilityParams.FilterDescendantsInstances, false)
-    else
-        result = Workspace:Raycast(origin, offset, visibilityParams)
-    end
+    local result = runtime.traceVisible(origin, offset, visibilityParams.FilterDescendantsInstances, false)
     return result == nil or result.Instance:IsDescendantOf(model),result
 end
 
@@ -626,22 +617,20 @@ local function exposedPoint(candidate, origin, center, limit)
     local parts = {}
     local head = model:FindFirstChild("Head")
     if head and head:IsA("BasePart") then table.insert(parts, head) end
-    if config.BodyFallback or runtime.extra.OP2 or contact or runtime.immediateThreat(model,root) then
-        for _, name in ipairs({
+    for _, name in ipairs({
             "UpperTorso", "Torso", "LowerTorso",
             "LeftUpperArm", "RightUpperArm", "LeftLowerArm", "RightLowerArm",
             "LeftHand", "RightHand", "Left Arm", "Right Arm",
             "LeftUpperLeg", "RightUpperLeg", "LeftLowerLeg", "RightLowerLeg",
             "LeftFoot", "RightFoot", "Left Leg", "Right Leg"
         }) do
-            local part = model:FindFirstChild(name)
-            if part and part:IsA("BasePart") then table.insert(parts, part) end
-        end
+        local part = model:FindFirstChild(name)
+        if part and part:IsA("BasePart") then table.insert(parts, part) end
     end
     local bestPart,bestPoint,bestDamage,fallbackPart,fallbackPoint
     local damageCache={};local reason="No aimable body parts";local reachedRange=false
     for _, part in ipairs(parts) do
-        local points = runtime.targetPoints(part,origin,config.WeaponClearance or ignoreFOV or contact)
+        local points = runtime.targetPoints(part,origin,true)
         for _, point in ipairs(points) do
             local screen, onScreen = Camera:WorldToViewportPoint(point)
             local eligible=ignoreFOV or (onScreen and (Vector2.new(screen.X, screen.Y) - center).Magnitude <= config.FOVRadius)
@@ -650,21 +639,14 @@ local function exposedPoint(candidate, origin, center, limit)
             elseif not withinRange(origin,point,limit) then if not reachedRange then reason="Outside gun range" end;eligible=false
             else
                 reachedRange=true
-                if config.WeaponClearance or ignoreFOV then
-                    local clear;clear,hit=clearPath(origin,point,model)
-                    if not clear then reason="Shot path blocked: "..tostring(hit and hit.Instance and hit.Instance.Name or "geometry");eligible=false end
-                end
-                if eligible and not ignoreFOV and config.VisibleCheck and not clearPath(Camera.CFrame.Position,point,model) then
+                local clear;clear,hit=clearPath(origin,point,model)
+                if not clear then reason="Shot path blocked: "..tostring(hit and hit.Instance and hit.Instance.Name or "geometry");eligible=false end
+                if eligible and not ignoreFOV and not clearPath(Camera.CFrame.Position,point,model) then
                     reason="Camera visibility blocked";eligible=false
                 end
             end
             if eligible and (not contact or (point-origin).Magnitude>=.001) then
-                if not runtime.extra.OP2 then return part, point end
                 local actual=part
-                local start=origin or Camera.CFrame.Position
-                if not (config.WeaponClearance or ignoreFOV) then
-                    if config.IgnoreInvisibleParts then hit=runtime.traceVisible(start,point-start,visibilityParams.FilterDescendantsInstances,false) else hit=Workspace:Raycast(start,point-start,visibilityParams) end
-                end
                 if hit and hit.Instance and hit.Instance:IsDescendantOf(model) then actual=hit.Instance
                 elseif hit then actual=nil end
                 if actual and not runtime.armouredPart(actual) then
@@ -691,10 +673,10 @@ local function protectedZombie(model)
     if model:FindFirstChildOfClass("ForceField") then return true,"ForceField" end
     local humanoid = model:FindFirstChildOfClass("Humanoid")
     if humanoid and humanoid.MaxHealth==math.huge then return true,"Invulnerable (infinite MaxHealth)" end
-    if runtime.extra.SkipCloaked and model.Name=="Assassin" then
+    if model.Name=="Assassin" then
         -- Visibility proxy: the extracted client does not expose its server vulnerability flag.
         local body=model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso") or model:FindFirstChild("Head")
-        if body and body:IsA("BasePart") and body.Transparency>=.95 then return true,"Skip cloaked Assassins is enabled (appearance check)" end
+        if body and body:IsA("BasePart") and body.Transparency>=.95 then return true,"Cloaked Assassin (appearance check)" end
     end
     return false
 end
@@ -715,8 +697,8 @@ local function getTargetHead()
     local limit
     if ignoreFOV then limit=config.RangeMode=="Manual" and config.ManualRange or detectedRange(tool,current)
     else limit=rangeLimit(tool,current) end
-    local origin = (ignoreFOV or config.WeaponClearance or config.RangeCheck) and getWeaponOrigin() or nil
-    if limit == nil or ((ignoreFOV or config.WeaponClearance or config.RangeCheck) and not origin) then return nil end
+    local origin = getWeaponOrigin()
+    if limit == nil or not origin then return nil end
     local character = LocalPlayer.Character
     local root = character and character:FindFirstChild("HumanoidRootPart")
     local ignored = {Camera}
@@ -1064,18 +1046,13 @@ runtime.slot.handler = function(self, ...)
         if type(args[2]) == "table" then
             local ignored = {}
             for _, instance in ipairs(args[2]) do table.insert(ignored, instance) end
-            local changed = false
             for _, player in ipairs(Players:GetPlayers()) do
                 if player ~= LocalPlayer and player.Character then
                     table.insert(ignored, player.Character)
-                    changed = true
                 end
             end
-            if config.IgnoreInvisibleParts then
-                local _, filtered = runtime.traceVisible(ray.Origin, args[1].Direction, ignored, args[4])
-                ignored, changed = filtered, true
-            end
-            if changed then args[2] = ignored end
+            local _, filtered = runtime.traceVisible(ray.Origin, args[1].Direction, ignored, args[4])
+            args[2] = filtered
         end
         return args
     end)
@@ -1165,8 +1142,7 @@ function runtime.gunCallbacks()
     if not gun then return end
     runtime.watchGunCallbacks(tool)
     local now=os.clock()
-    if runtime.callbackTool==tool and runtime.callbackExperimental==runtime.extra.ExperimentalFire and now<(runtime.callbackUntil or 0) then return runtime.callbacks end
-    runtime.callbackExperimental=runtime.extra.ExperimentalFire
+    if runtime.callbackTool==tool and now<(runtime.callbackUntil or 0) then return runtime.callbacks end
     -- Equip callbacks may be installed just after the ancestry notification.
     -- A missing pair must be retried promptly instead of cached for half a second.
     runtime.callbackTool,runtime.callbackUntil,runtime.callbacks=tool,now+.05,nil
@@ -1183,7 +1159,7 @@ function runtime.gunCallbacks()
             end
         end
     end
-    if runtime.extra.ExperimentalFire then
+    do
         local playerGui=LocalPlayer:FindFirstChild("PlayerGui")
         local screen=playerGui and playerGui:FindFirstChild("ScreenGui")
         local touch=screen and screen:FindFirstChild("TouchControls")
@@ -1192,7 +1168,7 @@ function runtime.gunCallbacks()
         local down=attack and find(attack.MouseButton1Down)
         local up=attack and find(attack.InputEnded)
         if down and up then
-            runtime.callbacks={down=down,up=up,reload=find(UIS.InputBegan),backend="Attack-button callbacks (experimental)"}
+            runtime.callbacks={down=down,up=up,reload=find(UIS.InputBegan),backend="Attack-button callbacks"}
             runtime.callbackUntil=now+.5
             return runtime.callbacks
         end
@@ -1357,8 +1333,9 @@ local function finishReloadKey(now)
 end
 runtime.heatStates=setmetatable({}, {__mode="k"})
 function runtime.heatBlocked(tool,current,now)
-    local harmony=runtime.extra.OP3 and LocalPlayer:FindFirstChild("PlayerPerks") and LocalPlayer.PlayerPerks:FindFirstChild("HeatHighLow")
-    if not (runtime.extra.OverheatManagement or harmony) or not tool then return false end
+    if not tool then return false end
+    local perks=LocalPlayer:FindFirstChild("PlayerPerks")
+    local harmony=perks and perks:FindFirstChild("HeatHighLow")
     local heat=readValue(current,"HeatClient")
     if heat==nil then return false end
     if not validRange(heat) then return true end
@@ -1764,10 +1741,6 @@ toggle(runtime.weaponGroup, "NoRecoil", "No recoil", "NoRecoilToggle", function(
     config.NoRecoil = value
     runtime.updateRecoil()
 end)
-toggle(targeting, "IgnoreInvisibleParts", "Ignore transparent barriers", "IgnoreInvisiblePartsToggle")
-toggle(targeting, "BodyFallback", "Allow body / limb targets", "BodyFallbackToggle")
-toggle(targeting, "WeaponClearance", "Check shot-path clearance", "WeaponClearanceToggle")
-toggle(targeting, "VisibleCheck", "Visible Check", "VisibleCheckToggle")
 dropdown(targeting, "TargetMode", "Targeting Mode", "TargetModeDropdown", {"Closest to Crosshair", "Closest to Player"})
 toggle(targeting, "ShowFOV", "Show FOV Circle", "ShowFOVToggle")
 slider(targeting, "FOVRadius", "Manual silent aim FOV", "FOVRangeSlider", 10, 1000, "px")
@@ -1986,7 +1959,7 @@ local autoloadPath = profileFolder .. "/autoload.json"
 local typedProfile, selectedProfile = "Default", nil
 local profileDropdown, autoloadLabel
 local hideOnAutoload = true
-local booleanKeys = {"SilentAim", "Triggerbot", "VisibleCheck", "WeaponClearance", "AutoFireMode", "ShowFOV"}
+local booleanKeys = {"SilentAim", "Triggerbot", "AutoFireMode", "ShowFOV"}
 local cursorModes = {"Follow mouse", "Fixed position", "Screen center"}
 local targetModes = {"Closest to Crosshair", "Closest to Player"}
 
@@ -2049,12 +2022,10 @@ local function snapshotProfile()
     settings.CursorMode = config.CursorMode
     settings.TargetMode = config.TargetMode
     settings.FOVColor = {R = config.FOVColor.R, G = config.FOVColor.G, B = config.FOVColor.B}
-    settings.IgnoreInvisibleParts = config.IgnoreInvisibleParts
     settings.Extras = {}
-    for key,value in pairs(runtime.extra) do settings.Extras[key]=value end
+    for key in pairs(runtime.extraSpecs) do settings.Extras[key]=runtime.extra[key] end
     settings.HeadshotConversion = config.HeadshotConversion
     settings.NoSpread, settings.NoRecoil = config.NoSpread, config.NoRecoil
-    settings.BodyFallback = config.BodyFallback
     settings.SuperPriorityList = namesFromSet(config.SuperPriorityList)
     settings.PriorityList = namesFromSet(config.PriorityList)
     settings.IgnoreList = namesFromSet(config.IgnoreList)
@@ -2093,17 +2064,11 @@ local function validateProfile(data, allowIncomplete)
     assert(type(data) == "table" and data.Version == 1 and type(data.Settings) == "table", "Unsupported or invalid profile format.")
     local source, clean = data.Settings, {}
     clean.Extras = runtime.validateExtras(source.Extras)
-    clean.IgnoreInvisibleParts = source.IgnoreInvisibleParts
-    if clean.IgnoreInvisibleParts == nil then clean.IgnoreInvisibleParts = false end
-    assert(type(clean.IgnoreInvisibleParts) == "boolean", "Invalid invisible-parts option.")
     for _, key in ipairs({"HeadshotConversion", "NoSpread", "NoRecoil"}) do
         clean[key] = source[key]
         if clean[key] == nil then clean[key] = false end
         assert(type(clean[key]) == "boolean", "Invalid " .. key)
     end
-    clean.BodyFallback = source.BodyFallback
-    if clean.BodyFallback == nil then clean.BodyFallback = true end
-    assert(type(clean.BodyFallback) == "boolean", "Invalid body fallback.")
     clean.RangeCheck = source.RangeCheck
     if clean.RangeCheck == nil then clean.RangeCheck = true end
     clean.RangeMode = source.RangeMode
@@ -2149,7 +2114,7 @@ local function applyProfile(clean)
         end
     end
     runtime.refreshZombieChoices()
-    for _, key in ipairs({"HeadshotConversion", "NoSpread", "NoRecoil", "IgnoreInvisibleParts", "BodyFallback", "FOVRadius", "TriggerIntervalMs", "VisibleCheck", "WeaponClearance", "AutoFireMode", "ShowFOV"}) do
+    for _, key in ipairs({"HeadshotConversion", "NoSpread", "NoRecoil", "FOVRadius", "TriggerIntervalMs", "AutoFireMode", "ShowFOV"}) do
         settingsUI[key]:SetValue(clean[key])
     end
     for _, key in ipairs({"RangeCheck", "RangeMode", "ManualRange"}) do settingsUI[key]:SetValue(clean[key]) end
@@ -2690,10 +2655,6 @@ voting:AddButton({Text="Emergency stop (End)",Func=state.stop})
 local weapons=runtime.extensionTabs.Weapons:AddRightGroupbox("Fire mode & input")
 control(weapons,"HipFireADS","ADS state without zoom (experimental)")
 runtime.label(weapons,"Sets ADS state without changing the camera or zoom. Requires executor upvalue APIs and supported sights. Critical Aim upgrade must be owned; server bonus unverified. ADS restrictions may remain; scope charging is suppressed. Release manual ADS before enabling.",true)
-control(weapons,"OverheatManagement","Manage triggerbot heat")
-runtime.label(weapons,"Pauses before overheating; resumes after cooling. Applies to triggerbot only. Unsupported heat data pauses firing while enabled.",true)
-control(weapons,"ExperimentalFire","Attack-button firing (test)")
-runtime.label(weapons,"Uses the equipped gun's native callback; falls back if unavailable.",true)
 control(weapons,"FireModeOverride","Override fire mode")
 control(weapons,"FireMode","Mode")
 runtime.label(weapons,"Re-equip after changing; charge/continuous modes excluded.",true)
@@ -2723,8 +2684,6 @@ runtime.label(scene,"Red: super priority; gold: priority; blue: normal.",true)
 local priority=CombatTab:AddLeftGroupbox("Priority & protection")
 control(priority,"ClosePriority","Close Range Prioritize")
 control(priority,"CloseDistance","Close distance (studs)")
-control(priority,"SkipCloaked","Skip cloaked Assassins")
-runtime.label(priority,"Optional appearance filter: skips highly transparent Assassins. Transparency alone does not prove immunity. Off by default; saved profiles retain their setting.",true)
 control(priority,"QuietReload","Reload early during quiet periods")
 control(priority,"QuietReloadPercent","Reload at magazine % or below")
 control(priority,"ReloadClearance","No enemies within (studs)")
@@ -2733,7 +2692,6 @@ runtime.label(priority,"Threat > Close > Super > Priority > Normal. Triggerbot p
 runtime.label(priority,"Triggerbot always ignores FOV and uses built-in aim. Range, obstacles and priorities still apply. FOV only limits manual silent aim. Off-screen server acceptance remains unverified.",true)
 local actions=CombatTab:AddRightGroupbox("Melee")
 control(actions,"MeleeAura","Melee aura")
-control(actions,"UseKnife","Use knife with guns")
 runtime.label(actions,"Direct melee sweep within native range, including behind teammates or other zombies and while reading menus. No visibility/FOV check. Server hit rules still apply. Knife is a fallback, not a simultaneous second attack.",true)
 local donation=automation:AddLeftGroupbox("Donations")
 control(donation,"AutoDonate","Auto donate")
@@ -2787,9 +2745,6 @@ connect(UIS.InputBegan,function(input,processed)
 end)
 
 local items=runtime.extensionTabs.Items
-local itemOptions=items:AddLeftGroupbox("Item activation")
-control(itemOptions,"IgnoreEquippingTool","ignore equipping tool")
-runtime.label(itemOptions,"All drinks and healing items always use immediate backpack requests, regardless of this toggle. Throwables equip and restore your previous tool.")
 local use=items:AddLeftGroupbox("Use consumables")
 for index,item in ipairs(runtime.consumableDefinitions) do
     if index==5 then use:AddDivider() end
@@ -3146,7 +3101,7 @@ function state.directMelee()
     if not humanoid or not root then return end
     local tool=character:FindFirstChildOfClass("Tool")
     local melee=child(tool,"MeleeScript")
-    if not melee and (not e.UseKnife or not child(character,"MeleeWeapon")) then return end
+    if not melee and not child(character,"MeleeWeapon") then return end
     local playerActions=child(child(LocalPlayer,"PlayerScripts"),"PlayerActions")
     if readValue(playerActions,"Meleeing")==true or readValue(tool,"Attacking")==true
         or readValue(tool,"Reloading")==true or readValue(tool,"Consuming")==true then return end
@@ -5582,10 +5537,6 @@ ui.OPCanKey=canToggle.Addons[#canToggle.Addons]
 control(weapons,"OP17","Projectile velocity multiplier (PVM)")
 control(weapons,"ProjectileMultiplier","Projectile velocity (1–3x)")
 runtime.label(weapons,"Projectile weapons only. Re-equip if the gun caches its values. Server acceptance remains unverified.",true)
-control(priority,"OP2","Armour-aware aim points")
-runtime.label(priority,"Skips armour and shield intersections. Hit Override independently requests head damage; server acceptance is unverified.",true)
-control(weapons,"OP3","Hot Harmony heat optimization")
-runtime.label(weapons,"Needs Hot Harmony + triggerbot. Keeps heat above 50% when possible; real overheating still waits for zero.",true)
 connect(UIS.InputBegan,function(input,processed)
     if processed or UIS:GetFocusedTextBox() or not on(6) then return end
     local key=e.OPCanKey
