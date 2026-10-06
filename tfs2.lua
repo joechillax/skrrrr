@@ -2826,20 +2826,41 @@ for index,item in ipairs(runtime.consumableDefinitions) do
 end
 use:AddDivider()
 runtime.consumables.label=runtime.label(use,runtime.consumables.message,true)
-runtime.label(use,"Shared drink key sends every enabled drink immediately from your backpack. No equip or animation wait. Charges still apply.",true)
-connect(UIS.InputBegan,function(input,processed)
-    if processed or UIS:GetFocusedTextBox() or runtime.consumableBusy or runtime.refillBusy or runtime.throwKeyMatches(input) then return end
-    local drinks={}
+runtime.label(use,"A shared key uses every enabled consumable bound to it. Immediate backpack requests; no equip or animation wait. Charges still apply.",true)
+function runtime.manualConsumableKey(input,processed)
+    if UIS:GetFocusedTextBox() or guiService.MenuIsOpen then return end
+    -- Native game actions may consume keyboard keys; chat and GUI mouse clicks remain excluded.
+    if processed and input.UserInputType~=Enum.UserInputType.Keyboard then return end
+    local entries={}
     for index,item in ipairs(runtime.consumableDefinitions) do
         local key=e["ItemKey"..index]
-        local matches=input.KeyCode.Name==key or (key=="MB1" and input.UserInputType==Enum.UserInputType.MouseButton1)
+        local matches=key~="None" and (input.KeyCode.Name==key or (key=="MB1" and input.UserInputType==Enum.UserInputType.MouseButton1)
             or (key=="MB2" and input.UserInputType==Enum.UserInputType.MouseButton2)
+        )
         if e["UseItem"..index] and matches then
-            if index<=4 then table.insert(drinks,index)
-            elseif #drinks==0 then runtime.useConsumable(item[1]);return end
+            table.insert(entries,{name=item[1],index=index,key=key})
         end
     end
-    if #drinks>0 then runtime.useDrinkBatch(drinks) end
+    if #entries==0 then return end
+    local c=runtime.consumables
+    if runtime.refillBusy then c.message="Manual use paused: ammo refill is in progress.";return end
+    if runtime.consumableBusy then c.message="Manual use paused: another item action is in progress.";return end
+    if runtime.throwKeyMatches(input) then c.message="Manual use paused: this key is also assigned to an enabled throwable.";return end
+    local started=runtime.instantConsumableBatch(entries,function(entry)
+        return e["UseItem"..entry.index]==true and e["ItemKey"..entry.index]==entry.key
+    end,runtime.consumableResult,"manual")
+    local queued,skipped={},{}
+    for _,entry in ipairs(entries) do
+        if entry.manualBlocked then table.insert(skipped,entry.name..": "..entry.manualBlocked)
+        else table.insert(queued,entry.name) end
+    end
+    if #queued>0 then c.message="Requested: "..table.concat(queued,", ").."." end
+    if #skipped>0 then c.message=(#queued>0 and c.message.."\n" or "")..table.concat(skipped,"\n") end
+    return started
+end
+connect(UIS.InputBegan,function(input,processed)
+    local ok,err=pcall(runtime.manualConsumableKey,input,processed)
+    if not ok then runtime.consumables.message="Manual use paused: "..tostring(err) end
 end)
 connect(RunService.Heartbeat,function()
     local c=runtime.consumables
@@ -4377,13 +4398,21 @@ function runtime.instantConsumableBatch(entries,eligible,done,scope)
     runtime.instantConsumableMonitor()
     local folder=child(game:GetService("ReplicatedStorage"),"RemoteFunctions")
     local remote=child(folder,"UseConsumable")
-    if not remote or not remote:IsA("RemoteFunction") then return false end
+    if not remote or not remote:IsA("RemoteFunction") then
+        if scope=="manual" then for _,entry in ipairs(entries) do entry.manualBlocked="Consumable service unavailable." end end
+        return false
+    end
     local c=runtime.consumables;c.itemAt=c.itemAt or {}
     local started=0
     for _,entry in ipairs(entries) do
         local supported=false
         for _,item in ipairs(runtime.consumableDefinitions) do if item[1]==entry.name then supported=true;break end end
         local ok,tool,target,duration,amount,character,humanoid=pcall(runtime.consumableContext,entry.name)
+        if scope=="manual" then
+            entry.manualBlocked=not supported and "Unsupported consumable." or not ok and tostring(tool)
+                or runtime.instantUses[entry.name] and "A use is already awaiting confirmation."
+                or os.clock()<(c.itemAt[entry.name] or 0) and "Item cooldown is active." or nil
+        end
         if supported and ok and not runtime.instantUses[entry.name] and os.clock()>=(c.itemAt[entry.name] or 0) then
             entry.before=amount
             entry.character=character
