@@ -173,7 +173,7 @@ function runtime.parseResetSettings(waveText,timeText)
     return {wave=wave,minutes=hour*60+minute,time=string.format("%02d:%02d",hour,minute),key=wave..":"..(hour*60+minute)}
 end
 runtime.extraSpecs = {
-    Autofarm={false}, AutoC96={false}, AutoLeaveSpawn={false}, AutoNightDrinks={false},
+    Autofarm={false}, AutoNightDrinks={false},
     DrinkTimes={"18:15, 00:10"}, DrinkFiveTimes={"18:15, 00:05, 00:40"}, DrinkFirstTimes={"18:15"},
     DrinkWaveSchedules={{}}, DrinkOnExpiry={false},
     FarmResetWave={"30"}, FarmResetTime={"04:30"},
@@ -193,7 +193,6 @@ runtime.opDefinitions={{2,"Armour-Aware Aim Points"},{3,"Hot Harmony Heat Optimi
 for _,entry in ipairs(runtime.opDefinitions) do runtime.extraSpecs["OP"..entry[1]]={false} end
 runtime.extraSpecs.OPPredictionSeconds={1,0,3}
 runtime.extraSpecs.ProjectileMultiplier={1.5,1,3}
-runtime.extraSpecs.AssassinShotGuard={false}
 runtime.extraSpecs.QuietReload={false}
 runtime.extraSpecs.QuietReloadPercent={40,10,90}
 runtime.extraSpecs.ReloadClearance={100,20,200}
@@ -977,12 +976,6 @@ if not runtime.slot.original then
     end))
 end
 runtime.penetrationRays=setmetatable({}, {__mode="k"})
-function runtime.singleHitEnabled()
-    if not runtime.extra.AssassinShotGuard or not (config.SilentAim or config.Triggerbot) then return false end
-    local tool,mode,current=gunProfile()
-    if not tool or mode=="Continuous" or (readValue(current,"RayRadius") or 0)>0 then return false end
-    return true
-end
 function runtime.penetrationDirection(ray,ignored)
     if type(ignored)~="table" then return end
     local previous=runtime.penetrationRays[ignored]
@@ -1053,11 +1046,6 @@ runtime.slot.handler = function(self, ...)
         local ray = original[1]
         if typeof(ray) ~= "Ray" or ray.Direction.Magnitude<=0.001 then return end
         local continuation=runtime.penetrationDirection(ray,original[2])
-        if continuation and runtime.singleHitEnabled() then
-            -- Native GunScript subtracts this segment length and ends the loop on zero range.
-            -- Keep the real first hit; do not query or manufacture a subsequent damage target.
-            return {singleHitEnd=ray.Origin+continuation.Unit*ray.Direction.Magnitude}
-        end
         local targetPosition = (config.SilentAim or config.Triggerbot) and os.clock()-cachedAt<=0.15 and cachedPosition or nil
         if not continuation and not targetPosition and config.NoSpread then
             -- Match GunScript's Mouse coordinates, not UIS screen coordinates or a saved FOV point.
@@ -1098,10 +1086,6 @@ runtime.slot.handler = function(self, ...)
             warn("[Combat Assistant] Aim calculation failed; forwarding original shot: " .. tostring(redirected))
         end
         return oldNamecall(self, table.unpack(original, 1, original.n))
-    end
-    if redirected and redirected.singleHitEnd then
-        runtime.penetrationRays[original[2]]=nil
-        return nil,redirected.singleHitEnd,Vector3.new(0,0,0),Enum.Material.Air
     end
     local args = redirected or original
     if redirected then runtime.rayWarning=false;runtime.lastRedirect=os.clock() end
@@ -1727,6 +1711,7 @@ Window = Linoria:CreateWindow({
 local CombatTab = Window:AddTab("Combat")
 runtime.extensionTabs = {
     Weapons=Window:AddTab("Weapons"), Automation=Window:AddTab("Automation"),
+    Autofarm=Window:AddTab("Autofarm"),
     Visuals=Window:AddTab("Visuals"), Items=Window:AddTab("Items")
 }
 runtime.weaponGroup=runtime.extensionTabs.Weapons:AddLeftGroupbox("Weapon controls & range")
@@ -2312,7 +2297,6 @@ local function control(group,key,text,choices)
         e[key]=value==nil and spec[1] or value
         if key=="Autofarm" and not e[key] and state.farm then state.farm.stop() end
         if key=="AutoNightDrinks" and not e[key] and not e.Autofarm and runtime.cancelInstantConsumables then runtime.cancelInstantConsumables("standalone") end
-        if key=="AutoLeaveSpawn" and not e[key] and state.farm and not e.Autofarm then state.farm.cancelWalk() end
         if selection then selection:SetText(table.concat(namesFromSet(e[key]),", ")) end
     end}
     for _,entry in ipairs(runtime.opDefinitions) do if key=="OP"..entry[1] then options.Tooltip=entry[2]..". Check the release notes for requirements and verification limits.";break end end
@@ -2652,7 +2636,6 @@ function state.automation()
         end
         return
     end
-    if e.AutoLeaveSpawn and state.farm then state.farm.leave(1) end
     runtime.refillStep()
     if state.actions then state.actions() end
     if state.spending then state.spending() end
@@ -2733,8 +2716,6 @@ control(priority,"ClosePriority","Close Range Prioritize")
 control(priority,"CloseDistance","Close distance (studs)")
 control(priority,"SkipCloaked","Skip cloaked Assassins")
 runtime.label(priority,"Optional appearance filter: skips highly transparent Assassins. Transparency alone does not prove immunity. Off by default; saved profiles retain their setting.",true)
-control(priority,"AssassinShotGuard","Assassin protection: single-hit hitscan")
-runtime.label(priority,"Silent aim / triggerbot: each hitscan pellet stops after its first zombie hit; no fire pause. Overrides penetration while enabled. Does not protect against an Assassin in front, separate pellets, projectiles or splash.",true)
 control(priority,"QuietReload","Reload early during quiet periods")
 control(priority,"QuietReloadPercent","Reload at magazine % or below")
 control(priority,"ReloadClearance","No enemies within (studs)")
@@ -2910,8 +2891,6 @@ function state.refreshTools()
     if not ok then error(err,0) end
 end
 local group=automation:AddRightGroupbox("Auto-upgrade tools")
-control(group,"AutoC96","Auto Upgrade C96: Unlimited Ammo first")
-runtime.label(group,"Reserves spending for Unlimited Ammo before buying any other C96 upgrade. Uses all available C96 upgrades automatically.",true)
 for index=1,3 do
     if index>1 then group:AddDivider() end
     runtime.label(group,"Tool "..index)
@@ -3388,7 +3367,7 @@ function state.actions()
             or ("Wave "..tostring(readValue(values,"LocalWave") or "?")..": ready-up closed by the game.")
         if not e.Autofarm and state.readyText~=message then state.readyText=message;state.readyStatus:SetText(message) end
     end
-    if e.AutoDonate and not (e.AutoC96 and state.farm and not state.farm.unlimitedOwned()) then job("Donate",e.DonateInterval,state.donate) end
+    if e.AutoDonate then job("Donate",e.DonateInterval,state.donate) end
     if e.MeleeAura and os.clock()>=(state.meleeAt or 0) then state.meleeAt=os.clock()+.05;state.melee() end
 end
 
@@ -3405,7 +3384,7 @@ local function availableMoney(maintenance)
     return math.max(0,(readValue(LocalPlayer,"ReplicatedMoney") or 0)-state.purchaseReserve(maintenance))
 end
 function state.upgradeTool(name,upgradeName,farmOwned)
-    if not farmOwned and (e.Autofarm or (e.AutoC96 and name=="C96")) then return false end
+    if not farmOwned and e.Autofarm then return false end
     local _,tools=ownedTools();local tool=tools[name]
     if state.upgradeBlocked("weaponUpgradeFaults",name,tool) then return false end
     local upgrade=child(toolUpgrades(name),upgradeName)
@@ -3444,7 +3423,7 @@ function state.upgradeTool(name,upgradeName,farmOwned)
     return true
 end
 function state.purchase(name,farmOwned,buyOnly)
-    if not farmOwned and (e.Autofarm or (e.AutoC96 and state.farm and not state.farm.unlimitedOwned())) then return false end
+    if not farmOwned and e.Autofarm then return false end
     if name=="Armour" and readValue(LocalPlayer,"InsideShop")~=true then return false end
     local upgrade=child(child(storage(),"Upgrades"),name)
     if not upgrade then return false end
@@ -3474,7 +3453,7 @@ function state.purchase(name,farmOwned,buyOnly)
     return true
 end
 function state.repair(name)
-    if (e.Autofarm or e.AutoC96) and state.farm and not state.farm.unlimitedOwned() then return false end
+    if e.Autofarm and state.farm and not state.farm.unlimitedOwned() then return false end
     if readValue(LocalPlayer,"InsideShop")~=true then return false end
     local upgrade=child(child(storage(),"Upgrades"),name)
     if not upgrade or (readValue(upgrade,"UStructure")==true and readValue(LocalPlayer,"FirstWave")==true) then return false end
@@ -3700,7 +3679,7 @@ function farm.request(object,cost,event,...)
     local observation=farm.purchaseObservation
     farm.inFlight=true;farm.requestAt=os.clock()+math.max(.5,e.ActionInterval)
     task.spawn(function()
-        if not runtime.active or LocalPlayer.Character~=character or farm.runId~=run or not (e.Autofarm or e.AutoC96) then farm.inFlight=false;return end
+        if not runtime.active or LocalPlayer.Character~=character or farm.runId~=run or not e.Autofarm then farm.inFlight=false;return end
         if farm.healthDue() then
             if not (args[1]=="Health" and (event=="BuyPlayerUpgrade" or (event=="UpgradeStructurePlayer" and (args[2]=="Health" or args[2]=="HealthRegen")))) then farm.inFlight=false;return end
         elseif farm.healingDue() and not ((event=="UpgradeWeapon" or event=="BuyHealing") and farm.healingItem(args[1])) then farm.inFlight=false;return end
@@ -4079,7 +4058,7 @@ function farm.holdAmmoBox()
     farm.status("Jumping / adjusting onto Ammo Box top");return false
 end
 
-local conflicts={"AutoVote","AutoSkip","AutoEquip","AutoUpgrade1","AutoUpgrade2","AutoUpgrade3","AutoPurchase","AutoDonate","AutoC96","AutoLeaveSpawn","MeleeAura"}
+local conflicts={"AutoVote","AutoSkip","AutoEquip","AutoUpgrade1","AutoUpgrade2","AutoUpgrade3","AutoPurchase","AutoDonate","MeleeAura"}
 function farm.begin()
     farm.runId=(farm.runId or 0)+1
     if runtime.cancelRefill then runtime.cancelRefill() end
@@ -4252,7 +4231,7 @@ end
 if RunService.BindToRenderStep then
     local binding="CombatAssistantFarmMovement"
     RunService:BindToRenderStep(binding,Enum.RenderPriority.Last.Value,function()
-        if runtime.active and (e.Autofarm or e.AutoLeaveSpawn) and (not e.Autofarm or farm.supported()) then
+        if runtime.active and e.Autofarm and farm.supported() then
             local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
             if humanoid and root then
                 if farm.route and not farm.retreat and farm.steerRoute then farm.steerRoute(humanoid,root) end
@@ -4269,9 +4248,8 @@ if RunService.BindToRenderStep then
     end)
     table.insert(runtime.connections,{Disconnect=function() RunService:UnbindFromRenderStep(binding) end})
 end
-local farmGroup=automation:AddLeftGroupbox("C96 autofarm")
+local farmGroup=runtime.extensionTabs.Autofarm:AddLeftGroupbox("C96 autofarm")
 control(farmGroup,"Autofarm","One-click C96 autofarm")
-control(farmGroup,"AutoLeaveSpawn","Auto Leave Spawn")
 farm.label=runtime.label(farmGroup,"Off",true)
 runtime.label(farmGroup,"Forest > Arctic > Lakeside voting priority. Other maps: wait in spawn and ready up. Sniper is followed by Body Building Handling, then Bandage, First Aid Kit and Booster Kit before Mortar Squad. Wave 28 prioritizes Max Health and Health Regen, then resumes interrupted upgrades. Weapon and support settings are preserved. Backup Weapon required for starting C96. Farm stands on the shop Ammo Box; no roof access or Rooftop Camper required. Live routes remain unverified.",true)
 
@@ -4782,7 +4760,7 @@ function farm.webhookTick()
         end
     end)
 end
-local webhookGroup=automation:AddRightGroupbox("Wave webhook")
+local webhookGroup=runtime.extensionTabs.Autofarm:AddRightGroupbox("Wave webhook")
 farm.loadWebhook()
 farm.webhook.loading=true
 addControl(webhookGroup,"Input","FarmWebhookURL",{Text="Discord webhook URL (saved locally)",Default=farm.webhook.url,Finished=true,Callback=function(value) farm.webhook.url=tostring(value or ""):match("^%s*(.-)%s*$");farm.saveWebhook() end})
@@ -5363,10 +5341,11 @@ function farm.resetStatus()
     end
     return prefix.." reset: scheduled for "..settings.time.."; repeat after Ammo Box recovery."
 end
-control(farmGroup,"FarmResetWave","Reset on wave")
-control(farmGroup,"FarmResetTime","Reset time (in-game H:MM)")
-runtime.label(farmGroup,"Press Enter to apply. Night times: 18:00–05:59. Repeats after Ammo Box recovery until dawn; saved with your Settings profile.",true)
-farm.resetLabel=runtime.label(farmGroup,farm.resetStatus(),true)
+local resetGroup=runtime.extensionTabs.Autofarm:AddRightGroupbox("Scheduled reset")
+control(resetGroup,"FarmResetWave","Reset on wave")
+control(resetGroup,"FarmResetTime","Reset time (in-game H:MM)")
+runtime.label(resetGroup,"Press Enter to apply. Night times: 18:00–05:59. Repeats after Ammo Box recovery until dawn; saved with your Settings profile.",true)
+farm.resetLabel=runtime.label(resetGroup,farm.resetStatus(),true)
 connect(RunService.Heartbeat,function()
     if os.clock()<(farm.resetTickAt or 0) then return end
     farm.resetTickAt=os.clock()+.1
@@ -5381,7 +5360,6 @@ end)
 
 function state.upgradeShopMoney()
     if not e.AutoShopMoney or e.Autofarm or readValue(LocalPlayer,"FirstWave")~=false then return false end
-    if e.AutoC96 and state.farm and not state.farm.unlimitedOwned() then return false end
     local owned=child(child(storage(),"Upgrades"),"Shop")
     if readValue(owned,"UPurchased")~=true then return false end
     return state.upgradeShop("Shop",true,owned,availableMoney(),{MoneyUpgrade=true})
@@ -5390,7 +5368,6 @@ function state.spending(supportOnly)
     if state.spendingBusy or os.clock()<(state.spendAt or 0) then return end
     local _,humanoid=alive();if not humanoid or runtime.consumableBusy or runtime.refillBusy then return end
     state.spendAt=os.clock()+e.ActionInterval
-    if not supportOnly and e.AutoC96 and state.farm then if not state.farm.upgradeC96(false) then return end end
     local actions={}
     if not supportOnly and e.AutoShopMoney and not e.Autofarm then table.insert(actions,{name="Shop Money",run=state.upgradeShopMoney}) end
     local function selections(enabledKey,selectedKey,fn)
