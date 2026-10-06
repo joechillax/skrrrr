@@ -287,6 +287,7 @@ function runtime.validateExtras(source)
     end
     local reset,resetError=runtime.parseResetSettings(clean.FarmResetWave,clean.FarmResetTime)
     assert(reset,resetError)
+    if clean.DrinkOnExpiry then clean.AutoNightDrinks=false end
     return clean
 end
 
@@ -2166,6 +2167,7 @@ local function applyProfile(clean)
     end
     runtime.loadingProfile=false
     if runtime.refreshDrinkEditor then runtime.refreshDrinkEditor() end
+    if runtime.extensions and runtime.extensions.farm then runtime.extensions.farm.drinkModeChanged() end
     if runtime.extensions then runtime.extensions.refresh() end
     config.FOVColor = clean.FOVColor
     invalidateTarget()
@@ -2296,7 +2298,14 @@ local function control(group,key,text,choices)
     local options={Text=text,Default=e[key],Callback=function(value)
         e[key]=value==nil and spec[1] or value
         if key=="Autofarm" and not e[key] and state.farm then state.farm.stop() end
-        if key=="AutoNightDrinks" and not e[key] and not e.Autofarm and runtime.cancelInstantConsumables then runtime.cancelInstantConsumables("standalone") end
+        if key=="AutoNightDrinks" or key=="DrinkOnExpiry" then
+            if e[key] then
+                local other=key=="DrinkOnExpiry" and "AutoNightDrinks" or "DrinkOnExpiry"
+                e[other]=false
+                if ui[other] and ui[other].Value~=false then ui[other]:SetValue(false) end
+            end
+            if not runtime.loadingProfile and state.farm and state.farm.drinkModeChanged then state.farm.drinkModeChanged() end
+        end
         if selection then selection:SetText(table.concat(namesFromSet(e[key]),", ")) end
     end}
     for _,entry in ipairs(runtime.opDefinitions) do if key=="OP"..entry[1] then options.Tooltip=entry[2]..". Check the release notes for requirements and verification limits.";break end end
@@ -2837,7 +2846,7 @@ connect(RunService.Heartbeat,function()
     if not ok then runtime.consumables.message="Auto-heal paused: "..tostring(err) end
 end)
 
-local purchasing=automation:AddLeftGroupbox("Shop & supplies")
+local purchasing=automation:AddRightGroupbox("Shop & supplies")
 control(purchasing,"AutoShopMoney","Auto upgrade Shop Money only")
 runtime.label(purchasing,"Only MoneyUpgrade; respects money reserve and upgrade delay. Autofarm manages this in its own sequence.",true)
 control(purchasing,"AutoPurchase","Auto buy / upgrade")
@@ -4411,7 +4420,10 @@ function farm.drinkTimes(wave)
     for _,slot in ipairs(farm.drinkSlots(wave)) do times[#times+1]=slot.at end
     return #times>0 and table.concat(times," / ") or "off"
 end
-function farm.drinkSchedule(wave,minutes,map,minimumWave)
+function farm.drinkWindow(minutes,expiry)
+    return minutes>=1080 or minutes<(expiry and 330 or 360)
+end
+function farm.drinkSchedule(wave,minutes,map,minimumWave,expiry)
     local night=minutes>=1080 or minutes<360
     local clock=farm.drinkClock
     if not clock or clock.map~=map or wave~=clock.wave or (night and clock.wasDay) then
@@ -4419,7 +4431,7 @@ function farm.drinkSchedule(wave,minutes,map,minimumWave)
     end
     clock.wasDay=not night
     local slots={}
-    for _,definition in ipairs(farm.drinkSlots(wave)) do
+    for _,definition in ipairs(expiry and {} or farm.drinkSlots(wave)) do
         local due=night and farm.drinkEligible(wave,minimumWave or 15) and
             ((minutes>=1080 and definition.minutes>=1080 and minutes>=definition.minutes)
             or (minutes<360 and definition.minutes<360 and minutes>=definition.minutes))
@@ -4445,6 +4457,7 @@ function farm.drinkSummary(clock)
         end
     end
     for name,entry in pairs(clock.expiry) do
+        consumed=consumed+(entry.confirmed or 0)
         if entry.state=="unknown" then unknown=unknown+1
         elseif entry.state=="inflight" or (entry.state=="pending" and entry.reason) then
             pending=pending+1;reason=reason or (name..": "..(entry.reason or "refresh requested"))
@@ -4454,12 +4467,21 @@ function farm.drinkSummary(clock)
         (covered>0 and " "..covered.." overlapping uses avoided." or "")..(reason and " "..reason or "")
 end
 function farm.drinkPolicy()
+    if e.DrinkOnExpiry then return true,1,"expiry" end
     if e.Autofarm then return farm.active and farm.supported(),15,"autofarm" end
     return e.AutoNightDrinks==true,1,"standalone"
 end
+function farm.drinkModeChanged()
+    local enabled,_,owner=farm.drinkPolicy()
+    for _,scope in ipairs({"expiry","standalone","autofarm"}) do
+        if not enabled or scope~=owner then runtime.cancelInstantConsumables(scope) end
+    end
+    runtime.consumables.drinkAt=0;farm.standaloneDrinkAt=0
+    farm.drinkMessage=nil
+end
 function farm.resolveDrinkRecord(entry)
     if entry.state=="unknown" and entry.character==LocalPlayer.Character and runtime.instantUseConfirmed(entry) then
-        entry.state="consumed";entry.reason=nil
+        entry.state="consumed";entry.reason=nil;entry.confirmed=(entry.confirmed or 0)+1
     end
 end
 function farm.drinkUncertain(clock,name)
@@ -4491,18 +4513,19 @@ function farm.drinkTick()
     local wave=readValue(values,"LocalWave")
     if not finite(wave) or wave<1 then return end
     local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
-    local clock=farm.drinkSchedule(wave,minutes,child(Workspace,"Map"),minimumWave)
+    local expiry=owner=="expiry"
+    local clock=farm.drinkSchedule(wave,minutes,child(Workspace,"Map"),minimumWave,expiry)
     if not farm.drinkEligible(wave,minimumWave) then return end
-    if minutes>=360 and minutes<1080 then
-        farm.drinkMessage="Drinks: wave "..wave.." schedule "..farm.drinkTimes(wave)..".";return
+    if not farm.drinkWindow(minutes,expiry) then
+        farm.drinkMessage=expiry and "Drink expiry: waiting for 18:00; stops at 05:30." or
+            "Drinks: wave "..wave.." schedule "..farm.drinkTimes(wave)..".";return
     end
     local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
     if not humanoid or not root or runtime.consumableBusy or runtime.refillBusy or runtime.action then return end
     if clock.character~=character then clock.character=character;clock.expiry={} end
     local c=runtime.consumables;c.itemAt=c.itemAt or {}
-    if os.clock()<(c.drinkAt or 0) then return end
-    local expiry=e.DrinkOnExpiry and wave%5~=1
-    local definitions=farm.drinkSlots(wave)
+    if not expiry and os.clock()<(c.drinkAt or 0) then return end
+    local definitions=expiry and {} or farm.drinkSlots(wave)
     local slot
     -- If several slots elapsed while dead/paused, use the newest batch once.
     -- Confirming it covers older pending batches instead of draining charges.
@@ -4518,21 +4541,17 @@ function farm.drinkTick()
         local record=slot and slot.items[name]
         if slot and not record then record={name=name,state="pending",retryAt=0};slot.items[name]=record end
         if record then farm.resolveDrinkRecord(record) end
-        if record and record.state=="pending" and expiry and finite(remaining) and remaining>0 then
-            record.state="covered";record.reason=nil;farm.coverEarlierDrinks(clock,slot,name)
-        end
         local refresh=clock.expiry[name]
         if expiry then
             if not refresh then refresh={name=name,state="pending",retryAt=0};clock.expiry[name]=refresh end
             farm.resolveDrinkRecord(refresh)
             if finite(remaining) and remaining>0 then
-                refresh.observed=true
                 refresh.reason=nil
                 if refresh.state=="consumed" then refresh.state="pending" end
             end
         end
         local selected=record and record.state=="pending" and record or
-            (expiry and refresh.observed and remaining==0 and refresh.state=="pending" and refresh)
+            (expiry and remaining==0 and refresh.state=="pending" and refresh)
         if selected and os.clock()>=(selected.retryAt or 0) and os.clock()>=(c.itemAt[name] or 0) and not uncertain then
             local ok,err=pcall(runtime.consumableContext,name)
             selected.retryAt=os.clock()+5
@@ -4547,30 +4566,28 @@ function farm.drinkTick()
         local active,currentMinimum,currentOwner=farm.drinkPolicy()
         local currentWave=readValue(values,"LocalWave")
         if not (active and currentOwner==owner and currentWave==clock.wave and farm.drinkEligible(currentWave,currentMinimum)
-            and farm.drinkClock==clock and (t>=1080 or t<360) and (readValue(values,"LocalLives") or 1)>0
+            and farm.drinkClock==clock and farm.drinkWindow(t,currentOwner=="expiry") and (readValue(values,"LocalLives") or 1)>0
             and child(Workspace,"Map")==clock.map and (readValue(values,"VotingTime") or 0)<=0) then return false end
         if entry.slot then
             local configured=false
             for _,definition in ipairs(farm.drinkSlots(currentWave)) do if definition.at==entry.slot.at then configured=true;break end end
-            local remaining=runtime.drinkEffect(entry.name)
-            return configured and clock.slots[entry.slot.key]==entry.slot and not
-                (e.DrinkOnExpiry and currentWave%5~=1 and finite(remaining) and remaining>0)
+            return configured and clock.slots[entry.slot.key]==entry.slot
         end
         local remaining=runtime.drinkEffect(entry.name)
-        return e.DrinkOnExpiry and currentWave%5~=1 and remaining==0
+        return currentOwner=="expiry" and remaining==0
     end,function(entry,status,reason)
         local record=entry.record
         if record.owner~=entry then return end
         record.owner=nil;record.state=status;record.reason=status~="consumed" and reason or nil
         record.before=entry.before;record.effectBefore=entry.effectBefore;record.character=entry.character
         if status=="consumed" then
+            record.confirmed=(record.confirmed or 0)+1
             record.attempts=0;record.retryAt=os.clock()+1
-            if entry.slot then farm.coverEarlierDrinks(clock,entry.slot,entry.name)
-            else record.observed=false end
+            if entry.slot then farm.coverEarlierDrinks(clock,entry.slot,entry.name) end
             local refresh=clock.expiry[entry.name]
             local remaining=runtime.drinkEffect(entry.name)
             if refresh and finite(remaining) and remaining>0 then
-                refresh.observed=true;refresh.reason=nil
+                refresh.reason=nil
                 if refresh.state=="consumed" then refresh.state="pending" end
             end
         else
@@ -4579,7 +4596,7 @@ function farm.drinkTick()
         c.itemAt[entry.name]=math.max(c.itemAt[entry.name] or 0,os.clock()+1)
         farm.drinkMessage=farm.drinkSummary(clock)
     end,owner)
-    if started then c.drinkAt=os.clock()+1
+    if started then if not expiry then c.drinkAt=os.clock()+1 end
     else for _,entry in ipairs(entries) do
         if entry.record.owner==entry then entry.record.owner=nil;entry.record.state="pending" end
     end end
@@ -4597,12 +4614,13 @@ function farm.scheduleInput(group,key,text)
 end
 function farm.addNightDrinkControls(group)
     group:AddDivider()
+    control(group,"DrinkOnExpiry","Reuse drinks when their effects expire")
+    runtime.label(group,"Uses each owned drink while its effect is inactive, then refreshes it when the effect ends. Every wave, 18:00–05:30 only. Choose this or nightly drinks; autofarm also follows the selected mode.",true)
     control(group,"AutoNightDrinks","Auto use nightly drinks")
     farm.scheduleInput(group,"DrinkFirstTimes","Waves 1, 6, 11, ... (one batch)")
     farm.scheduleInput(group,"DrinkTimes","Other ordinary waves: drink times")
     farm.scheduleInput(group,"DrinkFiveTimes","Waves 5, 10, 15, ...: default times")
-    control(group,"DrinkOnExpiry","Reuse drinks when their effects expire")
-    runtime.label(group,"Comma-separated night times; Enter applies. 'off' disables a schedule. Expiry reuse adds uses only after an observed effect ends, except on waves 1, 6, 11, ... . Both modes share these settings and stay instant.",true)
+    runtime.label(group,"Nightly mode: comma-separated night times; Enter applies. 'off' disables a schedule. Both modes use drinks instantly without equipping.",true)
     local editor={wave="5",loading=false};farm.drinkEditor=editor
     runtime.refreshDrinkEditor=function()
         editor.loading=true
@@ -4634,7 +4652,8 @@ end
 farm.addNightDrinkControls(healing)
 function farm.showDrinks()
     local message=farm.drinkMessage
-    local status=not e.AutoNightDrinks and "Nightly drinks: off" or
+    local status=e.DrinkOnExpiry and (message or "Drink expiry: active from 18:00 to 05:30.") or
+        not e.AutoNightDrinks and "Nightly drinks: off" or
         (e.Autofarm and "Nightly drinks: autofarm controls the shared schedule." or (message or "Nightly drinks: waiting for night."))
     for _,entry in ipairs({{farm.drinkLabel,message,"drinkDisplayed"},{farm.nightDrinkLabel,status,"nightDrinkDisplayed"},
         {farm.drinkSettingsLabel,farm.drinkSettingsMessage,"drinkSettingsDisplayed"}}) do
@@ -4658,8 +4677,8 @@ function farm.showDrinks()
 end
 function farm.standaloneDrinkMonitor()
     if not runtime.active or os.clock()<(farm.standaloneDrinkAt or 0) then return end
-    farm.standaloneDrinkAt=os.clock()+.2
-    if e.Autofarm or e.AutoNightDrinks then
+    farm.standaloneDrinkAt=os.clock()+(e.DrinkOnExpiry and .1 or .2)
+    if e.Autofarm or e.AutoNightDrinks or e.DrinkOnExpiry then
         local ok,err=pcall(farm.drinkTick)
         if not ok then farm.drinkMessage="Drink scheduler: "..tostring(err) end
     end
@@ -5017,13 +5036,14 @@ function farm.purchaseSummary()
     return p.state..": "..tostring(p.item or p.name)
 end
 function farm.nextDrinkSummary(wave,minutes)
+    if e.DrinkOnExpiry then return farm.drinkWindow(minutes,true) and "Each drink on expiry (until 05:30)" or "Effect expiry at 18:00" end
     if not farm.drinkEligible(wave,15) then
         local nextWave=math.min(15,(math.floor(wave/5)+1)*5)
         local slots=farm.drinkSlots(nextWave)
         return "Wave "..nextWave..(#slots>0 and " at "..slots[1].at or " schedule off")
     end
     local definitions=farm.drinkSlots(wave)
-    if #definitions==0 then return e.DrinkOnExpiry and wave%5~=1 and "Effect expiry" or "Schedule off" end
+    if #definitions==0 then return "Schedule off" end
     if minutes>=360 and minutes<1080 then return definitions[1].at end
     local clock=farm.drinkClock
     if clock and clock.wave==wave then
@@ -5041,7 +5061,7 @@ function farm.nextDrinkSummary(wave,minutes)
         if (minutes>=1080 and (definition.minutes<360 or minutes<definition.minutes))
             or (minutes<360 and definition.minutes<360 and minutes<definition.minutes) then return definition.at end
     end
-    return e.DrinkOnExpiry and wave%5~=1 and "Effect expiry / next night" or "Next night"
+    return "Next night"
 end
 farm.detailLabel=runtime.label(farmGroup,"",true)
 connect(RunService.Heartbeat,function()
