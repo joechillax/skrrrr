@@ -2684,7 +2684,7 @@ runtime.label(priority,"Triggerbot always ignores FOV and uses built-in aim. Ran
 local actions=CombatTab:AddRightGroupbox("Melee")
 control(actions,"MeleeAura","Melee aura")
 control(actions,"UseKnife","Use knife with guns")
-runtime.label(actions,"Direct 360-degree requests within native range. Ignores gun target lists. Knife is a fallback, not a simultaneous second attack.",true)
+runtime.label(actions,"Direct 360-degree requests within native range, including while reading game menus. Ignores gun target lists. Knife is a fallback, not a simultaneous second attack.",true)
 local donation=automation:AddLeftGroupbox("Donations")
 control(donation,"AutoDonate","Auto donate")
 control(donation,"DonatePlayer","Recipient",{})
@@ -3067,7 +3067,9 @@ end
 function state.directMelee()
     if not runtime.active or not e.MeleeAura or runtime.action or runtime.consumableBusy or runtime.refillBusy then return end
     local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
-    if not humanoid or not root or child(child(LocalPlayer,"PlayerGui"),"MenuGui") then return end
+    -- Direct aura does not generate mouse clicks or use the menu-blocked swing
+    -- callback. Keep protecting actual character/action state while menus are read.
+    if not humanoid or not root then return end
     local tool=character:FindFirstChildOfClass("Tool")
     local melee=child(tool,"MeleeScript")
     if not melee and (not e.UseKnife or not child(character,"MeleeWeapon")) then return end
