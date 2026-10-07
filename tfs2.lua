@@ -11,9 +11,38 @@ if runtime.slot.current then
 end
 runtime.slot.damageHistory = nil -- Release retired state on reload.
 runtime.slot.current = runtime
+runtime.drawings = {}
+runtime.bindings = {}
+runtime.workers = {}
+runtime.operations = {}
+runtime.pendingRequests = 0
+runtime.limits = {responseSeconds=15, maxPendingRequests=16, dependencyRetry=2}
+function runtime.disposeResources()
+    for _,connection in ipairs(runtime.connections) do pcall(function() connection:Disconnect() end) end
+    table.clear(runtime.connections)
+    for _,drawing in ipairs(runtime.drawings) do pcall(function() drawing:Remove() end) end
+    table.clear(runtime.drawings)
+    if runtime.runService then
+        for name in pairs(runtime.bindings) do pcall(function() runtime.runService:UnbindFromRenderStep(name) end) end
+    end
+    if type(task.cancel)=="function" then for _,thread in pairs(runtime.workers) do pcall(task.cancel,thread) end end
+    if runtime.library then pcall(function() runtime.library:Unload() end) end
+end
+-- Available before any download, GUI, hook or dependency initialization can fail.
+function runtime.unload()
+    if runtime.releaseGunInput and not runtime.releaseGunInput() then return false end
+    runtime.active=false
+    if runtime.restoreRecoil then pcall(runtime.restoreRecoil) end
+    if runtime.extensions and runtime.extensions.cleanup then pcall(runtime.extensions.cleanup) end
+    runtime.disposeResources()
+    if runtime.slot.current==runtime then runtime.slot.current=nil;runtime.slot.handler=nil end
+    return true
+end
+local function initializeAssistant()
 local function connect(signal, callback)
+    assert(runtime.active and runtime.slot.current==runtime,"Initialization cancelled by unload or a newer instance")
     local connection = signal:Connect(function(...)
-        if runtime.active then return callback(...) end
+        if runtime.active and not runtime.loadingProfile then return callback(...) end
     end)
     table.insert(runtime.connections, connection)
     return connection
@@ -21,12 +50,21 @@ end
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
+runtime.runService=RunService
 local HttpService = game:GetService("HttpService")
 local UIS = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
-local zombiesFolder = Workspace:WaitForChild("Zombies")
-local Linoria = loadstring(game:HttpGet("https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/Library.lua"))()
+local zombiesFolder = assert(Workspace:WaitForChild("Zombies",30),"Zombie folder unavailable; run again after the game loads")
+assert(runtime.active and runtime.slot.current==runtime,"Initialization cancelled")
+local librarySource=game:HttpGet("https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/b45769a8593792bc756a5bba66ca6cb03586ea4a/Library.lua")
+assert(runtime.active and runtime.slot.current==runtime,"Initialization cancelled during UI download")
+local Linoria = loadstring(librarySource)()
+runtime.library=Linoria
+function runtime.newDrawing(kind)
+    local drawing=Drawing.new(kind);runtime.drawings[#runtime.drawings+1]=drawing;return drawing
+end
+
 -- Fit tab scrolling columns to the available panel height instead of 509px.
 do
     local create=Linoria.Create
@@ -264,6 +302,10 @@ function runtime.validateExtras(source)
         if type(value)=="string" then
             assert(#value<=100 and not value:find("%c"),"Invalid text: "..key)
             if type(spec[2])=="table" then assert(table.find(spec[2],value),"Invalid choice: "..key) end
+            if key:match("^ItemKey") or key:match("^ThrowKey") or key=="OPCanKey" then
+                local ok,code=pcall(function() return Enum.KeyCode[value] end)
+                assert(value=="None" or value=="MB1" or value=="MB2" or value=="MB3" or (ok and code),"Invalid hotkey: "..key)
+            end
         end
         if key=="DrinkTimes" or key=="DrinkFiveTimes" or key=="DrinkFirstTimes" then
             local times,text=runtime.parseDrinkTimes(value);assert(times,text);value=text
@@ -317,6 +359,7 @@ local nextScan = 0
 local scanWarned = false
 local function invalidateTarget()
     cachedTarget, cachedPosition, cachedAt = nil, nil, 0
+    runtime.aimAnchor=nil
     nextScan = 0
     if runtime.clearFireTargetWatch then runtime.clearFireTargetWatch() end
     if runtime.clearFacingPose then runtime.clearFacingPose() end
@@ -346,12 +389,12 @@ local function menuVisible()
     local ok, visible = pcall(function() return Window == nil or Window.Holder == nil or Window.Holder.Visible end)
     return not ok or visible -- Pause when menu visibility cannot be determined.
 end
-local pickerArrow = Drawing.new("Triangle")
+local pickerArrow = runtime.newDrawing("Triangle")
 pickerArrow.Filled = true
 pickerArrow.Color = Color3.fromRGB(255, 255, 255)
 pickerArrow.Visible = false
 pickerArrow.ZIndex = 1000
-local pickerOutline = Drawing.new("Triangle")
+local pickerOutline = runtime.newDrawing("Triangle")
 pickerOutline.Filled = false
 pickerOutline.Thickness = 2
 pickerOutline.Color = Color3.fromRGB(0, 0, 0)
@@ -374,7 +417,7 @@ connect(UIS.WindowFocusReleased, function()
     if pointState.picking then finishPick() end
 end)
 connect(UIS.WindowFocused, function() pointState.focused = true; pointState.recoverHold = true end)
-local fovCircle = Drawing.new("Circle")
+local fovCircle = runtime.newDrawing("Circle")
 fovCircle.Thickness = 1.5
 fovCircle.NumSides = 64
 fovCircle.Filled = false
@@ -457,13 +500,40 @@ connect(RunService.Heartbeat,function()
 end)
 
 local rangeManager, rangeMods
-pcall(function()
-    local modules = game:GetService("ReplicatedStorage"):FindFirstChild("ModuleScripts")
-    if modules then
-        rangeManager = require(modules:FindFirstChild("CharacterManager"))
-        rangeMods = require(modules:FindFirstChild("ModOperations"))
+runtime.gameModules={}
+function runtime.moduleObject(name)
+    if name=="ShopPurchase" then
+        local scripts=LocalPlayer:FindFirstChild("PlayerScripts")
+        local gui=scripts and scripts:FindFirstChild("GuiManager")
+        local main=gui and gui:FindFirstChild("MainGui")
+        local shop=main and main:FindFirstChild("ShopGui")
+        return shop and shop:FindFirstChild("ShopPurchase")
     end
-end)
+    local modules=game:GetService("ReplicatedStorage"):FindFirstChild("ModuleScripts")
+    return modules and modules:FindFirstChild(name)
+end
+function runtime.refreshDependencies()
+    for _,name in ipairs({"CharacterManager","ModOperations","Utility","ShopModule","ShopPurchase"}) do
+        if not runtime.active then return end
+        local object=runtime.moduleObject(name)
+        local cached=runtime.gameModules[name]
+        if not cached or cached.module~=object or not cached.value then
+            local ok,value=pcall(function() assert(object,name.." is not ready");return require(object) end)
+            if not runtime.active then return end
+            runtime.gameModules[name]={module=object,value=ok and value or nil,error=not ok and tostring(value) or nil}
+        end
+    end
+    local manager=runtime.gameModules.CharacterManager.value
+    if manager~=rangeManager and runtime.op then runtime.op.cleanup() end
+    rangeManager,rangeMods=manager,runtime.gameModules.ModOperations.value
+end
+function runtime.moduleValue(name)
+    local cached=runtime.gameModules[name]
+    assert(cached and cached.module==runtime.moduleObject(name) and cached.value,name.." is not ready; automatic dependency retry is active")
+    return cached.value
+end
+runtime.refreshDependencies()
+assert(runtime.active and runtime.slot.current==runtime,"Initialization cancelled during dependency loading")
 local rangeCache = {tool = nil, nextUpdate = 0, value = nil, source = "No gun equipped"}
 local rangeLabel
 local function validRange(value)
@@ -533,6 +603,7 @@ local function updatePickerCursor()
         UIS.MouseIconEnabled = restoreIconValue
     end
 end
+runtime.bindings.CombatAssistantPickerCursor=true
 RunService:BindToRenderStep("CombatAssistantPickerCursor", Enum.RenderPriority.Last.Value + 1, updatePickerCursor)
 -- Native weapon rays exclude cosmetic effects and the new client-side corpses.
 -- Keep these exclusions out of movement rays: corpse parts can still collide.
@@ -542,6 +613,51 @@ function runtime.combatIgnore(ignored)
         if folder and not table.find(ignored,folder) then table.insert(ignored,folder) end
     end
     return ignored
+end
+runtime.zombieIndex={folder=nil,models={},positions={},connections={},records={}}
+function runtime.clearZombieIndex()
+    local index=runtime.zombieIndex
+    for _,connection in ipairs(index.connections) do pcall(function() connection:Disconnect() end) end
+    index.folder=nil;index.models={};index.positions={};index.connections={};index.records={}
+end
+function runtime.zombieModels()
+    local index=runtime.zombieIndex
+    local folder=Workspace:FindFirstChild("Zombies") or zombiesFolder
+    if not folder.ChildAdded or not folder.ChildRemoved then return folder:GetChildren() end
+    if index.folder~=folder then
+        runtime.clearZombieIndex();zombiesFolder=folder;index.folder=folder
+        local function add(model)
+            if not runtime.active or index.folder~=folder or model.Parent~=folder then return end
+            if index.positions[model] then return end
+            index.models[#index.models+1]=model;index.positions[model]=#index.models
+        end
+        local function remove(model)
+            if index.folder~=folder then return end
+            local position=index.positions[model];if not position then return end
+            local last=index.models[#index.models];index.models[position]=last;index.positions[last]=position
+            index.models[#index.models]=nil;index.positions[model]=nil;index.records[model]=nil
+        end
+        for _,model in ipairs(folder:GetChildren()) do add(model) end
+        index.connections={folder.ChildAdded:Connect(add),folder.ChildRemoved:Connect(remove)}
+    end
+    return index.models
+end
+table.insert(runtime.connections,{Disconnect=runtime.clearZombieIndex})
+function runtime.aimParts(model)
+    local index=runtime.zombieIndex;local cached=index.records[model]
+    if cached and os.clock()<cached.untilAt then
+        local valid=true
+        for _,part in ipairs(cached.parts) do if part.Parent~=model then valid=false;break end end
+        if valid then return cached.parts end
+    end
+    local parts={}
+    for _,name in ipairs({"Head","UpperTorso","Torso","LowerTorso","LeftUpperArm","RightUpperArm","LeftLowerArm","RightLowerArm",
+        "LeftHand","RightHand","Left Arm","Right Arm","LeftUpperLeg","RightUpperLeg","LeftLowerLeg","RightLowerLeg",
+        "LeftFoot","RightFoot","Left Leg","Right Leg"}) do
+        local part=model:FindFirstChild(name);if part and part:IsA("BasePart") then parts[#parts+1]=part end
+    end
+    if index.folder and index.positions[model] and #parts>1 then index.records[model]={parts=parts,untilAt=os.clock()+.2} end
+    return parts
 end
 local visibilityParams = RaycastParams.new()
 visibilityParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -614,26 +730,17 @@ local function exposedPoint(candidate, origin, center, limit)
     local contact=config.Triggerbot and root and body and (root.Position-body.Position).Magnitude<=6
     local ignoreFOV=config.Triggerbot
     if contact and not origin then origin=Camera.CFrame.Position end
-    local parts = {}
-    local head = model:FindFirstChild("Head")
-    if head and head:IsA("BasePart") then table.insert(parts, head) end
-    for _, name in ipairs({
-            "UpperTorso", "Torso", "LowerTorso",
-            "LeftUpperArm", "RightUpperArm", "LeftLowerArm", "RightLowerArm",
-            "LeftHand", "RightHand", "Left Arm", "Right Arm",
-            "LeftUpperLeg", "RightUpperLeg", "LeftLowerLeg", "RightLowerLeg",
-            "LeftFoot", "RightFoot", "Left Leg", "Right Leg"
-        }) do
-        local part = model:FindFirstChild(name)
-        if part and part:IsA("BasePart") then table.insert(parts, part) end
-    end
+    local parts = runtime.aimParts(model)
     local bestPart,bestPoint,bestDamage,fallbackPart,fallbackPoint
     local damageCache={};local reason="No aimable body parts";local reachedRange=false
     for _, part in ipairs(parts) do
         local points = runtime.targetPoints(part,origin,true)
         for _, point in ipairs(points) do
-            local screen, onScreen = Camera:WorldToViewportPoint(point)
-            local eligible=ignoreFOV or (onScreen and (Vector2.new(screen.X, screen.Y) - center).Magnitude <= config.FOVRadius)
+            local eligible=ignoreFOV
+            if not ignoreFOV then
+                local screen,onScreen=Camera:WorldToViewportPoint(point)
+                eligible=onScreen and (Vector2.new(screen.X,screen.Y)-center).Magnitude<=config.FOVRadius
+            end
             local hit
             if not eligible then reason="Outside manual aim FOV"
             elseif not withinRange(origin,point,limit) then if not reachedRange then reason="Outside gun range" end;eligible=false
@@ -658,7 +765,6 @@ local function exposedPoint(candidate, origin, center, limit)
                     end
                     if damage==false then
                         -- Missing client damage estimates must not disable an otherwise clear shot.
-                        runtime.damageEstimateUnavailable=true
                         if not fallbackPart then fallbackPart,fallbackPoint=actual,hit and hit.Position or point end
                     elseif damage>0 and (not bestDamage or damage>bestDamage) then bestDamage,bestPart,bestPoint=damage,actual,hit and hit.Position or point
                     elseif damage==0 then reason="Estimated damage is zero" end
@@ -684,10 +790,12 @@ function runtime.closeZombie(model,root)
     local part=model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChild("Head")
     return runtime.extra.ClosePriority and root and part and (part.Position-root.Position).Magnitude<=runtime.extra.CloseDistance or false
 end
+function runtime.targetEligible(model,root)
+    return model and model.Parent==zombiesFolder and not protectedZombie(model)
+        and (not config.IgnoreList[model.Name] or runtime.closeZombie(model,root))
+end
 local function getTargetHead()
     runtime.targetName, runtime.targetTier = nil, nil
-    runtime.targetBlocked=nil;runtime.damageEstimateUnavailable=nil
-    runtime.superSeen = 0
     Camera = Workspace.CurrentCamera
     local center = getAimPoint()
     if not Camera or not center then return nil end
@@ -707,32 +815,27 @@ local function getTargetHead()
     end
     visibilityParams.FilterDescendantsInstances = runtime.combatIgnore(ignored)
     local candidate
-    for _, zombie in ipairs(zombiesFolder:GetChildren()) do
-        if config.SuperPriorityList[zombie.Name] then runtime.superSeen = runtime.superSeen + 1 end
-        local protected,blockReason=protectedZombie(zombie)
-        if config.IgnoreList[zombie.Name] then blockReason=blockReason or "Ignore list" end
-        if zombie:IsA("Model") and zombie.Parent==zombiesFolder and not protected and (not config.IgnoreList[zombie.Name] or runtime.closeZombie(zombie,root)) then
-            local humanoid = zombie:FindFirstChildOfClass("Humanoid")
-            if humanoid and humanoid.Health > 0 then
-                local part, point,reason = exposedPoint({model = zombie}, origin, center, limit)
-                if not part then blockReason=reason end
-                if part then
-                    blockReason=nil
-                    local projected = Camera:WorldToViewportPoint(point)
-                    local score = (Vector2.new(projected.X, projected.Y) - center).Magnitude
-                    if (ignoreFOV or config.TargetMode == "Closest to Player") and root then score = (point - root.Position).Magnitude end
-                    local found = {part = part, point = point, model = zombie, score = score,
-                        priority = runtime.immediateThreat(zombie,root) and 4 or runtime.closeZombie(zombie,root) and 3 or (config.SuperPriorityList[zombie.Name] and 2 or (config.PriorityList[zombie.Name] and 1 or 0))}
-                    if not candidate or found.priority>candidate.priority or (found.priority==candidate.priority and found.score<candidate.score) then candidate=found end
-                end
+    local candidates={}
+    for _,zombie in ipairs(runtime.zombieModels()) do
+        if zombie:IsA("Model") and runtime.targetEligible(zombie,root) then
+            local humanoid=zombie:FindFirstChildOfClass("Humanoid")
+            if humanoid and humanoid.Health>0 then
+                candidates[#candidates+1]={model=zombie,priority=runtime.immediateThreat(zombie,root) and 4
+                    or runtime.closeZombie(zombie,root) and 3 or config.SuperPriorityList[zombie.Name] and 2
+                    or config.PriorityList[zombie.Name] and 1 or 0,order=#candidates+1}
             end
         end
-        if blockReason and root then
-            local body=zombie:FindFirstChild("HumanoidRootPart") or zombie:FindFirstChild("Torso") or zombie:FindFirstChild("UpperTorso") or zombie:FindFirstChild("Head")
-            local distance=body and (body.Position-root.Position).Magnitude
-            if distance and distance<=30 and (not runtime.targetBlocked or distance<runtime.targetBlocked.distance) then
-                runtime.targetBlocked={name=zombie.Name,reason=blockReason,distance=distance}
-            end
+    end
+    table.sort(candidates,function(a,b) return a.priority>b.priority or (a.priority==b.priority and a.order<b.order) end)
+    for _,entry in ipairs(candidates) do
+        -- Once a priority tier has a legal shot, lower tiers cannot win the existing policy.
+        if candidate and entry.priority<candidate.priority then break end
+        local part,point=exposedPoint(entry,origin,center,limit)
+        if part then
+            local score
+            if (ignoreFOV or config.TargetMode=="Closest to Player") and root then score=(point-root.Position).Magnitude
+            else local projected=Camera:WorldToViewportPoint(point);score=(Vector2.new(projected.X,projected.Y)-center).Magnitude end
+            if not candidate or score<candidate.score then candidate={part=part,point=point,model=entry.model,score=score,priority=entry.priority} end
         end
     end
     if candidate then
@@ -782,6 +885,11 @@ function runtime.scanFireTarget(now)
     local ok, head, point = pcall(getTargetHead)
     cachedTarget = ok and head or nil
     cachedPosition = cachedTarget and point or nil
+    runtime.aimAnchor=nil
+    if cachedTarget and cachedPosition and cachedTarget.CFrame then
+        local anchored,localPoint=pcall(function() return cachedTarget.CFrame:PointToObjectSpace(cachedPosition) end)
+        if anchored then runtime.aimAnchor={part=cachedTarget,localPoint=localPoint} end
+    end
     cachedAt = now
     runtime.scanningFireTarget=false
     runtime.watchFireTarget()
@@ -798,9 +906,15 @@ end
 function runtime.fireTargetValid()
     if not cachedTarget or not cachedPosition or os.clock()-cachedAt>.15 then return false end
     local model=runtime.fireTargetModel()
-    if not model or config.IgnoreList[model.Name] or protectedZombie(model) then return false end
+    local root=LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not runtime.targetEligible(model,root) then return false end
     local humanoid=model:FindFirstChildOfClass("Humanoid")
     if not humanoid or humanoid.Health<=0 then return false end
+    local anchor=runtime.aimAnchor
+    if config.Triggerbot and anchor and anchor.part==cachedTarget then
+        local refreshed,point=pcall(function() return cachedTarget.CFrame:PointToWorldSpace(anchor.localPoint) end)
+        if refreshed then cachedPosition=point end
+    end
     local tool,_,current=gunProfile()
     local origin=getWeaponOrigin()
     if not tool or not origin then return false end
@@ -903,6 +1017,8 @@ function runtime.facingFailure(reason)
 end
 function runtime.installFacing()
     local a=runtime.facing
+    if a.available then return end
+    runtime.restoreFacing()
     local ok,err=pcall(function()
         local scripts=LocalPlayer:FindFirstChild("PlayerScripts")
         local manager=scripts and scripts:FindFirstChild("LocalManager")
@@ -912,6 +1028,7 @@ function runtime.installFacing()
         a.look=require(assert(manager:FindFirstChild("LookPosManager"),"LookPosManager missing"))
         a.rotation=require(assert(manager:FindFirstChild("RotationManager"),"RotationManager missing"))
         a.network=require(assert(manager:FindFirstChild("NetworkManager"),"NetworkManager missing"))
+        assert(runtime.active,"Aim module initialization cancelled")
         assert(type(a.look.UpdateLocalLookPos)=="function" and type(a.rotation.RenderStepped)=="function"
             and type(a.network.PassDataA)=="function" and type(a.network.GetPlayerNetworkData)=="function","Unsupported native aim modules")
         a.originalLook=a.look.UpdateLocalLookPos;a.originalRotation=a.rotation.RenderStepped
@@ -997,6 +1114,7 @@ function runtime.restoreFacing()
     if a.rotation and a.rotation.RenderStepped==a.rotationWrapper then a.rotation.RenderStepped=a.originalRotation end
 end
 runtime.installFacing()
+assert(runtime.active and runtime.slot.current==runtime,"Initialization cancelled during aim setup")
 table.insert(runtime.connections,{Disconnect=runtime.restoreFacing})
 
 -- LookPosManager and camera modules use this ray API too. Only redirect
@@ -1062,7 +1180,7 @@ runtime.slot.handler = function(self, ...)
         runtime.op.busy=true
         local ok,result=pcall(runtime.op.namecall,self,method,table.pack(...))
         runtime.op.busy=false;setnamecallmethod(method)
-        if not ok then runtime.op.last="Experimental request transform failed: "..tostring(result)
+        if not ok then runtime.extensions.message="Weapon request transform failed: "..tostring(result)
         elseif result then
             if result.blocked then return end
             return oldNamecall(self,table.unpack(result,1,result.n))
@@ -1098,7 +1216,7 @@ runtime.slot.handler = function(self, ...)
         local continuation=runtime.penetrationDirection(ray,original[2])
         if config.Triggerbot and not continuation then runtime.ensureFireTarget() end
         local targetPosition = (config.SilentAim or config.Triggerbot) and os.clock()-cachedAt<=0.15 and cachedPosition or nil
-        if not continuation and not targetPosition and config.NoSpread then
+        if not continuation and not targetPosition and config.NoSpread and not config.Triggerbot then
             -- Match GunScript's Mouse coordinates, not UIS screen coordinates or a saved FOV point.
             local camera,mouse=Workspace.CurrentCamera,LocalPlayer:GetMouse()
             if camera and mouse and _G.ActiveInput~="Touch" then
@@ -1446,19 +1564,38 @@ function runtime.heatBlocked(tool,current,now)
     return false
 end
 
+function runtime.effectiveMaxClip(tool,current)
+    local mounted=readValue(tool and tool:FindFirstChild("OtherValues"),"MountedWeapon")
+    if mounted then return readValue(mounted:FindFirstChild("CurrentValues"),"MaxClip") end
+    local base=readValue(current,"MaxClip")
+    if not validRange(base) or base<=0 then return base end
+    local perks=LocalPlayer:FindFirstChild("PlayerPerks")
+    local multiplier=1+(readValue(perks,"MaxClip") or 0)
+    if perks and perks:FindFirstChild("MinClip") and readValue(current,"MaxAmmo")~=0 and base>2 then multiplier=multiplier-.25 end
+    local saved=_G.ClientPlayerMods and _G.ClientPlayerMods[tool.Name]
+    if saved and not rangeMods then return nil end
+    local ok,mods=pcall(function() return saved and rangeMods:GetModStats(saved) or {} end)
+    if not ok or type(mods)~="table" then return nil end
+    local magazine=mods["Magazine Size"]
+    if magazine then
+        if type(magazine)~="table" or type(magazine[1])~="number" or magazine[1]~=magazine[1] or math.abs(magazine[1])==math.huge then return nil end
+        multiplier=multiplier*(1+magazine[1])
+    end
+    return math.floor(base*multiplier+.5)
+end
 function runtime.challengeReloadReady(tool,current,now)
     if not runtime.extra.QuietReload or not tool or not current then runtime.quietSince=nil;return false end
     if now<(runtime.quietScanAt or 0) then return false end
     runtime.quietScanAt=now+.2
     local root=LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     if not root then runtime.quietSince=nil;return false end
-    for _,model in ipairs(zombiesFolder:GetChildren()) do
+    for _,model in ipairs(runtime.zombieModels()) do
         local humanoid=model:FindFirstChildOfClass("Humanoid")
         local part=model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChild("Head")
         if humanoid and humanoid.Health>0 and part and (part.Position-root.Position).Magnitude<=runtime.extra.ReloadClearance then runtime.quietSince=nil;return false end
     end
     runtime.quietSince=runtime.quietSince or now
-    local clip,maxClip=readValue(current,"Clip"),readValue(current,"MaxClip")
+    local clip,maxClip=readValue(current,"Clip"),runtime.effectiveMaxClip(tool,current)
     if type(clip)~="number" or type(maxClip)~="number" or maxClip<=0 or clip<=0 or clip>=maxClip then return false end
     if readValue(current,"FeedType")=="None" or readValue(current,"Ammo")==0 or readValue(tool,"Reloading")==true then return false end
     if now-runtime.quietSince<1.5 or now<(runtime.quietReloadAt or 0) or clip/maxClip*100>runtime.extra.QuietReloadPercent then return false end
@@ -1642,11 +1779,53 @@ function runtime.findRefillSource(tool,root)
     end
     return best,method,duration
 end
+function runtime.startOperation(key,seconds,valid,expire)
+    local previous=runtime.operations[key]
+    if previous then
+        local ok,current=pcall(previous.valid)
+        if ok and current then return nil end
+        runtime.expireOperation(previous,"Context changed before a replacement request")
+        if runtime.operations[key]==previous then runtime.operations[key]=nil end
+    end
+    if runtime.pendingRequests>=runtime.limits.maxPendingRequests then return nil end
+    local operation={key=key,valid=valid,expire=expire,deadline=os.clock()+seconds,counted=true}
+    local thread,main=coroutine.running();if not main then operation.thread=thread end
+    runtime.operations[key]=operation;runtime.pendingRequests=runtime.pendingRequests+1
+    return operation
+end
+function runtime.finishOperation(operation)
+    if not operation then return end
+    if operation.counted then runtime.pendingRequests=math.max(0,runtime.pendingRequests-1);operation.counted=false end
+    if runtime.operations[operation.key]==operation then runtime.operations[operation.key]=nil end
+end
+function runtime.expireOperation(operation,reason)
+    if operation.expired then return end
+    operation.expired=true;operation.reason=reason
+    if operation.expire then pcall(operation.expire,reason) end
+    if operation.thread and type(task.cancel)=="function" then
+        local ok=pcall(task.cancel,operation.thread)
+        if ok and operation.counted then runtime.pendingRequests=math.max(0,runtime.pendingRequests-1);operation.counted=false end
+    end
+end
+function runtime.operationTick()
+    for key,operation in pairs(runtime.operations) do
+        local ok,valid=pcall(operation.valid)
+        if not runtime.active or not ok or not valid then
+            runtime.expireOperation(operation,"Context changed before the response")
+            if runtime.operations[key]==operation then runtime.operations[key]=nil end
+        elseif os.clock()>=operation.deadline then runtime.expireOperation(operation,"Response overdue; result remains unknown") end
+    end
+end
+connect(RunService.Heartbeat,function()
+    if os.clock()<(runtime.operationAt or 0) then return end
+    runtime.operationAt=os.clock()+.2;runtime.operationTick()
+end)
 function runtime.cancelRefill()
     local job=runtime.refill.job
     if job and not job.cancelled then
         job.cancelled=true
         if job.tool and job.tool.Parent and job.tool.Enabled==false then job.tool.Enabled=job.enabled end
+        if runtime.refill.job==job then runtime.refill.job=nil;runtime.refillBusy=false end
     end
 end
 function runtime.refillStep()
@@ -1664,6 +1843,8 @@ function runtime.refillStep()
     if playerGui and playerGui:FindFirstChild("MenuGui") then return end
     local source,method,seconds=runtime.findRefillSource(tool,root)
     if not source then state.message="Waiting for an available ammo source within 8 studs.";return end
+    local lease=runtime.operations[tool]
+    if lease and lease.valid() then state.message="Previous refill result is unknown; waiting for its response or a new character.";return end
     local modules=game:GetService("ReplicatedStorage"):FindFirstChild("ModuleScripts")
     local manager=modules and modules:FindFirstChild("CharacterManager")
     local ok,speed=pcall(function() return require(manager):GetMulti("InteractionSpeed",LocalPlayer,{IgnoreTool=true}) end)
@@ -1680,6 +1861,13 @@ function runtime.refillStep()
             and not (playerGui and playerGui:FindFirstChild("MenuGui"))
     end
     task.spawn(function()
+        if state.job~=job or job.cancelled or not runtime.active then return end
+        local operation=runtime.startOperation(tool,duration+runtime.limits.responseSeconds,function()
+            return runtime.active and LocalPlayer.Character==character and humanoid.Health>0 and tool.Parent~=nil
+        end,function(reason)
+            if state.job==job then runtime.cancelRefill();state.message="Refill paused: "..reason end
+        end)
+        if not operation then runtime.cancelRefill();state.message="Refill waiting for an unresolved request.";return end
         local completed=false
         local success,err=pcall(function()
             if not valid() then return end
@@ -1714,6 +1902,7 @@ function runtime.refillStep()
             completed=true
             state.message="Refill returned "..tostring(clip).."/"..tostring(ammo).."."
         end)
+        runtime.finishOperation(operation)
         if not job.cancelled and tool.Parent and tool.Enabled==false then tool.Enabled=job.enabled end
         if not success and runtime.active then state.message="Refill: "..tostring(err) end
         if state.job==job then state.job=nil;runtime.refillBusy=false;state.next=os.clock()+(completed and .25 or 3) end
@@ -1882,7 +2071,7 @@ local function updateDropdowns(zombieName)
         pcall(saveZombies)
     end
 end
-for _, zombie in ipairs(zombiesFolder:GetChildren()) do
+for _, zombie in ipairs(runtime.zombieModels()) do
     if zombie:IsA("Model") then updateDropdowns(zombie.Name) end
 end
 connect(zombiesFolder.ChildAdded, function(zombie)
@@ -1890,7 +2079,7 @@ connect(zombiesFolder.ChildAdded, function(zombie)
 end)
 firing:AddBlank(5)
 firing:AddButton({Text = "Refresh zombie list", Func = function()
-    for _, zombie in ipairs(zombiesFolder:GetChildren()) do
+    for _, zombie in ipairs(runtime.zombieModels()) do
         if zombie:IsA("Model") and not table.find(knownZombies, zombie.Name) then
             table.insert(knownZombies, zombie.Name)
         end
@@ -1935,22 +2124,6 @@ function runtime.consumableContext(name)
 end
 function runtime.consumableResult(entry,status,reason)
     runtime.consumables.message=entry.name..": "..(status=="consumed" and "use confirmed." or (reason or "Use unconfirmed."))
-end
-function runtime.useDrinkBatch(indices)
-    local c=runtime.consumables
-    if runtime.refillBusy or os.clock()<(c.drinkAt or 0) then return end
-    local entries={}
-    for _,index in ipairs(indices) do
-        if index>=1 and index<=4 and runtime.extra["UseItem"..index] then
-            table.insert(entries,{name=runtime.consumableDefinitions[index][1],index=index})
-        end
-    end
-    if #entries==0 then return end
-    local started=runtime.instantConsumableBatch(entries,function(entry)
-        return runtime.extra["UseItem"..entry.index]==true
-    end,runtime.consumableResult,"manual")
-    if started then c.drinkAt=os.clock()+1;c.message="Immediate backpack requests for selected drinks." end
-    return started
 end
 function runtime.useConsumable(name,automatic)
     if runtime.refillBusy then return end
@@ -2004,17 +2177,13 @@ local function unloadAssistant()
         end
     end
     runtime.active = false
+    runtime.operationTick()
+    if type(task.cancel)=="function" then for _,thread in pairs(runtime.workers) do pcall(task.cancel,thread) end end
     if runtime.extensions then runtime.extensions.cleanup() end
     if runtime.slot.current == runtime then
         runtime.slot.handler, runtime.slot.current = nil, nil
     end
-    for _, connection in ipairs(runtime.connections) do pcall(function() connection:Disconnect() end) end
-    table.clear(runtime.connections)
-    pcall(function() RunService:UnbindFromRenderStep("CombatAssistantPickerCursor") end)
-    for _, drawing in ipairs({fovCircle, pickerArrow, pickerOutline}) do
-        pcall(function() drawing.Visible = false; drawing:Remove() end)
-    end
-    pcall(function() Linoria:Unload() end)
+    runtime.disposeResources()
     UIS.MouseIconEnabled = true
     -- Dispatcher has no reference to this runtime after unload.
     return true
@@ -2168,7 +2337,7 @@ local function validateProfile(data, allowIncomplete)
     assert(allowIncomplete or clean.CursorMode ~= "Fixed position" or clean.FixedPoint, "Fixed-position mode needs a saved point.")
     return clean
 end
-local function applyProfile(clean)
+local function applyProfileValues(clean)
     assert(not (runtime.consumableBusy or runtime.refillBusy),"Wait for consumable use to finish before loading a profile.")
     -- Validate first; release input and restore Triggerbot last.
     assert(releaseHeld(), "Input release is pending. Retry loading after the blocked UI clears.")
@@ -2191,19 +2360,40 @@ local function applyProfile(clean)
     settingsUI.SuperPriorityList:SetValue(toSet(clean.SuperPriorityList))
     PriorityDropdown:SetValue(toSet(clean.PriorityList))
     IgnoreDropdown:SetValue(toSet(clean.IgnoreList))
-    runtime.consumables.playerKey = nil
-    runtime.loadingProfile=true
-    for key,value in pairs(clean.Extras) do
+    local keys={}
+    for key in pairs(clean.Extras) do if key~="Autofarm" then keys[#keys+1]=key end end
+    table.sort(keys)
+    for _,key in ipairs(keys) do
+        local value=clean.Extras[key]
         if runtime.extraUI[key] then runtime.extraUI[key]:SetValue((key:match("^ItemKey") or key:match("^ThrowKey") or key=="OPCanKey") and {value,"Toggle"} or value) end
         runtime.extra[key]=value
     end
-    runtime.loadingProfile=false
     if runtime.refreshDrinkEditor then runtime.refreshDrinkEditor() end
     if runtime.extensions then runtime.extensions.refresh() end
     config.FOVColor = clean.FOVColor
     invalidateTarget()
     settingsUI.SilentAim:SetValue(clean.SilentAim)
     triggerToggle:SetValue(clean.Triggerbot)
+end
+local function applyProfile(clean)
+    assert(not runtime.loadingProfile,"A profile transition is already in progress")
+    assert(not (runtime.consumableBusy or runtime.refillBusy),"Wait for the current item action before loading a profile")
+    assert(releaseHeld(),"Input release is pending; retry after the blocked UI clears")
+    runtime.loadingProfile=true
+    local ok,err=pcall(function()
+        local state=runtime.extensions
+        if state then
+            if state.farm and state.farm.active then state.farm.stop() end
+            state.epoch=(state.epoch or 0)+1
+        end
+        runtime.extra.Autofarm=false
+        applyProfileValues(clean)
+        runtime.extra.Autofarm=clean.Extras.Autofarm==true
+        if runtime.extraUI.Autofarm then runtime.extraUI.Autofarm:SetValue(runtime.extra.Autofarm) end
+        if runtime.extra.Autofarm and state and state.farm then state.farm.begin() end
+    end)
+    runtime.loadingProfile=false
+    if not ok then config.Triggerbot=false;releaseHeld();error(err,0) end
 end
 local function readProfile(name)
     diskReady()
@@ -2213,10 +2403,10 @@ local function readProfile(name)
 end
 local function loadProfile(name)
     local clean = readProfile(name)
-    local previous = validateProfile(snapshotProfile(), true)
+    local previousOK,previous = pcall(validateProfile,snapshotProfile(),true)
     local ok, err = pcall(applyProfile, clean)
     if not ok then
-        local restored = pcall(applyProfile, previous)
+        local restored = previousOK and pcall(applyProfile, previous)
         error(tostring(err) .. (restored and " Previous settings restored." or " Settings could not be fully restored; input remains paused."))
     end
     return true
@@ -2313,16 +2503,22 @@ end
 local function notice(message) state.message=tostring(message) end
 local function job(key,seconds,fn)
     if not runtime.active or state.jobs[key] or os.clock()<(state.cooldowns[key] or 0) then return end
-    state.jobs[key]=true;state.cooldowns[key]=os.clock()+seconds
+    local token={epoch=state.epoch or 0,deadline=os.clock()+runtime.limits.responseSeconds+5}
+    state.jobs[key]=token;state.cooldowns[key]=os.clock()+seconds
     local epoch=state.epoch or 0
     task.spawn(function()
         if runtime.active and (state.epoch or 0)==epoch then
             local ok,err=pcall(fn)
             if not ok and runtime.active then notice(key..": "..tostring(err)) end
         end
-        state.jobs[key]=nil
+        if state.jobs[key]==token then state.jobs[key]=nil end
     end)
 end
+connect(RunService.Heartbeat,function()
+    for key,token in pairs(state.jobs) do
+        if type(token)=="table" and (token.epoch~=(state.epoch or 0) or os.clock()>=token.deadline) then state.jobs[key]=nil end
+    end
+end)
 local function control(group,key,text,choices)
     local spec=runtime.extraSpecs[key]
     local selection
@@ -2545,10 +2741,21 @@ function state.skip()
     local wave=readValue(values,"LocalWave")
     local character=LocalPlayer.Character;local map=child(Workspace,"Map");local epoch=state.epoch
     local voteCycle=state.skipCycle
+    local operation=runtime.startOperation("VoteSkip",runtime.limits.responseSeconds,function()
+        return runtime.active and state.epoch==epoch and state.skipCycle==voteCycle and LocalPlayer.Character==character
+            and child(Workspace,"Map")==map and readValue(values,"LocalWave")==wave and readValue(values,"Vote")==true
+    end,function(reason)
+        if state.skipOperation and state.skipOperation.expired then state.skipBusy=false;state.skipStartedAt=nil;state.skipLastError=reason end
+    end)
+    if not operation then return false end
+    state.skipOperation=operation
     state.skipBusy=true;state.skipStartedAt=os.clock()
     state.skipLastAttempt=os.clock();state.skipLastWave=wave;state.skipLastError=nil;state.skipLastResult=nil
     local ok,result=pcall(remote,"RemoteFunctions","VoteSkip","InvokeServer")
-    state.skipBusy=false;state.skipStartedAt=nil
+    runtime.finishOperation(operation)
+    if state.skipOperation~=operation then return end
+    state.skipOperation=nil;state.skipBusy=false;state.skipStartedAt=nil
+    if operation.expired then return end
     if not ok then state.skipLastError=tostring(result);error(result) end
     state.skipLastResult=result==true and "acknowledged" or "not acknowledged"
     if not runtime.active or state.epoch~=epoch or state.skipCycle~=voteCycle or LocalPlayer.Character~=character or child(Workspace,"Map")~=map
@@ -2558,14 +2765,7 @@ function state.skip()
     end
     notice(result==true and "Ready vote acknowledged; waiting for other players." or "Ready vote not acknowledged; will retry.")
 end
-local function shop()
-    local scripts=child(LocalPlayer,"PlayerScripts")
-    local module=child(child(child(child(scripts,"GuiManager"),"MainGui"),"ShopGui"),"ShopPurchase")
-    assert(module,"ShopPurchase module is unavailable")
-    local cached=runtime.gameModules and runtime.gameModules.ShopPurchase
-    assert(cached and cached.module==module and cached.value,"ShopPurchase initialization unavailable; reload after game loads. "..tostring(cached and cached.error or "module changed"))
-    return cached.value
-end
+local function shop() return runtime.moduleValue("ShopPurchase") end
 function state.stop()
     state.restoreHipADS()
     if state.farm then state.farm.stop() end
@@ -2575,7 +2775,6 @@ function state.stop()
     if runtime.cancelAction then runtime.cancelAction() end
     runtime.cancelRefill()
     state.epoch=(state.epoch or 0)+1
-    runtime.consumableEpoch=(runtime.consumableEpoch or 0)+1
     for key,value in pairs(e) do if type(value)=="boolean" then e[key]=false;if ui[key] then ui[key]:SetValue(false) end end end
     config.SilentAim,config.Triggerbot,config.NoSpread,config.NoRecoil,config.HeadshotConversion=false,false,false,false,false
     settingsUI.SilentAim:SetValue(false);triggerToggle:SetValue(false)
@@ -2618,7 +2817,7 @@ function state.visuals()
     local keep={};local count=0
     if e.ZombieHighlights and root then
         local candidates={}
-        for _,model in ipairs(zombiesFolder:GetChildren()) do
+        for _,model in ipairs(runtime.zombieModels()) do
             local humanoid=model:FindFirstChildOfClass("Humanoid")
             local part=child(model,"Head") or child(model,"Torso") or child(model,"HumanoidRootPart")
             local matches=e.HighlightMode=="All" or (e.HighlightMode=="Priority only" and (config.PriorityList[model.Name] or config.SuperPriorityList[model.Name]))
@@ -2654,7 +2853,7 @@ connect(RunService.RenderStepped,function()
     local camera=Workspace.CurrentCamera
     local screen,onScreen
     if position and camera and os.clock()-cachedAt<=.15 then screen,onScreen=camera:WorldToViewportPoint(position) end
-    if e.TargetMarker and not state.marker then state.marker=Drawing.new("Circle");state.marker.Radius=6;state.marker.Thickness=2;state.marker.Color=Color3.fromRGB(255,90,90);state.marker.Filled=false end
+    if e.TargetMarker and not state.marker then state.marker=runtime.newDrawing("Circle");state.marker.Radius=6;state.marker.Thickness=2;state.marker.Color=Color3.fromRGB(255,90,90);state.marker.Filled=false end
     if e.TargetTracer and not state.tracer then state.tracer=Drawing.new("Line");state.tracer.Thickness=1;state.tracer.Color=Color3.fromRGB(255,190,60) end
     if state.marker then state.marker.Visible=e.TargetMarker and onScreen==true;if onScreen then state.marker.Position=Vector2.new(screen.X,screen.Y) end end
     if state.tracer then state.tracer.Visible=e.TargetTracer and onScreen==true;if onScreen then state.tracer.From=getAimPoint() or camera.ViewportSize/2;state.tracer.To=Vector2.new(screen.X,screen.Y) end end
@@ -2942,26 +3141,8 @@ for index=1,3 do
         state.refreshTools()
     end)
 end
--- Resolve dependencies in the script's initialization context, before Heartbeat
--- callbacks. Requiring them from an engine callback fails in some executors.
-runtime.gameModules={}
-for _,name in ipairs({"Utility","CharacterManager","ShopModule"}) do
-    local module=child(child(storage(),"ModuleScripts"),name)
-    local ok,value=pcall(function() assert(module,name.." unavailable");return require(module) end)
-    runtime.gameModules[name]={module=module,value=ok and value or nil,error=not ok and tostring(value) or nil}
-end
-do
-    local scripts=child(LocalPlayer,"PlayerScripts")
-    local module=child(child(child(child(scripts,"GuiManager"),"MainGui"),"ShopGui"),"ShopPurchase")
-    local ok,value=pcall(function() assert(module,"ShopPurchase unavailable");return require(module) end)
-    runtime.gameModules.ShopPurchase={module=module,value=ok and value or nil,error=not ok and tostring(value) or nil}
-end
-local function gameModule(name)
-    local module=child(child(storage(),"ModuleScripts"),name)
-    local cached=runtime.gameModules[name]
-    assert(cached and cached.module==module and cached.value,name.." initialization failed; reload after game loads. "..tostring(cached and cached.error or "module changed"))
-    return cached.value
-end
+-- Dependencies are loaded by the initialization-context worker, not engine callbacks.
+local function gameModule(name) return runtime.moduleValue(name) end
 function state.upgradeCost(tool,upgrade)
     local level,minimum=upgrade.Value,upgrade.MinValue
     local cost,increase=readValue(upgrade,"Cost"),readValue(upgrade,"CostIncrease")
@@ -3108,7 +3289,7 @@ function state.actionTargets(origin,range,melee)
         params.FilterDescendantsInstances=runtime.combatIgnore({LocalPlayer.Character,Workspace.CurrentCamera})
     end
     local list={}
-    for _,model in ipairs(zombiesFolder:GetChildren()) do
+    for _,model in ipairs(runtime.zombieModels()) do
         local humanoid=model:FindFirstChildOfClass("Humanoid")
         local part=child(model,"Torso") or child(model,"UpperTorso") or child(model,"Head")
         if humanoid and humanoid.Health>0 and part and part:IsA("BasePart") and not protectedZombie(model) and (melee or not config.IgnoreList[model.Name]) then
@@ -3128,7 +3309,7 @@ function runtime.cancelAction()
     if action then
         action.cancelled=true
         if action.release then pcall(action.release);action.release=nil end
-        if not action.ignoreEquip and action.previous and action.humanoid and action.humanoid.Health>0 and LocalPlayer.Character==action.character
+        if action.previous and action.humanoid and action.humanoid.Health>0 and LocalPlayer.Character==action.character
             and action.previous.Parent==child(LocalPlayer,"Backpack") and action.character:FindFirstChildOfClass("Tool")==action.tool then
             pcall(function() action.humanoid:EquipTool(action.previous) end)
         end
@@ -3140,22 +3321,21 @@ function state.runAction(tool,enabled,fn)
     local character,humanoid=alive()
     if not humanoid then return end
     local previous=character:FindFirstChildOfClass("Tool")
-    local ignoreEquip=false -- Item actions here are melee/throwables; native throwables prepare while equipped.
-    local action={character=character,tool=tool,previous=previous,humanoid=humanoid,ignoreEquip=ignoreEquip}
+    local action={character=character,tool=tool,previous=previous,humanoid=humanoid}
     runtime.action=action;runtime.consumableBusy=true
     local function valid()
         return runtime.active and not action.cancelled and e[enabled] and LocalPlayer.Character==character and humanoid.Health>0
-            and (not tool or tool.Parent==character or (ignoreEquip and tool.Parent==child(LocalPlayer,"Backpack")))
+            and (not tool or tool.Parent==character)
     end
     task.spawn(function()
         local ok,err=pcall(function()
             if not runtime.active or action.cancelled or not e[enabled] then return end
-            if not ignoreEquip and tool and tool~=previous then humanoid:EquipTool(tool);task.wait(.15) end
+            if tool and tool~=previous then humanoid:EquipTool(tool);task.wait(.15) end
             if valid() then fn(action,valid) end
         end)
         if action.release then pcall(action.release) end
         runtime.actionAim=nil
-        if not ignoreEquip and runtime.active and LocalPlayer.Character==character and humanoid.Health>0 and tool and previous and previous~=tool
+        if runtime.active and LocalPlayer.Character==character and humanoid.Health>0 and tool and previous and previous~=tool
             and previous.Parent==child(LocalPlayer,"Backpack") and (character:FindFirstChildOfClass("Tool")==tool or not character:FindFirstChildOfClass("Tool")) then
             pcall(function() humanoid:EquipTool(previous) end)
         end
@@ -3176,6 +3356,10 @@ function state.directMelee()
     if readValue(playerActions,"Meleeing")==true or readValue(tool,"Attacking")==true
         or readValue(tool,"Reloading")==true or readValue(tool,"Consuming")==true then return end
     if not melee and child(child(tool,"OtherValues"),"MountedWeapon") then return end
+    if not melee and config.Triggerbot then
+        local gun,_,values=gunProfile()
+        if gun and gunReady(gun,values) and not runtime.heatBlocked(gun,values,os.clock()) and runtime.ensureFireTarget() then return end
+    end
     local manager=gameModule("CharacterManager")
     local range,speed
     if melee then
@@ -3206,11 +3390,13 @@ function state.directMelee()
     -- Native rate, no range multiplier, no claimed critical/overhead/combo state.
     -- This intentionally skips native animation callbacks; server acceptance requires live testing.
     state.directMeleeAt=now+math.max(.1,60/speed)
-    remote("RemoteEvents","RemoteFireMelee","FireServer",melee and tool or "Melee",hits,{})
+    state.directMeleeHits=hits
+    local ok,err=pcall(remote,"RemoteEvents","RemoteFireMelee","FireServer",melee and tool or "Melee",hits,{})
+    state.directMeleeHits=nil
+    if not ok then error(err,0) end
     notice("Direct melee: "..#hits.." hits requested; server damage unverified.")
 end
 
-function state.melee() return state.directMelee() end
 function state.refreshActions()
     local names={}
     for _,player in ipairs(Players:GetPlayers()) do if player~=LocalPlayer then table.insert(names,player.Name) end end
@@ -3229,9 +3415,19 @@ function state.donate()
     if type(money)~="number" or type(debt)~="number" then return end
     local amount=math.floor(math.min(e.DonateAmount,money-debt-e.MoneyReserve))
     if amount<=0 then return end
-    state.spendingBusy=true
+    local character,map=LocalPlayer.Character,child(Workspace,"Map")
+    local operation=runtime.startOperation("TransferMoney",runtime.limits.responseSeconds,function()
+        return runtime.active and LocalPlayer.Character==character and child(Workspace,"Map")==map
+    end,function(reason)
+        if state.donationOperation and state.donationOperation.expired then state.spendingBusy=false;notice("Donation paused: "..reason) end
+    end)
+    if not operation then return end
+    state.donationOperation=operation;state.spendingBusy=true
     local ok,result=pcall(remote,"RemoteFunctions","TransferMoney","InvokeServer",recipient,amount)
-    state.spendingBusy=false
+    runtime.finishOperation(operation)
+    if state.donationOperation~=operation then return end
+    state.donationOperation=nil;state.spendingBusy=false
+    if operation.expired then return end
     notice(ok and result~="FAIL" and result~=false and "Donation submitted: "..recipient.Name or "Donation rejected; retrying later.")
 end
 function state.bossLurePoint(root)
@@ -3247,7 +3443,7 @@ function state.bossLurePoint(root)
     local shopPoint=position(shop)
     if not shopPoint then return nil,"Shop position unavailable" end
     local boss,bossDistance
-    for _,model in ipairs(zombiesFolder:GetChildren()) do
+    for _,model in ipairs(runtime.zombieModels()) do
         local humanoid=model:FindFirstChildOfClass("Humanoid")
         local part=child(model,"HumanoidRootPart") or child(model,"Torso") or child(model,"Head")
         if model.Name=="Boss" and humanoid and humanoid.Health>0 and part and part:IsA("BasePart") then
@@ -3402,7 +3598,7 @@ function state.actions()
         if not e.Autofarm and state.readyText~=message then state.readyText=message;state.readyStatus:SetText(message) end
     end
     if e.AutoDonate then job("Donate",e.DonateInterval,state.donate) end
-    if e.MeleeAura and os.clock()>=(state.meleeAt or 0) then state.meleeAt=os.clock()+.05;state.melee() end
+    if e.MeleeAura and os.clock()>=(state.meleeAt or 0) then state.meleeAt=os.clock()+.05;state.directMelee() end
 end
 
 function state.purchaseReserve(maintenance)
@@ -3488,7 +3684,6 @@ function state.purchase(name,farmOwned,buyOnly)
 end
 function state.repair(name)
     if e.Autofarm and state.farm and not state.farm.unlimitedOwned() then return false end
-    if readValue(LocalPlayer,"InsideShop")~=true then return false end
     local upgrade=child(child(storage(),"Upgrades"),name)
     if not upgrade or (readValue(upgrade,"UStructure")==true and readValue(LocalPlayer,"FirstWave")==true) then return false end
     local cost
@@ -3515,7 +3710,7 @@ function state.repair(name)
         if os.clock()<(state.armourRetryAt or 0) then return false end
         state.armourRetryAt=os.clock()+5
         remote("RemoteEvents","SellRepair","FireServer","Armour")
-        notice("Armour repair requested inside shop; awaiting game update.")
+        notice("Armour repair requested; awaiting game update.")
     else shop():RepairStructure(name);notice("Repair / replenish checked: "..name) end
     return true
 end
@@ -3669,8 +3864,7 @@ function farm.status(message)
     if farm.displayed==message or not farm.label or os.clock()<(farm.displayRetryAt or 0) then return end
     farm.displayRetryAt=os.clock()+.5
     local ok,result=pcall(function() return farm.label:SetText(message) end)
-    if ok and result~=false then farm.displayed=message;farm.displayError=nil
-    else farm.displayError=tostring(farm.label.renderError or result) end
+    if ok and result~=false then farm.displayed=message end
 end
 function farm.waitStatus(reason)
     if farm.waitReason~=reason then farm.waitReason=reason;farm.waitSince=os.clock() end
@@ -3711,15 +3905,16 @@ function farm.request(object,cost,event,...)
     local args={...};local character=LocalPlayer.Character;local run=farm.runId
     farm.purchaseObservation={object=object,before=object.Value,event=event,item=args[1],name=object.Name,state="Queued"}
     local observation=farm.purchaseObservation
-    farm.inFlight=true;farm.requestAt=os.clock()+math.max(.5,e.ActionInterval)
+    local requestToken={}
+    farm.requestToken=requestToken;farm.inFlight=true;farm.requestAt=os.clock()+math.max(.5,e.ActionInterval)
     task.spawn(function()
-        if not runtime.active or LocalPlayer.Character~=character or farm.runId~=run or not e.Autofarm then farm.inFlight=false;return end
+        if not runtime.active or LocalPlayer.Character~=character or farm.runId~=run or not e.Autofarm then if farm.requestToken==requestToken then farm.inFlight=false end;return end
         if farm.healthDue() then
-            if not (args[1]=="Health" and (event=="BuyPlayerUpgrade" or (event=="UpgradeStructurePlayer" and (args[2]=="Health" or args[2]=="HealthRegen")))) then farm.inFlight=false;return end
-        elseif farm.healingDue() and not ((event=="UpgradeWeapon" or event=="BuyHealing") and farm.healingItem(args[1])) then farm.inFlight=false;return end
+            if not (args[1]=="Health" and (event=="BuyPlayerUpgrade" or (event=="UpgradeStructurePlayer" and (args[2]=="Health" or args[2]=="HealthRegen")))) then if farm.requestToken==requestToken then farm.inFlight=false end;return end
+        elseif farm.healingDue() and not ((event=="UpgradeWeapon" or event=="BuyHealing") and farm.healingItem(args[1])) then if farm.requestToken==requestToken then farm.inFlight=false end;return end
         -- A queued job must respect a newly reached wave floor or maintenance spending.
         if cost>availableMoney() then
-            observation.state="Waiting for purchase budget";farm.inFlight=false
+            observation.state="Waiting for purchase budget";if farm.requestToken==requestToken then farm.inFlight=false end
             farm.status("Purchase held: "..object.Name.."; reserve "..tostring(state.purchaseReserve()))
             return
         end
@@ -3735,7 +3930,7 @@ function farm.request(object,cost,event,...)
             end
             return state.purchase(args[1],true,true)
         end)
-        farm.inFlight=false
+        if farm.requestToken==requestToken then farm.inFlight=false end
         if farm.runId~=run or LocalPlayer.Character~=character then return end
         if not ok then observation.state="Native request failed";farm.fault="Native purchase failed: "..tostring(result);farm.status(farm.fault)
         elseif result then observation.state="Request sent";farm.status("Native purchase sent: "..object.Name..". Waiting for observed ownership/level change.")
@@ -4105,7 +4300,7 @@ function farm.begin()
     farm.healingDone=false;farm.healingBuyAt=0
     farm.healthDone=false
     farm.resetNightReached=false;farm.resetAttempt=nil;farm.resetMessage=nil;farm.resetCount=0
-    farm.forwardDone=false;farm.forwardGoal=nil;farm.forwardScanAt=0
+    farm.forwardDone=false
     farm.pathAt=0;farm.forcePathUntil=0;farm.fault=nil;farm.exitTransit=nil;farm.exitWalking=nil
     farm.savedTrigger=config.Triggerbot;triggerToggle:SetValue(false)
     for _,key in ipairs(conflicts) do if e[key] then e[key]=false;if ui[key] then ui[key]:SetValue(false) end end end
@@ -4169,7 +4364,7 @@ function farm.step()
         if farm.positionReached or farm.stage>=6 then farm.positionReached=true;farm.resumeCharacter()
         else farm.stop();farm.begin() end
     end
-    farm.lastWave=wave;farm.lastTick=os.clock()
+    farm.lastWave=wave
     for _,key in ipairs(conflicts) do if e[key] then e[key]=false;if ui[key] then ui[key]:SetValue(false) end end end
     if farm.voteMap() then triggerToggle:SetValue(false);releaseHeld();farm.cancelWalk();return end
     if not farm.supported() then
@@ -4344,7 +4539,7 @@ function runtime.instantUseConfirmed(entry)
 end
 function runtime.finishInstantUse(job,status,reason)
     if job.reported then return end
-    job.reported=true
+    job.reported=true;job.status=status
     if runtime.instantUses[job.entry.name]==job and (job.returned or not job.invoked) then
         runtime.instantUses[job.entry.name]=nil
     end
@@ -4360,7 +4555,10 @@ function runtime.instantConsumableMonitor()
         elseif os.clock()>=job.deadline then
             runtime.finishInstantUse(job,job.invoked and "unknown" or "pending","No charge decrease or new drink effect observed")
         end
-        if job.reported and job.returned and runtime.instantUses[name]==job then runtime.instantUses[name]=nil end
+        if job.reported and (job.returned or LocalPlayer.Character~=job.character or job.humanoid.Health<=0) and runtime.instantUses[name]==job then
+            runtime.instantUses[name]=nil
+            if job.operation then runtime.expireOperation(job.operation,"Consumable character changed") end
+        end
     end
 end
 function runtime.cancelInstantConsumables(scope)
@@ -4409,9 +4607,17 @@ function runtime.instantConsumableBatch(entries,eligible,done,scope)
                     runtime.finishInstantUse(job,"pending","Use cancelled before dispatch");return
                 end
                 job.eligible=nil
-                job.invoked=true;c.lastItem=entry.name
+                local operation=runtime.startOperation("Consumable:"..entry.name,runtime.limits.responseSeconds,function()
+                    return runtime.active and LocalPlayer.Character==character and humanoid.Health>0 and job.status~="consumed"
+                end,function(reason) runtime.finishInstantUse(job,"unknown",reason) end)
+                if not operation then runtime.finishInstantUse(job,"pending","Previous use is unresolved");return end
+                job.operation=operation;job.invoked=true;c.lastItem=entry.name
                 local success,response=pcall(function() return remote:InvokeServer(entry.name,target) end)
-                job.returned=true
+                runtime.finishOperation(operation);job.returned=true
+                if operation.expired or runtime.instantUses[entry.name]~=job then
+                    if runtime.instantUses[entry.name]==job then runtime.instantUses[entry.name]=nil end
+                    return
+                end
                 if LocalPlayer.Character~=character or humanoid.Health<=0 then runtime.finishInstantUse(job,"unknown","Character changed before confirmation")
                 elseif runtime.instantUseConfirmed(entry) then runtime.finishInstantUse(job,"consumed")
                 elseif success and (response==false or response=="FAIL") then runtime.finishInstantUse(job,"pending","Game rejected use")
@@ -4605,7 +4811,7 @@ function farm.addNightDrinkControls(group)
     farm.scheduleInput(group,"DrinkTimes","Other ordinary waves: drink times")
     farm.scheduleInput(group,"DrinkFiveTimes","Waves 5, 10, 15, ...: default times")
     runtime.label(group,"Comma-separated night times; Enter applies. 'off' disables a schedule. Drinks are used instantly without equipping.",true)
-    local editor={wave="5",loading=false};farm.drinkEditor=editor
+    local editor={wave="5",loading=false}
     runtime.refreshDrinkEditor=function()
         editor.loading=true
         if editor.waveInput then editor.waveInput:SetValue(editor.wave) end
@@ -4656,36 +4862,7 @@ end
 connect(RunService.Heartbeat,farm.standaloneDrinkMonitor)
 
 
--- Separate local settings file; not included in shareable gameplay profiles.
-farm.webhook={enabled=false,url="",sent={}}
-farm.webhookFile="CombatAssistantWebhook.json"
-function farm.saveWebhook()
-    local w=farm.webhook
-    if w.loading then return end
-    if w.url~="" and not farm.webhookURL(w.url) then w.saveMessage="Not saved: invalid webhook URL.";return false end
-    if type(writefile)~="function" then w.saveMessage="Not saved: file writing unavailable.";return false end
-    local ok=pcall(function()
-        writefile(farm.webhookFile,HttpService:JSONEncode({Version=1,URL=w.url,Enabled=w.enabled}))
-    end)
-    w.saveMessage=ok and "Webhook settings saved locally." or "Webhook settings could not be saved."
-    return ok
-end
-function farm.loadWebhook()
-    local w=farm.webhook
-    if type(readfile)~="function" then w.saveMessage="Local settings unavailable: no file reader.";return end
-    if type(isfile)=="function" then
-        local ok,exists=pcall(isfile,farm.webhookFile)
-        if ok and not exists then return end
-    end
-    local ok,data=pcall(function() return HttpService:JSONDecode(readfile(farm.webhookFile)) end)
-    if not ok or type(data)~="table" or data.Version~=1 or type(data.URL)~="string" or type(data.Enabled)~="boolean"
-        or (data.URL~="" and not farm.webhookURL(data.URL)) then
-        w.saveMessage="Saved webhook settings unavailable or invalid; enter them again.";return
-    end
-    w.url=data.URL:match("^%s*(.-)%s*$");w.enabled=data.Enabled
-    w.saveMessage="Saved webhook settings loaded."
-end
-function farm.webhookStep()
+function farm.stepName()
     if farm.recovering then return "Returning to Ammo Box after respawn" end
     if farm.resetWindow and farm.resetWindow() and farm.resetAttempt and not farm.resetAttempt.confirmed then return "Wave "..farm.resetAttempt.wave.." reset / awaiting death" end
     if farm.healthDue() then return "Max Health / Health Regen" end
@@ -4697,77 +4874,6 @@ function farm.webhookStep()
     local names={"Leaving spawn","Leaving shop","C96 Unlimited Ammo","Completing first night","Early farming / Ammo Box","C96 / Shop Money","Armour upgrades","Barricade upgrades","Shop upgrades","Night Vision / drinks","Sniper / Handling Speed","Healing items and upgrades","Mortar upgrades"}
     return names[farm.stage] or "Ammo Box damage upgrades"
 end
-function farm.webhookURL(value)
-    if type(value)~="string" then return nil end
-    value=value:match("^%s*(.-)%s*$")
-    if value:match("^https://discord%.com/api/webhooks/%d+/[%w_%-]+$") or value:match("^https://discordapp%.com/api/webhooks/%d+/[%w_%-]+$") then return value.."?wait=true" end
-end
-function farm.webhookTick()
-    local w=farm.webhook
-    local values=child(storage(),"Values")
-    local wave=readValue(values,"LocalWave")
-    if not finite(wave) or wave<1 or wave%1~=0 then return end
-    local map=child(Workspace,"Map")
-    if not map then return end
-    if w.map~=map or (w.wave and wave<w.wave) then w.map=map;w.sent={} end
-    w.wave=wave
-    if not runtime.active or not e.Autofarm or not farm.active or not w.enabled or wave%5~=0 or (readValue(values,"VotingTime") or 0)>0 then return end
-    if w.sent[wave] or w.busy or os.clock()<(w.retryAt or 0) then return end
-    local url=farm.webhookURL(w.url)
-    if not url then w.message="Enter a valid Discord webhook URL.";return end
-    local send=request or http_request
-    if type(send)~="function" then w.message="HTTP request function unavailable.";return end
-    local name=farm.mapName()
-    name=({Default="Forest",Winter="Arctic"})[name] or name or "Unknown"
-    name=tostring(name):gsub("[%c]"," "):sub(1,50)
-    local content="Currently wave "..wave.."\nMap: "..name.."\nCurrent step: "..farm.webhookStep()
-    local body=HttpService:JSONEncode({content=content,allowed_mentions={parse={}}})
-    -- Explicitly encode an empty JSON array, even on encoders that use {} for empty tables.
-    body=body:gsub('"parse"%s*:%s*{}','"parse":[]')
-    local sent=w.sent
-    sent[wave]="pending";w.busy=true;w.message="Sending wave "..wave.." update..."
-    task.spawn(function()
-        if not runtime.active or not e.Autofarm or not w.enabled or w.sent~=sent or farm.webhookURL(w.url)~=url then
-            sent[wave]=nil;w.busy=false;return
-        end
-        local ok,response=pcall(send,{Url=url,Method="POST",Headers={["Content-Type"]="application/json"},Body=body})
-        w.busy=false
-        if w.sent~=sent then return end
-        local code=ok and type(response)=="table" and tonumber(response.StatusCode)
-        if code and code>=200 and code<300 then
-            sent[wave]="sent";w.message="Sent wave "..wave.." update."
-        elseif code==429 then
-            local delay=60
-            local decoded,data=pcall(function() return HttpService:JSONDecode(response.Body) end)
-            if decoded and type(data)=="table" and finite(data.retry_after) then delay=math.max(delay,data.retry_after) end
-            w.retryAt=os.clock()+delay;sent[wave]=nil;w.message="Rate limited; waiting before retry."
-        else
-            sent[wave]="failed"
-            -- Never print response bodies/errors: they can contain the webhook token.
-            w.message=code and ("Webhook HTTP "..code.."; check URL/channel.") or "Delivery uncertain; not retrying this wave."
-        end
-    end)
-end
-local webhookGroup=runtime.extensionTabs.Autofarm:AddRightGroupbox("Wave webhook")
-farm.loadWebhook()
-farm.webhook.loading=true
-addControl(webhookGroup,"Input","FarmWebhookURL",{Text="Discord webhook URL (saved locally)",Default=farm.webhook.url,Finished=true,Callback=function(value) farm.webhook.url=tostring(value or ""):match("^%s*(.-)%s*$");farm.saveWebhook() end})
-addControl(webhookGroup,"Toggle","FarmWebhookEnabled",{Text="Send every 5 waves",Default=farm.webhook.enabled,Callback=function(value) farm.webhook.enabled=value==true;farm.saveWebhook() end})
-farm.webhook.loading=false
-farm.webhook.label=runtime.label(webhookGroup,"Off. Sends wave, map and current step only.",true)
-connect(RunService.Heartbeat,function()
-    local w=farm.webhook
-    if os.clock()<(w.tickAt or 0) then return end
-    w.tickAt=os.clock()+1
-    local ok=pcall(farm.webhookTick)
-    if not ok then w.message="Webhook update failed locally." end
-    local message=w.enabled and (w.message or "Waiting for a 5-wave milestone.") or "Off"
-    if w.saveMessage then message=message.."\n"..w.saveMessage end
-    if w.label and w.displayed~=message then
-        local ok,result=pcall(function() return w.label:SetText(message) end)
-        if ok and result~=false then w.displayed=message end
-    end
-end)
 
 function farm.grounded(humanoid,root)
     local material=humanoid.FloorMaterial
@@ -4971,7 +5077,7 @@ end
 function farm.sprintThreat(root)
     if os.clock()>=(farm.sprintThreatAt or 0) then
         farm.sprintThreatAt=os.clock()+.25;farm.sprintThreatPresent=false
-        for _,zombie in ipairs(zombiesFolder:GetChildren()) do
+        for _,zombie in ipairs(runtime.zombieModels()) do
             local humanoid=zombie:FindFirstChildOfClass("Humanoid")
             local body=child(zombie,"HumanoidRootPart") or child(zombie,"Torso") or child(zombie,"UpperTorso") or child(zombie,"Head")
             if humanoid and humanoid.Health>0 and body and (body.Position-root.Position).Magnitude<40 then farm.sprintThreatPresent=true;break end
@@ -5041,7 +5147,7 @@ connect(RunService.Heartbeat,function()
         local priority=farm.healthDue() and "Wave 28 health" or (farm.healingDue() and "Post-Handling healing" or "Normal upgrades")
         local purchase=farm.purchaseBudget
         local nextPurchase=purchase and (tostring(purchase.item).." ($"..math.ceil(purchase.cost)..")") or "Waiting for purchase selection"
-        local text="Step: "..farm.webhookStep().."\nPurchase: "..nextPurchase.."\n"..farm.purchaseSummary().."\nCash reserve: $"..state.purchaseReserve().."\nPriority: "..priority.."\nNext drinks: "..farm.nextDrinkSummary(wave,game:GetService("Lighting"):GetMinutesAfterMidnight()).."\nMovement: "..(farm.motionStatus or "Idle")
+        local text="Step: "..farm.stepName().."\nPurchase: "..nextPurchase.."\n"..farm.purchaseSummary().."\nCash reserve: $"..state.purchaseReserve().."\nPriority: "..priority.."\nNext drinks: "..farm.nextDrinkSummary(wave,game:GetService("Lighting"):GetMinutesAfterMidnight()).."\nMovement: "..(farm.motionStatus or "Idle")
         if farm.detailDisplayed~=text then
             local result=farm.detailLabel:SetText(text)
             if result~=false then farm.detailDisplayed=text end
@@ -5072,7 +5178,7 @@ function farm.reconcileVote()
     farm.voteMismatchAt=farm.voteMismatchAt or os.clock()
     if os.clock()-farm.voteMismatchAt<10 or os.clock()-(state.skipLastAttempt or -100)<10 then return end
     flag.Value=false
-    farm.voteMismatchAt=nil;farm.voteRepairs=(farm.voteRepairs or 0)+1
+    farm.voteMismatchAt=nil
     state.skipLastResult=nil
 end
 function farm.voteStatus()
@@ -5085,6 +5191,8 @@ function farm.voteStatus()
     if farm.resetVoteHeld and farm.resetVoteHeld() then return "Ready-up: held for wave "..farm.resetSettings().wave.." reset until dawn; resumes after Ammo Box recovery" end
     if readValue(values,"Vote")~=true then return "Ready-up: CLOSED by game (wave "..tostring(wave)..")" end
     if state.skipBusy then return "Ready-up: request pending for "..math.floor(os.clock()-(state.skipStartedAt or os.clock())).."s" end
+    local unresolved=runtime.operations.VoteSkip
+    if unresolved and unresolved.expired and unresolved.valid() then return "Ready-up: response overdue; holding this vote to avoid toggling it twice" end
     if readValue(LocalPlayer,"Voted")==true then
         local count=readValue(values,"Voted")
         if count==0 then return "Ready-up: local vote conflicts with 0 counted votes; checking before retry" end
@@ -5343,13 +5451,12 @@ connect(RunService.Heartbeat,function()
     if os.clock()>=state.catalogAt then state.catalogAt=os.clock()+3;local ok,err=pcall(state.refresh);if not ok then notice(err) end end
     if state.displayed~=state.message then state.displayed=state.message;state.status:SetText(state.message) end
 end)
-local op={wrappers={},hits={},last="No modifier requests sent",any=false}
+local op={wrappers={},any=false}
 runtime.op=op
 local function on(id) return runtime.active and e["OP"..id]==true end
 local function copy(t) local n={} for k,v in pairs(t or {}) do n[k]=v end return n end
 local function currentTool() local c=LocalPlayer.Character;return c and c:FindFirstChildOfClass("Tool") end
 local function owned(tool) return tool and (tool.Parent==LocalPlayer.Character or tool.Parent==child(LocalPlayer,"Backpack")) end
-local function mark(id,text) op.hits[id]=(op.hits[id] or 0)+1;op.last=text.."; server result unverified" end
 local function modsFor(tool)
     local saved=_G.ClientPlayerMods and _G.ClientPlayerMods[tool.Name]
     return saved and rangeMods and rangeMods:GetModStats(saved) or {}
@@ -5389,14 +5496,13 @@ end
 function op.overrideHits(kind,hits,tool,tags)
     if not config.HeadshotConversion or not owned(tool) or not child(tool,"GunScript") or type(hits)~="table" then return hits end
     if tags and tags.IgnoreHeadshot or child(child(tool,"OtherValues"),"IgnoreHeadshot") then
-        op.last="Hit Override: weapon disables headshot damage";return hits
+        return hits
     end
     local function convert(hit)
         if type(hit)~="table" then return hit end
         local head=runtime.headForHit(hit[1])
         if not head or typeof(head.Position)~="Vector3" or not finite(head.Position.Magnitude) then return hit end
         local changed=copy(hit);changed[1]=head;changed[2]=head.Position
-        op.last="Head hit requested; server damage unverified"
         return changed
     end
     if kind=="ProjectileImpact" then return convert(hits) end
@@ -5430,6 +5536,7 @@ function op.namecall(object,method,args)
         end
         if changed then args[1]=data;return args end
     elseif name=="RemoteFireMelee" and (owned(args[1]) or args[1]=="Melee") and type(args[2])=="table" then
+        if args[2]==state.directMeleeHits then return end
         local knife=args[1]=="Melee"
         local tool=not knife and args[1] or nil;local hits={};local seen={}
         for _,hit in ipairs(args[2]) do
@@ -5448,7 +5555,7 @@ function op.namecall(object,method,args)
                     if #hits>=20 then break end
                     if not seen[target.model] then table.insert(hits,{target.part,{}});seen[target.model]=true end
                 end
-                mark(16,"Melee sweep hit list modified")
+                
             end
         end
         args[2]=hits;return args
@@ -5460,8 +5567,7 @@ function op.step()
         if op.installed then op.cleanup() end
         return
     end
-    op.install()
-
+    if on(17) then op.install() elseif op.installed then op.cleanup() end
 end
 function op.detonate()
     if not on(6) or os.clock()<(op.canAt or 0) then return end
@@ -5478,7 +5584,7 @@ function op.detonate()
             end
         end
     end
-    if best then best:FireServer();mark(6,"Owned can detonation requested") else op.last="No owned can with known radius and safe player clearance" end
+    if best then best:FireServer() else notice("No owned can with known radius and safe player clearance") end
 end
 local utilities=runtime.extensionTabs.Items:AddRightGroupbox("Throwable utilities")
 control(utilities,"OP5","Predict throwable targets")
@@ -5491,11 +5597,11 @@ runtime.label(weapons,"Projectile weapons only. Re-equip if the gun caches its v
 connect(UIS.InputBegan,function(input,processed)
     if processed or UIS:GetFocusedTextBox() or not on(6) then return end
     local key=e.OPCanKey
-    if input.KeyCode and input.KeyCode.Name==key then local ok,err=pcall(op.detonate);if not ok then op.last=tostring(err) end end
+    if input.KeyCode and input.KeyCode.Name==key then local ok,err=pcall(op.detonate);if not ok then notice(tostring(err)) end end
 end)
 connect(RunService.Heartbeat,function()
     if os.clock()<(op.next or 0) then return end;op.next=os.clock()+.1
-    local ok,err=pcall(op.step);if not ok then op.last="Weapon modifier error: "..tostring(err) end
+    local ok,err=pcall(op.step);if not ok then notice("Weapon modifier error: "..tostring(err)) end
 end)
 
 control(utilities,"OPPredictionSeconds","Throw prediction seconds")
@@ -5511,6 +5617,35 @@ end
 end
 runtime.initializeExtensions()
 runtime.initializeExtensions = nil
+runtime.capabilityLabel=runtime.label(menuGroup,"Feature readiness: checking dependencies")
+function runtime.showReadiness()
+    local messages={}
+    for _,name in ipairs({"CharacterManager","ModOperations","Utility","ShopModule","ShopPurchase"}) do
+        local cached=runtime.gameModules[name]
+        if not cached or not cached.value or cached.module~=runtime.moduleObject(name) then messages[#messages+1]=name..": waiting; retrying automatically" end
+    end
+    if config.Triggerbot and (type(runtime.callerLookup)~="function" or type(setnamecallmethod)~="function") then messages[#messages+1]="Triggerbot: required hook APIs unavailable" end
+    if config.Triggerbot and runtime.lastInputError then messages[#messages+1]="Firing: "..runtime.lastInputError end
+    if config.NoRecoil and not runtime.recoilPatch then messages[#messages+1]=runtime.modifierStatus or "No recoil: waiting for native callback" end
+    if (config.Triggerbot or config.SilentAim) and not runtime.facing.available then messages[#messages+1]="Arm aiming: "..runtime.facing.status end
+    for _,operation in pairs(runtime.operations) do if operation.expired then messages[#messages+1]="A request result is unknown; duplicate requests are held";break end end
+    local farm=runtime.extensions and runtime.extensions.farm
+    if farm and runtime.extra.Autofarm and farm.label and farm.label.renderError then messages[#messages+1]="Autofarm: "..farm.message end
+    runtime.capabilityLabel:SetText(#messages>0 and table.concat(messages,"\n") or "Required dependencies ready")
+end
+connect(RunService.Heartbeat,function()
+    if os.clock()<(runtime.readinessAt or 0) then return end
+    runtime.readinessAt=os.clock()+1;runtime.showReadiness()
+end)
+runtime.workers.dependencies=task.spawn(function()
+    while runtime.active do
+        task.wait(runtime.limits.dependencyRetry)
+        if runtime.active and not runtime.loadingProfile then
+            pcall(runtime.refreshDependencies)
+            if not runtime.facing.available then runtime.installFacing() end
+        end
+    end
+end)
 
 task.defer(function()
     if not runtime.active then return end
@@ -5533,3 +5668,16 @@ task.defer(function()
         profileNotice("Autoloaded: " .. name)
     end)
 end)
+
+-- REVIEW_TEST_INSERTION_POINT
+end
+local initialized,initializationError=xpcall(initializeAssistant,function(err) return tostring(err) end)
+if not initialized then
+    local cleaned=pcall(runtime.unload)
+    if not cleaned then
+        runtime.active=false
+        runtime.disposeResources()
+        if runtime.slot.current==runtime then runtime.slot.current=nil;runtime.slot.handler=nil end
+    end
+    error("Combat Assistant initialization failed: "..initializationError,0)
+end
