@@ -1,4 +1,4 @@
--- JoesAAS 5.8 | standalone source | October 2026
+-- JoesAAS 5.9 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -8,7 +8,7 @@ if game.GameId ~= 10502841145 then
     warn("JoesAAS: this build targets the exported game's universe, not this experience.")
     return
 end
-local A = {}
+local A = {version="5.9"}
 environment.JoesAAS = A
 environment.AnimeSuite = A -- Compatibility with older running versions.
 A.Core = (function()
@@ -65,15 +65,16 @@ function Core.portalMode(key,cfg)
         or (cfg and (tostring(cfg.AchievementModeKey):find('^MaxTacCall') or tostring(cfg.Name):lower():find('maxtac',1,true))) then return 'MaxTac' end
     return 'Gate'
 end
-function Core.renameEligible(id,pet,named,target,petStats)
+function Core.renameEligible(id,pet,named,petStats)
     if type(id)~='string' or type(pet)~='table' then return false,'unexpected inventory format' end
     if not petStats or type(petStats.GetRarity)~='function' then return false,'rarity API missing' end
-    if petStats.GetRarity(pet)~='Astral' then return false,'not Astral' end
+    local rarity=petStats.GetRarity(pet)
+    if rarity~='Astral' then return false,'not Astral',rarity end
     -- Match NamedStateUtil.IsNamed: only a table is a naming record.
-    if type(named)=='table' and type(named[id])=='table' then return false,'existing named record' end
+    if type(named)=='table' and type(named[id])=='table' then return false,'existing named record',rarity end
     -- Pet.Name is catalog data; the game stores custom names in NamedPets.
-    if petStats and petStats.IsDynamicById and petStats.IsDynamicById(pet.PetId) then return false,'percentage pet' end
-    return true,'eligible'
+    if petStats and petStats.IsDynamicById and petStats.IsDynamicById(pet.PetId) then return false,'percentage pet',rarity end
+    return true,'eligible',rarity
 end
 function Core.activityKeys(choices,mode)
     local keys=Core.keys(choices)
@@ -130,7 +131,7 @@ return function(A)
         UIS=game:GetService('UserInputService'),Gui=game:GetService('GuiService')}
     A.player=A.S.Players.LocalPlayer
     A.logs={}; A.status={}; A.connections={}; A.tasks={}; A.cache={}; A.cooldowns={}
-    A.alive=true; A.running=false; A.epoch=0; A.started=os.clock()
+    A.alive=true; A.running=false; A.epoch=0
     A.defaults={version=4,priority=Core.copy(Core.defaultPriority),world='0',mobsByWorld={},target='Nearest',farm=false,trialFollow=false,trialAutoJoin=false,trialJoinSelection={},
         towerAutoJoin=false,towerSelection={},raidAutoJoin=false,raidSelection={},defenseAutoJoin=false,defenseSelection={},
         gateAutoJoin=false,gateSelection={},gateRanks={S=true,A=true,B=true,C=true,D=true,E=true},
@@ -140,7 +141,7 @@ return function(A)
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
         blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false,ripperdocAuto=false,ripperdocSlots={},
-        autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20,fixerAutoClaim=false,fixerAutoDeploy=false}
+        autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20,fixerAutoClaim=false,fixerAutoDeploy=false,fixerPreference='Board order'}
     A.legacyFolder='AnimeSuite_'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.folder='JoesAAS/'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.file=A.folder..'/settings.json'
@@ -175,6 +176,7 @@ return function(A)
             s[key]=(value and value==value and value<math.huge) and math.clamp(value,1,3600) or A.defaults[key]
         end
         if not Core.contains({'Nearest','Highest HP','Lowest HP'},s.target) then s.target='Nearest' end
+        if not Core.contains({'Board order','Big Jobs first'},s.fixerPreference) then s.fixerPreference='Board order' end
         if not Core.contains({'Walk','Teleport'},s.moveStyle) then s.moveStyle='Walk' end
         for _,k in ipairs({'webhookEvents','pingEvents','trialJoinSelection','towerSelection','raidSelection','defenseSelection','dungeonSelection','gateSelection','gateRanks','maxTacSelection','maxTacRanks','bossRushSelection','ripperdocSlots'}) do
             for id,v in pairs(s[k]) do if type(id)~='string' or type(v)~='boolean' then s[k][id]=nil end end
@@ -429,7 +431,7 @@ return function(A)
     A.job('Connection cleanup',60,function()
         local live={}
         for _,c in ipairs(A.connections) do
-            local ok,connected=pcall(function() return c.Connected end)
+            local ok,connected=pcall(function() if c.Connected~=nil then return c.Connected end; return c.IsConnected end)
             if not ok or connected~=false then live[#live+1]=c end
         end
         A.connections=live
@@ -456,6 +458,16 @@ return function(A)
     local env=(type(getgenv)=='function' and getgenv()) or _G
     env.AnimeSuiteHTTP=env.AnimeSuiteHTTP or {busy=false}
     local transport=env.AnimeSuiteHTTP
+    transport.results=transport.results or {}
+    transport.resultOrder=transport.resultOrder or {}
+    local function takeResult(key)
+        local response=transport.results[key]
+        if response then
+            transport.results[key]=nil
+            for i=#transport.resultOrder,1,-1 do if transport.resultOrder[i]==key then table.remove(transport.resultOrder,i) end end
+        end
+        return response
+    end
     local function fingerprint(url)
         local n=0; for i=1,#url do n=(n*31+url:byte(i))%2147483647 end; return tostring(n)
     end
@@ -469,14 +481,31 @@ return function(A)
     end
     function A.http(options,completeOnStop)
         if not A.httpRequest then return false,'HTTP request API unavailable' end
-        if transport.busy then return false,'HTTP already in flight' end
-        options.Timeout=15
-        A.httpBusy=true; transport.busy=true; local response
-        task.spawn(function() response=table.pack(pcall(A.httpRequest,options)); A.httpBusy=false; transport.busy=false end)
+        local key=options.Method..'|'..options.Url..'|'..tostring(options.Body)
+        local completed=takeResult(key)
+        if completed then return table.unpack(completed,1,completed.n) end
+        local operation=transport.operation
+        if operation and operation.key~=key then return false,'Waiting for another HTTP request',true end
+        if not operation then
+            if transport.busy then return false,'HTTP already in flight',true end
+            options.Timeout=15
+            operation={key=key,at=os.clock()}; transport.operation=operation
+            transport.busy=true; transport.at=operation.at
+            task.spawn(function()
+                operation.response=table.pack(pcall(A.httpRequest,options))
+                transport.results[key]=operation.response
+                transport.resultOrder[#transport.resultOrder+1]=key
+                while #transport.resultOrder>64 do transport.results[table.remove(transport.resultOrder,1)]=nil end
+                transport.operation=nil; transport.at=nil
+                transport.busy=false
+            end)
+        end
         local deadline=os.clock()+15
-        while (A.alive or completeOnStop) and not response and os.clock()<deadline do task.wait(0.05) end
-        if not response then return false,'HTTP timed out; waiting for transport to recover' end
-        return table.unpack(response,1,response.n)
+        while (A.alive or completeOnStop) and not operation.response and os.clock()<deadline do task.wait(0.05) end
+        if not operation.response then return false,'HTTP result unknown; waiting for the original request',true end
+        if not A.alive and not completeOnStop then return false,'Stopped; original HTTP result retained',true end
+        takeResult(key)
+        return table.unpack(operation.response,1,operation.response.n)
     end
     function A.notify(kind,message,force)
         local s=A.settings
@@ -498,7 +527,10 @@ return function(A)
     end
     A.job('Webhook delivery',1,function()
         if not A.alive or not A.settings.webhook or #A.outbox==0 or os.clock()<A.webhookNext then return end
-        if transport.busy then A.status.Webhook='Waiting for executor HTTP request to finish'; return end
+        if transport.busy then
+            A.status.Webhook='Waiting for executor HTTP request to finish'..(transport.at and (' ('..math.floor(os.clock()-transport.at)..'s)') or '')
+            return
+        end
         local entry=A.outbox[1]
         if type(entry)~='table' or type(entry.message)~='string' or entry.target~=fingerprint(A.settings.webhookURL) then
             table.remove(A.outbox,1); persist(); return
@@ -513,8 +545,9 @@ return function(A)
         data=data:sub(1,-2)..','..mentions..'}'
         local url=A.settings.webhookURL:gsub('([?&])wait=[^&]*','%1wait=true')
         if not url:find('wait=',1,true) then url=url..(url:find('?',1,true) and '&' or '?')..'wait=true' end
-        local ok,response=A.http({Url=url,Method='POST',Headers={['Content-Type']=contentType},Body=data})
+        local ok,response,unresolved=A.http({Url=url,Method='POST',Headers={['Content-Type']=contentType},Body=data})
         if not A.alive then return end
+        if unresolved then A.status.Webhook=tostring(response); return end
         local status=ok and type(response)=='table' and tonumber(response.StatusCode or response.Status) or 0
         local body; if ok and type(response)=='table' then
             local parsed,value=pcall(A.S.HTTP.JSONDecode,A.S.HTTP,response.Body or '')
@@ -602,8 +635,17 @@ return function(A)
     end
     function A.discover()
         local cat=A.catalog
+        A.catalogRevision=(A.catalogRevision or 0)+1
         local world=A.config('WorldConfig'); if world then cat.worlds=world:GetAllWorlds() end
         local enemy=A.config('EnemyConfig'); if enemy then cat.enemies=enemy:GetAllEnemies() end
+        cat.enemyLookup={}
+        for key,entry in pairs(cat.enemies) do
+            local world=tostring(entry.World or entry.WorldId)
+            cat.enemyLookup[world]=cat.enemyLookup[world] or {}
+            for _,name in ipairs({key,entry.Name or key,entry.ModelName or key}) do
+                cat.enemyLookup[world][name]={key=key,info=entry}
+            end
+        end
         A.status.Discovery=string.format('%d worlds / %d enemies',#C.keys(cat.worlds),#C.keys(cat.enemies))
         if A.refreshUI then A.refreshUI() end
     end
@@ -618,24 +660,217 @@ end
 
 end)()(A);
 
+-- ===== run_identity =====
+(function()
+return function(A)
+    local fields={Raid='RaidKey',Defense='DefenseKey',Tower='TowerKey',TimeTrial='TrialKey',Dungeon='DungeonKey',BossRush='RushKey'}
+    local folders={Raid='RaidArenas',Defense='DefenseArenas',Tower='TowerArenas',TimeTrial='TimeTrialArenas',Dungeon='DungeonArenas',BossRush='BossRushArenas'}
+    local known,order={},{}
+    local function remember(prefix,instance,key)
+        local id=prefix..':'..instance
+        if not known[id] then order[#order+1]=id end
+        known[id]=key
+        while #order>64 do known[table.remove(order,1)]=nil end
+    end
+    A.rememberRun=remember
+    function A.runKey(raw)
+        if type(raw)~='string' then return nil end
+        local prefix,instance=raw:match('^([^:]+):(.+)$')
+        if prefix=='Trial' then return instance end
+        if prefix=='Dungeon' then return instance end
+        if not fields[prefix] then return nil end
+        if known[prefix..':'..instance] then return known[prefix..':'..instance] end
+        local root=workspace:FindFirstChild(folders[prefix])
+        local arena=root and root:FindFirstChild(instance)
+        local key=arena and arena:GetAttribute(fields[prefix])
+        if type(key)=='string' then remember(prefix,instance,key) end
+        return key
+    end
+    for prefix,field in pairs(fields) do
+        local name,keyField=prefix,field
+        A.on(name..'State',function(packet)
+            if type(packet)=='table' and type(packet.InstanceKey)=='string' and type(packet[keyField])=='string' then
+                remember(name,packet.InstanceKey,packet[keyField])
+            end
+        end)
+        if name~='Tower' and name~='TimeTrial' and name~='Dungeon' then
+            A.on(name..'MapReady',function(instance,key)
+                if type(instance)=='string' and type(key)=='string' then remember(name,instance,key) end
+            end)
+        end
+    end
+    function A.endPacket(first,second)
+        return type(second)=='table' and second or (type(first)=='table' and first or nil)
+    end
+    -- Missing identifiers cannot prove a different run; explicit foreign identifiers always do.
+    function A.runEventMatches(prefix,packet,raw,key)
+        raw=raw or A.player:GetAttribute('VisibilityContext')
+        local context,instance
+        if type(raw)=='string' then context,instance=raw:match('^([^:]+):(.+)$') end
+        if not context then return false end
+        if context=='Trial' then context='TimeTrial' end
+        if context~=prefix then return false end
+        if type(packet)~='table' then return true end
+        key=key or A.runKey(raw)
+        if packet.InstanceKey and packet.InstanceKey~=instance then return false end
+        local declared=packet[fields[prefix]]
+        if (prefix=='TimeTrial' or prefix=='Dungeon') and declared and declared~=instance then return false end
+        if key and declared and declared~=key then return false end
+        return true
+    end
+end
+
+end)()(A);
+
+-- ===== pet_inventory =====
+(function()
+return function(A)
+    local pets,equipped,sequence=nil,nil,nil
+    local listeners={}
+    local function publish(ids)
+        for _,fn in ipairs(listeners) do fn(ids) end
+    end
+    function A.onPetInventory(fn) listeners[#listeners+1]=fn end
+    local function nativeSnapshot()
+        local inventory=A.client('InventoryController')
+        local delta=A.util('PetInventoryDeltaUtil')
+        local ok,snapshot=pcall(function()
+            return inventory and inventory.HasSynced and inventory:HasSynced() and delta and delta.Get and delta.Get()
+        end)
+        return ok and type(snapshot)=='table' and snapshot or nil
+    end
+    function A.petData()
+        local data=A.data()
+        if data and not pets then
+            local snapshot=nativeSnapshot()
+            if snapshot then pets=A.Core.copy(snapshot) end
+        end
+        if not data or (not pets and not equipped) then return data end
+        local view={}; for key,value in pairs(data) do view[key]=value end
+        if pets then view.Pets=pets end
+        if equipped then view.EquippedPets=equipped end
+        return view
+    end
+    A.on('InventoryUpdated',function(packet)
+        if type(packet)~='table' then return end
+        local seq=tonumber(packet.Seq)
+        if seq and sequence and seq<=sequence then return end
+        local changed={}
+        if type(packet.Full)=='table' then
+            pets=A.Core.copy(packet.Full)
+            if seq then sequence=seq end
+            publish(nil); return
+        end
+        if not pets then
+            local data=A.data()
+            local snapshot=nativeSnapshot() or (data and data.Pets)
+            if type(snapshot)~='table' then return end
+            -- Work on our own snapshot; never mutate the game's inventory cache.
+            pets=A.Core.copy(snapshot)
+        end
+        for id,value in pairs(type(packet.Changed)=='table' and packet.Changed or {}) do
+            pets[id]=A.Core.copy(value); changed[id]=true
+        end
+        for _,id in ipairs(type(packet.Removed)=='table' and packet.Removed or {}) do
+            pets[id]=nil; changed[id]=true
+        end
+        if seq then sequence=seq end
+        publish(changed)
+    end)
+    A.on('EquippedUpdated',function(snapshot)
+        if type(snapshot)=='table' then equipped=A.Core.copy(snapshot) end
+    end)
+    if A.container and type(A.container.OnChange)=='function' then
+        local ok,connection=pcall(A.container.OnChange,A.container,{'Pets'},function(_,_,path)
+            local data=A.data()
+            if pets and data and type(data.Pets)=='table' then
+                if type(path)=='table' and path[1] then pets[path[1]]=A.Core.copy(data.Pets[path[1]])
+                else pets=A.Core.copy(data.Pets) end
+            end
+            publish(type(path)=='table' and path[1] and {[path[1]]=true} or nil)
+        end)
+        if ok and connection then A.connections[#A.connections+1]=connection end
+        local equipOK,equipConnection=pcall(A.container.OnChange,A.container,{'EquippedPets'},function()
+            local data=A.data()
+            equipped=data and type(data.EquippedPets)=='table' and A.Core.copy(data.EquippedPets) or nil
+        end)
+        if equipOK and equipConnection then A.connections[#A.connections+1]=equipConnection end
+    end
+end
+
+end)()(A);
+
+-- ===== requests =====
+(function()
+return function(A)
+    local env=(type(getgenv)=='function' and getgenv()) or _G
+    env.JoesAASRequests=env.JoesAASRequests or {}
+    local active=env.JoesAASRequests
+    function A.requestInFlight(name) return active[name] and active[name].busy==true end
+    function A.invoke(name,args,callback)
+        if not A.alive or not A.running or A.requestInFlight(name) then return nil end
+        local remote=A.Library.Network.Functions:FindFirstChild(name)
+        if not remote then return nil end
+        local request={busy=true,at=os.clock(),epoch=A.epoch}
+        active[name]=request
+        -- Resume immediately like task.spawn, but retain a handle for controlled yield tests.
+        request.thread=coroutine.create(function()
+            local result=table.pack(pcall(remote.InvokeServer,remote,table.unpack(args,1,args.n)))
+            request.busy=false
+            if active[name]==request then active[name]=nil end
+            if A.alive and A.running and A.epoch==request.epoch then
+                local ok,err=pcall(callback,table.unpack(result,1,result.n))
+                if not ok then A.log('Request',name..': '..tostring(err)) end
+            end
+        end)
+        local ok,err=coroutine.resume(request.thread)
+        if not ok then request.busy=false; A.log('Request',name..': '..tostring(err)) end
+        return request
+    end
+end
+
+end)()(A);
+
 -- ===== spending =====
 (function()
 return function(A)
     local C=A.Core
     A.sessionNamed={}
+    local eligibility,acceptedUntil,serverConfirmed={},{},{}
+    local function inspect(id,pet,named,stats)
+        local row=eligibility[id]
+        local record=type(named)=='table' and named[id]
+        if not row or row.pet~=pet or row.petId~=(type(pet)=='table' and pet.PetId)
+            or row.inventoryRarity~=(type(pet)=='table' and pet.Rarity) or row.named~=record
+            or row.stats~=stats or row.rarityFn~=(stats and stats.GetRarity) or os.clock()-row.at>=30 then
+            local ok,eligible,reason,rarity=pcall(C.renameEligible,id,pet,named,stats)
+            row={pet=pet,petId=type(pet)=='table' and pet.PetId,inventoryRarity=type(pet)=='table' and pet.Rarity,
+                named=record,stats=stats,rarityFn=stats and stats.GetRarity,at=os.clock(),eligible=ok and eligible==true,
+                reason=ok and reason or 'eligibility unavailable; will recheck',rarity=rarity or 'unknown'}
+            eligibility[id]=row
+        end
+        return row.eligible,row.reason,row.rarity
+    end
+    local function invalidate(ids)
+        if ids then for id in pairs(ids) do eligibility[id]=nil end else eligibility={} end
+        if not A.alive then return end
+        A.renameInventoryEvents=(A.renameInventoryEvents or 0)+1
+        A.renameLastInventoryEvent=os.clock()
+        if A.tasks.Renaming then A.tasks.Renaming.next=0 end
+    end
+    A.onPetInventory(invalidate)
     function A.renameDiagnostics()
-        local d=A.data() or {}; local stats=A.util('PetStatsUtil')
-        local report={version='5.8',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
+        local d=A.petData() or {}; local stats=A.util('PetStatsUtil')
+        local report={version=A.version,status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
             inventoryEvents=A.renameInventoryEvents or 0,lastInventoryEvent=A.renameLastInventoryEvent}
         local named=type(d.NamedPets)=='table' and d.NamedPets or {}
         local sampled={}
         for _,id in ipairs(C.keys(type(d.Pets)=='table' and d.Pets or {})) do
             local pet=d.Pets[id]; report.total=report.total+1
-            local ok,eligible,reason=pcall(C.renameEligible,id,pet,named,A.settings.petName,stats)
-            reason=ok and (A.sessionNamed[id] and 'renamed this session' or reason) or 'eligibility error'
+            local eligible,reason,rarity=inspect(id,pet,named,stats)
+            reason=A.sessionNamed[id] and 'renamed this session' or reason
             report.reasons[reason]=(report.reasons[reason] or 0)+1
-            local rarityOK,rarity=pcall(function() return stats.GetRarity(pet) end)
-            rarity=rarityOK and tostring(rarity) or 'unknown'
+            rarity=tostring(rarity)
             report.rarities[rarity]=(report.rarities[rarity] or 0)+1
             if #report.samples<40 and (sampled[reason] or 0)<5 then
                 sampled[reason]=(sampled[reason] or 0)+1
@@ -664,12 +899,14 @@ return function(A)
     local nextRename=0
     A.renamePending=nil
     local function isConfirmed(id)
-        local d=A.data()
-        return d and type(d.NamedPets)=='table' and type(d.NamedPets[id])=='table'
+        local d=A.petData()
+        return serverConfirmed[id]==true or (d and type(d.NamedPets)=='table' and type(d.NamedPets[id])=='table')
     end
     local function finish(id,success,reason)
         if success then
-            A.sessionNamed[id]=true; retries[id]=nil
+            A.sessionNamed[id]=true
+            if isConfirmed(id) then retries[id]=nil; acceptedUntil[id]=nil
+            else acceptedUntil[id]=os.clock()+30 end
             A.status.Rename='Named Astral: '..id
             if A.settings.webhook then A.notify('Inventory','Renamed an unnamed Astral pet: '..id) end
         else
@@ -688,11 +925,12 @@ return function(A)
         if accepted==true and type(payload)=='table' and (payload.Kind==nil or payload.Kind=='Pet')
             and payload.UniqueId==id then finish(id,true)
         elseif type(payload)=='table' and payload.UniqueId==id then
-            finish(id,false,reason)
+            if reason=='same_name' then serverConfirmed[id]=true; finish(id,true)
+            else finish(id,false,reason) end
         end
     end)
     local function renameStep()
-        local d=A.data()
+        local d=A.petData()
         if not d then A.status.Rename='Waiting for player data'; return end
         local id=A.renamePending
         if id then
@@ -713,18 +951,32 @@ return function(A)
         local valid,reason=cfg:Validate(name)
         if not valid then A.status.Rename=cfg:GetErrorMessage(reason); return end
         local skipped,total={},0
+        for petId,deadline in pairs(acceptedUntil) do
+            if isConfirmed(petId) then acceptedUntil[petId]=nil; retries[petId]=nil
+            elseif os.clock()>=deadline then
+                acceptedUntil[petId]=nil; A.sessionNamed[petId]=nil
+                if (retries[petId] or 0)>=3 then retryAfter[petId]=os.clock()+120 end
+            end
+        end
+        for petId in pairs(eligibility) do if d.Pets[petId]==nil then eligibility[petId]=nil end end
+        local candidates={}
+        for petId,pet in pairs(d.Pets) do
+            local eligible,reason=inspect(petId,pet,d.NamedPets or {},stats)
+            if eligible then candidates[petId]=true else
+                skipped[reason]=(skipped[reason] or 0)+1
+            end
+            total=total+1
+        end
         -- Removed pets must not leave session state or retry timers behind.
         for petId in pairs(A.sessionNamed) do
-            if d.Pets[petId]==nil then A.sessionNamed[petId]=nil; A.cooldowns['rename:'..petId]=nil end
+            if d.Pets[petId]==nil then A.sessionNamed[petId]=nil; serverConfirmed[petId]=nil; acceptedUntil[petId]=nil; A.cooldowns['rename:'..petId]=nil end
         end
         for petId in pairs(retries) do
             if d.Pets[petId]==nil then retries[petId]=nil; retryAfter[petId]=nil; A.cooldowns['rename:'..petId]=nil end
         end
-        for _,petId in ipairs(C.keys(d.Pets)) do
-            total=total+1
+        for _,petId in ipairs(C.keys(candidates)) do
             -- A partially replicated or malformed entry must not block the rest.
-            local checked,canRename,skip=pcall(C.renameEligible,petId,d.Pets[petId],d.NamedPets or {},name,stats)
-            if not checked then canRename=false; skip='eligibility unavailable; will recheck' end
+            local canRename,skip=inspect(petId,d.Pets[petId],d.NamedPets or {},stats)
             if retryAfter[petId] and os.clock()>=retryAfter[petId] then
                 retries[petId]=nil; retryAfter[petId]=nil
             end
@@ -763,7 +1015,9 @@ return function(A)
     end
     function A.retryRenaming()
         if A.renamePending then return end
-        retries={}; retryAfter={}
+        retries={}; retryAfter={}; eligibility={}
+        for key in pairs(A.cooldowns) do if key:find('^rename:') then A.cooldowns[key]=nil end end
+        A.tasks.Renaming.next=0
         A.status.Rename='Retry enabled; checking unnamed Astral pets'
     end
     A.job('Renaming',1,function()
@@ -772,19 +1026,10 @@ return function(A)
         if not ok then A.status.Rename='Rename error: '..tostring(err); A.log('Rename',A.status.Rename) end
         if not A.renamePending and not tostring(A.status.Rename):find('^Named Astral:') then saveDiagnostic() end
     end)
-    -- Wake the existing serial worker when live replication adds/updates pets.
-    -- Keep polling as a fallback: no per-pet listeners or extra scan loops.
+    -- Naming records are separate from both native inventory feeds.
     if A.container and type(A.container.OnChange)=='function' then
-        local function wake()
-            if not A.alive then return end
-            A.renameInventoryEvents=(A.renameInventoryEvents or 0)+1
-            A.renameLastInventoryEvent=os.clock()
-            A.tasks.Renaming.next=0
-        end
-        for _,field in ipairs({'Pets','NamedPets'}) do
-            local ok,connection=pcall(A.container.OnChange,A.container,{field},wake)
-            if ok and connection then A.connections[#A.connections+1]=connection end
-        end
+        local ok,connection=pcall(A.container.OnChange,A.container,{'NamedPets'},function(_,_,path) invalidate(type(path)=='table' and path[1] and {[path[1]]=true} or nil) end)
+        if ok and connection then A.connections[#A.connections+1]=connection end
     end
 end
 
@@ -833,9 +1078,12 @@ return function(A)
         end
         return false
     end
-    local function resolveEnemy(name)
+    local function resolveEnemy(name,world)
+        local lookup=A.catalog.enemyLookup and A.catalog.enemyLookup[tostring(world)]
+        local row=lookup and lookup[name]
+        if row then return row.key,row.info end
         for key,e in pairs(A.catalog.enemies) do
-            if key==name or e.Name==name or e.ModelName==name then return key,e end
+            if ((e.World or e.WorldId)==nil or tostring(e.World or e.WorldId)==tostring(world)) and (key==name or e.Name==name or e.ModelName==name) then return key,e end
         end
     end
     local function enemyHealth(enemy)
@@ -864,7 +1112,7 @@ return function(A)
         for _,folder in ipairs(folders) do
             for _,enemy in ipairs(folder:GetChildren()) do
                 local part=enemy:FindFirstChild('HumanoidRootPart')
-                local id,info=resolveEnemy(enemy.Name)
+                local id,info=resolveEnemy(enemy.Name,world)
                 local selection=A.settings.mobsByWorld[tostring(world)] or {}
                 local allowed=next(selection)==nil or selection[id]==true
                 local alive,health=enemyHealth(enemy)
@@ -958,6 +1206,7 @@ return function(A)
         local activeKey,target,loadingSince,endedKey
         local mapReady,state={},{}
         local streamBusy,nextStream=false,0
+        local generationBusy=false
         local stalledSince,lastReportAt=nil,0
         local function getContext()
             local context=A.player:GetAttribute('VisibilityContext')
@@ -1009,18 +1258,21 @@ return function(A)
             if renderBound then A.S.Run:UnbindFromRenderStep(renderName); renderBound=false end
         end
         A.on(bridge..'MapReady',function(key,room,generation,position,token)
-            if type(key)~='string' then return end
+            if type(key)~='string' or (getContext() and getContext()~=key) then return end
             mapReady={key=key,room=tonumber(room) or 1,generation=generation,position=position,token=token,at=os.clock()}
             state={[keyField]=key,Room=tonumber(room) or 1}
             endedKey=nil
         end)
         A.on(bridge..'State',function(packet)
-            if type(packet)~='table' or packet.Refused then return end
+            if type(packet)~='table' or packet.Refused or not A.runEventMatches(bridge,packet) then return end
             if packet.Full or (packet[keyField] and packet[keyField]~=state[keyField]) then state={} end
             for k,v in pairs(packet) do if k~='Full' and k~='Cleared' then state[k]=v end end
             for _,k in ipairs(type(packet.Cleared)=='table' and packet.Cleared or {}) do state[k]=nil end
         end)
-        A.on(bridge..'Ended',function() stopMovement(); endedKey=getContext(); target=nil; mapReady={}; state={} end)
+        A.on(bridge..'Ended',function(first,second)
+            if not A.runEventMatches(bridge,A.endPacket(first,second)) then return end
+            stopMovement(); endedKey=getContext(); target=nil; mapReady={}; state={}
+        end)
         local function roomSpawn(arena,index)
             local rooms=arena and arena:FindFirstChild('Rooms')
             local room=rooms and rooms:FindFirstChild('Room'..tostring(index))
@@ -1040,6 +1292,30 @@ return function(A)
                     end
                     streamBusy=false
                 end)
+            end
+            if kind=='Dungeon' and mapReady.key==key and not generationBusy and (mapReady.attempts or 0)<3
+                and os.clock()-mapReady.at>=5 and os.clock()>=(mapReady.nextAck or 0)
+                and type(mapReady.generation)=='number' and type(mapReady.token)=='string'
+                and (not room or room==mapReady.room) then
+                local ctrl=A.client('DungeonController')
+                if ctrl and type(ctrl.GenerateRoomsThrough)=='function' then
+                    local request=mapReady
+                    request.attempts=(request.attempts or 0)+1; request.nextAck=os.clock()+10
+                    generationBusy=true
+                    task.spawn(function()
+                        if A.alive and A.running and A.settings[toggle] and getContext()==key and mapReady==request
+                            and (state.Room==nil or state.Room==request.room) then
+                            local ok,generated=pcall(ctrl.GenerateRoomsThrough,ctrl,key,request.room)
+                            if ok and generated==true and A.alive and A.running and A.settings[toggle]
+                                and getContext()==key and mapReady==request
+                            and (state.Room==nil or state.Room==request.room) then
+                                request.acknowledged=true
+                                A.fire(bridge..'ClientReady',key,request.generation,request.token)
+                            end
+                        end
+                        generationBusy=false
+                    end)
+                end
             end
             if kind=='Trial' and mapReady.key==key and (mapReady.attempts or 0)<3 and os.clock()-mapReady.at>=3
                 and os.clock()>=(mapReady.nextAck or 0)
@@ -1069,7 +1345,7 @@ return function(A)
                         context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
                 end
                 local ctrl=A.client('TeleportController')
-                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.8',reason=message,
+                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version=A.version,reason=message,
                     context=A.player:GetAttribute('VisibilityContext'),room=state[keyField]==key and state.Room,
                     serverEnemies=state[keyField]==key and state.EnemyCount,anchored=root and root.Anchored,
                     loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
@@ -1123,6 +1399,7 @@ return function(A)
             local loading=ctrl and ctrl:IsLoading()
             if loading then
                 loadingSince=loadingSince or os.clock()
+                recoverLoading(key,arena)
                 if os.clock()-loadingSince<3 then A.status[label..' follow']='Waiting for '..label..' loading'; return end
                 -- Recover only with a living target in our exact arena and a usable character.
                 -- Do not modify the game's loading flag or join/room-ready handshake.
@@ -1197,7 +1474,7 @@ return function(A)
         local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
         local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
         local activityJob=A.tasks.Activities
-        local snapshot={schema=1,version='5.8',userId=A.player.UserId,gameId=game.GameId,
+        local snapshot={schema=1,version=A.version,userId=A.player.UserId,gameId=game.GameId,
             savedAt=os.time(),context=A.player:GetAttribute('VisibilityContext'),running=A.running,
             activities=A.status.Activities,error=A.status['Activity error'],events=events,openings=openings,
             coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
@@ -1245,7 +1522,7 @@ return function(A)
     local stuckBackoff={}
     local stuckRetry
     local leaveAt,leaveAttempts=0,0
-    local raidInstance,raidKey
+    local choiceCache={}
     for _,mode in ipairs(order) do available[mode]={} end
     function A.activityOrder()
         local result={}
@@ -1285,6 +1562,8 @@ return function(A)
     function A.activityChoices(mode)
         local def=definitions[mode]; if not def then return {} end
         local cfg=A.config(def.config)
+        local cached=choiceCache[mode]
+        if cached and cached.config==cfg and cached.getter==(cfg and cfg[def.method]) and cached.revision==A.catalogRevision then return cached.value end
         local choices=cfg and type(cfg[def.method])=='function' and cfg[def.method](cfg) or {}
         if mode=='BossRush' then
             local rows={}
@@ -1298,6 +1577,7 @@ return function(A)
                     end
                 end
             end
+            choiceCache[mode]={config=cfg,getter=cfg and cfg[def.method],revision=A.catalogRevision,value=rows}
             return rows
         end
         if mode=='Gate' or mode=='MaxTac' or mode=='Raid' then
@@ -1305,8 +1585,10 @@ return function(A)
             for key,value in pairs(choices) do
                 if (mode=='Raid' and value.GateOnly~=true) or A.Core.portalMode(key,value)==mode then filtered[key]=value end
             end
+            choiceCache[mode]={config=cfg,getter=cfg and cfg[def.method],revision=A.catalogRevision,value=filtered}
             return filtered
         end
+        choiceCache[mode]={config=cfg,getter=cfg and cfg[def.method],revision=A.catalogRevision,value=choices}
         return choices
     end
     -- Older profiles stored only the rush key. Keep the same V1 choice when declared.
@@ -1357,7 +1639,6 @@ return function(A)
         end
         return keys
     end
-    function A.trialChoices() return A.activityChoices('TimeTrial') end
     function A.activityRows(mode)
         local choices=A.activityChoices(mode); local rows={}
         for _,key in ipairs(A.Core.activityKeys(choices,mode)) do
@@ -1376,7 +1657,7 @@ return function(A)
         if mode=='Trial' then mode='TimeTrial' end
         if mode=='Raid' then
             local instance=raw:match('^Raid:(.+)$')
-            local key=instance==raidInstance and raidKey or instance
+            local key=A.runKey(raw) or instance
             local cfg=A.config('RaidConfig'); local entries=cfg and cfg:GetAllRaids() or {}
             if instance and not entries[key] then
                 local arenas=workspace:FindFirstChild('RaidArenas')
@@ -1385,10 +1666,12 @@ return function(A)
                 local base=instance:match('^([^_]+)_')
                 if type(observed)=='string' and entries[observed] then key=observed
                 elseif base and entries[base] then key=base end
-                if entries[key] then raidInstance=instance; raidKey=key end
             end
+            if entries[key] then A.rememberRun('Raid',instance,key) end
             if entries[key] and entries[key].GateOnly==true then mode=A.Core.portalMode(key,entries[key])
-            elseif pending and (pending.mode=='Gate' or pending.mode=='MaxTac') and raw~=pending.fromContext then mode=pending.mode end
+            elseif not entries[key] and pending and (pending.mode=='Gate' or pending.mode=='MaxTac') and raw~=pending.fromContext then
+                mode='UnidentifiedRaid' -- Metadata must establish a portal before acquiring its lock.
+            end
         end
         return mode~='World' and mode or nil,raw
     end
@@ -1521,7 +1804,15 @@ return function(A)
             if nextMode and priority(nextMode)>priority(pending.mode) then pending=nil end
         end
         if pending then
-            if current==pending.mode then
+            if os.clock()-pending.at>=60 then
+                backoff[pending.mode..':'..pending.key]=os.clock()+30
+                A.status['Activity error']='Entry timed out: '..pending.mode..'; waiting for native state before retrying'
+                pending=nil
+                if loading then status(A.status['Activity error']); return end
+            end
+        end
+        if pending then
+            if current==pending.mode and (A.runKey(raw)==pending.key or (current~='Gate' and current~='MaxTac' and current~='TimeTrial' and current~='Dungeon')) then
                 pending=nil; returning=nil
             elseif protected[current] and returning~=current then pending=nil
             elseif not loading and (not current or definitions[current]) then
@@ -1538,8 +1829,7 @@ return function(A)
                     else
                         backoff[pending.mode..':'..pending.key]=os.clock()+5; pending=nil
                     end
-                elseif pending.accepted and os.clock()-pending.at>=60 then
-                    backoff[pending.mode..':'..pending.key]=os.clock()+5; pending=nil
+
                 else status('Waiting for '..pending.mode..' entry confirmation'); return end
             else status('Waiting for '..pending.mode..' entry confirmation'); return end
         end
@@ -1596,7 +1886,10 @@ return function(A)
             available[mode][p.Key]={deadline=os.clock()+math.min(duration,600),modeId=p.ModeId}
             A.coordinateActivities()
         end) end
-        A.on(mode..'Ended',function(_,packet)
+        A.on(mode..'Ended',function(first,second)
+            local packet=A.endPacket(first,second)
+            local _,raw=context()
+            if not A.runEventMatches(mode,packet,raw,A.runKey(raw)) then return end
             A.joinTrace('run ended',{mode=mode,autoRetry=type(packet)=='table' and packet.AutoRetry==true,timeTrialTransfer=type(packet)=='table' and packet.TimeTrialTransfer==true})
             local current=context()
             -- The native portal transfer can deliver the previous Raid's end
@@ -1633,8 +1926,7 @@ return function(A)
                 if accepted==false then
                     local key=pending.key
                     if mode=='Defense' and reason=='defense_already_active' then
-                        available[mode][key]={deadline=os.clock()+15}
-                        backoff[mode..':'..key]=0
+                        backoff[mode..':'..key]=os.clock()+30
                     else
                         if reason=='no_active_raid' or reason=='no_active_defense' or reason=='join_closed' or reason=='trial_closed' or reason=='dungeon_closed' then available[mode][key]=nil end
                         backoff[mode..':'..key]=os.clock()+(mode=='Raid' and 30 or 5)
@@ -1659,30 +1951,8 @@ return function(A)
         available[mode][p.Key]={deadline=os.clock()+math.min(duration,600),rank=rank}
         A.coordinateActivities()
     end)
-    A.on('RaidMapReady',function(instance,key)
-        if type(instance)=='string' and type(key)=='string' then raidInstance=instance; raidKey=key end
-        A.coordinateActivities()
-    end)
-    A.on('RaidState',function(packet)
-        if type(packet)=='table' and type(packet.RaidKey)=='string' and type(packet.InstanceKey)=='string' then
-            raidInstance=packet.InstanceKey; raidKey=packet.RaidKey
-        end
-        A.coordinateActivities()
-    end)
-    for _,name in ipairs({'Defense'}) do
-        local mode=name
-        A.on(mode..'ActiveStatus',function(states)
-            if type(states)~='table' then return end
-            local replacement={}
-            for key,value in pairs(states) do
-                if type(key)=='string' and (value==true or (type(value)=='table' and value.Active~=false)) then
-                    replacement[key]={deadline=os.clock()+30}
-                end
-            end
-            available[mode]=replacement
-            A.coordinateActivities()
-        end)
-    end
+    A.on('RaidMapReady',A.coordinateActivities)
+    A.on('RaidState',A.coordinateActivities)
     A.on('TowerState',function(p)
         if type(p)=='table' and p.Refused then A.joinTrace('server reply',{mode='Tower',accepted=false,reason=tostring(p.Refused)}) end
         if type(p)=='table' and p.Refused and pending and pending.mode=='Tower' then
@@ -1708,7 +1978,7 @@ return function(A)
     end)
     -- Native popup attributes provide recovery when injection happens after the
     -- announcement. Read only the small notification containers, never the scene.
-    local observedRoots={}
+    local observedRoots=setmetatable({},{__mode='k'})
     local function readCard(card)
         if not card:IsA('GuiObject') or card.Visible~=true or not card.Parent then return end
         local setting=card:GetAttribute('GamemodePopupSettingKey')
@@ -1744,10 +2014,12 @@ return function(A)
             local root=parent and parent:FindFirstChild('GamemodeNotify')
             if root then roots[#roots+1]=root end
         end
+        for old,connection in pairs(observedRoots) do
+            if not old.Parent then connection:Disconnect(); observedRoots[old]=nil end
+        end
         for _,root in ipairs(roots) do
             if not observedRoots[root] and root.ChildAdded then
-                observedRoots[root]=true
-                A.connect(root.ChildAdded,function(card)
+                observedRoots[root]=A.connect(root.ChildAdded,function(card)
                     readCard(card); A.coordinateActivities()
                 end)
             end
@@ -1892,14 +2164,15 @@ return function(A)
     for _,prefix in ipairs({'Raid','Defense','Tower','TimeTrial','Dungeon','BossRush'}) do
         local name=prefix
         A.on(name..'State',function(packet) receive(name,packet) end)
-        A.on(name..'Ended',function(_,packet)
+        A.on(name..'Ended',function(first,second)
+            local packet=A.endPacket(first,second)
             local w=current()
-            if not w or specs[w.mode].bridge~=name then return end
+            if not w or specs[w.mode].bridge~=name or not A.runEventMatches(name,packet,w.context,w.key) then return end
             if name=='Raid' and w.mode=='MaxTac' and type(packet)=='table' and packet.AutoGateTransfer==true then return end
             if type(packet)=='table' and packet.InstanceKey and packet.InstanceKey~=w.context:match('^[^:]+:(.+)$') then return end
             w.ended=true; w.deaths={}
         end)
-        if name~='Tower' then A.on(name..'MapReady',function(instance,detail)
+        if name~='Tower' then A.on(name..'MapReady',function(instance,detail,generation)
             local w=current()
             if not w or specs[w.mode].bridge~=name or instance~=w.context:match('^[^:]+:(.+)$') then return end
             local room=(name=='TimeTrial' or name=='Dungeon') and tonumber(detail)
@@ -1907,6 +2180,9 @@ return function(A)
                 watch=nil; w=current()
             end
             w.associated=true
+            if room and generation~=nil and generation~=w.generation then
+                w.generation=generation; w.graceUntil=math.max(w.graceUntil,os.clock()+30)
+            end
             if room and (not tonumber(w.state.Room) or room>tonumber(w.state.Room)) then
                 w.state.Room=room; progress(w,'Room loaded')
             end
@@ -1969,16 +2245,18 @@ return function(A)
         return rows
     end
     local gigPending,gigNext=nil,0
+    local gigBackoff,petBackoff={},{}
+    local function gigKey(action,index,gig) return action..':'..index..':'..tostring(gig.Id) end
+    local function allowed(action,index,gig) return (gigBackoff[gigKey(action,index,gig)] or 0)<=os.clock() end
     local ranked,rankingDirty,rankingAt=nil,true,0
-    local function sameGig(gig,request)
-        return type(gig)=='table' and gig.Id==request.id and gig.PetUid==request.pet and gig.EndsAt==request.endsAt
-    end
     A.job('Fixer gigs',0.2,function()
         if not A.alive or not A.running then return end
         if not A.settings.fixerAutoClaim and not A.settings.fixerAutoDeploy and not gigPending then
             A.status['Fixer gigs']='Fixer automation is OFF'; return
         end
-        local cfg=A.config('FixerGigConfig'); local util=A.util('FixerGigUtil'); local d=A.data()
+        for key,deadline in pairs(gigBackoff) do if deadline<=os.clock() then gigBackoff[key]=nil end end
+        for uid,deadline in pairs(petBackoff) do if deadline<=os.clock() then petBackoff[uid]=nil end end
+        local cfg=A.config('FixerGigConfig'); local util=A.util('FixerGigUtil'); local d=A.petData()
         if not cfg or cfg.Enabled~=true or not util or not d then A.status['Fixer gigs']='Waiting for gig data'; return end
         -- An unavailable replication snapshot is not evidence of a successful claim.
         if type(d.FixerGigs)~='table' or type(d.FixerGigs.Board)~='table' then
@@ -1987,7 +2265,8 @@ return function(A)
         local board=util.GetBoard(d)
         if gigPending then
             local current=board[gigPending.index]
-            local confirmed=gigPending.action=='Claim' and not sameGig(current,gigPending)
+            local confirmed=gigPending.action=='Claim' and type(current)=='table' and current.Id==gigPending.id
+                and type(current.PetUid)~='string' and current.EndsAt==nil
                 or (gigPending.action=='Send' and type(current)=='table' and current.Id==gigPending.id
                     and current.PetUid==gigPending.pet and type(current.EndsAt)=='number' and current.EndsAt>0)
             if confirmed then
@@ -1995,14 +2274,22 @@ return function(A)
                     or ('Deployed pet rank '..gigPending.rank..' to gig '..gigPending.index)
                 if A.settings.webhook then A.notify('Progress',A.status['Fixer gigs']) end
                 gigPending=nil; rankingDirty=true
+            elseif gigPending.action=='Claim' and (type(current)~='table' or current.Id~=gigPending.id
+                or (type(current.PetUid)=='string' and (current.PetUid~=gigPending.pet or current.EndsAt~=gigPending.endsAt))) then
+                gigPending=nil; rankingDirty=true; gigNext=os.clock()+1
+                A.status['Fixer gigs']='Gig board changed; claim not confirmed'; return
             elseif gigPending.action=='Send' and (type(current)~='table' or current.Id~=gigPending.id
                 or (type(current.PetUid)=='string' and current.PetUid~=gigPending.pet)) then
                 gigPending=nil; rankingDirty=true; gigNext=os.clock()+1
                 A.status['Fixer gigs']='Gig changed before deployment; checking the new board'; return
+            elseif A.requestInFlight('FixerGigAction') and os.clock()-gigPending.at>=20 then
+                A.status['Fixer gigs']='Gig request still in flight; result unknown, no duplicate will be sent'; return
             elseif os.clock()-gigPending.at<20 then
                 A.status['Fixer gigs']='Waiting for gig '..(gigPending.action=='Claim' and 'claim' or 'deployment')..' confirmation'; return
             else
-                gigPending=nil; gigNext=os.clock()+120
+                gigBackoff[gigKey(gigPending.action,gigPending.index,{Id=gigPending.id})]=os.clock()+120
+                if gigPending.action=='Send' then petBackoff[gigPending.pet]=os.clock()+120 end
+                gigPending=nil
                 A.status['Fixer gigs']='Gig action unconfirmed; retrying after 120s'; return
             end
         end
@@ -2010,20 +2297,31 @@ return function(A)
             A.status['Fixer gigs']='Fixer automation is OFF'; return
         end
         if os.clock()<gigNext then return end
+        if A.requestInFlight('FixerGigAction') then A.status['Fixer gigs']='Waiting for the previous gig request'; return end
         if not A.unlocked(cfg.WorldId) then A.status['Fixer gigs']='Unlock Night City first'; return end
         local ctrl=A.client('TeleportController')
         if ctrl and ctrl:IsLoading() then A.status['Fixer gigs']='Waiting for game loading'; return end
         local index,gig,action,pet,rank
         if A.settings.fixerAutoClaim then
             for i,value in ipairs(board) do
-                if util.IsReady(value,os.time()) then index=i; gig=value; action='Claim'; break end
+                if util.IsReady(value,os.time()) and allowed('Claim',i,value) then index=i; gig=value; action='Claim'; break end
             end
         end
         if not action and A.settings.fixerAutoDeploy then
             local slots=tonumber(d.FixerGigs.Slots) or cfg:GetSlots(d)
             if util.CountActive(d)<slots then
-                for i,value in ipairs(board) do
-                    if type(value)=='table' and type(value.PetUid)~='string' then
+                local indices={}
+                for i in ipairs(board) do indices[#indices+1]=i end
+                if A.settings.fixerPreference=='Big Jobs first' then
+                    table.sort(indices,function(a,b)
+                        local x=board[a].Duration=='Long' and 1 or 0
+                        local y=board[b].Duration=='Long' and 1 or 0
+                        if x~=y then return x>y end; return a<b
+                    end)
+                end
+                for _,i in ipairs(indices) do
+                    local value=board[i]
+                    if type(value)=='table' and type(value.PetUid)~='string' and allowed('Send',i,value) then
                         index=i; gig=value; break
                     end
                 end
@@ -2034,7 +2332,7 @@ return function(A)
                         A.status['Fixer gigs']='Native pet ranking unavailable'; return
                     end
                     -- Keep gig pets in the ranking: busy rank 4 must not make rank 7 eligible.
-                    if rankingDirty or not ranked or os.clock()-rankingAt>=5 then
+                    if rankingDirty or not ranked or os.clock()-rankingAt>=30 then
                         ranked={}
                         for _,row in ipairs(power.BuildRanking(d,{IncludeGigPets=true})) do
                             if row.IsDynamic==false then ranked[#ranked+1]=row.UniqueId end
@@ -2043,7 +2341,7 @@ return function(A)
                     end
                     for position=4,6 do
                         local uid=ranked[position]
-                        if type(uid)=='string' and type(d.Pets[uid])=='table' and not util.IsPetOnGig(d,uid) then
+                        if type(uid)=='string' and type(d.Pets[uid])=='table' and not util.IsPetOnGig(d,uid) and (petBackoff[uid] or 0)<=os.clock() then
                             pet=uid; rank=position; action='Send'; break
                         end
                     end
@@ -2059,12 +2357,24 @@ return function(A)
         A.status['Fixer gigs']=action=='Claim' and ('Claiming gig '..index)
             or ('Deploying pet rank '..rank..' to gig '..index)
         -- Native Claim/Send payloads; one request at a time, below the shared function limit.
-        local ok,accepted,reason=pcall(fn.InvokeServer,fn,action,index,pet)
-        if not A.alive then return end
-        if not ok or accepted~=true then
-            gigPending=nil; gigNext=os.clock()+30
-            A.status['Fixer gigs']=action..' refused: '..tostring(ok and reason or accepted)
-        end
+        local request=gigPending
+        A.invoke('FixerGigAction',table.pack(action,index,pet),function(ok,accepted,reason)
+            if gigPending~=request then return end
+            if not ok or accepted~=true then
+                gigBackoff[gigKey(action,index,gig)]=os.clock()+30
+                if action=='Send' then petBackoff[pet]=os.clock()+30 end
+                gigPending=nil
+                A.status['Fixer gigs']=action..' refused: '..tostring(ok and reason or accepted)
+            end
+        end)
+    end)
+    A.on('EquippedUpdated',function()
+        rankingDirty=true
+        if A.alive then A.tasks['Fixer gigs'].next=0 end
+    end)
+    A.onPetInventory(function()
+        rankingDirty=true
+        if A.alive then A.tasks['Fixer gigs'].next=0 end
     end)
     if A.container and type(A.container.OnChange)=='function' then
         for _,field in ipairs({'FixerGigs','Pets','EquippedPets','EquippedPetAccessories','PetAccessories','PetPassives','NamedPets'}) do
@@ -2086,6 +2396,8 @@ return function(A)
                 A.status.Ripperdoc='Upgraded '..pending.slot..' to Lv.'..cfg:GetLevel(d,pending.slot)
                 if A.settings.webhook then A.notify('Progress',A.status.Ripperdoc) end
                 pending=nil
+            elseif A.requestInFlight('RipperdocUpgrade') and os.clock()-pending.at>=20 then
+                A.status.Ripperdoc='Upgrade still in flight; result unknown, no duplicate will be sent'; return
             elseif os.clock()-pending.at<20 then
                 A.status.Ripperdoc='Waiting for '..pending.slot..' upgrade confirmation'; return
             else
@@ -2094,6 +2406,7 @@ return function(A)
             end
         end
         if not A.settings.ripperdocAuto or os.clock()<nextAttempt then return end
+        if A.requestInFlight('RipperdocUpgrade') then A.status.Ripperdoc='Waiting for the previous upgrade request'; return end
         if not A.unlocked(cfg.WorldId) then A.status.Ripperdoc='Unlock Night City first'; return end
         local chosen,level,cost
         for _,slot in ipairs(cfg.SlotOrder) do
@@ -2112,12 +2425,14 @@ return function(A)
         -- One normal, serial server request; never spend again before replication confirms.
         pending={slot=chosen,level=level,at=os.clock()}; nextAttempt=os.clock()+2
         A.status.Ripperdoc='Upgrading '..chosen
-        local ok,accepted,reason=pcall(fn.InvokeServer,fn,chosen)
-        if not A.alive then return end
-        if not ok or accepted~=true then
-            pending=nil; nextAttempt=os.clock()+30
-            A.status.Ripperdoc='Upgrade refused: '..tostring(ok and reason or accepted)
-        end
+        local request=pending
+        A.invoke('RipperdocUpgrade',table.pack(chosen),function(ok,accepted,reason)
+            if pending~=request then return end
+            if not ok or accepted~=true then
+                pending=nil; nextAttempt=os.clock()+30
+                A.status.Ripperdoc='Upgrade refused: '..tostring(ok and reason or accepted)
+            end
+        end)
     end)
 end
 
@@ -2143,10 +2458,9 @@ return function(A)
     local function esc(text)
         return tostring(text or ''):gsub('[%c]',' '):gsub('([\\`*_~|%[%]<>])','\\%1')
     end
-    A.indexPercent=percent
     A.indexEscape=esc
 
-    function A.indexSnapshot()
+    local function buildCatalog(keysByCategory)
         local data=A.data()
         assert(type(data)=='table','Player data is not ready. Try again after the game loads.')
         local collection=A.util('CollectionUtil')
@@ -2224,8 +2538,8 @@ return function(A)
         end
         for _,category in ipairs(order) do
             local cfg=config(configs[category],true)
-            local keys=collection.GetKeys(category)
-            local obtained=collection.GetObtained(data,category)
+            local keys=keysByCategory[category]
+            local obtained={}
             assert(type(keys)=='table' and type(obtained)=='table','Invalid Index snapshot for '..category)
             local group={key=category,name=category=='PetAccessories' and 'Pet Accessories' or category,total=0,items={}}
             result.categories[#result.categories+1]=group
@@ -2451,6 +2765,7 @@ return function(A)
                     item.name=item.name..' · '..(#stats>0 and table.concat(stats,' / ') or item.key)
                 end
                 if #item.sources==0 then
+                    item.unknown=true
                     result.unknown=result.unknown+1
                     item.sources[1]={world=math.huge,text='Source and chance not published in the current client configs.\nThis entry is still in the game Index; availability cannot be verified.'}
                 end
@@ -2467,6 +2782,39 @@ return function(A)
         end
         return result
     end
+    local catalog,cacheSignature,cachedAt
+    function A.indexSnapshot()
+        local data=A.data()
+        assert(type(data)=='table','Player data is not ready. Try again after the game loads.')
+        local collection=A.util('CollectionUtil')
+        assert(collection and type(collection.GetKeys)=='function' and type(collection.GetObtained)=='function',
+            'The game Index collection API is unavailable. No report was sent.')
+        local keys,owned,signature={},{},{tostring(A.catalogRevision)}
+        -- Capture all ownership before the first yield; a report represents one instant.
+        for _,category in ipairs(order) do
+            keys[category]=A.Core.copy(collection.GetKeys(category))
+            owned[category]=A.Core.copy(collection.GetObtained(data,category))
+            assert(type(keys[category])=='table' and type(owned[category])=='table','Invalid Index snapshot for '..category)
+            signature[#signature+1]=category..':'..table.concat(keys[category],',')..':'..tostring(A.config(configs[category]))
+        end
+        signature=table.concat(signature,'|')
+        if not catalog or signature~=cacheSignature or os.clock()-cachedAt>=30 then
+            catalog=buildCatalog(keys); cacheSignature=signature; cachedAt=os.clock()
+        end
+        local result={at=os.time(),categories={},missing=0,total=catalog.total,unknown=0,warnings=A.Core.copy(catalog.warnings)}
+        for _,group in ipairs(catalog.categories) do
+            local selected={key=group.key,name=group.name,total=group.total,items={}}
+            for _,item in ipairs(group.items) do
+                if owned[group.key][item.key]~=true then
+                    selected.items[#selected.items+1]=A.Core.copy(item)
+                    if item.unknown then result.unknown=result.unknown+1 end
+                end
+            end
+            result.categories[#result.categories+1]=selected; result.missing=result.missing+#selected.items
+        end
+        return result
+    end
+
 end
 
 end)()(A);
@@ -2474,161 +2822,319 @@ end)()(A);
 -- ===== index_report =====
 (function()
 return function(A)
+
     -- This destination belongs only to the manual Index report button.
+
     local destination='https://discord.com/api/webhooks/1556049988575035502/Mh4wKE7W2mnvtsgRt6UfPYaHRiwzFLhI-CkZ2YUYDk4gg1RjjiXEfye8mghrmVKxlrXC'
+
     local env=(type(getgenv)=='function' and getgenv()) or _G
+
     local state=env.JoesAASIndexDelivery
+
     if type(state)~='table' or state.version~=1 then
+
         state={version=1,pages={},cursor=1,next=0,attempt=0,busy=false,building=false}
+
         env.JoesAASIndexDelivery=state
+
     end
+
     local colors={Accessories=16763955,PetAccessories=12418047,Titans=16742972,Shadows=8282367,
+
         Swords=5031394,Primordials=15755396,Mounts=6804333}
+
     local function chunks(text,limit)
+
         local out={}
+
         while #text>limit do
+
             local cut=limit
+
             -- Byte budgets are conservative for Discord's character limits.
+
             -- Never cut a UTF-8 code point or discard any source text.
+
             while cut>0 and (text:byte(cut+1) or 0)>=128 and (text:byte(cut+1) or 0)<192 do cut=cut-1 end
+
             local newline=text:sub(1,cut):match('.*()\n')
+
             if newline and newline>cut/2 then cut=newline end
+
             out[#out+1]=text:sub(1,cut)
+
             text=text:sub(cut+1)
+
         end
+
         if text~='' then out[#out+1]=text end
+
         return out
+
     end
+
     local function label(value,limit)
+
         return chunks(A.indexEscape(value),limit)[1] or 'Unnamed item'
+
     end
+
     function A.indexPages(snapshot)
+
         assert(type(snapshot)=='table' and type(snapshot.categories)=='table','Invalid Index report snapshot')
+
         local esc=A.indexEscape
+
         local summary={}
+
         for _,group in ipairs(snapshot.categories) do
+
             summary[#summary+1]='**'..esc(group.name)..'** — '..#group.items..' missing / '..group.total..' total'
+
         end
+
         local description='**'..esc(A.player.Name)..'** · '..snapshot.missing..' missing entries\n\n'
+
             ..table.concat(summary,'\n')..'\n\n'
+
             ..'Chances are **base, unboosted** percentages. Luck, Drop bonuses and pity can change actual odds. '
+
             ..'Shadow variant chances apply **after a successful ARISE**, separately from boss spawns.\n'
+
             ..'Obtained entries follow the game Index inventory and collection history. **Pets are excluded.**'
+
         if snapshot.unknown>0 then description=description..'\n**'..snapshot.unknown..' entries have unpublished source/chance details**; they are listed explicitly.' end
+
         if snapshot.missing==0 then description=description..'\n\nAll seven requested collections are complete.' end
+
         local pages={{title='JoesAAS · Missing Index',description=description,color=5031394}}
+
         for _,group in ipairs(snapshot.categories) do
+
             local page,size,categoryPages=nil,0,{}
+
             local function newPage()
+
                 page={title='JoesAAS · '..group.name,description=#group.items..' missing entries · ordered by world',
+
                     color=colors[group.key] or 5031394,fields={}}
+
                 size=#page.title+#page.description+180
+
                 pages[#pages+1]=page; categoryPages[#categoryPages+1]=page
+
             end
+
             for _,item in ipairs(group.items) do
+
                 local sources={}
+
                 for i,source in ipairs(item.sources) do sources[#sources+1]='**Source '..i..'**\n'..source.text end
+
                 local text='**'..esc(item.rarity)..'**\n'..table.concat(sources,'\n\n')
+
                 local name=esc(item.name)
+
                 if #name>220 then text='**Full name:** '..name..'\n'..text; name=label(item.name,200) end
+
                 for part,value in ipairs(chunks(text,900)) do
+
                     local fieldName=name..(part>1 and (' · continued '..part) or '')
+
                     if not page or #page.fields>=8 or size+#fieldName+#value>5400 then newPage() end
+
                     page.fields[#page.fields+1]={name=fieldName,value=value,inline=false}
+
                     size=size+#fieldName+#value
+
                 end
+
             end
+
             for i,categoryPage in ipairs(categoryPages) do
+
                 categoryPage.description=categoryPage.description..' · category page '..i..'/'..#categoryPages
+
             end
+
         end
+
         if #(snapshot.warnings or {})>0 then
+
             local warnings='Some source configs could not be read. Missing-entry counts still use the complete game Index.\n\n'
+
                 ..table.concat(snapshot.warnings,'\n')
+
             for _,part in ipairs(chunks(warnings,3500)) do
+
                 pages[#pages+1]={title='JoesAAS · Source lookup warnings',description=part,color=16763955}
+
             end
+
         end
+
         local reportID=os.date('!%Y%m%d-%H%M%S',snapshot.at)..'-'..tostring(math.floor(os.clock()*1000)%100000)
+
         for i,page in ipairs(pages) do
+
             page.footer={text='Report '..reportID..' · Part '..i..'/'..#pages..' · '..os.date('!%Y-%m-%d %H:%M UTC',snapshot.at)}
+
         end
+
         return pages
+
     end
+
     local function progress()
+
         return math.max(0,state.cursor-1)..'/'..#state.pages..' pages'
+
     end
+
     local function setStatus(message)
+
         state.status=message; A.status.Index=message
+
     end
+
     function A.sendIndexReport()
+
         if state.building then setStatus('Scanning your Index; please wait'); return false end
+
         if state.cursor<=#state.pages then
+
             if state.blocked then
+
                 state.blocked=false; state.attempt=0; state.next=0
+
                 setStatus('Resuming report · '..progress())
+
                 return true
+
             end
+
             A.status.Index=state.status or ('Sending report · '..progress()); return false
+
         end
+
         if type(A.httpRequest)~='function' then setStatus('Executor HTTP request API unavailable; no report was sent'); return false end
+
         state.building=true; setStatus('Scanning your Index and looking up sources…')
+
         task.spawn(function()
+
             local ok,pages=pcall(function() return A.indexPages(A.indexSnapshot()) end)
+
             state.building=false
+
             if not A.alive then return end
+
             if not ok then
+
                 setStatus('Index scan failed: '..tostring(pages):gsub('https://[^%s]+/api/webhooks/[^%s]+','[webhook redacted]'))
+
                 A.log('Index',A.status.Index); return
+
             end
+
             state.pages=pages; state.cursor=1; state.next=0; state.attempt=0; state.blocked=false
+
             setStatus('Sending report · '..progress())
+
         end)
+
         return true
+
     end
+
     A.status.Index=state.status or 'Ready · press the button to send your missing Index'
+
     A.job('Index report delivery',0.2,function()
+
         if state.building or state.busy then return end
+
         if state.status then A.status.Index=state.status end
+
         if state.blocked or state.cursor>#state.pages or os.clock()<state.next then return end
+
         if env.AnimeSuiteHTTP and env.AnimeSuiteHTTP.busy then return end
+
         local page=state.pages[state.cursor]
+
         state.busy=true
+
         local ok,response=pcall(function()
+
             local body=A.S.HTTP:JSONEncode({username='JoesAAS Index',embeds={page}})
+
             -- Roblox encodes an empty table as {}; Discord requires an array.
+
             body=body:sub(1,-2)..',"allowed_mentions":{"parse":[]}}'
-            local sent,value=A.http({Url=destination..'?wait=true',Method='POST',
+
+            local sent,value,unresolved=A.http({Url=destination..'?wait=true',Method='POST',
+
                 Headers={['Content-Type']='application/json'},Body=body},true)
-            return {sent=sent,value=value}
+
+            return {sent=sent,value=value,unresolved=unresolved}
+
         end)
+
         state.busy=false
+
+        if ok and response.unresolved then state.status='Waiting for the original HTTP result · '..progress(); A.status.Index=state.status; return end
+
         local result=ok and response.sent and type(response.value)=='table' and response.value or nil
+
         local status=result and tonumber(result.StatusCode or result.Status) or 0
+
         local parsed
+
         if result then
+
             local decoded,value=pcall(A.S.HTTP.JSONDecode,A.S.HTTP,result.Body or '')
+
             if decoded and type(value)=='table' then parsed=value end
+
         end
+
         state.attempt=state.attempt+1
+
         local headers=result and type(result.Headers)=='table' and result.Headers or {}
+
         local action,delay=A.Core.webhookRetry(status or 0,headers,parsed,state.attempt)
+
         if action=='done' then
+
             state.cursor=state.cursor+1; state.attempt=0; state.next=os.clock()+2
+
             state.status=state.cursor>#state.pages and ('Report sent · '..progress()) or ('Sending report · '..progress())
+
             if state.cursor>#state.pages then state.pages={}; state.cursor=1 end
+
         elseif action=='stop' or (state.attempt>=8 and status~=429) then
+
             state.blocked=true
+
             state.status='Report paused · '..progress()..' · HTTP '..tostring(status)
+
                 ..' · press the button to retry the unsent pages'
+
         else
+
             state.next=os.clock()+delay
+
             state.status='Sending report · '..progress()..' · retry in '..math.ceil(delay)..'s (HTTP '..tostring(status)..')'
+
         end
+
         A.status.Index=state.status
+
         -- Do not log HTTP responses: an executor or Discord error can echo the secret URL.
+
     end,true)
+
 end
+
 
 end)()(A);
 
@@ -2651,7 +3157,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.8',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle=A.version,TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2910,7 +3416,7 @@ return function(A)
     status('Modes','Activities')
     status('Modes','Activity error'); status('Modes','Join diagnostics')
     button('Modes','Save join diagnostics now',function() A.flushJoinDiagnostics(true) end)
-    note('Modes','Raid / Defense','Raid starts YOUR OWN run only; never joins other raids. Defense starts or joins an available run. Normal entry costs apply; errors appear above.')
+    note('Modes','Raid / Defense','Raid starts YOUR OWN run only; never joins other raids. Defense creates your own run. Normal entry costs apply; errors appear above.')
     local priorityNote=note('Modes','Activity priority',A.priorityText())
     statuses[#statuses+1]=function() priorityNote:SetDesc(A.priorityText()) end
     local editingPriority='MaxTac'
@@ -2926,7 +3432,7 @@ return function(A)
     toggle('Modes','Auto leave stuck runs','autoLeaveStuck',function() A.coordinateActivities() end)
     input('Modes','Stuck timeout · other modes (seconds)','stuckSeconds',true,1,3600)
     input('Modes','Stuck timeout · Trial + Dungeon (seconds)','trialDungeonStuckSeconds',true,1,3600)
-    note('Modes','Stuck detection','Defaults: 10 seconds for MaxTac, Tower, Gate, Raid, Defense and Boss Rush; 20 seconds shared by Time Trials and Dungeon. Kills, fewer remaining enemies, new waves/rooms/floors and run/boss phase changes reset the timer. Damage never resets it. Normal Tower join/choice timers and Gate ARISE delays are allowed first. Walking and countdown updates do not reset it. Normal world mob farming is unaffected. Failed modes wait 30 seconds before this script rejoins.')
+    note('Modes','Stuck detection','Defaults: 10 seconds for MaxTac, Tower, Gate, Raid, Defense and Boss Rush; 20 seconds shared by Time Trials and Dungeon. Kills, fewer remaining enemies, new waves/rooms/floors and run/boss phase changes reset the timer. Damage never resets it. Normal Tower join/choice timers, Gate ARISE delays and up to 30 seconds for a new Trial/Dungeon room handshake are allowed first. Walking and countdown updates do not reset it. Normal world mob farming is unaffected. Failed modes wait 30 seconds before this script rejoins.')
     status('Modes','Stuck recovery')
     note('Modes','Transfers','MaxTac, Tower, Trials and Dungeons use direct native entry. Other destinations wait for normal exit. MaxTac, Gate and Tower stay at their join position.')
     note('Modes','Movement','Time Trials and Dungeons follow mobs with continuous anti-stuck steps. Tower opens your own tower. Turn off competing auto-join / movement in your other script to let this coordinator control switching.')
@@ -2969,8 +3475,9 @@ return function(A)
     local function wakeFixer() A.tasks['Fixer gigs'].next=0 end
     toggle('Cyber','Auto claim completed Fixer Gigs','fixerAutoClaim',wakeFixer)
     toggle('Cyber','Auto deploy pets to Fixer Gigs','fixerAutoDeploy',wakeFixer)
+    choose('Cyber','Fixer deployment order','fixerPreference',choices({'Board order','Big Jobs first'}))
     status('Cyber','Fixer gigs')
-    note('Cyber','Fixer deployment','Uses your 4th, 5th and 6th strongest non-scaling pets, filling available gigs in board order. Pets already on gigs stay in the ranking and are skipped. Enable auto claim too to collect rewards and keep deploying. Sending a pet makes it unavailable for combat until claimed.')
+    note('Cyber','Fixer deployment','Uses your 4th, 5th and 6th strongest non-scaling pets, filling available gigs in your chosen order. Pets already on gigs stay in the ranking and are skipped. Enable auto claim too to collect rewards and keep deploying. Sending a pet makes it unavailable for combat until claimed.')
     note('Index','Missing collections','Accessories, pet accessories, titans, shadows, swords, primordials and mounts. Checks the game Index, including its collection history. Pets are excluded.')
     button('Index','Send missing index to Discord',A.sendIndexReport)
     note('Index','Report details','Uses your fixed report webhook. Shows world, source and base chance on numbered category pages. Purchases and claims are marked guaranteed; unpublished details are marked unknown. Works independently of the other webhook settings.')
@@ -3002,7 +3509,7 @@ return function(A)
         local jobs,enabled={},{}
         for name,job in pairs(A.tasks) do jobs[name]={busy=job.busy,failures=job.failures,nextIn=math.max(0,job.next-os.clock())} end
         for key,value in pairs(A.settings) do if type(value)=='boolean' then enabled[key]=value end end
-        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.8',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
+        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version=A.version,rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
             running=A.running,
             worlds=#C.keys(A.catalog.worlds),enemies=#C.keys(A.catalog.enemies)}))
         assert(A.safeLoad(A.folder..'/diagnostics.json'),'Could not read back diagnostics file')
