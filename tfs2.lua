@@ -9,7 +9,7 @@ if runtime.slot.current then
     assert(type(runtime.slot.current.unload) == "function", "Previous Combat Assistant is still initializing. Rejoin before retrying.")
     assert(runtime.slot.current.unload() == true, "Previous Combat Assistant could not release input. Close menus/console and unload it before retrying.")
 end
-runtime.slot.damageHistory = nil -- Release history retained by the previous diagnostic build.
+runtime.slot.damageHistory = nil -- Release retired state on reload.
 runtime.slot.current = runtime
 local function connect(signal, callback)
     local connection = signal:Connect(function(...)
@@ -1134,7 +1134,7 @@ runtime.slot.handler = function(self, ...)
         return oldNamecall(self, table.unpack(original, 1, original.n))
     end
     local args = redirected or original
-    if redirected then runtime.rayWarning=false;runtime.lastRedirect=os.clock() end
+    if redirected then runtime.rayWarning=false end
     local result=table.pack(oldNamecall(self,table.unpack(args,1,args.n)))
     if redirected then
         pcall(runtime.rememberPenetration,original,args,result)
@@ -1159,7 +1159,6 @@ if not virtualInput then
     if ok then legacyInput = result end
 end
 local inputSupported = virtualInput ~= nil or legacyInput ~= nil
-local backendName = virtualInput and "VirtualInput" or (legacyInput and "VirtualInputManager" or "unavailable")
 local triggerToggle, cursorDropdown
 local guiService = game:GetService("GuiService")
 local playerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -1756,7 +1755,6 @@ connect(UIS.InputBegan, function(input, processed)
         if triggerToggle then triggerToggle:SetValue(true) else setTriggerEnabled(true) end
     end
 end)
-print("[Combat Assistant] Gun callbacks preferred; " .. backendName .. " fallback. Input status is shown under Weapons.")
 Linoria.ToggleKeybind = {Type = "KeyPicker", Value = "RightControl"}
 Window = Linoria:CreateWindow({
     Title = "Combat Assistant", Center = true, AutoShow = true,
@@ -1828,15 +1826,8 @@ connect(RunService.Heartbeat, function()
     runtime.nextTargetLabel = os.clock() + 0.25
     local target = runtime.targetName and (runtime.targetName .. " [" .. runtime.targetTier .. "]") or "none eligible"
     if pointState.picking then target = "paused (cursor selection)" end
-    local aim = not (config.SilentAim or config.Triggerbot) and "OFF - shots follow normal aim" or
-        (not runtime.callerLookup and "unavailable (caller API)" or
-        (runtime.lastRedirect and os.clock() - runtime.lastRedirect < 2 and "redirecting shots" or "ON - no recent redirected shot"))
-    local input = runtime.lastInputError and "Input: rejected; close menus/console" or "Input: no recorded rejection"
-    local super = (runtime.superSeen or 0) > 0 and not runtime.targetName and "\nSuper zombies present but filtered out" or ""
-    local rejected=runtime.targetBlocked
-    local detail=rejected and ("\nNearby "..rejected.name..": "..rejected.reason) or ""
-    if runtime.damageEstimateUnavailable then detail=detail.."\nDamage estimate unavailable; using exposed aim points" end
-    runtime.targetLabel:SetText("Target: " .. target .. "\nSilent Aim: " .. aim .. "\n" .. input .. "\nFacing: " .. tostring(runtime.facing and runtime.facing.status or "Unavailable") .. super .. detail)
+    local aim = (config.SilentAim or config.Triggerbot) and "On" or "Off"
+    runtime.targetLabel:SetText("Target: " .. target .. "\nSilent Aim: " .. aim)
 end)
 local function zombieFilter(key, text, flag)
     return addControl(firing, "Dropdown", flag, {
@@ -2726,16 +2717,6 @@ runtime.label(weapons,"Sets ADS state without changing the camera or zoom. Requi
 control(weapons,"FireModeOverride","Override fire mode")
 control(weapons,"FireMode","Mode")
 runtime.label(weapons,"Re-equip after changing; charge/continuous modes excluded.",true)
-runtime.modifierLabel=runtime.label(runtime.weaponGroup,"Checking weapon support...",true)
-connect(RunService.Heartbeat,function()
-    if os.clock()<(runtime.diagnosticAt or 0) then return end
-    runtime.diagnosticAt=os.clock()+1
-    local callbacks=runtime.gunCallbacks()
-    local input=callbacks and callbacks.backend or "Virtual input fallback (GUI can block)"
-    local rays=type(runtime.callerLookup)=="function" and type(setnamecallmethod)=="function"
-    local recoil=not config.NoRecoil and "Off" or (runtime.recoilPatch and runtime.recoilPatch.module.AddRecoil==runtime.recoilPatch.wrapper and "Installed" or "Unavailable / replaced")
-    runtime.modifierLabel:SetText("Input: "..input.."\nRay modifiers: "..(rays and "Available (hitscan)" or "Unsupported executor").."\nRecoil: "..recoil.."\nLast converted hit: "..(runtime.lastHeadshot and string.format("%.0fs ago",os.clock()-runtime.lastHeadshot) or "none"))
-end)
 local visuals=runtime.extensionTabs.Visuals
 local targets=visuals:AddLeftGroupbox("Zombie visuals")
 control(targets,"ZombieHighlights","Highlight zombies")
@@ -5146,100 +5127,39 @@ connect(RunService.Heartbeat,function()
     if not ok and farm.voteLabel then pcall(function() farm.voteLabel:SetText("Ready-up: unable to read live vote state") end) end
 end)
 
--- Bounded, local evidence only. The client dump cannot identify a server kill reason.
-farm.diagnostics={samples={},deaths={}}
-function farm.deathSample(humanoid)
-    local character=LocalPlayer.Character;local root=child(character,"HumanoidRootPart")
-    local function vector(value) return value and {value.X,value.Y,value.Z} or nil end
-    local values=child(storage(),"Values")
-    local sample={at=os.clock(),wave=readValue(values,"LocalWave"),minutes=game:GetService("Lighting"):GetMinutesAfterMidnight(),
-        map=farm.mapName(),step=farm.stage,health=humanoid and humanoid.Health,
-        position=vector(root and root.Position),velocity=vector(root and root.AssemblyLinearVelocity),
-        floor=humanoid and tostring(humanoid.FloorMaterial),state=humanoid and tostring(humanoid:GetState()),
-        recovering=farm.recovering,positionPhase=farm.boxPosition and farm.boxPosition.phase,moving=farm.moving==true,
-        drink=runtime.consumables.lastItem,target=runtime.targetName,targetTier=runtime.targetTier,
-        nearbyBlocked=runtime.targetBlocked,lastShotRedirectAge=runtime.lastRedirect and os.clock()-runtime.lastRedirect,
-        exit=farm.exitTransit and farm.exitTransit.which,nativeDamageCounter=farm.diagnostics.damageValue}
-    if root then
-        local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances={character};params.RespectCanCollide=true
-        local hit=Workspace:Raycast(root.Position,Vector3.new(0,-8,0),params)
-        if hit then sample.support=hit.Instance and hit.Instance.Name;sample.floorDistance=root.Position.Y-hit.Position.Y end
-    end
-    return sample
-end
-function farm.recordDeath(humanoid)
-    local d=farm.diagnostics
-    if not e.Autofarm or not farm.active or d.logged or humanoid~=d.humanoid then return end
-    d.logged=true
-    local ok,sample=pcall(farm.deathSample,humanoid)
-    local history={};for _,record in ipairs(d.samples) do table.insert(history,record) end
-    if ok then table.insert(history,sample) end
-    local planned=farm.resetAttempt and farm.resetAttempt.humanoid==humanoid and farm.resetAttempt.invoked==true
-    local record={previousHealth=d.lastPositive,serverCause="Not available in client dump",scheduledReset=planned or false,samples=history}
-    table.insert(d.deaths,record);if #d.deaths>5 then table.remove(d.deaths,1) end
-    d.message="Last death: HP "..tostring(d.lastPositive or "?").." → 0. "..(planned and "Scheduled reset was requested." or "Cause unconfirmed.")
-    if type(writefile)=="function" then
-        local saved=pcall(function() writefile("CombatAssistantDeaths.json",HttpService:JSONEncode({version=1,deaths=d.deaths})) end)
-        d.message=d.message..(saved and " Diagnostic saved." or " Diagnostic remains in memory.")
-    end
+farm.lifeWatch={connections={}}
+function farm.handleDeath(humanoid)
+    local watch=farm.lifeWatch
+    if not e.Autofarm or not farm.active or watch.handled or humanoid~=watch.humanoid or humanoid.Health>0 then return end
+    watch.handled=true
     if runtime.cancelInstantConsumables then runtime.cancelInstantConsumables() end
     farm.cancelWalk()
 end
-function farm.deathMonitor()
-    local d=farm.diagnostics
+function farm.watchLife()
+    local watch=farm.lifeWatch
     local character=LocalPlayer.Character;local humanoid=character and character:FindFirstChildOfClass("Humanoid")
-    if d.humanoid~=humanoid then
-        for _,connection in ipairs(d.connections or {}) do connection:Disconnect() end
-        d.connections={};d.humanoid=humanoid;d.samples={};d.logged=false;d.lastPositive=humanoid and humanoid.Health
+    if watch.humanoid~=humanoid then
+        for _,connection in ipairs(watch.connections) do connection:Disconnect() end
+        watch.connections={};watch.humanoid=humanoid;watch.handled=false
         if humanoid then
-            if humanoid.HealthChanged then table.insert(d.connections,humanoid.HealthChanged:Connect(function(value)
-                if value>0 then d.lastPositive=value;d.logged=false
-                else farm.recordDeath(humanoid) end
+            if humanoid.HealthChanged then table.insert(watch.connections,humanoid.HealthChanged:Connect(function(value)
+                if value>0 then watch.handled=false else farm.handleDeath(humanoid) end
             end)) end
-            if humanoid.Died then table.insert(d.connections,humanoid.Died:Connect(function() farm.recordDeath(humanoid) end)) end
+            if humanoid.Died then table.insert(watch.connections,humanoid.Died:Connect(function() farm.handleDeath(humanoid) end)) end
         end
     end
-    local damage=child(child(storage(),"RemoteEvents"),"SendPlayerDamage")
-    if damage~=d.damageRemote then
-        if d.damageConnection then d.damageConnection:Disconnect() end
-        d.damageRemote=damage;d.damageValue=nil;d.damageConnection=nil
-        if damage and damage.OnClientEvent then d.damageConnection=damage.OnClientEvent:Connect(function(value)
-            d.damageValue=finite(value) and value or nil
-        end) end
-    end
-    if e.Autofarm and farm.active and humanoid then
-        if humanoid.Health<=0 then farm.recordDeath(humanoid)
-        else
-            local ok,sample=pcall(farm.deathSample,humanoid)
-            if ok then table.insert(d.samples,sample);if #d.samples>48 then table.remove(d.samples,1) end end
-        end
-    end
-    if d.message and d.message~=d.displayed then
-        local ok,result=pcall(function() return d.label:SetText(d.message) end)
-        if ok and result~=false then d.displayed=d.message end
+    if humanoid then
+        if humanoid.Health>0 then watch.handled=false else farm.handleDeath(humanoid) end
     end
 end
-farm.diagnostics.label=runtime.label(farmGroup,"Death diagnostic: waiting for evidence.",true)
-farmGroup:AddButton({Text="Copy death diagnostic",Func=function()
-    local d=farm.diagnostics
-    if #d.deaths==0 then d.message="No autofarm death recorded yet.";return end
-    local ok=pcall(function()
-        assert(type(setclipboard)=="function","Clipboard unavailable")
-        setclipboard(HttpService:JSONEncode({version=1,deaths=d.deaths}))
-    end)
-    d.message=ok and "Death diagnostic copied." or "Clipboard unavailable; use CombatAssistantDeaths.json."
-end})
 connect(RunService.Heartbeat,function()
-    local d=farm.diagnostics
-    if os.clock()<(d.nextAt or 0) then return end;d.nextAt=os.clock()+.25
-    pcall(farm.deathMonitor)
+    if os.clock()<(farm.lifeWatch.nextAt or 0) then return end
+    farm.lifeWatch.nextAt=os.clock()+.25
+    pcall(farm.watchLife)
 end)
 table.insert(runtime.connections,{Disconnect=function()
-    local d=farm.diagnostics
-    for _,connection in ipairs(d.connections or {}) do pcall(function() connection:Disconnect() end) end
-    d.connections={}
-    if d.damageConnection then pcall(function() d.damageConnection:Disconnect() end);d.damageConnection=nil end
+    for _,connection in ipairs(farm.lifeWatch.connections) do pcall(function() connection:Disconnect() end) end
+    farm.lifeWatch.connections={};farm.lifeWatch.humanoid=nil
 end})
 
 -- End-of-run character resets do not change the game clock or shop lives.
@@ -5476,7 +5396,6 @@ function op.overrideHits(kind,hits,tool,tags)
         local head=runtime.headForHit(hit[1])
         if not head or typeof(head.Position)~="Vector3" or not finite(head.Position.Magnitude) then return hit end
         local changed=copy(hit);changed[1]=head;changed[2]=head.Position
-        runtime.lastHeadshot=os.clock()
         op.last="Head hit requested; server damage unverified"
         return changed
     end
