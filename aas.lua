@@ -1,4 +1,4 @@
--- JoesAAS 5.7 | standalone source | October 2026
+-- JoesAAS 5.8 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -140,7 +140,7 @@ return function(A)
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
         blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false,ripperdocAuto=false,ripperdocSlots={},
-        autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20,fixerAutoClaim=false}
+        autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20,fixerAutoClaim=false,fixerAutoDeploy=false}
     A.legacyFolder='AnimeSuite_'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.folder='JoesAAS/'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.file=A.folder..'/settings.json'
@@ -625,7 +625,7 @@ return function(A)
     A.sessionNamed={}
     function A.renameDiagnostics()
         local d=A.data() or {}; local stats=A.util('PetStatsUtil')
-        local report={version='5.7',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
+        local report={version='5.8',status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
             inventoryEvents=A.renameInventoryEvents or 0,lastInventoryEvent=A.renameLastInventoryEvent}
         local named=type(d.NamedPets)=='table' and d.NamedPets or {}
         local sampled={}
@@ -1069,7 +1069,7 @@ return function(A)
                         context=enemy:GetAttribute('VisibilityContext'),hasRoot=enemy:FindFirstChild('HumanoidRootPart')~=nil}
                 end
                 local ctrl=A.client('TeleportController')
-                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.7',reason=message,
+                writefile(A.folder..'/'..kind:lower()..'-diagnostics.json',A.S.HTTP:JSONEncode({version='5.8',reason=message,
                     context=A.player:GetAttribute('VisibilityContext'),room=state[keyField]==key and state.Room,
                     serverEnemies=state[keyField]==key and state.EnemyCount,anchored=root and root.Anchored,
                     loading=ctrl and ctrl:IsLoading(),mapReady=mapReady.key==key,readyRetried=mapReady.acknowledged==true,readyAttempts=mapReady.attempts or 0,
@@ -1197,7 +1197,7 @@ return function(A)
         local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
         local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
         local activityJob=A.tasks.Activities
-        local snapshot={schema=1,version='5.7',userId=A.player.UserId,gameId=game.GameId,
+        local snapshot={schema=1,version='5.8',userId=A.player.UserId,gameId=game.GameId,
             savedAt=os.time(),context=A.player:GetAttribute('VisibilityContext'),running=A.running,
             activities=A.status.Activities,error=A.status['Activity error'],events=events,openings=openings,
             coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
@@ -1968,115 +1968,114 @@ return function(A)
         for _,slot in ipairs(cfg and cfg.SlotOrder or {}) do rows[#rows+1]={key=slot,label=slot} end
         return rows
     end
-    function A.openCyberSystem(kind)
-        local cfg=A.config(kind..'Config'); local ctrl=A.client('TeleportController')
-        if not cfg or cfg.Enabled~=true then A.status.Cyber='System unavailable'; return end
-        if not A.unlocked(cfg.WorldId) then A.status.Cyber='Unlock World '..tostring(cfg.WorldId)..' first'; return end
-        if not ctrl or type(ctrl.OpenRemoteSystem)~='function' then A.status.Cyber='Native menu unavailable'; return end
-        if ctrl:IsLoading() then A.status.Cyber='Waiting for game loading'; return end
-        ctrl:OpenRemoteSystem(cfg.WorldId,kind)
-    end
-    function A.cyberSummary()
-        local cfg=A.config('CyberdeckConfig'); local d=A.data()
-        if not cfg or cfg.Enabled~=true then return 'Cyberdeck unavailable in this game version' end
-        if not d then return 'Waiting for player data' end
-        local equipped={}
-        for _,key in ipairs(cfg:GetEquipped(d)) do
-            local item=cfg:GetQuickhack(key)
-            local overclock=type(cfg.GetOverclocks)=='function' and cfg:GetOverclocks(d,key) or 0
-            equipped[#equipped+1]=(item and item.Name or key)..' Lv.'..cfg:GetQuickhackLevel(d,key)
-                ..(overclock>0 and (' · OC '..overclock) or '')
-        end
-        return 'Militech Convoy level: '..cfg:GetConvoyLevel(d)..' | Skill points: '..cfg:GetPoints(d)
-            ..'\nRAM: '..cfg:GetUsedRam(d)..' / '..cfg:GetMaxRam(d)
-            ..'\nEquipped: '..(#equipped>0 and table.concat(equipped,', ') or 'None')
-            ..'\nOverclock Chips: '..A.balance('OverclockChip')
-    end
-    function A.fixerSummary()
-        local cfg=A.config('FixerGigConfig'); local d=A.data(); local util=A.util('FixerGigUtil')
-        if not cfg or cfg.Enabled~=true or not util then return 'Fixer Gigs unavailable' end
-        if not d then return 'Waiting for player data' end
-        local slots=type(d.FixerGigs)=='table' and tonumber(d.FixerGigs.Slots) or nil
-        local lines={'Active gigs: '..util.CountActive(d)..' / '..(slots or cfg:GetSlots(d))}
-        local now=os.time()
-        for i,gig in ipairs(util.GetBoard(d)) do
-            if type(gig)=='table' then
-                local duration=cfg.Durations and cfg.Durations[gig.Duration]
-                local label=duration and duration.Name or tostring(gig.Duration or 'Gig')
-                local remaining=type(gig.EndsAt)=='number' and math.max(0,gig.EndsAt-now) or nil
-                local state=type(gig.PetUid)~='string' and 'Available' or
-                    (util.IsReady(gig,now) and 'READY TO CLAIM' or
-                    (remaining and (math.floor(remaining/60)..'m '..math.floor(remaining%60)..'s remaining') or 'End time unavailable'))
-                lines[#lines+1]=i..'. '..label..' · '..tostring(gig.Name or 'Fixer gig')..' · '..state
-            end
-        end
-        return table.concat(lines,'\n')
-    end
-    function A.serverBoostSummary()
-        local cfg=A.config('ServerBoostConfig')
-        local folder=cfg and A.S.RS:FindFirstChild(cfg.StateFolderName)
-        if not folder then return 'Waiting for server boost state' end
-        local lines={}; local now=workspace:GetServerTimeNow()
-        for _,kind in ipairs(cfg.TypeOrder or {}) do
-            local owner=folder:GetAttribute(kind..'Owner')
-            local finish=tonumber(folder:GetAttribute(kind..'EndsAt')) or 0
-            local remaining=math.max(0,finish-now)
-            local entry=cfg.Types and cfg.Types[kind] or {}
-            local bonus=entry.Multiplier and ('x'..entry.Multiplier) or ('+'..tostring(entry.Bonus or 0))
-            lines[#lines+1]=kind..' '..bonus..' · '..(remaining>0 and type(owner)=='string' and owner~='' and
-                (math.ceil(remaining/60)..'m left · '..owner) or 'Inactive')
-        end
-        return table.concat(lines,'\n')
-    end
     local gigPending,gigNext=nil,0
+    local ranked,rankingDirty,rankingAt=nil,true,0
     local function sameGig(gig,request)
         return type(gig)=='table' and gig.Id==request.id and gig.PetUid==request.pet and gig.EndsAt==request.endsAt
     end
-    A.job('Fixer gigs',5,function()
-        if not A.settings.fixerAutoClaim and not gigPending then return end
+    A.job('Fixer gigs',0.2,function()
+        if not A.alive or not A.running then return end
+        if not A.settings.fixerAutoClaim and not A.settings.fixerAutoDeploy and not gigPending then
+            A.status['Fixer gigs']='Fixer automation is OFF'; return
+        end
         local cfg=A.config('FixerGigConfig'); local util=A.util('FixerGigUtil'); local d=A.data()
-        if not cfg or cfg.Enabled~=true or not util or not d then return end
+        if not cfg or cfg.Enabled~=true or not util or not d then A.status['Fixer gigs']='Waiting for gig data'; return end
         -- An unavailable replication snapshot is not evidence of a successful claim.
         if type(d.FixerGigs)~='table' or type(d.FixerGigs.Board)~='table' then
             A.status['Fixer gigs']='Waiting for the gig board'; return
         end
         local board=util.GetBoard(d)
         if gigPending then
-            if not sameGig(board[gigPending.index],gigPending) then
-                A.status['Fixer gigs']='Claimed completed gig '..gigPending.index
+            local current=board[gigPending.index]
+            local confirmed=gigPending.action=='Claim' and not sameGig(current,gigPending)
+                or (gigPending.action=='Send' and type(current)=='table' and current.Id==gigPending.id
+                    and current.PetUid==gigPending.pet and type(current.EndsAt)=='number' and current.EndsAt>0)
+            if confirmed then
+                A.status['Fixer gigs']=gigPending.action=='Claim' and ('Claimed completed gig '..gigPending.index)
+                    or ('Deployed pet rank '..gigPending.rank..' to gig '..gigPending.index)
                 if A.settings.webhook then A.notify('Progress',A.status['Fixer gigs']) end
-                gigPending=nil
+                gigPending=nil; rankingDirty=true
+            elseif gigPending.action=='Send' and (type(current)~='table' or current.Id~=gigPending.id
+                or (type(current.PetUid)=='string' and current.PetUid~=gigPending.pet)) then
+                gigPending=nil; rankingDirty=true; gigNext=os.clock()+1
+                A.status['Fixer gigs']='Gig changed before deployment; checking the new board'; return
             elseif os.clock()-gigPending.at<20 then
-                A.status['Fixer gigs']='Waiting for gig claim confirmation'; return
+                A.status['Fixer gigs']='Waiting for gig '..(gigPending.action=='Claim' and 'claim' or 'deployment')..' confirmation'; return
             else
                 gigPending=nil; gigNext=os.clock()+120
-                A.status['Fixer gigs']='Gig claim unconfirmed; retrying after 120s'; return
+                A.status['Fixer gigs']='Gig action unconfirmed; retrying after 120s'; return
             end
         end
-        if not A.settings.fixerAutoClaim or not A.alive or not A.running or os.clock()<gigNext then return end
+        if not A.settings.fixerAutoClaim and not A.settings.fixerAutoDeploy then
+            A.status['Fixer gigs']='Fixer automation is OFF'; return
+        end
+        if os.clock()<gigNext then return end
         if not A.unlocked(cfg.WorldId) then A.status['Fixer gigs']='Unlock Night City first'; return end
         local ctrl=A.client('TeleportController')
         if ctrl and ctrl:IsLoading() then A.status['Fixer gigs']='Waiting for game loading'; return end
-        local index,gig
-        for i,value in ipairs(board) do if util.IsReady(value,os.time()) then index=i; gig=value; break end end
-        if not index then A.status['Fixer gigs']='Waiting for completed gigs'; return end
+        local index,gig,action,pet,rank
+        if A.settings.fixerAutoClaim then
+            for i,value in ipairs(board) do
+                if util.IsReady(value,os.time()) then index=i; gig=value; action='Claim'; break end
+            end
+        end
+        if not action and A.settings.fixerAutoDeploy then
+            local slots=tonumber(d.FixerGigs.Slots) or cfg:GetSlots(d)
+            if util.CountActive(d)<slots then
+                for i,value in ipairs(board) do
+                    if type(value)=='table' and type(value.PetUid)~='string' then
+                        index=i; gig=value; break
+                    end
+                end
+                if index then
+                    if type(d.Pets)~='table' then A.status['Fixer gigs']='Waiting for pet inventory'; return end
+                    local power=A.util('PetPowerUtil')
+                    if not power or type(power.BuildRanking)~='function' then
+                        A.status['Fixer gigs']='Native pet ranking unavailable'; return
+                    end
+                    -- Keep gig pets in the ranking: busy rank 4 must not make rank 7 eligible.
+                    if rankingDirty or not ranked or os.clock()-rankingAt>=5 then
+                        ranked={}
+                        for _,row in ipairs(power.BuildRanking(d,{IncludeGigPets=true})) do
+                            if row.IsDynamic==false then ranked[#ranked+1]=row.UniqueId end
+                        end
+                        rankingDirty=false; rankingAt=os.clock()
+                    end
+                    for position=4,6 do
+                        local uid=ranked[position]
+                        if type(uid)=='string' and type(d.Pets[uid])=='table' and not util.IsPetOnGig(d,uid) then
+                            pet=uid; rank=position; action='Send'; break
+                        end
+                    end
+                    if not action then A.status['Fixer gigs']='Waiting for an available non-scaling pet ranked 4–6'; return end
+                end
+            end
+        end
+        if not action then A.status['Fixer gigs']='Waiting for completed gigs or available slots'; return end
         local fn=A.Library.Network.Functions:FindFirstChild('FixerGigAction')
         if not fn then A.status['Fixer gigs']='FixerGigAction unavailable'; return end
-        gigPending={index=index,id=gig.Id,pet=gig.PetUid,endsAt=gig.EndsAt,at=os.clock()}
-        gigNext=os.clock()+5
-        -- Exact native Claim payload. Never send pets, buy slots or finish gigs for Robux.
-        local ok,accepted,reason=pcall(fn.InvokeServer,fn,'Claim',index,nil)
+        gigPending={action=action,index=index,id=gig.Id,pet=pet or gig.PetUid,rank=rank,endsAt=gig.EndsAt,at=os.clock()}
+        gigNext=os.clock()+0.3
+        A.status['Fixer gigs']=action=='Claim' and ('Claiming gig '..index)
+            or ('Deploying pet rank '..rank..' to gig '..index)
+        -- Native Claim/Send payloads; one request at a time, below the shared function limit.
+        local ok,accepted,reason=pcall(fn.InvokeServer,fn,action,index,pet)
         if not A.alive then return end
         if not ok or accepted~=true then
             gigPending=nil; gigNext=os.clock()+30
-            A.status['Fixer gigs']='Claim refused: '..tostring(ok and reason or accepted)
+            A.status['Fixer gigs']=action..' refused: '..tostring(ok and reason or accepted)
         end
     end)
     if A.container and type(A.container.OnChange)=='function' then
-        local ok,connection=pcall(A.container.OnChange,A.container,{'FixerGigs'},function()
-            if A.alive and A.settings.fixerAutoClaim then A.tasks['Fixer gigs'].next=0 end
-        end)
-        if ok and connection then A.connections[#A.connections+1]=connection end
+        for _,field in ipairs({'FixerGigs','Pets','EquippedPets','EquippedPetAccessories','PetAccessories','PetPassives','NamedPets'}) do
+            local ok,connection=pcall(A.container.OnChange,A.container,{field},function()
+                rankingDirty=true
+                if A.alive and (A.settings.fixerAutoClaim or A.settings.fixerAutoDeploy or gigPending) then
+                    A.tasks['Fixer gigs'].next=0
+                end
+            end)
+            if ok and connection then A.connections[#A.connections+1]=connection end
+        end
     end
     A.job('Ripperdoc',1,function()
         if not A.settings.ripperdocAuto and not pending then return end
@@ -2652,7 +2651,7 @@ return function(A)
         return math.min(680,math.max(120,viewport.X-24)),math.min(540,math.max(120,viewport.Y-(touch and 76 or 48)))
     end
     local width,height=dimensions()
-    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.7',TabWidth=touch and 92 or 150,
+    local window=F:CreateWindow({Title='JoesAAS',SubTitle='5.8',TabWidth=touch and 92 or 150,
         Size=UDim2.fromOffset(width,height),Acrylic=false,Theme='Dark',MinimizeKey=Enum.KeyCode.RightShift})
     A.gui.DisplayOrder=100001
     local popupLimits={}
@@ -2961,23 +2960,17 @@ return function(A)
     status('Pets','Rename')
     status('Pets','Rename report')
     button('Pets','Retry unconfirmed renames',A.retryRenaming)
-    local cyberSummary=note('Cyber','Night City',A.cyberSummary())
-    statuses[#statuses+1]=function() cyberSummary:SetDesc(A.cyberSummary()) end
-    button('Cyber','Open Cyberdeck',function() A.openCyberSystem('Cyberdeck') end)
-    button('Cyber','Open Ripperdoc',function() A.openCyberSystem('Ripperdoc') end)
     dropdown('Cyber','Ripperdoc slots to upgrade','ripperdocSlots',A.ripperdocRows,
         function(key) return A.settings.ripperdocSlots[key]==true end,
         function(selected) A.settings.ripperdocSlots=selected end,true)
     toggle('Cyber','Auto upgrade selected Ripperdoc slots','ripperdocAuto')
     note('Cyber','Ripperdoc costs','Spends Eddies only when enabled, in the normal Head → Torso → Shoulder → Waist → Back order. Each previous slot must be maxed. Waits for the game to confirm every upgrade.')
-    status('Cyber','Ripperdoc'); status('Cyber','Cyber')
-    button('Cyber','Open Fixer Gigs',function() A.openCyberSystem('FixerGig') end)
-    local fixerSummary=note('Cyber','Fixer Gigs',A.fixerSummary())
-    local serverBoosts=note('Cyber','Server boosts',A.serverBoostSummary())
-    statuses[#statuses+1]=function() fixerSummary:SetDesc(A.fixerSummary()); serverBoosts:SetDesc(A.serverBoostSummary()) end
-    toggle('Cyber','Auto claim completed Fixer Gigs','fixerAutoClaim')
+    status('Cyber','Ripperdoc')
+    local function wakeFixer() A.tasks['Fixer gigs'].next=0 end
+    toggle('Cyber','Auto claim completed Fixer Gigs','fixerAutoClaim',wakeFixer)
+    toggle('Cyber','Auto deploy pets to Fixer Gigs','fixerAutoDeploy',wakeFixer)
     status('Cyber','Fixer gigs')
-    note('Cyber','Gigs and Overclock','Pick your pet and start gigs in the native Fixer menu. Auto claim collects completed gigs only. Big Jobs can reward Overclock Chips. The native Cyberdeck handles Overclock upgrades; equipped quickhack OC levels and chip balance appear above.')
+    note('Cyber','Fixer deployment','Uses your 4th, 5th and 6th strongest non-scaling pets, filling available gigs in board order. Pets already on gigs stay in the ranking and are skipped. Enable auto claim too to collect rewards and keep deploying. Sending a pet makes it unavailable for combat until claimed.')
     note('Index','Missing collections','Accessories, pet accessories, titans, shadows, swords, primordials and mounts. Checks the game Index, including its collection history. Pets are excluded.')
     button('Index','Send missing index to Discord',A.sendIndexReport)
     note('Index','Report details','Uses your fixed report webhook. Shows world, source and base chance on numbered category pages. Purchases and claims are marked guaranteed; unpublished details are marked unknown. Works independently of the other webhook settings.')
@@ -3009,7 +3002,7 @@ return function(A)
         local jobs,enabled={},{}
         for name,job in pairs(A.tasks) do jobs[name]={busy=job.busy,failures=job.failures,nextIn=math.max(0,job.next-os.clock())} end
         for key,value in pairs(A.settings) do if type(value)=='boolean' then enabled[key]=value end end
-        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.7',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
+        writefile(A.folder..'/diagnostics.json',A.S.HTTP:JSONEncode({version='5.8',rename=A.renameDiagnostics(),status=A.status,logs=A.logs,jobs=jobs,enabled=enabled,
             running=A.running,
             worlds=#C.keys(A.catalog.worlds),enemies=#C.keys(A.catalog.enemies)}))
         assert(A.safeLoad(A.folder..'/diagnostics.json'),'Could not read back diagnostics file')
