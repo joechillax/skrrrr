@@ -16,8 +16,95 @@ runtime.bindings = {}
 runtime.workers = {}
 runtime.operations = {}
 runtime.pendingRequests = 0
-runtime.limits = {responseSeconds=15, maxPendingRequests=16, dependencyRetry=2}
+runtime.limits = {responseSeconds=15, maxPendingRequests=16, dependencyRetry=2, pathSeconds=8}
+runtime.jobs={}
+runtime.orphanJobs={}
+runtime.jobThreads=setmetatable({}, {__mode="k"})
+function runtime.cleanupStep(name,fn)
+    local ok,result=pcall(fn)
+    if not ok then runtime.cleanupError=name..": "..tostring(result) end
+    return ok,result
+end
+-- Local scheduling ownership is separate from uncertain server mutations.
+function runtime.cancelJob(key,reason)
+    local job=runtime.jobs[key]
+    if not job then return end
+    runtime.jobs[key]=nil;job.cancelled=true
+    runtime.orphanJobs[job]=true
+    if job.expire then runtime.cleanupStep(key,function() job.expire(reason or "Context changed") end) end
+    if job.thread and type(task.cancel)=="function" then local ok=pcall(task.cancel,job.thread);if ok then runtime.orphanJobs[job]=nil end end
+end
+function runtime.startJob(key,seconds,valid,run,expire,finish)
+    if runtime.jobs[key] then return nil end
+    local count=0;for _ in pairs(runtime.orphanJobs) do count=count+1 end
+    if count>=runtime.limits.maxPendingRequests then return nil end
+    local job={deadline=os.clock()+seconds,valid=valid,expire=expire}
+    runtime.jobs[key]=job
+    job.thread=task.spawn(function()
+        if job.cancelled then runtime.orphanJobs[job]=nil;return end
+        local thread=coroutine.running();if thread then runtime.jobThreads[thread]=job end
+        local ok,err=pcall(function() runtime.checkJob();return run(job) end)
+        if thread and runtime.jobThreads[thread]==job then runtime.jobThreads[thread]=nil end
+        runtime.orphanJobs[job]=nil
+        if runtime.jobs[key]==job then runtime.jobs[key]=nil end
+        if not ok and not job.cancelled and expire then runtime.cleanupStep(key,function() expire(tostring(err)) end) end
+        if finish then runtime.cleanupStep(key.." completion",finish) end
+    end)
+    return job
+end
+function runtime.checkJob()
+    local thread=coroutine.running();local job=thread and runtime.jobThreads[thread]
+    assert(not job or (not job.cancelled and runtime.active and not runtime.stopping),"Local action context expired")
+    if job then
+        local ok,current=pcall(job.valid)
+        assert(ok and current and os.clock()<job.deadline,"Local action context expired")
+    end
+    return job
+end
+function runtime.jobTick()
+    local expired={}
+    for key,job in pairs(runtime.jobs) do
+        local ok,current=pcall(job.valid)
+        if not runtime.active or not ok or not current or os.clock()>=job.deadline then expired[#expired+1]=key end
+    end
+    for _,key in ipairs(expired) do runtime.cancelJob(key,"Local operation timed out or its context changed") end
+end
+runtime.indexes={}
+function runtime.indexedObjects(key,root,predicate)
+    local index=runtime.indexes[key]
+    if not index or index.root~=root then
+        if index then for _,connection in ipairs(index.connections) do pcall(function() connection:Disconnect() end) end end
+        index={root=root,objects={},connections={},count=0,refreshAt=0};runtime.indexes[key]=index
+        if root then
+            local function add(object)
+                if runtime.active and index.count<512 and predicate(object) and not index.objects[object] then index.objects[object]=true;index.count=index.count+1 end
+            end
+            local function remove(object)
+                if index.objects[object] then index.objects[object]=nil;index.count=index.count-1 end
+            end
+            index.add=add
+            if root.DescendantAdded and root.DescendantRemoving then
+                index.connections[1]=root.DescendantAdded:Connect(add);index.connections[2]=root.DescendantRemoving:Connect(remove)
+            end
+        end
+    end
+    if root and os.clock()>=index.refreshAt then
+        index.refreshAt=os.clock()+(#index.connections>0 and 30 or 5)
+        index.objects={};index.count=0
+        for _,object in ipairs(root:GetDescendants()) do index.add(object) end
+    end
+    local objects={}
+    for object in pairs(index.objects) do
+        if object.Parent and predicate(object) then objects[#objects+1]=object
+        else index.objects[object]=nil;index.count=index.count-1 end
+    end
+    return objects
+end
 function runtime.disposeResources()
+    for _,index in pairs(runtime.indexes) do for _,connection in ipairs(index.connections) do pcall(function() connection:Disconnect() end) end end
+    runtime.indexes={}
+    local jobs={};for key in pairs(runtime.jobs) do jobs[#jobs+1]=key end
+    for _,key in ipairs(jobs) do runtime.cancelJob(key,"Unloaded") end
     for _,connection in ipairs(runtime.connections) do pcall(function() connection:Disconnect() end) end
     table.clear(runtime.connections)
     for _,drawing in ipairs(runtime.drawings) do pcall(function() drawing:Remove() end) end
@@ -42,7 +129,7 @@ local function initializeAssistant()
 local function connect(signal, callback)
     assert(runtime.active and runtime.slot.current==runtime,"Initialization cancelled by unload or a newer instance")
     local connection = signal:Connect(function(...)
-        if runtime.active and not runtime.loadingProfile then return callback(...) end
+        if runtime.active and not runtime.stopping and not runtime.loadingProfile then return callback(...) end
     end)
     table.insert(runtime.connections, connection)
     return connection
@@ -54,11 +141,3678 @@ runtime.runService=RunService
 local HttpService = game:GetService("HttpService")
 local UIS = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
+runtime.configGameId=tonumber(game.GameId) or 0
+runtime.configRoot="CombatAssistantConfigs"..(runtime.configGameId>0 and ("/Game-"..tostring(runtime.configGameId)) or "")
+function runtime.ensureConfigFolder()
+    assert(type(makefolder)=="function","Profile folder creation unavailable")
+    for _,path in ipairs({"CombatAssistantConfigs",runtime.configRoot}) do
+        if not (type(isfolder)=="function" and isfolder(path)) then
+            local ok,err=pcall(makefolder,path)
+            assert(ok or (type(isfolder)=="function" and isfolder(path)),tostring(err))
+        end
+    end
+end
+function runtime.hotkeyMatches(input,key)
+    if not input or key==nil or key=="None" then return false end
+    if input.KeyCode and input.KeyCode.Name==key then return true end
+    local buttons={MB1=Enum.UserInputType.MouseButton1,MB2=Enum.UserInputType.MouseButton2,MB3=Enum.UserInputType.MouseButton3}
+    return buttons[key]~=nil and input.UserInputType==buttons[key]
+end
+function runtime.nativeData()
+    if type(getrenv)=="function" then
+        local ok,env=pcall(getrenv)
+        if ok and env and env._G and type(env._G.LocalReplicatedDataStore)=="table" then return env._G.LocalReplicatedDataStore end
+    end
+    return type(_G.LocalReplicatedDataStore)=="table" and _G.LocalReplicatedDataStore or nil
+end
 local Camera = Workspace.CurrentCamera
 local zombiesFolder = assert(Workspace:WaitForChild("Zombies",30),"Zombie folder unavailable; run again after the game loads")
 assert(runtime.active and runtime.slot.current==runtime,"Initialization cancelled")
-local librarySource=game:HttpGet("https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/b45769a8593792bc756a5bba66ca6cb03586ea4a/Library.lua")
-assert(runtime.active and runtime.slot.current==runtime,"Initialization cancelled during UI download")
+-- Bundled pinned Linoria UI: no runtime download or separate files required.
+local librarySource=[========[
+local InputService = game:GetService('UserInputService');
+local TextService = game:GetService('TextService');
+local CoreGui = game:GetService('CoreGui');
+local Teams = game:GetService('Teams');
+local Players = game:GetService('Players');
+local RunService = game:GetService('RunService')
+local TweenService = game:GetService('TweenService');
+local RenderStepped = RunService.RenderStepped;
+local LocalPlayer = Players.LocalPlayer;
+local Mouse = LocalPlayer:GetMouse();
+
+local ProtectGui = protectgui or (syn and syn.protect_gui) or (function() end);
+
+local ScreenGui = Instance.new('ScreenGui');
+ProtectGui(ScreenGui);
+
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global;
+ScreenGui.Parent = CoreGui;
+
+local Toggles = {};
+local Options = {};
+
+getgenv().Toggles = Toggles;
+getgenv().Options = Options;
+
+local Library = {
+    Registry = {};
+    RegistryMap = {};
+
+    HudRegistry = {};
+
+    FontColor = Color3.fromRGB(255, 255, 255);
+    MainColor = Color3.fromRGB(28, 28, 28);
+    BackgroundColor = Color3.fromRGB(20, 20, 20);
+    AccentColor = Color3.fromRGB(0, 85, 255);
+    OutlineColor = Color3.fromRGB(50, 50, 50);
+    RiskColor = Color3.fromRGB(255, 50, 50),
+
+    Black = Color3.new(0, 0, 0);
+    Font = Enum.Font.Code,
+
+    OpenedFrames = {};
+    DependencyBoxes = {};
+
+    Signals = {};
+    ScreenGui = ScreenGui;
+};
+
+local RainbowStep = 0
+local Hue = 0
+
+table.insert(Library.Signals, RenderStepped:Connect(function(Delta)
+    RainbowStep = RainbowStep + Delta
+
+    if RainbowStep >= (1 / 60) then
+        RainbowStep = 0
+
+        Hue = Hue + (1 / 400);
+
+        if Hue > 1 then
+            Hue = 0;
+        end;
+
+        Library.CurrentRainbowHue = Hue;
+        Library.CurrentRainbowColor = Color3.fromHSV(Hue, 0.8, 1);
+    end
+end))
+
+local function GetPlayersString()
+    local PlayerList = Players:GetPlayers();
+
+    for i = 1, #PlayerList do
+        PlayerList[i] = PlayerList[i].Name;
+    end;
+
+    table.sort(PlayerList, function(str1, str2) return str1 < str2 end);
+
+    return PlayerList;
+end;
+
+local function GetTeamsString()
+    local TeamList = Teams:GetTeams();
+
+    for i = 1, #TeamList do
+        TeamList[i] = TeamList[i].Name;
+    end;
+
+    table.sort(TeamList, function(str1, str2) return str1 < str2 end);
+    
+    return TeamList;
+end;
+
+function Library:SafeCallback(f, ...)
+    if (not f) then
+        return;
+    end;
+
+    if not Library.NotifyOnError then
+        return f(...);
+    end;
+
+    local success, event = pcall(f, ...);
+
+    if not success then
+        local _, i = event:find(":%d+: ");
+
+        if not i then
+            return Library:Notify(event);
+        end;
+
+        return Library:Notify(event:sub(i + 1), 3);
+    end;
+end;
+
+function Library:AttemptSave()
+    if Library.SaveManager then
+        Library.SaveManager:Save();
+    end;
+end;
+
+function Library:Create(Class, Properties)
+    local _Instance = Class;
+
+    if type(Class) == 'string' then
+        _Instance = Instance.new(Class);
+    end;
+
+    for Property, Value in next, Properties do
+        _Instance[Property] = Value;
+    end;
+
+    return _Instance;
+end;
+
+function Library:ApplyTextStroke(Inst)
+    Inst.TextStrokeTransparency = 1;
+
+    Library:Create('UIStroke', {
+        Color = Color3.new(0, 0, 0);
+        Thickness = 1;
+        LineJoinMode = Enum.LineJoinMode.Miter;
+        Parent = Inst;
+    });
+end;
+
+function Library:CreateLabel(Properties, IsHud)
+    local _Instance = Library:Create('TextLabel', {
+        BackgroundTransparency = 1;
+        Font = Library.Font;
+        TextColor3 = Library.FontColor;
+        TextSize = 16;
+        TextStrokeTransparency = 0;
+    });
+
+    Library:ApplyTextStroke(_Instance);
+
+    Library:AddToRegistry(_Instance, {
+        TextColor3 = 'FontColor';
+    }, IsHud);
+
+    return Library:Create(_Instance, Properties);
+end;
+
+function Library:MakeDraggable(Instance, Cutoff)
+    Instance.Active = true;
+
+    Instance.InputBegan:Connect(function(Input)
+        if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+            local ObjPos = Vector2.new(
+                Mouse.X - Instance.AbsolutePosition.X,
+                Mouse.Y - Instance.AbsolutePosition.Y
+            );
+
+            if ObjPos.Y > (Cutoff or 40) then
+                return;
+            end;
+
+            while InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+                Instance.Position = UDim2.new(
+                    0,
+                    Mouse.X - ObjPos.X + (Instance.Size.X.Offset * Instance.AnchorPoint.X),
+                    0,
+                    Mouse.Y - ObjPos.Y + (Instance.Size.Y.Offset * Instance.AnchorPoint.Y)
+                );
+
+                RenderStepped:Wait();
+            end;
+        end;
+    end)
+end;
+
+function Library:AddToolTip(InfoStr, HoverInstance)
+    local X, Y = Library:GetTextBounds(InfoStr, Library.Font, 14);
+    local Tooltip = Library:Create('Frame', {
+        BackgroundColor3 = Library.MainColor,
+        BorderColor3 = Library.OutlineColor,
+
+        Size = UDim2.fromOffset(X + 5, Y + 4),
+        ZIndex = 100,
+        Parent = Library.ScreenGui,
+
+        Visible = false,
+    })
+
+    local Label = Library:CreateLabel({
+        Position = UDim2.fromOffset(3, 1),
+        Size = UDim2.fromOffset(X, Y);
+        TextSize = 14;
+        Text = InfoStr,
+        TextColor3 = Library.FontColor,
+        TextXAlignment = Enum.TextXAlignment.Left;
+        ZIndex = Tooltip.ZIndex + 1,
+
+        Parent = Tooltip;
+    });
+
+    Library:AddToRegistry(Tooltip, {
+        BackgroundColor3 = 'MainColor';
+        BorderColor3 = 'OutlineColor';
+    });
+
+    Library:AddToRegistry(Label, {
+        TextColor3 = 'FontColor',
+    });
+
+    local IsHovering = false
+
+    HoverInstance.MouseEnter:Connect(function()
+        if Library:MouseIsOverOpenedFrame() then
+            return
+        end
+
+        IsHovering = true
+
+        Tooltip.Position = UDim2.fromOffset(Mouse.X + 15, Mouse.Y + 12)
+        Tooltip.Visible = true
+
+        while IsHovering do
+            RunService.Heartbeat:Wait()
+            Tooltip.Position = UDim2.fromOffset(Mouse.X + 15, Mouse.Y + 12)
+        end
+    end)
+
+    HoverInstance.MouseLeave:Connect(function()
+        IsHovering = false
+        Tooltip.Visible = false
+    end)
+end
+
+function Library:OnHighlight(HighlightInstance, Instance, Properties, PropertiesDefault)
+    HighlightInstance.MouseEnter:Connect(function()
+        local Reg = Library.RegistryMap[Instance];
+
+        for Property, ColorIdx in next, Properties do
+            Instance[Property] = Library[ColorIdx] or ColorIdx;
+
+            if Reg and Reg.Properties[Property] then
+                Reg.Properties[Property] = ColorIdx;
+            end;
+        end;
+    end)
+
+    HighlightInstance.MouseLeave:Connect(function()
+        local Reg = Library.RegistryMap[Instance];
+
+        for Property, ColorIdx in next, PropertiesDefault do
+            Instance[Property] = Library[ColorIdx] or ColorIdx;
+
+            if Reg and Reg.Properties[Property] then
+                Reg.Properties[Property] = ColorIdx;
+            end;
+        end;
+    end)
+end;
+
+function Library:MouseIsOverOpenedFrame()
+    for Frame, _ in next, Library.OpenedFrames do
+        local AbsPos, AbsSize = Frame.AbsolutePosition, Frame.AbsoluteSize;
+
+        if Mouse.X >= AbsPos.X and Mouse.X <= AbsPos.X + AbsSize.X
+            and Mouse.Y >= AbsPos.Y and Mouse.Y <= AbsPos.Y + AbsSize.Y then
+
+            return true;
+        end;
+    end;
+end;
+
+function Library:IsMouseOverFrame(Frame)
+    local AbsPos, AbsSize = Frame.AbsolutePosition, Frame.AbsoluteSize;
+
+    if Mouse.X >= AbsPos.X and Mouse.X <= AbsPos.X + AbsSize.X
+        and Mouse.Y >= AbsPos.Y and Mouse.Y <= AbsPos.Y + AbsSize.Y then
+
+        return true;
+    end;
+end;
+
+function Library:UpdateDependencyBoxes()
+    for _, Depbox in next, Library.DependencyBoxes do
+        Depbox:Update();
+    end;
+end;
+
+function Library:MapValue(Value, MinA, MaxA, MinB, MaxB)
+    return (1 - ((Value - MinA) / (MaxA - MinA))) * MinB + ((Value - MinA) / (MaxA - MinA)) * MaxB;
+end;
+
+function Library:GetTextBounds(Text, Font, Size, Resolution)
+    local Bounds = TextService:GetTextSize(Text, Size, Font, Resolution or Vector2.new(1920, 1080))
+    return Bounds.X, Bounds.Y
+end;
+
+function Library:GetDarkerColor(Color)
+    local H, S, V = Color3.toHSV(Color);
+    return Color3.fromHSV(H, S, V / 1.5);
+end;
+Library.AccentColorDark = Library:GetDarkerColor(Library.AccentColor);
+
+function Library:AddToRegistry(Instance, Properties, IsHud)
+    local Idx = #Library.Registry + 1;
+    local Data = {
+        Instance = Instance;
+        Properties = Properties;
+        Idx = Idx;
+    };
+
+    table.insert(Library.Registry, Data);
+    Library.RegistryMap[Instance] = Data;
+
+    if IsHud then
+        table.insert(Library.HudRegistry, Data);
+    end;
+end;
+
+function Library:RemoveFromRegistry(Instance)
+    local Data = Library.RegistryMap[Instance];
+
+    if Data then
+        for Idx = #Library.Registry, 1, -1 do
+            if Library.Registry[Idx] == Data then
+                table.remove(Library.Registry, Idx);
+            end;
+        end;
+
+        for Idx = #Library.HudRegistry, 1, -1 do
+            if Library.HudRegistry[Idx] == Data then
+                table.remove(Library.HudRegistry, Idx);
+            end;
+        end;
+
+        Library.RegistryMap[Instance] = nil;
+    end;
+end;
+
+function Library:UpdateColorsUsingRegistry()
+    -- TODO: Could have an 'active' list of objects
+    -- where the active list only contains Visible objects.
+
+    -- IMPL: Could setup .Changed events on the AddToRegistry function
+    -- that listens for the 'Visible' propert being changed.
+    -- Visible: true => Add to active list, and call UpdateColors function
+    -- Visible: false => Remove from active list.
+
+    -- The above would be especially efficient for a rainbow menu color or live color-changing.
+
+    for Idx, Object in next, Library.Registry do
+        for Property, ColorIdx in next, Object.Properties do
+            if type(ColorIdx) == 'string' then
+                Object.Instance[Property] = Library[ColorIdx];
+            elseif type(ColorIdx) == 'function' then
+                Object.Instance[Property] = ColorIdx()
+            end
+        end;
+    end;
+end;
+
+function Library:GiveSignal(Signal)
+    -- Only used for signals not attached to library instances, as those should be cleaned up on object destruction by Roblox
+    table.insert(Library.Signals, Signal)
+end
+
+function Library:Unload()
+    -- Unload all of the signals
+    for Idx = #Library.Signals, 1, -1 do
+        local Connection = table.remove(Library.Signals, Idx)
+        Connection:Disconnect()
+    end
+
+     -- Call our unload callback, maybe to undo some hooks etc
+    if Library.OnUnload then
+        Library.OnUnload()
+    end
+
+    ScreenGui:Destroy()
+end
+
+function Library:OnUnload(Callback)
+    Library.OnUnload = Callback
+end
+
+Library:GiveSignal(ScreenGui.DescendantRemoving:Connect(function(Instance)
+    if Library.RegistryMap[Instance] then
+        Library:RemoveFromRegistry(Instance);
+    end;
+end))
+
+local BaseAddons = {};
+
+do
+    local Funcs = {};
+
+    function Funcs:AddColorPicker(Idx, Info)
+        local ToggleLabel = self.TextLabel;
+        -- local Container = self.Container;
+
+        assert(Info.Default, 'AddColorPicker: Missing default value.');
+
+        local ColorPicker = {
+            Value = Info.Default;
+            Transparency = Info.Transparency or 0;
+            Type = 'ColorPicker';
+            Title = type(Info.Title) == 'string' and Info.Title or 'Color picker',
+            Callback = Info.Callback or function(Color) end;
+        };
+
+        function ColorPicker:SetHSVFromRGB(Color)
+            local H, S, V = Color3.toHSV(Color);
+
+            ColorPicker.Hue = H;
+            ColorPicker.Sat = S;
+            ColorPicker.Vib = V;
+        end;
+
+        ColorPicker:SetHSVFromRGB(ColorPicker.Value);
+
+        local DisplayFrame = Library:Create('Frame', {
+            BackgroundColor3 = ColorPicker.Value;
+            BorderColor3 = Library:GetDarkerColor(ColorPicker.Value);
+            BorderMode = Enum.BorderMode.Inset;
+            Size = UDim2.new(0, 28, 0, 14);
+            ZIndex = 6;
+            Parent = ToggleLabel;
+        });
+
+        -- Transparency image taken from https://github.com/matas3535/SplixPrivateDrawingLibrary/blob/main/Library.lua cus i'm lazy
+        local CheckerFrame = Library:Create('ImageLabel', {
+            BorderSizePixel = 0;
+            Size = UDim2.new(0, 27, 0, 13);
+            ZIndex = 5;
+            Image = 'http://www.roblox.com/asset/?id=12977615774';
+            Visible = not not Info.Transparency;
+            Parent = DisplayFrame;
+        });
+
+        -- 1/16/23
+        -- Rewrote this to be placed inside the Library ScreenGui
+        -- There was some issue which caused RelativeOffset to be way off
+        -- Thus the color picker would never show
+
+        local PickerFrameOuter = Library:Create('Frame', {
+            Name = 'Color';
+            BackgroundColor3 = Color3.new(1, 1, 1);
+            BorderColor3 = Color3.new(0, 0, 0);
+            Position = UDim2.fromOffset(DisplayFrame.AbsolutePosition.X, DisplayFrame.AbsolutePosition.Y + 18),
+            Size = UDim2.fromOffset(230, Info.Transparency and 271 or 253);
+            Visible = false;
+            ZIndex = 15;
+            Parent = ScreenGui,
+        });
+
+        DisplayFrame:GetPropertyChangedSignal('AbsolutePosition'):Connect(function()
+            PickerFrameOuter.Position = UDim2.fromOffset(DisplayFrame.AbsolutePosition.X, DisplayFrame.AbsolutePosition.Y + 18);
+        end)
+
+        local PickerFrameInner = Library:Create('Frame', {
+            BackgroundColor3 = Library.BackgroundColor;
+            BorderColor3 = Library.OutlineColor;
+            BorderMode = Enum.BorderMode.Inset;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 16;
+            Parent = PickerFrameOuter;
+        });
+
+        local Highlight = Library:Create('Frame', {
+            BackgroundColor3 = Library.AccentColor;
+            BorderSizePixel = 0;
+            Size = UDim2.new(1, 0, 0, 2);
+            ZIndex = 17;
+            Parent = PickerFrameInner;
+        });
+
+        local SatVibMapOuter = Library:Create('Frame', {
+            BorderColor3 = Color3.new(0, 0, 0);
+            Position = UDim2.new(0, 4, 0, 25);
+            Size = UDim2.new(0, 200, 0, 200);
+            ZIndex = 17;
+            Parent = PickerFrameInner;
+        });
+
+        local SatVibMapInner = Library:Create('Frame', {
+            BackgroundColor3 = Library.BackgroundColor;
+            BorderColor3 = Library.OutlineColor;
+            BorderMode = Enum.BorderMode.Inset;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 18;
+            Parent = SatVibMapOuter;
+        });
+
+        local SatVibMap = Library:Create('ImageLabel', {
+            BorderSizePixel = 0;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 18;
+            Image = 'rbxassetid://4155801252';
+            Parent = SatVibMapInner;
+        });
+
+        local CursorOuter = Library:Create('ImageLabel', {
+            AnchorPoint = Vector2.new(0.5, 0.5);
+            Size = UDim2.new(0, 6, 0, 6);
+            BackgroundTransparency = 1;
+            Image = 'http://www.roblox.com/asset/?id=9619665977';
+            ImageColor3 = Color3.new(0, 0, 0);
+            ZIndex = 19;
+            Parent = SatVibMap;
+        });
+
+        local CursorInner = Library:Create('ImageLabel', {
+            Size = UDim2.new(0, CursorOuter.Size.X.Offset - 2, 0, CursorOuter.Size.Y.Offset - 2);
+            Position = UDim2.new(0, 1, 0, 1);
+            BackgroundTransparency = 1;
+            Image = 'http://www.roblox.com/asset/?id=9619665977';
+            ZIndex = 20;
+            Parent = CursorOuter;
+        })
+
+        local HueSelectorOuter = Library:Create('Frame', {
+            BorderColor3 = Color3.new(0, 0, 0);
+            Position = UDim2.new(0, 208, 0, 25);
+            Size = UDim2.new(0, 15, 0, 200);
+            ZIndex = 17;
+            Parent = PickerFrameInner;
+        });
+
+        local HueSelectorInner = Library:Create('Frame', {
+            BackgroundColor3 = Color3.new(1, 1, 1);
+            BorderSizePixel = 0;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 18;
+            Parent = HueSelectorOuter;
+        });
+
+        local HueCursor = Library:Create('Frame', { 
+            BackgroundColor3 = Color3.new(1, 1, 1);
+            AnchorPoint = Vector2.new(0, 0.5);
+            BorderColor3 = Color3.new(0, 0, 0);
+            Size = UDim2.new(1, 0, 0, 1);
+            ZIndex = 18;
+            Parent = HueSelectorInner;
+        });
+
+        local HueBoxOuter = Library:Create('Frame', {
+            BorderColor3 = Color3.new(0, 0, 0);
+            Position = UDim2.fromOffset(4, 228),
+            Size = UDim2.new(0.5, -6, 0, 20),
+            ZIndex = 18,
+            Parent = PickerFrameInner;
+        });
+
+        local HueBoxInner = Library:Create('Frame', {
+            BackgroundColor3 = Library.MainColor;
+            BorderColor3 = Library.OutlineColor;
+            BorderMode = Enum.BorderMode.Inset;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 18,
+            Parent = HueBoxOuter;
+        });
+
+        Library:Create('UIGradient', {
+            Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(212, 212, 212))
+            });
+            Rotation = 90;
+            Parent = HueBoxInner;
+        });
+
+        local HueBox = Library:Create('TextBox', {
+            BackgroundTransparency = 1;
+            Position = UDim2.new(0, 5, 0, 0);
+            Size = UDim2.new(1, -5, 1, 0);
+            Font = Library.Font;
+            PlaceholderColor3 = Color3.fromRGB(190, 190, 190);
+            PlaceholderText = 'Hex color',
+            Text = '#FFFFFF',
+            TextColor3 = Library.FontColor;
+            TextSize = 14;
+            TextStrokeTransparency = 0;
+            TextXAlignment = Enum.TextXAlignment.Left;
+            ZIndex = 20,
+            Parent = HueBoxInner;
+        });
+
+        Library:ApplyTextStroke(HueBox);
+
+        local RgbBoxBase = Library:Create(HueBoxOuter:Clone(), {
+            Position = UDim2.new(0.5, 2, 0, 228),
+            Size = UDim2.new(0.5, -6, 0, 20),
+            Parent = PickerFrameInner
+        });
+
+        local RgbBox = Library:Create(RgbBoxBase.Frame:FindFirstChild('TextBox'), {
+            Text = '255, 255, 255',
+            PlaceholderText = 'RGB color',
+            TextColor3 = Library.FontColor
+        });
+
+        local TransparencyBoxOuter, TransparencyBoxInner, TransparencyCursor;
+        
+        if Info.Transparency then 
+            TransparencyBoxOuter = Library:Create('Frame', {
+                BorderColor3 = Color3.new(0, 0, 0);
+                Position = UDim2.fromOffset(4, 251);
+                Size = UDim2.new(1, -8, 0, 15);
+                ZIndex = 19;
+                Parent = PickerFrameInner;
+            });
+
+            TransparencyBoxInner = Library:Create('Frame', {
+                BackgroundColor3 = ColorPicker.Value;
+                BorderColor3 = Library.OutlineColor;
+                BorderMode = Enum.BorderMode.Inset;
+                Size = UDim2.new(1, 0, 1, 0);
+                ZIndex = 19;
+                Parent = TransparencyBoxOuter;
+            });
+
+            Library:AddToRegistry(TransparencyBoxInner, { BorderColor3 = 'OutlineColor' });
+
+            Library:Create('ImageLabel', {
+                BackgroundTransparency = 1;
+                Size = UDim2.new(1, 0, 1, 0);
+                Image = 'http://www.roblox.com/asset/?id=12978095818';
+                ZIndex = 20;
+                Parent = TransparencyBoxInner;
+            });
+
+            TransparencyCursor = Library:Create('Frame', { 
+                BackgroundColor3 = Color3.new(1, 1, 1);
+                AnchorPoint = Vector2.new(0.5, 0);
+                BorderColor3 = Color3.new(0, 0, 0);
+                Size = UDim2.new(0, 1, 1, 0);
+                ZIndex = 21;
+                Parent = TransparencyBoxInner;
+            });
+        end;
+
+        local DisplayLabel = Library:CreateLabel({
+            Size = UDim2.new(1, 0, 0, 14);
+            Position = UDim2.fromOffset(5, 5);
+            TextXAlignment = Enum.TextXAlignment.Left;
+            TextSize = 14;
+            Text = ColorPicker.Title,--Info.Default;
+            TextWrapped = false;
+            ZIndex = 16;
+            Parent = PickerFrameInner;
+        });
+
+
+        local ContextMenu = {}
+        do
+            ContextMenu.Options = {}
+            ContextMenu.Container = Library:Create('Frame', {
+                BorderColor3 = Color3.new(),
+                ZIndex = 14,
+
+                Visible = false,
+                Parent = ScreenGui
+            })
+
+            ContextMenu.Inner = Library:Create('Frame', {
+                BackgroundColor3 = Library.BackgroundColor;
+                BorderColor3 = Library.OutlineColor;
+                BorderMode = Enum.BorderMode.Inset;
+                Size = UDim2.fromScale(1, 1);
+                ZIndex = 15;
+                Parent = ContextMenu.Container;
+            });
+
+            Library:Create('UIListLayout', {
+                Name = 'Layout',
+                FillDirection = Enum.FillDirection.Vertical;
+                SortOrder = Enum.SortOrder.LayoutOrder;
+                Parent = ContextMenu.Inner;
+            });
+
+            Library:Create('UIPadding', {
+                Name = 'Padding',
+                PaddingLeft = UDim.new(0, 4),
+                Parent = ContextMenu.Inner,
+            });
+
+            local function updateMenuPosition()
+                ContextMenu.Container.Position = UDim2.fromOffset(
+                    (DisplayFrame.AbsolutePosition.X + DisplayFrame.AbsoluteSize.X) + 4,
+                    DisplayFrame.AbsolutePosition.Y + 1
+                )
+            end
+
+            local function updateMenuSize()
+                local menuWidth = 60
+                for i, label in next, ContextMenu.Inner:GetChildren() do
+                    if label:IsA('TextLabel') then
+                        menuWidth = math.max(menuWidth, label.TextBounds.X)
+                    end
+                end
+
+                ContextMenu.Container.Size = UDim2.fromOffset(
+                    menuWidth + 8,
+                    ContextMenu.Inner.Layout.AbsoluteContentSize.Y + 4
+                )
+            end
+
+            DisplayFrame:GetPropertyChangedSignal('AbsolutePosition'):Connect(updateMenuPosition)
+            ContextMenu.Inner.Layout:GetPropertyChangedSignal('AbsoluteContentSize'):Connect(updateMenuSize)
+
+            task.spawn(updateMenuPosition)
+            task.spawn(updateMenuSize)
+
+            Library:AddToRegistry(ContextMenu.Inner, {
+                BackgroundColor3 = 'BackgroundColor';
+                BorderColor3 = 'OutlineColor';
+            });
+
+            function ContextMenu:Show()
+                self.Container.Visible = true
+            end
+
+            function ContextMenu:Hide()
+                self.Container.Visible = false
+            end
+
+            function ContextMenu:AddOption(Str, Callback)
+                if type(Callback) ~= 'function' then
+                    Callback = function() end
+                end
+
+                local Button = Library:CreateLabel({
+                    Active = false;
+                    Size = UDim2.new(1, 0, 0, 15);
+                    TextSize = 13;
+                    Text = Str;
+                    ZIndex = 16;
+                    Parent = self.Inner;
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                });
+
+                Library:OnHighlight(Button, Button, 
+                    { TextColor3 = 'AccentColor' },
+                    { TextColor3 = 'FontColor' }
+                );
+
+                Button.InputBegan:Connect(function(Input)
+                    if Input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+                        return
+                    end
+
+                    Callback()
+                end)
+            end
+
+            ContextMenu:AddOption('Copy color', function()
+                Library.ColorClipboard = ColorPicker.Value
+                Library:Notify('Copied color!', 2)
+            end)
+
+            ContextMenu:AddOption('Paste color', function()
+                if not Library.ColorClipboard then
+                    return Library:Notify('You have not copied a color!', 2)
+                end
+                ColorPicker:SetValueRGB(Library.ColorClipboard)
+            end)
+
+
+            ContextMenu:AddOption('Copy HEX', function()
+                pcall(setclipboard, ColorPicker.Value:ToHex())
+                Library:Notify('Copied hex code to clipboard!', 2)
+            end)
+
+            ContextMenu:AddOption('Copy RGB', function()
+                pcall(setclipboard, table.concat({ math.floor(ColorPicker.Value.R * 255), math.floor(ColorPicker.Value.G * 255), math.floor(ColorPicker.Value.B * 255) }, ', '))
+                Library:Notify('Copied RGB values to clipboard!', 2)
+            end)
+
+        end
+
+        Library:AddToRegistry(PickerFrameInner, { BackgroundColor3 = 'BackgroundColor'; BorderColor3 = 'OutlineColor'; });
+        Library:AddToRegistry(Highlight, { BackgroundColor3 = 'AccentColor'; });
+        Library:AddToRegistry(SatVibMapInner, { BackgroundColor3 = 'BackgroundColor'; BorderColor3 = 'OutlineColor'; });
+
+        Library:AddToRegistry(HueBoxInner, { BackgroundColor3 = 'MainColor'; BorderColor3 = 'OutlineColor'; });
+        Library:AddToRegistry(RgbBoxBase.Frame, { BackgroundColor3 = 'MainColor'; BorderColor3 = 'OutlineColor'; });
+        Library:AddToRegistry(RgbBox, { TextColor3 = 'FontColor', });
+        Library:AddToRegistry(HueBox, { TextColor3 = 'FontColor', });
+
+        local SequenceTable = {};
+
+        for Hue = 0, 1, 0.1 do
+            table.insert(SequenceTable, ColorSequenceKeypoint.new(Hue, Color3.fromHSV(Hue, 1, 1)));
+        end;
+
+        local HueSelectorGradient = Library:Create('UIGradient', {
+            Color = ColorSequence.new(SequenceTable);
+            Rotation = 90;
+            Parent = HueSelectorInner;
+        });
+
+        HueBox.FocusLost:Connect(function(enter)
+            if enter then
+                local success, result = pcall(Color3.fromHex, HueBox.Text)
+                if success and typeof(result) == 'Color3' then
+                    ColorPicker.Hue, ColorPicker.Sat, ColorPicker.Vib = Color3.toHSV(result)
+                end
+            end
+
+            ColorPicker:Display()
+        end)
+
+        RgbBox.FocusLost:Connect(function(enter)
+            if enter then
+                local r, g, b = RgbBox.Text:match('(%d+),%s*(%d+),%s*(%d+)')
+                if r and g and b then
+                    ColorPicker.Hue, ColorPicker.Sat, ColorPicker.Vib = Color3.toHSV(Color3.fromRGB(r, g, b))
+                end
+            end
+
+            ColorPicker:Display()
+        end)
+
+        function ColorPicker:Display()
+            ColorPicker.Value = Color3.fromHSV(ColorPicker.Hue, ColorPicker.Sat, ColorPicker.Vib);
+            SatVibMap.BackgroundColor3 = Color3.fromHSV(ColorPicker.Hue, 1, 1);
+
+            Library:Create(DisplayFrame, {
+                BackgroundColor3 = ColorPicker.Value;
+                BackgroundTransparency = ColorPicker.Transparency;
+                BorderColor3 = Library:GetDarkerColor(ColorPicker.Value);
+            });
+
+            if TransparencyBoxInner then
+                TransparencyBoxInner.BackgroundColor3 = ColorPicker.Value;
+                TransparencyCursor.Position = UDim2.new(1 - ColorPicker.Transparency, 0, 0, 0);
+            end;
+
+            CursorOuter.Position = UDim2.new(ColorPicker.Sat, 0, 1 - ColorPicker.Vib, 0);
+            HueCursor.Position = UDim2.new(0, 0, ColorPicker.Hue, 0);
+
+            HueBox.Text = '#' .. ColorPicker.Value:ToHex()
+            RgbBox.Text = table.concat({ math.floor(ColorPicker.Value.R * 255), math.floor(ColorPicker.Value.G * 255), math.floor(ColorPicker.Value.B * 255) }, ', ')
+
+            Library:SafeCallback(ColorPicker.Callback, ColorPicker.Value);
+            Library:SafeCallback(ColorPicker.Changed, ColorPicker.Value);
+        end;
+
+        function ColorPicker:OnChanged(Func)
+            ColorPicker.Changed = Func;
+            Func(ColorPicker.Value)
+        end;
+
+        function ColorPicker:Show()
+            for Frame, Val in next, Library.OpenedFrames do
+                if Frame.Name == 'Color' then
+                    Frame.Visible = false;
+                    Library.OpenedFrames[Frame] = nil;
+                end;
+            end;
+
+            PickerFrameOuter.Visible = true;
+            Library.OpenedFrames[PickerFrameOuter] = true;
+        end;
+
+        function ColorPicker:Hide()
+            PickerFrameOuter.Visible = false;
+            Library.OpenedFrames[PickerFrameOuter] = nil;
+        end;
+
+        function ColorPicker:SetValue(HSV, Transparency)
+            local Color = Color3.fromHSV(HSV[1], HSV[2], HSV[3]);
+
+            ColorPicker.Transparency = Transparency or 0;
+            ColorPicker:SetHSVFromRGB(Color);
+            ColorPicker:Display();
+        end;
+
+        function ColorPicker:SetValueRGB(Color, Transparency)
+            ColorPicker.Transparency = Transparency or 0;
+            ColorPicker:SetHSVFromRGB(Color);
+            ColorPicker:Display();
+        end;
+
+        SatVibMap.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+                while InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+                    local MinX = SatVibMap.AbsolutePosition.X;
+                    local MaxX = MinX + SatVibMap.AbsoluteSize.X;
+                    local MouseX = math.clamp(Mouse.X, MinX, MaxX);
+
+                    local MinY = SatVibMap.AbsolutePosition.Y;
+                    local MaxY = MinY + SatVibMap.AbsoluteSize.Y;
+                    local MouseY = math.clamp(Mouse.Y, MinY, MaxY);
+
+                    ColorPicker.Sat = (MouseX - MinX) / (MaxX - MinX);
+                    ColorPicker.Vib = 1 - ((MouseY - MinY) / (MaxY - MinY));
+                    ColorPicker:Display();
+
+                    RenderStepped:Wait();
+                end;
+
+                Library:AttemptSave();
+            end;
+        end);
+
+        HueSelectorInner.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+                while InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+                    local MinY = HueSelectorInner.AbsolutePosition.Y;
+                    local MaxY = MinY + HueSelectorInner.AbsoluteSize.Y;
+                    local MouseY = math.clamp(Mouse.Y, MinY, MaxY);
+
+                    ColorPicker.Hue = ((MouseY - MinY) / (MaxY - MinY));
+                    ColorPicker:Display();
+
+                    RenderStepped:Wait();
+                end;
+
+                Library:AttemptSave();
+            end;
+        end);
+
+        DisplayFrame.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 and not Library:MouseIsOverOpenedFrame() then
+                if PickerFrameOuter.Visible then
+                    ColorPicker:Hide()
+                else
+                    ContextMenu:Hide()
+                    ColorPicker:Show()
+                end;
+            elseif Input.UserInputType == Enum.UserInputType.MouseButton2 and not Library:MouseIsOverOpenedFrame() then
+                ContextMenu:Show()
+                ColorPicker:Hide()
+            end
+        end);
+
+        if TransparencyBoxInner then
+            TransparencyBoxInner.InputBegan:Connect(function(Input)
+                if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+                    while InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+                        local MinX = TransparencyBoxInner.AbsolutePosition.X;
+                        local MaxX = MinX + TransparencyBoxInner.AbsoluteSize.X;
+                        local MouseX = math.clamp(Mouse.X, MinX, MaxX);
+
+                        ColorPicker.Transparency = 1 - ((MouseX - MinX) / (MaxX - MinX));
+
+                        ColorPicker:Display();
+
+                        RenderStepped:Wait();
+                    end;
+
+                    Library:AttemptSave();
+                end;
+            end);
+        end;
+
+        Library:GiveSignal(InputService.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+                local AbsPos, AbsSize = PickerFrameOuter.AbsolutePosition, PickerFrameOuter.AbsoluteSize;
+
+                if Mouse.X < AbsPos.X or Mouse.X > AbsPos.X + AbsSize.X
+                    or Mouse.Y < (AbsPos.Y - 20 - 1) or Mouse.Y > AbsPos.Y + AbsSize.Y then
+
+                    ColorPicker:Hide();
+                end;
+
+                if not Library:IsMouseOverFrame(ContextMenu.Container) then
+                    ContextMenu:Hide()
+                end
+            end;
+
+            if Input.UserInputType == Enum.UserInputType.MouseButton2 and ContextMenu.Container.Visible then
+                if not Library:IsMouseOverFrame(ContextMenu.Container) and not Library:IsMouseOverFrame(DisplayFrame) then
+                    ContextMenu:Hide()
+                end
+            end
+        end))
+
+        ColorPicker:Display();
+        ColorPicker.DisplayFrame = DisplayFrame
+
+        Options[Idx] = ColorPicker;
+
+        return self;
+    end;
+
+    function Funcs:AddKeyPicker(Idx, Info)
+        local ParentObj = self;
+        local ToggleLabel = self.TextLabel;
+        local Container = self.Container;
+
+        assert(Info.Default, 'AddKeyPicker: Missing default value.');
+
+        local KeyPicker = {
+            Value = Info.Default;
+            Toggled = false;
+            Mode = Info.Mode or 'Toggle'; -- Always, Toggle, Hold
+            Type = 'KeyPicker';
+            Callback = Info.Callback or function(Value) end;
+            ChangedCallback = Info.ChangedCallback or function(New) end;
+
+            SyncToggleState = Info.SyncToggleState or false;
+        };
+
+        if KeyPicker.SyncToggleState then
+            Info.Modes = { 'Toggle' }
+            Info.Mode = 'Toggle'
+        end
+
+        local PickOuter = Library:Create('Frame', {
+            BackgroundColor3 = Color3.new(0, 0, 0);
+            BorderColor3 = Color3.new(0, 0, 0);
+            Size = UDim2.new(0, 28, 0, 15);
+            ZIndex = 6;
+            Parent = ToggleLabel;
+        });
+
+        local PickInner = Library:Create('Frame', {
+            BackgroundColor3 = Library.BackgroundColor;
+            BorderColor3 = Library.OutlineColor;
+            BorderMode = Enum.BorderMode.Inset;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 7;
+            Parent = PickOuter;
+        });
+
+        Library:AddToRegistry(PickInner, {
+            BackgroundColor3 = 'BackgroundColor';
+            BorderColor3 = 'OutlineColor';
+        });
+
+        local DisplayLabel = Library:CreateLabel({
+            Size = UDim2.new(1, 0, 1, 0);
+            TextSize = 13;
+            Text = Info.Default;
+            TextWrapped = true;
+            ZIndex = 8;
+            Parent = PickInner;
+        });
+
+        local ModeSelectOuter = Library:Create('Frame', {
+            BorderColor3 = Color3.new(0, 0, 0);
+            Position = UDim2.fromOffset(ToggleLabel.AbsolutePosition.X + ToggleLabel.AbsoluteSize.X + 4, ToggleLabel.AbsolutePosition.Y + 1);
+            Size = UDim2.new(0, 60, 0, 45 + 2);
+            Visible = false;
+            ZIndex = 14;
+            Parent = ScreenGui;
+        });
+
+        ToggleLabel:GetPropertyChangedSignal('AbsolutePosition'):Connect(function()
+            ModeSelectOuter.Position = UDim2.fromOffset(ToggleLabel.AbsolutePosition.X + ToggleLabel.AbsoluteSize.X + 4, ToggleLabel.AbsolutePosition.Y + 1);
+        end);
+
+        local ModeSelectInner = Library:Create('Frame', {
+            BackgroundColor3 = Library.BackgroundColor;
+            BorderColor3 = Library.OutlineColor;
+            BorderMode = Enum.BorderMode.Inset;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 15;
+            Parent = ModeSelectOuter;
+        });
+
+        Library:AddToRegistry(ModeSelectInner, {
+            BackgroundColor3 = 'BackgroundColor';
+            BorderColor3 = 'OutlineColor';
+        });
+
+        Library:Create('UIListLayout', {
+            FillDirection = Enum.FillDirection.Vertical;
+            SortOrder = Enum.SortOrder.LayoutOrder;
+            Parent = ModeSelectInner;
+        });
+
+        local ContainerLabel = Library:CreateLabel({
+            TextXAlignment = Enum.TextXAlignment.Left;
+            Size = UDim2.new(1, 0, 0, 18);
+            TextSize = 13;
+            Visible = false;
+            ZIndex = 110;
+            Parent = Library.KeybindContainer;
+        },  true);
+
+        local Modes = Info.Modes or { 'Always', 'Toggle', 'Hold' };
+        local ModeButtons = {};
+
+        for Idx, Mode in next, Modes do
+            local ModeButton = {};
+
+            local Label = Library:CreateLabel({
+                Active = false;
+                Size = UDim2.new(1, 0, 0, 15);
+                TextSize = 13;
+                Text = Mode;
+                ZIndex = 16;
+                Parent = ModeSelectInner;
+            });
+
+            function ModeButton:Select()
+                for _, Button in next, ModeButtons do
+                    Button:Deselect();
+                end;
+
+                KeyPicker.Mode = Mode;
+
+                Label.TextColor3 = Library.AccentColor;
+                Library.RegistryMap[Label].Properties.TextColor3 = 'AccentColor';
+
+                ModeSelectOuter.Visible = false;
+            end;
+
+            function ModeButton:Deselect()
+                KeyPicker.Mode = nil;
+
+                Label.TextColor3 = Library.FontColor;
+                Library.RegistryMap[Label].Properties.TextColor3 = 'FontColor';
+            end;
+
+            Label.InputBegan:Connect(function(Input)
+                if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+                    ModeButton:Select();
+                    Library:AttemptSave();
+                end;
+            end);
+
+            if Mode == KeyPicker.Mode then
+                ModeButton:Select();
+            end;
+
+            ModeButtons[Mode] = ModeButton;
+        end;
+
+        function KeyPicker:Update()
+            if Info.NoUI then
+                return;
+            end;
+
+            local State = KeyPicker:GetState();
+
+            ContainerLabel.Text = string.format('[%s] %s (%s)', KeyPicker.Value, Info.Text, KeyPicker.Mode);
+
+            ContainerLabel.Visible = true;
+            ContainerLabel.TextColor3 = State and Library.AccentColor or Library.FontColor;
+
+            Library.RegistryMap[ContainerLabel].Properties.TextColor3 = State and 'AccentColor' or 'FontColor';
+
+            local YSize = 0
+            local XSize = 0
+
+            for _, Label in next, Library.KeybindContainer:GetChildren() do
+                if Label:IsA('TextLabel') and Label.Visible then
+                    YSize = YSize + 18;
+                    if (Label.TextBounds.X > XSize) then
+                        XSize = Label.TextBounds.X
+                    end
+                end;
+            end;
+
+            Library.KeybindFrame.Size = UDim2.new(0, math.max(XSize + 10, 210), 0, YSize + 23)
+        end;
+
+        function KeyPicker:GetState()
+            if KeyPicker.Mode == 'Always' then
+                return true;
+            elseif KeyPicker.Mode == 'Hold' then
+                if KeyPicker.Value == 'None' then
+                    return false;
+                end
+
+                local Key = KeyPicker.Value;
+
+                if Key == 'MB1' or Key == 'MB2' then
+                    return Key == 'MB1' and InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+                        or Key == 'MB2' and InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2);
+                else
+                    return InputService:IsKeyDown(Enum.KeyCode[KeyPicker.Value]);
+                end;
+            else
+                return KeyPicker.Toggled;
+            end;
+        end;
+
+        function KeyPicker:SetValue(Data)
+            local Key, Mode = Data[1], Data[2];
+            DisplayLabel.Text = Key;
+            KeyPicker.Value = Key;
+            ModeButtons[Mode]:Select();
+            KeyPicker:Update();
+        end;
+
+        function KeyPicker:OnClick(Callback)
+            KeyPicker.Clicked = Callback
+        end
+
+        function KeyPicker:OnChanged(Callback)
+            KeyPicker.Changed = Callback
+            Callback(KeyPicker.Value)
+        end
+
+        if ParentObj.Addons then
+            table.insert(ParentObj.Addons, KeyPicker)
+        end
+
+        function KeyPicker:DoClick()
+            if ParentObj.Type == 'Toggle' and KeyPicker.SyncToggleState then
+                ParentObj:SetValue(not ParentObj.Value)
+            end
+
+            Library:SafeCallback(KeyPicker.Callback, KeyPicker.Toggled)
+            Library:SafeCallback(KeyPicker.Clicked, KeyPicker.Toggled)
+        end
+
+        local Picking = false;
+
+        PickOuter.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 and not Library:MouseIsOverOpenedFrame() then
+                Picking = true;
+
+                DisplayLabel.Text = '';
+
+                local Break;
+                local Text = '';
+
+                task.spawn(function()
+                    while (not Break) do
+                        if Text == '...' then
+                            Text = '';
+                        end;
+
+                        Text = Text .. '.';
+                        DisplayLabel.Text = Text;
+
+                        wait(0.4);
+                    end;
+                end);
+
+                wait(0.2);
+
+                local Event;
+                Event = InputService.InputBegan:Connect(function(Input)
+                    local Key;
+
+                    if Input.UserInputType == Enum.UserInputType.Keyboard then
+                        Key = Input.KeyCode.Name;
+                    elseif Input.UserInputType == Enum.UserInputType.MouseButton1 then
+                        Key = 'MB1';
+                    elseif Input.UserInputType == Enum.UserInputType.MouseButton2 then
+                        Key = 'MB2';
+                    end;
+
+                    Break = true;
+                    Picking = false;
+
+                    DisplayLabel.Text = Key;
+                    KeyPicker.Value = Key;
+
+                    Library:SafeCallback(KeyPicker.ChangedCallback, Input.KeyCode or Input.UserInputType)
+                    Library:SafeCallback(KeyPicker.Changed, Input.KeyCode or Input.UserInputType)
+
+                    Library:AttemptSave();
+
+                    Event:Disconnect();
+                end);
+            elseif Input.UserInputType == Enum.UserInputType.MouseButton2 and not Library:MouseIsOverOpenedFrame() then
+                ModeSelectOuter.Visible = true;
+            end;
+        end);
+
+        Library:GiveSignal(InputService.InputBegan:Connect(function(Input)
+            if (not Picking) then
+                if KeyPicker.Mode == 'Toggle' then
+                    local Key = KeyPicker.Value;
+
+                    if Key == 'MB1' or Key == 'MB2' then
+                        if Key == 'MB1' and Input.UserInputType == Enum.UserInputType.MouseButton1
+                        or Key == 'MB2' and Input.UserInputType == Enum.UserInputType.MouseButton2 then
+                            KeyPicker.Toggled = not KeyPicker.Toggled
+                            KeyPicker:DoClick()
+                        end;
+                    elseif Input.UserInputType == Enum.UserInputType.Keyboard then
+                        if Input.KeyCode.Name == Key then
+                            KeyPicker.Toggled = not KeyPicker.Toggled;
+                            KeyPicker:DoClick()
+                        end;
+                    end;
+                end;
+
+                KeyPicker:Update();
+            end;
+
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+                local AbsPos, AbsSize = ModeSelectOuter.AbsolutePosition, ModeSelectOuter.AbsoluteSize;
+
+                if Mouse.X < AbsPos.X or Mouse.X > AbsPos.X + AbsSize.X
+                    or Mouse.Y < (AbsPos.Y - 20 - 1) or Mouse.Y > AbsPos.Y + AbsSize.Y then
+
+                    ModeSelectOuter.Visible = false;
+                end;
+            end;
+        end))
+
+        Library:GiveSignal(InputService.InputEnded:Connect(function(Input)
+            if (not Picking) then
+                KeyPicker:Update();
+            end;
+        end))
+
+        KeyPicker:Update();
+
+        Options[Idx] = KeyPicker;
+
+        return self;
+    end;
+
+    BaseAddons.__index = Funcs;
+    BaseAddons.__namecall = function(Table, Key, ...)
+        return Funcs[Key](...);
+    end;
+end;
+
+local BaseGroupbox = {};
+
+do
+    local Funcs = {};
+
+    function Funcs:AddBlank(Size)
+        local Groupbox = self;
+        local Container = Groupbox.Container;
+
+        Library:Create('Frame', {
+            BackgroundTransparency = 1;
+            Size = UDim2.new(1, 0, 0, Size);
+            ZIndex = 1;
+            Parent = Container;
+        });
+    end;
+
+    function Funcs:AddLabel(Text, DoesWrap)
+        local Label = {};
+
+        local Groupbox = self;
+        local Container = Groupbox.Container;
+
+        local TextLabel = Library:CreateLabel({
+            Size = UDim2.new(1, -4, 0, 15);
+            TextSize = 14;
+            Text = Text;
+            TextWrapped = DoesWrap or false,
+            TextXAlignment = Enum.TextXAlignment.Left;
+            ZIndex = 5;
+            Parent = Container;
+        });
+
+        if DoesWrap then
+            local Y = select(2, Library:GetTextBounds(Text, Library.Font, 14, Vector2.new(TextLabel.AbsoluteSize.X, math.huge)))
+            TextLabel.Size = UDim2.new(1, -4, 0, Y)
+        else
+            Library:Create('UIListLayout', {
+                Padding = UDim.new(0, 4);
+                FillDirection = Enum.FillDirection.Horizontal;
+                HorizontalAlignment = Enum.HorizontalAlignment.Right;
+                SortOrder = Enum.SortOrder.LayoutOrder;
+                Parent = TextLabel;
+            });
+        end
+
+        Label.TextLabel = TextLabel;
+        Label.Container = Container;
+
+        function Label:SetText(Text)
+            TextLabel.Text = Text
+
+            if DoesWrap then
+                local Y = select(2, Library:GetTextBounds(Text, Library.Font, 14, Vector2.new(TextLabel.AbsoluteSize.X, math.huge)))
+                TextLabel.Size = UDim2.new(1, -4, 0, Y)
+            end
+
+            Groupbox:Resize();
+        end
+
+        if (not DoesWrap) then
+            setmetatable(Label, BaseAddons);
+        end
+
+        Groupbox:AddBlank(5);
+        Groupbox:Resize();
+
+        return Label;
+    end;
+
+    function Funcs:AddButton(...)
+        -- TODO: Eventually redo this
+        local Button = {};
+        local function ProcessButtonParams(Class, Obj, ...)
+            local Props = select(1, ...)
+            if type(Props) == 'table' then
+                Obj.Text = Props.Text
+                Obj.Func = Props.Func
+                Obj.DoubleClick = Props.DoubleClick
+                Obj.Tooltip = Props.Tooltip
+            else
+                Obj.Text = select(1, ...)
+                Obj.Func = select(2, ...)
+            end
+
+            assert(type(Obj.Func) == 'function', 'AddButton: `Func` callback is missing.');
+        end
+
+        ProcessButtonParams('Button', Button, ...)
+
+        local Groupbox = self;
+        local Container = Groupbox.Container;
+
+        local function CreateBaseButton(Button)
+            local Outer = Library:Create('Frame', {
+                BackgroundColor3 = Color3.new(0, 0, 0);
+                BorderColor3 = Color3.new(0, 0, 0);
+                Size = UDim2.new(1, -4, 0, 20);
+                ZIndex = 5;
+            });
+
+            local Inner = Library:Create('Frame', {
+                BackgroundColor3 = Library.MainColor;
+                BorderColor3 = Library.OutlineColor;
+                BorderMode = Enum.BorderMode.Inset;
+                Size = UDim2.new(1, 0, 1, 0);
+                ZIndex = 6;
+                Parent = Outer;
+            });
+
+            local Label = Library:CreateLabel({
+                Size = UDim2.new(1, 0, 1, 0);
+                TextSize = 14;
+                Text = Button.Text;
+                ZIndex = 6;
+                Parent = Inner;
+            });
+
+            Library:Create('UIGradient', {
+                Color = ColorSequence.new({
+                    ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
+                    ColorSequenceKeypoint.new(1, Color3.fromRGB(212, 212, 212))
+                });
+                Rotation = 90;
+                Parent = Inner;
+            });
+
+            Library:AddToRegistry(Outer, {
+                BorderColor3 = 'Black';
+            });
+
+            Library:AddToRegistry(Inner, {
+                BackgroundColor3 = 'MainColor';
+                BorderColor3 = 'OutlineColor';
+            });
+
+            Library:OnHighlight(Outer, Outer,
+                { BorderColor3 = 'AccentColor' },
+                { BorderColor3 = 'Black' }
+            );
+
+            return Outer, Inner, Label
+        end
+
+        local function InitEvents(Button)
+            local function WaitForEvent(event, timeout, validator)
+                local bindable = Instance.new('BindableEvent')
+                local connection = event:Once(function(...)
+
+                    if type(validator) == 'function' and validator(...) then
+                        bindable:Fire(true)
+                    else
+                        bindable:Fire(false)
+                    end
+                end)
+                task.delay(timeout, function()
+                    connection:disconnect()
+                    bindable:Fire(false)
+                end)
+                return bindable.Event:Wait()
+            end
+
+            local function ValidateClick(Input)
+                if Library:MouseIsOverOpenedFrame() then
+                    return false
+                end
+
+                if Input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+                    return false
+                end
+
+                return true
+            end
+
+            Button.Outer.InputBegan:Connect(function(Input)
+                if not ValidateClick(Input) then return end
+                if Button.Locked then return end
+
+                if Button.DoubleClick then
+                    Library:RemoveFromRegistry(Button.Label)
+                    Library:AddToRegistry(Button.Label, { TextColor3 = 'AccentColor' })
+
+                    Button.Label.TextColor3 = Library.AccentColor
+                    Button.Label.Text = 'Are you sure?'
+                    Button.Locked = true
+
+                    local clicked = WaitForEvent(Button.Outer.InputBegan, 0.5, ValidateClick)
+
+                    Library:RemoveFromRegistry(Button.Label)
+                    Library:AddToRegistry(Button.Label, { TextColor3 = 'FontColor' })
+
+                    Button.Label.TextColor3 = Library.FontColor
+                    Button.Label.Text = Button.Text
+                    task.defer(rawset, Button, 'Locked', false)
+
+                    if clicked then
+                        Library:SafeCallback(Button.Func)
+                    end
+
+                    return
+                end
+
+                Library:SafeCallback(Button.Func);
+            end)
+        end
+
+        Button.Outer, Button.Inner, Button.Label = CreateBaseButton(Button)
+        Button.Outer.Parent = Container
+
+        InitEvents(Button)
+
+        function Button:AddTooltip(tooltip)
+            if type(tooltip) == 'string' then
+                Library:AddToolTip(tooltip, self.Outer)
+            end
+            return self
+        end
+
+
+        function Button:AddButton(...)
+            local SubButton = {}
+
+            ProcessButtonParams('SubButton', SubButton, ...)
+
+            self.Outer.Size = UDim2.new(0.5, -2, 0, 20)
+
+            SubButton.Outer, SubButton.Inner, SubButton.Label = CreateBaseButton(SubButton)
+
+            SubButton.Outer.Position = UDim2.new(1, 3, 0, 0)
+            SubButton.Outer.Size = UDim2.fromOffset(self.Outer.AbsoluteSize.X - 2, self.Outer.AbsoluteSize.Y)
+            SubButton.Outer.Parent = self.Outer
+
+            function SubButton:AddTooltip(tooltip)
+                if type(tooltip) == 'string' then
+                    Library:AddToolTip(tooltip, self.Outer)
+                end
+                return SubButton
+            end
+
+            if type(SubButton.Tooltip) == 'string' then
+                SubButton:AddTooltip(SubButton.Tooltip)
+            end
+
+            InitEvents(SubButton)
+            return SubButton
+        end
+
+        if type(Button.Tooltip) == 'string' then
+            Button:AddTooltip(Button.Tooltip)
+        end
+
+        Groupbox:AddBlank(5);
+        Groupbox:Resize();
+
+        return Button;
+    end;
+
+    function Funcs:AddDivider()
+        local Groupbox = self;
+        local Container = self.Container
+
+        local Divider = {
+            Type = 'Divider',
+        }
+
+        Groupbox:AddBlank(2);
+        local DividerOuter = Library:Create('Frame', {
+            BackgroundColor3 = Color3.new(0, 0, 0);
+            BorderColor3 = Color3.new(0, 0, 0);
+            Size = UDim2.new(1, -4, 0, 5);
+            ZIndex = 5;
+            Parent = Container;
+        });
+
+        local DividerInner = Library:Create('Frame', {
+            BackgroundColor3 = Library.MainColor;
+            BorderColor3 = Library.OutlineColor;
+            BorderMode = Enum.BorderMode.Inset;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 6;
+            Parent = DividerOuter;
+        });
+
+        Library:AddToRegistry(DividerOuter, {
+            BorderColor3 = 'Black';
+        });
+
+        Library:AddToRegistry(DividerInner, {
+            BackgroundColor3 = 'MainColor';
+            BorderColor3 = 'OutlineColor';
+        });
+
+        Groupbox:AddBlank(9);
+        Groupbox:Resize();
+    end
+
+    function Funcs:AddInput(Idx, Info)
+        assert(Info.Text, 'AddInput: Missing `Text` string.')
+
+        local Textbox = {
+            Value = Info.Default or '';
+            Numeric = Info.Numeric or false;
+            Finished = Info.Finished or false;
+            Type = 'Input';
+            Callback = Info.Callback or function(Value) end;
+        };
+
+        local Groupbox = self;
+        local Container = Groupbox.Container;
+
+        local InputLabel = Library:CreateLabel({
+            Size = UDim2.new(1, 0, 0, 15);
+            TextSize = 14;
+            Text = Info.Text;
+            TextXAlignment = Enum.TextXAlignment.Left;
+            ZIndex = 5;
+            Parent = Container;
+        });
+
+        Groupbox:AddBlank(1);
+
+        local TextBoxOuter = Library:Create('Frame', {
+            BackgroundColor3 = Color3.new(0, 0, 0);
+            BorderColor3 = Color3.new(0, 0, 0);
+            Size = UDim2.new(1, -4, 0, 20);
+            ZIndex = 5;
+            Parent = Container;
+        });
+
+        local TextBoxInner = Library:Create('Frame', {
+            BackgroundColor3 = Library.MainColor;
+            BorderColor3 = Library.OutlineColor;
+            BorderMode = Enum.BorderMode.Inset;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 6;
+            Parent = TextBoxOuter;
+        });
+
+        Library:AddToRegistry(TextBoxInner, {
+            BackgroundColor3 = 'MainColor';
+            BorderColor3 = 'OutlineColor';
+        });
+
+        Library:OnHighlight(TextBoxOuter, TextBoxOuter,
+            { BorderColor3 = 'AccentColor' },
+            { BorderColor3 = 'Black' }
+        );
+
+        if type(Info.Tooltip) == 'string' then
+            Library:AddToolTip(Info.Tooltip, TextBoxOuter)
+        end
+
+        Library:Create('UIGradient', {
+            Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(212, 212, 212))
+            });
+            Rotation = 90;
+            Parent = TextBoxInner;
+        });
+
+        local Container = Library:Create('Frame', {
+            BackgroundTransparency = 1;
+            ClipsDescendants = true;
+
+            Position = UDim2.new(0, 5, 0, 0);
+            Size = UDim2.new(1, -5, 1, 0);
+
+            ZIndex = 7;
+            Parent = TextBoxInner;
+        })
+
+        local Box = Library:Create('TextBox', {
+            BackgroundTransparency = 1;
+
+            Position = UDim2.fromOffset(0, 0),
+            Size = UDim2.fromScale(5, 1),
+
+            Font = Library.Font;
+            PlaceholderColor3 = Color3.fromRGB(190, 190, 190);
+            PlaceholderText = Info.Placeholder or '';
+
+            Text = Info.Default or '';
+            TextColor3 = Library.FontColor;
+            TextSize = 14;
+            TextStrokeTransparency = 0;
+            TextXAlignment = Enum.TextXAlignment.Left;
+
+            ZIndex = 7;
+            Parent = Container;
+        });
+
+        Library:ApplyTextStroke(Box);
+
+        function Textbox:SetValue(Text)
+            if Info.MaxLength and #Text > Info.MaxLength then
+                Text = Text:sub(1, Info.MaxLength);
+            end;
+
+            if Textbox.Numeric then
+                if (not tonumber(Text)) and Text:len() > 0 then
+                    Text = Textbox.Value
+                end
+            end
+
+            Textbox.Value = Text;
+            Box.Text = Text;
+
+            Library:SafeCallback(Textbox.Callback, Textbox.Value);
+            Library:SafeCallback(Textbox.Changed, Textbox.Value);
+        end;
+
+        if Textbox.Finished then
+            Box.FocusLost:Connect(function(enter)
+                if not enter then return end
+
+                Textbox:SetValue(Box.Text);
+                Library:AttemptSave();
+            end)
+        else
+            Box:GetPropertyChangedSignal('Text'):Connect(function()
+                Textbox:SetValue(Box.Text);
+                Library:AttemptSave();
+            end);
+        end
+
+        -- https://devforum.roblox.com/t/how-to-make-textboxes-follow-current-cursor-position/1368429/6
+        -- thank you nicemike40 :)
+
+        local function Update()
+            local PADDING = 2
+            local reveal = Container.AbsoluteSize.X
+
+            if not Box:IsFocused() or Box.TextBounds.X <= reveal - 2 * PADDING then
+                -- we aren't focused, or we fit so be normal
+                Box.Position = UDim2.new(0, PADDING, 0, 0)
+            else
+                -- we are focused and don't fit, so adjust position
+                local cursor = Box.CursorPosition
+                if cursor ~= -1 then
+                    -- calculate pixel width of text from start to cursor
+                    local subtext = string.sub(Box.Text, 1, cursor-1)
+                    local width = TextService:GetTextSize(subtext, Box.TextSize, Box.Font, Vector2.new(math.huge, math.huge)).X
+
+                    -- check if we're inside the box with the cursor
+                    local currentCursorPos = Box.Position.X.Offset + width
+
+                    -- adjust if necessary
+                    if currentCursorPos < PADDING then
+                        Box.Position = UDim2.fromOffset(PADDING-width, 0)
+                    elseif currentCursorPos > reveal - PADDING - 1 then
+                        Box.Position = UDim2.fromOffset(reveal-width-PADDING-1, 0)
+                    end
+                end
+            end
+        end
+
+        task.spawn(Update)
+
+        Box:GetPropertyChangedSignal('Text'):Connect(Update)
+        Box:GetPropertyChangedSignal('CursorPosition'):Connect(Update)
+        Box.FocusLost:Connect(Update)
+        Box.Focused:Connect(Update)
+
+        Library:AddToRegistry(Box, {
+            TextColor3 = 'FontColor';
+        });
+
+        function Textbox:OnChanged(Func)
+            Textbox.Changed = Func;
+            Func(Textbox.Value);
+        end;
+
+        Groupbox:AddBlank(5);
+        Groupbox:Resize();
+
+        Options[Idx] = Textbox;
+
+        return Textbox;
+    end;
+
+    function Funcs:AddToggle(Idx, Info)
+        assert(Info.Text, 'AddInput: Missing `Text` string.')
+
+        local Toggle = {
+            Value = Info.Default or false;
+            Type = 'Toggle';
+
+            Callback = Info.Callback or function(Value) end;
+            Addons = {},
+            Risky = Info.Risky,
+        };
+
+        local Groupbox = self;
+        local Container = Groupbox.Container;
+
+        local ToggleOuter = Library:Create('Frame', {
+            BackgroundColor3 = Color3.new(0, 0, 0);
+            BorderColor3 = Color3.new(0, 0, 0);
+            Size = UDim2.new(0, 13, 0, 13);
+            ZIndex = 5;
+            Parent = Container;
+        });
+
+        Library:AddToRegistry(ToggleOuter, {
+            BorderColor3 = 'Black';
+        });
+
+        local ToggleInner = Library:Create('Frame', {
+            BackgroundColor3 = Library.MainColor;
+            BorderColor3 = Library.OutlineColor;
+            BorderMode = Enum.BorderMode.Inset;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 6;
+            Parent = ToggleOuter;
+        });
+
+        Library:AddToRegistry(ToggleInner, {
+            BackgroundColor3 = 'MainColor';
+            BorderColor3 = 'OutlineColor';
+        });
+
+        local ToggleLabel = Library:CreateLabel({
+            Size = UDim2.new(0, 216, 1, 0);
+            Position = UDim2.new(1, 6, 0, 0);
+            TextSize = 14;
+            Text = Info.Text;
+            TextXAlignment = Enum.TextXAlignment.Left;
+            ZIndex = 6;
+            Parent = ToggleInner;
+        });
+
+        Library:Create('UIListLayout', {
+            Padding = UDim.new(0, 4);
+            FillDirection = Enum.FillDirection.Horizontal;
+            HorizontalAlignment = Enum.HorizontalAlignment.Right;
+            SortOrder = Enum.SortOrder.LayoutOrder;
+            Parent = ToggleLabel;
+        });
+
+        local ToggleRegion = Library:Create('Frame', {
+            BackgroundTransparency = 1;
+            Size = UDim2.new(0, 170, 1, 0);
+            ZIndex = 8;
+            Parent = ToggleOuter;
+        });
+
+        Library:OnHighlight(ToggleRegion, ToggleOuter,
+            { BorderColor3 = 'AccentColor' },
+            { BorderColor3 = 'Black' }
+        );
+
+        function Toggle:UpdateColors()
+            Toggle:Display();
+        end;
+
+        if type(Info.Tooltip) == 'string' then
+            Library:AddToolTip(Info.Tooltip, ToggleRegion)
+        end
+
+        function Toggle:Display()
+            ToggleInner.BackgroundColor3 = Toggle.Value and Library.AccentColor or Library.MainColor;
+            ToggleInner.BorderColor3 = Toggle.Value and Library.AccentColorDark or Library.OutlineColor;
+
+            Library.RegistryMap[ToggleInner].Properties.BackgroundColor3 = Toggle.Value and 'AccentColor' or 'MainColor';
+            Library.RegistryMap[ToggleInner].Properties.BorderColor3 = Toggle.Value and 'AccentColorDark' or 'OutlineColor';
+        end;
+
+        function Toggle:OnChanged(Func)
+            Toggle.Changed = Func;
+            Func(Toggle.Value);
+        end;
+
+        function Toggle:SetValue(Bool)
+            Bool = (not not Bool);
+
+            Toggle.Value = Bool;
+            Toggle:Display();
+
+            for _, Addon in next, Toggle.Addons do
+                if Addon.Type == 'KeyPicker' and Addon.SyncToggleState then
+                    Addon.Toggled = Bool
+                    Addon:Update()
+                end
+            end
+
+            Library:SafeCallback(Toggle.Callback, Toggle.Value);
+            Library:SafeCallback(Toggle.Changed, Toggle.Value);
+            Library:UpdateDependencyBoxes();
+        end;
+
+        ToggleRegion.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 and not Library:MouseIsOverOpenedFrame() then
+                Toggle:SetValue(not Toggle.Value) -- Why was it not like this from the start?
+                Library:AttemptSave();
+            end;
+        end);
+
+        if Toggle.Risky then
+            Library:RemoveFromRegistry(ToggleLabel)
+            ToggleLabel.TextColor3 = Library.RiskColor
+            Library:AddToRegistry(ToggleLabel, { TextColor3 = 'RiskColor' })
+        end
+
+        Toggle:Display();
+        Groupbox:AddBlank(Info.BlankSize or 5 + 2);
+        Groupbox:Resize();
+
+        Toggle.TextLabel = ToggleLabel;
+        Toggle.Container = Container;
+        setmetatable(Toggle, BaseAddons);
+
+        Toggles[Idx] = Toggle;
+
+        Library:UpdateDependencyBoxes();
+
+        return Toggle;
+    end;
+
+    function Funcs:AddSlider(Idx, Info)
+        assert(Info.Default, 'AddSlider: Missing default value.');
+        assert(Info.Text, 'AddSlider: Missing slider text.');
+        assert(Info.Min, 'AddSlider: Missing minimum value.');
+        assert(Info.Max, 'AddSlider: Missing maximum value.');
+        assert(Info.Rounding, 'AddSlider: Missing rounding value.');
+
+        local Slider = {
+            Value = Info.Default;
+            Min = Info.Min;
+            Max = Info.Max;
+            Rounding = Info.Rounding;
+            MaxSize = 232;
+            Type = 'Slider';
+            Callback = Info.Callback or function(Value) end;
+        };
+
+        local Groupbox = self;
+        local Container = Groupbox.Container;
+
+        if not Info.Compact then
+            Library:CreateLabel({
+                Size = UDim2.new(1, 0, 0, 10);
+                TextSize = 14;
+                Text = Info.Text;
+                TextXAlignment = Enum.TextXAlignment.Left;
+                TextYAlignment = Enum.TextYAlignment.Bottom;
+                ZIndex = 5;
+                Parent = Container;
+            });
+
+            Groupbox:AddBlank(3);
+        end
+
+        local SliderOuter = Library:Create('Frame', {
+            BackgroundColor3 = Color3.new(0, 0, 0);
+            BorderColor3 = Color3.new(0, 0, 0);
+            Size = UDim2.new(1, -4, 0, 13);
+            ZIndex = 5;
+            Parent = Container;
+        });
+
+        Library:AddToRegistry(SliderOuter, {
+            BorderColor3 = 'Black';
+        });
+
+        local SliderInner = Library:Create('Frame', {
+            BackgroundColor3 = Library.MainColor;
+            BorderColor3 = Library.OutlineColor;
+            BorderMode = Enum.BorderMode.Inset;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 6;
+            Parent = SliderOuter;
+        });
+
+        Library:AddToRegistry(SliderInner, {
+            BackgroundColor3 = 'MainColor';
+            BorderColor3 = 'OutlineColor';
+        });
+
+        local Fill = Library:Create('Frame', {
+            BackgroundColor3 = Library.AccentColor;
+            BorderColor3 = Library.AccentColorDark;
+            Size = UDim2.new(0, 0, 1, 0);
+            ZIndex = 7;
+            Parent = SliderInner;
+        });
+
+        Library:AddToRegistry(Fill, {
+            BackgroundColor3 = 'AccentColor';
+            BorderColor3 = 'AccentColorDark';
+        });
+
+        local HideBorderRight = Library:Create('Frame', {
+            BackgroundColor3 = Library.AccentColor;
+            BorderSizePixel = 0;
+            Position = UDim2.new(1, 0, 0, 0);
+            Size = UDim2.new(0, 1, 1, 0);
+            ZIndex = 8;
+            Parent = Fill;
+        });
+
+        Library:AddToRegistry(HideBorderRight, {
+            BackgroundColor3 = 'AccentColor';
+        });
+
+        local DisplayLabel = Library:CreateLabel({
+            Size = UDim2.new(1, 0, 1, 0);
+            TextSize = 14;
+            Text = 'Infinite';
+            ZIndex = 9;
+            Parent = SliderInner;
+        });
+
+        Library:OnHighlight(SliderOuter, SliderOuter,
+            { BorderColor3 = 'AccentColor' },
+            { BorderColor3 = 'Black' }
+        );
+
+        if type(Info.Tooltip) == 'string' then
+            Library:AddToolTip(Info.Tooltip, SliderOuter)
+        end
+
+        function Slider:UpdateColors()
+            Fill.BackgroundColor3 = Library.AccentColor;
+            Fill.BorderColor3 = Library.AccentColorDark;
+        end;
+
+        function Slider:Display()
+            local Suffix = Info.Suffix or '';
+
+            if Info.Compact then
+                DisplayLabel.Text = Info.Text .. ': ' .. Slider.Value .. Suffix
+            elseif Info.HideMax then
+                DisplayLabel.Text = string.format('%s', Slider.Value .. Suffix)
+            else
+                DisplayLabel.Text = string.format('%s/%s', Slider.Value .. Suffix, Slider.Max .. Suffix);
+            end
+
+            local X = math.ceil(Library:MapValue(Slider.Value, Slider.Min, Slider.Max, 0, Slider.MaxSize));
+            Fill.Size = UDim2.new(0, X, 1, 0);
+
+            HideBorderRight.Visible = not (X == Slider.MaxSize or X == 0);
+        end;
+
+        function Slider:OnChanged(Func)
+            Slider.Changed = Func;
+            Func(Slider.Value);
+        end;
+
+        local function Round(Value)
+            if Slider.Rounding == 0 then
+                return math.floor(Value);
+            end;
+
+
+            return tonumber(string.format('%.' .. Slider.Rounding .. 'f', Value))
+        end;
+
+        function Slider:GetValueFromXOffset(X)
+            return Round(Library:MapValue(X, 0, Slider.MaxSize, Slider.Min, Slider.Max));
+        end;
+
+        function Slider:SetValue(Str)
+            local Num = tonumber(Str);
+
+            if (not Num) then
+                return;
+            end;
+
+            Num = math.clamp(Num, Slider.Min, Slider.Max);
+
+            Slider.Value = Num;
+            Slider:Display();
+
+            Library:SafeCallback(Slider.Callback, Slider.Value);
+            Library:SafeCallback(Slider.Changed, Slider.Value);
+        end;
+
+        SliderInner.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 and not Library:MouseIsOverOpenedFrame() then
+                local mPos = Mouse.X;
+                local gPos = Fill.Size.X.Offset;
+                local Diff = mPos - (Fill.AbsolutePosition.X + gPos);
+
+                while InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+                    local nMPos = Mouse.X;
+                    local nX = math.clamp(gPos + (nMPos - mPos) + Diff, 0, Slider.MaxSize);
+
+                    local nValue = Slider:GetValueFromXOffset(nX);
+                    local OldValue = Slider.Value;
+                    Slider.Value = nValue;
+
+                    Slider:Display();
+
+                    if nValue ~= OldValue then
+                        Library:SafeCallback(Slider.Callback, Slider.Value);
+                        Library:SafeCallback(Slider.Changed, Slider.Value);
+                    end;
+
+                    RenderStepped:Wait();
+                end;
+
+                Library:AttemptSave();
+            end;
+        end);
+
+        Slider:Display();
+        Groupbox:AddBlank(Info.BlankSize or 6);
+        Groupbox:Resize();
+
+        Options[Idx] = Slider;
+
+        return Slider;
+    end;
+
+    function Funcs:AddDropdown(Idx, Info)
+        if Info.SpecialType == 'Player' then
+            Info.Values = GetPlayersString();
+            Info.AllowNull = true;
+        elseif Info.SpecialType == 'Team' then
+            Info.Values = GetTeamsString();
+            Info.AllowNull = true;
+        end;
+
+        assert(Info.Values, 'AddDropdown: Missing dropdown value list.');
+        assert(Info.AllowNull or Info.Default, 'AddDropdown: Missing default value. Pass `AllowNull` as true if this was intentional.')
+
+        if (not Info.Text) then
+            Info.Compact = true;
+        end;
+
+        local Dropdown = {
+            Values = Info.Values;
+            Value = Info.Multi and {};
+            Multi = Info.Multi;
+            Type = 'Dropdown';
+            SpecialType = Info.SpecialType; -- can be either 'Player' or 'Team'
+            Callback = Info.Callback or function(Value) end;
+        };
+
+        local Groupbox = self;
+        local Container = Groupbox.Container;
+
+        local RelativeOffset = 0;
+
+        if not Info.Compact then
+            local DropdownLabel = Library:CreateLabel({
+                Size = UDim2.new(1, 0, 0, 10);
+                TextSize = 14;
+                Text = Info.Text;
+                TextXAlignment = Enum.TextXAlignment.Left;
+                TextYAlignment = Enum.TextYAlignment.Bottom;
+                ZIndex = 5;
+                Parent = Container;
+            });
+
+            Groupbox:AddBlank(3);
+        end
+
+        for _, Element in next, Container:GetChildren() do
+            if not Element:IsA('UIListLayout') then
+                RelativeOffset = RelativeOffset + Element.Size.Y.Offset;
+            end;
+        end;
+
+        local DropdownOuter = Library:Create('Frame', {
+            BackgroundColor3 = Color3.new(0, 0, 0);
+            BorderColor3 = Color3.new(0, 0, 0);
+            Size = UDim2.new(1, -4, 0, 20);
+            ZIndex = 5;
+            Parent = Container;
+        });
+
+        Library:AddToRegistry(DropdownOuter, {
+            BorderColor3 = 'Black';
+        });
+
+        local DropdownInner = Library:Create('Frame', {
+            BackgroundColor3 = Library.MainColor;
+            BorderColor3 = Library.OutlineColor;
+            BorderMode = Enum.BorderMode.Inset;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 6;
+            Parent = DropdownOuter;
+        });
+
+        Library:AddToRegistry(DropdownInner, {
+            BackgroundColor3 = 'MainColor';
+            BorderColor3 = 'OutlineColor';
+        });
+
+        Library:Create('UIGradient', {
+            Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(212, 212, 212))
+            });
+            Rotation = 90;
+            Parent = DropdownInner;
+        });
+
+        local DropdownArrow = Library:Create('ImageLabel', {
+            AnchorPoint = Vector2.new(0, 0.5);
+            BackgroundTransparency = 1;
+            Position = UDim2.new(1, -16, 0.5, 0);
+            Size = UDim2.new(0, 12, 0, 12);
+            Image = 'http://www.roblox.com/asset/?id=6282522798';
+            ZIndex = 8;
+            Parent = DropdownInner;
+        });
+
+        local ItemList = Library:CreateLabel({
+            Position = UDim2.new(0, 5, 0, 0);
+            Size = UDim2.new(1, -5, 1, 0);
+            TextSize = 14;
+            Text = '--';
+            TextXAlignment = Enum.TextXAlignment.Left;
+            TextWrapped = true;
+            ZIndex = 7;
+            Parent = DropdownInner;
+        });
+
+        Library:OnHighlight(DropdownOuter, DropdownOuter,
+            { BorderColor3 = 'AccentColor' },
+            { BorderColor3 = 'Black' }
+        );
+
+        if type(Info.Tooltip) == 'string' then
+            Library:AddToolTip(Info.Tooltip, DropdownOuter)
+        end
+
+        local MAX_DROPDOWN_ITEMS = 8;
+
+        local ListOuter = Library:Create('Frame', {
+            BackgroundColor3 = Color3.new(0, 0, 0);
+            BorderColor3 = Color3.new(0, 0, 0);
+            ZIndex = 20;
+            Visible = false;
+            Parent = ScreenGui;
+        });
+
+        local function RecalculateListPosition()
+            ListOuter.Position = UDim2.fromOffset(DropdownOuter.AbsolutePosition.X, DropdownOuter.AbsolutePosition.Y + DropdownOuter.Size.Y.Offset + 1);
+        end;
+
+        local function RecalculateListSize(YSize)
+            ListOuter.Size = UDim2.fromOffset(DropdownOuter.AbsoluteSize.X, YSize or (MAX_DROPDOWN_ITEMS * 20 + 2))
+        end;
+
+        RecalculateListPosition();
+        RecalculateListSize();
+
+        DropdownOuter:GetPropertyChangedSignal('AbsolutePosition'):Connect(RecalculateListPosition);
+
+        local ListInner = Library:Create('Frame', {
+            BackgroundColor3 = Library.MainColor;
+            BorderColor3 = Library.OutlineColor;
+            BorderMode = Enum.BorderMode.Inset;
+            BorderSizePixel = 0;
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 21;
+            Parent = ListOuter;
+        });
+
+        Library:AddToRegistry(ListInner, {
+            BackgroundColor3 = 'MainColor';
+            BorderColor3 = 'OutlineColor';
+        });
+
+        local Scrolling = Library:Create('ScrollingFrame', {
+            BackgroundTransparency = 1;
+            BorderSizePixel = 0;
+            CanvasSize = UDim2.new(0, 0, 0, 0);
+            Size = UDim2.new(1, 0, 1, 0);
+            ZIndex = 21;
+            Parent = ListInner;
+
+            TopImage = 'rbxasset://textures/ui/Scroll/scroll-middle.png',
+            BottomImage = 'rbxasset://textures/ui/Scroll/scroll-middle.png',
+
+            ScrollBarThickness = 3,
+            ScrollBarImageColor3 = Library.AccentColor,
+        });
+
+        Library:AddToRegistry(Scrolling, {
+            ScrollBarImageColor3 = 'AccentColor'
+        })
+
+        Library:Create('UIListLayout', {
+            Padding = UDim.new(0, 0);
+            FillDirection = Enum.FillDirection.Vertical;
+            SortOrder = Enum.SortOrder.LayoutOrder;
+            Parent = Scrolling;
+        });
+
+        function Dropdown:Display()
+            local Values = Dropdown.Values;
+            local Str = '';
+
+            if Info.Multi then
+                for Idx, Value in next, Values do
+                    if Dropdown.Value[Value] then
+                        Str = Str .. Value .. ', ';
+                    end;
+                end;
+
+                Str = Str:sub(1, #Str - 2);
+            else
+                Str = Dropdown.Value or '';
+            end;
+
+            ItemList.Text = (Str == '' and '--' or Str);
+        end;
+
+        function Dropdown:GetActiveValues()
+            if Info.Multi then
+                local T = {};
+
+                for Value, Bool in next, Dropdown.Value do
+                    table.insert(T, Value);
+                end;
+
+                return T;
+            else
+                return Dropdown.Value and 1 or 0;
+            end;
+        end;
+
+        function Dropdown:BuildDropdownList()
+            local Values = Dropdown.Values;
+            local Buttons = {};
+
+            for _, Element in next, Scrolling:GetChildren() do
+                if not Element:IsA('UIListLayout') then
+                    Element:Destroy();
+                end;
+            end;
+
+            local Count = 0;
+
+            for Idx, Value in next, Values do
+                local Table = {};
+
+                Count = Count + 1;
+
+                local Button = Library:Create('Frame', {
+                    BackgroundColor3 = Library.MainColor;
+                    BorderColor3 = Library.OutlineColor;
+                    BorderMode = Enum.BorderMode.Middle;
+                    Size = UDim2.new(1, -1, 0, 20);
+                    ZIndex = 23;
+                    Active = true,
+                    Parent = Scrolling;
+                });
+
+                Library:AddToRegistry(Button, {
+                    BackgroundColor3 = 'MainColor';
+                    BorderColor3 = 'OutlineColor';
+                });
+
+                local ButtonLabel = Library:CreateLabel({
+                    Active = false;
+                    Size = UDim2.new(1, -6, 1, 0);
+                    Position = UDim2.new(0, 6, 0, 0);
+                    TextSize = 14;
+                    Text = Value;
+                    TextXAlignment = Enum.TextXAlignment.Left;
+                    ZIndex = 25;
+                    Parent = Button;
+                });
+
+                Library:OnHighlight(Button, Button,
+                    { BorderColor3 = 'AccentColor', ZIndex = 24 },
+                    { BorderColor3 = 'OutlineColor', ZIndex = 23 }
+                );
+
+                local Selected;
+
+                if Info.Multi then
+                    Selected = Dropdown.Value[Value];
+                else
+                    Selected = Dropdown.Value == Value;
+                end;
+
+                function Table:UpdateButton()
+                    if Info.Multi then
+                        Selected = Dropdown.Value[Value];
+                    else
+                        Selected = Dropdown.Value == Value;
+                    end;
+
+                    ButtonLabel.TextColor3 = Selected and Library.AccentColor or Library.FontColor;
+                    Library.RegistryMap[ButtonLabel].Properties.TextColor3 = Selected and 'AccentColor' or 'FontColor';
+                end;
+
+                ButtonLabel.InputBegan:Connect(function(Input)
+                    if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+                        local Try = not Selected;
+
+                        if Dropdown:GetActiveValues() == 1 and (not Try) and (not Info.AllowNull) then
+                        else
+                            if Info.Multi then
+                                Selected = Try;
+
+                                if Selected then
+                                    Dropdown.Value[Value] = true;
+                                else
+                                    Dropdown.Value[Value] = nil;
+                                end;
+                            else
+                                Selected = Try;
+
+                                if Selected then
+                                    Dropdown.Value = Value;
+                                else
+                                    Dropdown.Value = nil;
+                                end;
+
+                                for _, OtherButton in next, Buttons do
+                                    OtherButton:UpdateButton();
+                                end;
+                            end;
+
+                            Table:UpdateButton();
+                            Dropdown:Display();
+
+                            Library:SafeCallback(Dropdown.Callback, Dropdown.Value);
+                            Library:SafeCallback(Dropdown.Changed, Dropdown.Value);
+
+                            Library:AttemptSave();
+                        end;
+                    end;
+                end);
+
+                Table:UpdateButton();
+                Dropdown:Display();
+
+                Buttons[Button] = Table;
+            end;
+
+            Scrolling.CanvasSize = UDim2.fromOffset(0, (Count * 20) + 1);
+
+            local Y = math.clamp(Count * 20, 0, MAX_DROPDOWN_ITEMS * 20) + 1;
+            RecalculateListSize(Y);
+        end;
+
+        function Dropdown:SetValues(NewValues)
+            if NewValues then
+                Dropdown.Values = NewValues;
+            end;
+
+            Dropdown:BuildDropdownList();
+        end;
+
+        function Dropdown:OpenDropdown()
+            ListOuter.Visible = true;
+            Library.OpenedFrames[ListOuter] = true;
+            DropdownArrow.Rotation = 180;
+        end;
+
+        function Dropdown:CloseDropdown()
+            ListOuter.Visible = false;
+            Library.OpenedFrames[ListOuter] = nil;
+            DropdownArrow.Rotation = 0;
+        end;
+
+        function Dropdown:OnChanged(Func)
+            Dropdown.Changed = Func;
+            Func(Dropdown.Value);
+        end;
+
+        function Dropdown:SetValue(Val)
+            if Dropdown.Multi then
+                local nTable = {};
+
+                for Value, Bool in next, Val do
+                    if table.find(Dropdown.Values, Value) then
+                        nTable[Value] = true
+                    end;
+                end;
+
+                Dropdown.Value = nTable;
+            else
+                if (not Val) then
+                    Dropdown.Value = nil;
+                elseif table.find(Dropdown.Values, Val) then
+                    Dropdown.Value = Val;
+                end;
+            end;
+
+            Dropdown:BuildDropdownList();
+
+            Library:SafeCallback(Dropdown.Callback, Dropdown.Value);
+            Library:SafeCallback(Dropdown.Changed, Dropdown.Value);
+        end;
+
+        DropdownOuter.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 and not Library:MouseIsOverOpenedFrame() then
+                if ListOuter.Visible then
+                    Dropdown:CloseDropdown();
+                else
+                    Dropdown:OpenDropdown();
+                end;
+            end;
+        end);
+
+        InputService.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+                local AbsPos, AbsSize = ListOuter.AbsolutePosition, ListOuter.AbsoluteSize;
+
+                if Mouse.X < AbsPos.X or Mouse.X > AbsPos.X + AbsSize.X
+                    or Mouse.Y < (AbsPos.Y - 20 - 1) or Mouse.Y > AbsPos.Y + AbsSize.Y then
+
+                    Dropdown:CloseDropdown();
+                end;
+            end;
+        end);
+
+        Dropdown:BuildDropdownList();
+        Dropdown:Display();
+
+        local Defaults = {}
+
+        if type(Info.Default) == 'string' then
+            local Idx = table.find(Dropdown.Values, Info.Default)
+            if Idx then
+                table.insert(Defaults, Idx)
+            end
+        elseif type(Info.Default) == 'table' then
+            for _, Value in next, Info.Default do
+                local Idx = table.find(Dropdown.Values, Value)
+                if Idx then
+                    table.insert(Defaults, Idx)
+                end
+            end
+        elseif type(Info.Default) == 'number' and Dropdown.Values[Info.Default] ~= nil then
+            table.insert(Defaults, Info.Default)
+        end
+
+        if next(Defaults) then
+            for i = 1, #Defaults do
+                local Index = Defaults[i]
+                if Info.Multi then
+                    Dropdown.Value[Dropdown.Values[Index]] = true
+                else
+                    Dropdown.Value = Dropdown.Values[Index];
+                end
+
+                if (not Info.Multi) then break end
+            end
+
+            Dropdown:BuildDropdownList();
+            Dropdown:Display();
+        end
+
+        Groupbox:AddBlank(Info.BlankSize or 5);
+        Groupbox:Resize();
+
+        Options[Idx] = Dropdown;
+
+        return Dropdown;
+    end;
+
+    function Funcs:AddDependencyBox()
+        local Depbox = {
+            Dependencies = {};
+        };
+        
+        local Groupbox = self;
+        local Container = Groupbox.Container;
+
+        local Holder = Library:Create('Frame', {
+            BackgroundTransparency = 1;
+            Size = UDim2.new(1, 0, 0, 0);
+            Visible = false;
+            Parent = Container;
+        });
+
+        local Frame = Library:Create('Frame', {
+            BackgroundTransparency = 1;
+            Size = UDim2.new(1, 0, 1, 0);
+            Visible = true;
+            Parent = Holder;
+        });
+
+        local Layout = Library:Create('UIListLayout', {
+            FillDirection = Enum.FillDirection.Vertical;
+            SortOrder = Enum.SortOrder.LayoutOrder;
+            Parent = Frame;
+        });
+
+        function Depbox:Resize()
+            Holder.Size = UDim2.new(1, 0, 0, Layout.AbsoluteContentSize.Y);
+            Groupbox:Resize();
+        end;
+
+        Layout:GetPropertyChangedSignal('AbsoluteContentSize'):Connect(function()
+            Depbox:Resize();
+        end);
+
+        Holder:GetPropertyChangedSignal('Visible'):Connect(function()
+            Depbox:Resize();
+        end);
+
+        function Depbox:Update()
+            for _, Dependency in next, Depbox.Dependencies do
+                local Elem = Dependency[1];
+                local Value = Dependency[2];
+
+                if Elem.Type == 'Toggle' and Elem.Value ~= Value then
+                    Holder.Visible = false;
+                    Depbox:Resize();
+                    return;
+                end;
+            end;
+
+            Holder.Visible = true;
+            Depbox:Resize();
+        end;
+
+        function Depbox:SetupDependencies(Dependencies)
+            for _, Dependency in next, Dependencies do
+                assert(type(Dependency) == 'table', 'SetupDependencies: Dependency is not of type `table`.');
+                assert(Dependency[1], 'SetupDependencies: Dependency is missing element argument.');
+                assert(Dependency[2] ~= nil, 'SetupDependencies: Dependency is missing value argument.');
+            end;
+
+            Depbox.Dependencies = Dependencies;
+            Depbox:Update();
+        end;
+
+        Depbox.Container = Frame;
+
+        setmetatable(Depbox, BaseGroupbox);
+
+        table.insert(Library.DependencyBoxes, Depbox);
+
+        return Depbox;
+    end;
+
+    BaseGroupbox.__index = Funcs;
+    BaseGroupbox.__namecall = function(Table, Key, ...)
+        return Funcs[Key](...);
+    end;
+end;
+
+-- < Create other UI elements >
+do
+    Library.NotificationArea = Library:Create('Frame', {
+        BackgroundTransparency = 1;
+        Position = UDim2.new(0, 0, 0, 40);
+        Size = UDim2.new(0, 300, 0, 200);
+        ZIndex = 100;
+        Parent = ScreenGui;
+    });
+
+    Library:Create('UIListLayout', {
+        Padding = UDim.new(0, 4);
+        FillDirection = Enum.FillDirection.Vertical;
+        SortOrder = Enum.SortOrder.LayoutOrder;
+        Parent = Library.NotificationArea;
+    });
+
+    local WatermarkOuter = Library:Create('Frame', {
+        BorderColor3 = Color3.new(0, 0, 0);
+        Position = UDim2.new(0, 100, 0, -25);
+        Size = UDim2.new(0, 213, 0, 20);
+        ZIndex = 200;
+        Visible = false;
+        Parent = ScreenGui;
+    });
+
+    local WatermarkInner = Library:Create('Frame', {
+        BackgroundColor3 = Library.MainColor;
+        BorderColor3 = Library.AccentColor;
+        BorderMode = Enum.BorderMode.Inset;
+        Size = UDim2.new(1, 0, 1, 0);
+        ZIndex = 201;
+        Parent = WatermarkOuter;
+    });
+
+    Library:AddToRegistry(WatermarkInner, {
+        BorderColor3 = 'AccentColor';
+    });
+
+    local InnerFrame = Library:Create('Frame', {
+        BackgroundColor3 = Color3.new(1, 1, 1);
+        BorderSizePixel = 0;
+        Position = UDim2.new(0, 1, 0, 1);
+        Size = UDim2.new(1, -2, 1, -2);
+        ZIndex = 202;
+        Parent = WatermarkInner;
+    });
+
+    local Gradient = Library:Create('UIGradient', {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Library:GetDarkerColor(Library.MainColor)),
+            ColorSequenceKeypoint.new(1, Library.MainColor),
+        });
+        Rotation = -90;
+        Parent = InnerFrame;
+    });
+
+    Library:AddToRegistry(Gradient, {
+        Color = function()
+            return ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Library:GetDarkerColor(Library.MainColor)),
+                ColorSequenceKeypoint.new(1, Library.MainColor),
+            });
+        end
+    });
+
+    local WatermarkLabel = Library:CreateLabel({
+        Position = UDim2.new(0, 5, 0, 0);
+        Size = UDim2.new(1, -4, 1, 0);
+        TextSize = 14;
+        TextXAlignment = Enum.TextXAlignment.Left;
+        ZIndex = 203;
+        Parent = InnerFrame;
+    });
+
+    Library.Watermark = WatermarkOuter;
+    Library.WatermarkText = WatermarkLabel;
+    Library:MakeDraggable(Library.Watermark);
+
+
+
+    local KeybindOuter = Library:Create('Frame', {
+        AnchorPoint = Vector2.new(0, 0.5);
+        BorderColor3 = Color3.new(0, 0, 0);
+        Position = UDim2.new(0, 10, 0.5, 0);
+        Size = UDim2.new(0, 210, 0, 20);
+        Visible = false;
+        ZIndex = 100;
+        Parent = ScreenGui;
+    });
+
+    local KeybindInner = Library:Create('Frame', {
+        BackgroundColor3 = Library.MainColor;
+        BorderColor3 = Library.OutlineColor;
+        BorderMode = Enum.BorderMode.Inset;
+        Size = UDim2.new(1, 0, 1, 0);
+        ZIndex = 101;
+        Parent = KeybindOuter;
+    });
+
+    Library:AddToRegistry(KeybindInner, {
+        BackgroundColor3 = 'MainColor';
+        BorderColor3 = 'OutlineColor';
+    }, true);
+
+    local ColorFrame = Library:Create('Frame', {
+        BackgroundColor3 = Library.AccentColor;
+        BorderSizePixel = 0;
+        Size = UDim2.new(1, 0, 0, 2);
+        ZIndex = 102;
+        Parent = KeybindInner;
+    });
+
+    Library:AddToRegistry(ColorFrame, {
+        BackgroundColor3 = 'AccentColor';
+    }, true);
+
+    local KeybindLabel = Library:CreateLabel({
+        Size = UDim2.new(1, 0, 0, 20);
+        Position = UDim2.fromOffset(5, 2),
+        TextXAlignment = Enum.TextXAlignment.Left,
+
+        Text = 'Keybinds';
+        ZIndex = 104;
+        Parent = KeybindInner;
+    });
+
+    local KeybindContainer = Library:Create('Frame', {
+        BackgroundTransparency = 1;
+        Size = UDim2.new(1, 0, 1, -20);
+        Position = UDim2.new(0, 0, 0, 20);
+        ZIndex = 1;
+        Parent = KeybindInner;
+    });
+
+    Library:Create('UIListLayout', {
+        FillDirection = Enum.FillDirection.Vertical;
+        SortOrder = Enum.SortOrder.LayoutOrder;
+        Parent = KeybindContainer;
+    });
+
+    Library:Create('UIPadding', {
+        PaddingLeft = UDim.new(0, 5),
+        Parent = KeybindContainer,
+    })
+
+    Library.KeybindFrame = KeybindOuter;
+    Library.KeybindContainer = KeybindContainer;
+    Library:MakeDraggable(KeybindOuter);
+end;
+
+function Library:SetWatermarkVisibility(Bool)
+    Library.Watermark.Visible = Bool;
+end;
+
+function Library:SetWatermark(Text)
+    local X, Y = Library:GetTextBounds(Text, Library.Font, 14);
+    Library.Watermark.Size = UDim2.new(0, X + 15, 0, (Y * 1.5) + 3);
+    Library:SetWatermarkVisibility(true)
+
+    Library.WatermarkText.Text = Text;
+end;
+
+function Library:Notify(Text, Time)
+    local XSize, YSize = Library:GetTextBounds(Text, Library.Font, 14);
+
+    YSize = YSize + 7
+
+    local NotifyOuter = Library:Create('Frame', {
+        BorderColor3 = Color3.new(0, 0, 0);
+        Position = UDim2.new(0, 100, 0, 10);
+        Size = UDim2.new(0, 0, 0, YSize);
+        ClipsDescendants = true;
+        ZIndex = 100;
+        Parent = Library.NotificationArea;
+    });
+
+    local NotifyInner = Library:Create('Frame', {
+        BackgroundColor3 = Library.MainColor;
+        BorderColor3 = Library.OutlineColor;
+        BorderMode = Enum.BorderMode.Inset;
+        Size = UDim2.new(1, 0, 1, 0);
+        ZIndex = 101;
+        Parent = NotifyOuter;
+    });
+
+    Library:AddToRegistry(NotifyInner, {
+        BackgroundColor3 = 'MainColor';
+        BorderColor3 = 'OutlineColor';
+    }, true);
+
+    local InnerFrame = Library:Create('Frame', {
+        BackgroundColor3 = Color3.new(1, 1, 1);
+        BorderSizePixel = 0;
+        Position = UDim2.new(0, 1, 0, 1);
+        Size = UDim2.new(1, -2, 1, -2);
+        ZIndex = 102;
+        Parent = NotifyInner;
+    });
+
+    local Gradient = Library:Create('UIGradient', {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Library:GetDarkerColor(Library.MainColor)),
+            ColorSequenceKeypoint.new(1, Library.MainColor),
+        });
+        Rotation = -90;
+        Parent = InnerFrame;
+    });
+
+    Library:AddToRegistry(Gradient, {
+        Color = function()
+            return ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Library:GetDarkerColor(Library.MainColor)),
+                ColorSequenceKeypoint.new(1, Library.MainColor),
+            });
+        end
+    });
+
+    local NotifyLabel = Library:CreateLabel({
+        Position = UDim2.new(0, 4, 0, 0);
+        Size = UDim2.new(1, -4, 1, 0);
+        Text = Text;
+        TextXAlignment = Enum.TextXAlignment.Left;
+        TextSize = 14;
+        ZIndex = 103;
+        Parent = InnerFrame;
+    });
+
+    local LeftColor = Library:Create('Frame', {
+        BackgroundColor3 = Library.AccentColor;
+        BorderSizePixel = 0;
+        Position = UDim2.new(0, -1, 0, -1);
+        Size = UDim2.new(0, 3, 1, 2);
+        ZIndex = 104;
+        Parent = NotifyOuter;
+    });
+
+    Library:AddToRegistry(LeftColor, {
+        BackgroundColor3 = 'AccentColor';
+    }, true);
+
+    pcall(NotifyOuter.TweenSize, NotifyOuter, UDim2.new(0, XSize + 8 + 4, 0, YSize), 'Out', 'Quad', 0.4, true);
+
+    task.spawn(function()
+        wait(Time or 5);
+
+        pcall(NotifyOuter.TweenSize, NotifyOuter, UDim2.new(0, 0, 0, YSize), 'Out', 'Quad', 0.4, true);
+
+        wait(0.4);
+
+        NotifyOuter:Destroy();
+    end);
+end;
+
+function Library:CreateWindow(...)
+    local Arguments = { ... }
+    local Config = { AnchorPoint = Vector2.zero }
+
+    if type(...) == 'table' then
+        Config = ...;
+    else
+        Config.Title = Arguments[1]
+        Config.AutoShow = Arguments[2] or false;
+    end
+
+    if type(Config.Title) ~= 'string' then Config.Title = 'No title' end
+    if type(Config.TabPadding) ~= 'number' then Config.TabPadding = 0 end
+    if type(Config.MenuFadeTime) ~= 'number' then Config.MenuFadeTime = 0.2 end
+
+    if typeof(Config.Position) ~= 'UDim2' then Config.Position = UDim2.fromOffset(175, 50) end
+    if typeof(Config.Size) ~= 'UDim2' then Config.Size = UDim2.fromOffset(550, 600) end
+
+    if Config.Center then
+        Config.AnchorPoint = Vector2.new(0.5, 0.5)
+        Config.Position = UDim2.fromScale(0.5, 0.5)
+    end
+
+    local Window = {
+        Tabs = {};
+    };
+
+    local Outer = Library:Create('Frame', {
+        AnchorPoint = Config.AnchorPoint,
+        BackgroundColor3 = Color3.new(0, 0, 0);
+        BorderSizePixel = 0;
+        Position = Config.Position,
+        Size = Config.Size,
+        Visible = false;
+        ZIndex = 1;
+        Parent = ScreenGui;
+    });
+
+    Library:MakeDraggable(Outer, 25);
+
+    local Inner = Library:Create('Frame', {
+        BackgroundColor3 = Library.MainColor;
+        BorderColor3 = Library.AccentColor;
+        BorderMode = Enum.BorderMode.Inset;
+        Position = UDim2.new(0, 1, 0, 1);
+        Size = UDim2.new(1, -2, 1, -2);
+        ZIndex = 1;
+        Parent = Outer;
+    });
+
+    Library:AddToRegistry(Inner, {
+        BackgroundColor3 = 'MainColor';
+        BorderColor3 = 'AccentColor';
+    });
+
+    local WindowLabel = Library:CreateLabel({
+        Position = UDim2.new(0, 7, 0, 0);
+        Size = UDim2.new(0, 0, 0, 25);
+        Text = Config.Title or '';
+        TextXAlignment = Enum.TextXAlignment.Left;
+        ZIndex = 1;
+        Parent = Inner;
+    });
+
+    local MainSectionOuter = Library:Create('Frame', {
+        BackgroundColor3 = Library.BackgroundColor;
+        BorderColor3 = Library.OutlineColor;
+        Position = UDim2.new(0, 8, 0, 25);
+        Size = UDim2.new(1, -16, 1, -33);
+        ZIndex = 1;
+        Parent = Inner;
+    });
+
+    Library:AddToRegistry(MainSectionOuter, {
+        BackgroundColor3 = 'BackgroundColor';
+        BorderColor3 = 'OutlineColor';
+    });
+
+    local MainSectionInner = Library:Create('Frame', {
+        BackgroundColor3 = Library.BackgroundColor;
+        BorderColor3 = Color3.new(0, 0, 0);
+        BorderMode = Enum.BorderMode.Inset;
+        Position = UDim2.new(0, 0, 0, 0);
+        Size = UDim2.new(1, 0, 1, 0);
+        ZIndex = 1;
+        Parent = MainSectionOuter;
+    });
+
+    Library:AddToRegistry(MainSectionInner, {
+        BackgroundColor3 = 'BackgroundColor';
+    });
+
+    local TabArea = Library:Create('Frame', {
+        BackgroundTransparency = 1;
+        Position = UDim2.new(0, 8, 0, 8);
+        Size = UDim2.new(1, -16, 0, 21);
+        ZIndex = 1;
+        Parent = MainSectionInner;
+    });
+
+    local TabListLayout = Library:Create('UIListLayout', {
+        Padding = UDim.new(0, Config.TabPadding);
+        FillDirection = Enum.FillDirection.Horizontal;
+        SortOrder = Enum.SortOrder.LayoutOrder;
+        Parent = TabArea;
+    });
+
+    local TabContainer = Library:Create('Frame', {
+        BackgroundColor3 = Library.MainColor;
+        BorderColor3 = Library.OutlineColor;
+        Position = UDim2.new(0, 8, 0, 30);
+        Size = UDim2.new(1, -16, 1, -38);
+        ZIndex = 2;
+        Parent = MainSectionInner;
+    });
+    
+
+    Library:AddToRegistry(TabContainer, {
+        BackgroundColor3 = 'MainColor';
+        BorderColor3 = 'OutlineColor';
+    });
+
+    function Window:SetWindowTitle(Title)
+        WindowLabel.Text = Title;
+    end;
+
+    function Window:AddTab(Name)
+        local Tab = {
+            Groupboxes = {};
+            Tabboxes = {};
+        };
+
+        local TabButtonWidth = Library:GetTextBounds(Name, Library.Font, 16);
+
+        local TabButton = Library:Create('Frame', {
+            BackgroundColor3 = Library.BackgroundColor;
+            BorderColor3 = Library.OutlineColor;
+            Size = UDim2.new(0, TabButtonWidth + 8 + 4, 1, 0);
+            ZIndex = 1;
+            Parent = TabArea;
+        });
+
+        Library:AddToRegistry(TabButton, {
+            BackgroundColor3 = 'BackgroundColor';
+            BorderColor3 = 'OutlineColor';
+        });
+
+        local TabButtonLabel = Library:CreateLabel({
+            Position = UDim2.new(0, 0, 0, 0);
+            Size = UDim2.new(1, 0, 1, -1);
+            Text = Name;
+            ZIndex = 1;
+            Parent = TabButton;
+        });
+
+        local Blocker = Library:Create('Frame', {
+            BackgroundColor3 = Library.MainColor;
+            BorderSizePixel = 0;
+            Position = UDim2.new(0, 0, 1, 0);
+            Size = UDim2.new(1, 0, 0, 1);
+            BackgroundTransparency = 1;
+            ZIndex = 3;
+            Parent = TabButton;
+        });
+
+        Library:AddToRegistry(Blocker, {
+            BackgroundColor3 = 'MainColor';
+        });
+
+        local TabFrame = Library:Create('Frame', {
+            Name = 'TabFrame',
+            BackgroundTransparency = 1;
+            Position = UDim2.new(0, 0, 0, 0);
+            Size = UDim2.new(1, 0, 1, 0);
+            Visible = false;
+            ZIndex = 2;
+            Parent = TabContainer;
+        });
+
+        local LeftSide = Library:Create('ScrollingFrame', {
+            BackgroundTransparency = 1;
+            BorderSizePixel = 0;
+            Position = UDim2.new(0, 8 - 1, 0, 8 - 1);
+            Size = UDim2.new(0.5, -12 + 2, 0, 507 + 2);
+            CanvasSize = UDim2.new(0, 0, 0, 0);
+            BottomImage = '';
+            TopImage = '';
+            ScrollBarThickness = 0;
+            ZIndex = 2;
+            Parent = TabFrame;
+        });
+
+        local RightSide = Library:Create('ScrollingFrame', {
+            BackgroundTransparency = 1;
+            BorderSizePixel = 0;
+            Position = UDim2.new(0.5, 4 + 1, 0, 8 - 1);
+            Size = UDim2.new(0.5, -12 + 2, 0, 507 + 2);
+            CanvasSize = UDim2.new(0, 0, 0, 0);
+            BottomImage = '';
+            TopImage = '';
+            ScrollBarThickness = 0;
+            ZIndex = 2;
+            Parent = TabFrame;
+        });
+
+        Library:Create('UIListLayout', {
+            Padding = UDim.new(0, 8);
+            FillDirection = Enum.FillDirection.Vertical;
+            SortOrder = Enum.SortOrder.LayoutOrder;
+            HorizontalAlignment = Enum.HorizontalAlignment.Center;
+            Parent = LeftSide;
+        });
+
+        Library:Create('UIListLayout', {
+            Padding = UDim.new(0, 8);
+            FillDirection = Enum.FillDirection.Vertical;
+            SortOrder = Enum.SortOrder.LayoutOrder;
+            HorizontalAlignment = Enum.HorizontalAlignment.Center;
+            Parent = RightSide;
+        });
+
+        for _, Side in next, { LeftSide, RightSide } do
+            Side:WaitForChild('UIListLayout'):GetPropertyChangedSignal('AbsoluteContentSize'):Connect(function()
+                Side.CanvasSize = UDim2.fromOffset(0, Side.UIListLayout.AbsoluteContentSize.Y);
+            end);
+        end;
+
+        function Tab:ShowTab()
+            for _, Tab in next, Window.Tabs do
+                Tab:HideTab();
+            end;
+
+            Blocker.BackgroundTransparency = 0;
+            TabButton.BackgroundColor3 = Library.MainColor;
+            Library.RegistryMap[TabButton].Properties.BackgroundColor3 = 'MainColor';
+            TabFrame.Visible = true;
+        end;
+
+        function Tab:HideTab()
+            Blocker.BackgroundTransparency = 1;
+            TabButton.BackgroundColor3 = Library.BackgroundColor;
+            Library.RegistryMap[TabButton].Properties.BackgroundColor3 = 'BackgroundColor';
+            TabFrame.Visible = false;
+        end;
+
+        function Tab:SetLayoutOrder(Position)
+            TabButton.LayoutOrder = Position;
+            TabListLayout:ApplyLayout();
+        end;
+
+        function Tab:AddGroupbox(Info)
+            local Groupbox = {};
+
+            local BoxOuter = Library:Create('Frame', {
+                BackgroundColor3 = Library.BackgroundColor;
+                BorderColor3 = Library.OutlineColor;
+                BorderMode = Enum.BorderMode.Inset;
+                Size = UDim2.new(1, 0, 0, 507 + 2);
+                ZIndex = 2;
+                Parent = Info.Side == 1 and LeftSide or RightSide;
+            });
+
+            Library:AddToRegistry(BoxOuter, {
+                BackgroundColor3 = 'BackgroundColor';
+                BorderColor3 = 'OutlineColor';
+            });
+
+            local BoxInner = Library:Create('Frame', {
+                BackgroundColor3 = Library.BackgroundColor;
+                BorderColor3 = Color3.new(0, 0, 0);
+                -- BorderMode = Enum.BorderMode.Inset;
+                Size = UDim2.new(1, -2, 1, -2);
+                Position = UDim2.new(0, 1, 0, 1);
+                ZIndex = 4;
+                Parent = BoxOuter;
+            });
+
+            Library:AddToRegistry(BoxInner, {
+                BackgroundColor3 = 'BackgroundColor';
+            });
+
+            local Highlight = Library:Create('Frame', {
+                BackgroundColor3 = Library.AccentColor;
+                BorderSizePixel = 0;
+                Size = UDim2.new(1, 0, 0, 2);
+                ZIndex = 5;
+                Parent = BoxInner;
+            });
+
+            Library:AddToRegistry(Highlight, {
+                BackgroundColor3 = 'AccentColor';
+            });
+
+            local GroupboxLabel = Library:CreateLabel({
+                Size = UDim2.new(1, 0, 0, 18);
+                Position = UDim2.new(0, 4, 0, 2);
+                TextSize = 14;
+                Text = Info.Name;
+                TextXAlignment = Enum.TextXAlignment.Left;
+                ZIndex = 5;
+                Parent = BoxInner;
+            });
+
+            local Container = Library:Create('Frame', {
+                BackgroundTransparency = 1;
+                Position = UDim2.new(0, 4, 0, 20);
+                Size = UDim2.new(1, -4, 1, -20);
+                ZIndex = 1;
+                Parent = BoxInner;
+            });
+
+            Library:Create('UIListLayout', {
+                FillDirection = Enum.FillDirection.Vertical;
+                SortOrder = Enum.SortOrder.LayoutOrder;
+                Parent = Container;
+            });
+
+            function Groupbox:Resize()
+                local Size = 0;
+
+                for _, Element in next, Groupbox.Container:GetChildren() do
+                    if (not Element:IsA('UIListLayout')) and Element.Visible then
+                        Size = Size + Element.Size.Y.Offset;
+                    end;
+                end;
+
+                BoxOuter.Size = UDim2.new(1, 0, 0, 20 + Size + 2 + 2);
+            end;
+
+            Groupbox.Container = Container;
+            setmetatable(Groupbox, BaseGroupbox);
+
+            Groupbox:AddBlank(3);
+            Groupbox:Resize();
+
+            Tab.Groupboxes[Info.Name] = Groupbox;
+
+            return Groupbox;
+        end;
+
+        function Tab:AddLeftGroupbox(Name)
+            return Tab:AddGroupbox({ Side = 1; Name = Name; });
+        end;
+
+        function Tab:AddRightGroupbox(Name)
+            return Tab:AddGroupbox({ Side = 2; Name = Name; });
+        end;
+
+        function Tab:AddTabbox(Info)
+            local Tabbox = {
+                Tabs = {};
+            };
+
+            local BoxOuter = Library:Create('Frame', {
+                BackgroundColor3 = Library.BackgroundColor;
+                BorderColor3 = Library.OutlineColor;
+                BorderMode = Enum.BorderMode.Inset;
+                Size = UDim2.new(1, 0, 0, 0);
+                ZIndex = 2;
+                Parent = Info.Side == 1 and LeftSide or RightSide;
+            });
+
+            Library:AddToRegistry(BoxOuter, {
+                BackgroundColor3 = 'BackgroundColor';
+                BorderColor3 = 'OutlineColor';
+            });
+
+            local BoxInner = Library:Create('Frame', {
+                BackgroundColor3 = Library.BackgroundColor;
+                BorderColor3 = Color3.new(0, 0, 0);
+                -- BorderMode = Enum.BorderMode.Inset;
+                Size = UDim2.new(1, -2, 1, -2);
+                Position = UDim2.new(0, 1, 0, 1);
+                ZIndex = 4;
+                Parent = BoxOuter;
+            });
+
+            Library:AddToRegistry(BoxInner, {
+                BackgroundColor3 = 'BackgroundColor';
+            });
+
+            local Highlight = Library:Create('Frame', {
+                BackgroundColor3 = Library.AccentColor;
+                BorderSizePixel = 0;
+                Size = UDim2.new(1, 0, 0, 2);
+                ZIndex = 10;
+                Parent = BoxInner;
+            });
+
+            Library:AddToRegistry(Highlight, {
+                BackgroundColor3 = 'AccentColor';
+            });
+
+            local TabboxButtons = Library:Create('Frame', {
+                BackgroundTransparency = 1;
+                Position = UDim2.new(0, 0, 0, 1);
+                Size = UDim2.new(1, 0, 0, 18);
+                ZIndex = 5;
+                Parent = BoxInner;
+            });
+
+            Library:Create('UIListLayout', {
+                FillDirection = Enum.FillDirection.Horizontal;
+                HorizontalAlignment = Enum.HorizontalAlignment.Left;
+                SortOrder = Enum.SortOrder.LayoutOrder;
+                Parent = TabboxButtons;
+            });
+
+            function Tabbox:AddTab(Name)
+                local Tab = {};
+
+                local Button = Library:Create('Frame', {
+                    BackgroundColor3 = Library.MainColor;
+                    BorderColor3 = Color3.new(0, 0, 0);
+                    Size = UDim2.new(0.5, 0, 1, 0);
+                    ZIndex = 6;
+                    Parent = TabboxButtons;
+                });
+
+                Library:AddToRegistry(Button, {
+                    BackgroundColor3 = 'MainColor';
+                });
+
+                local ButtonLabel = Library:CreateLabel({
+                    Size = UDim2.new(1, 0, 1, 0);
+                    TextSize = 14;
+                    Text = Name;
+                    TextXAlignment = Enum.TextXAlignment.Center;
+                    ZIndex = 7;
+                    Parent = Button;
+                });
+
+                local Block = Library:Create('Frame', {
+                    BackgroundColor3 = Library.BackgroundColor;
+                    BorderSizePixel = 0;
+                    Position = UDim2.new(0, 0, 1, 0);
+                    Size = UDim2.new(1, 0, 0, 1);
+                    Visible = false;
+                    ZIndex = 9;
+                    Parent = Button;
+                });
+
+                Library:AddToRegistry(Block, {
+                    BackgroundColor3 = 'BackgroundColor';
+                });
+
+                local Container = Library:Create('Frame', {
+                    BackgroundTransparency = 1;
+                    Position = UDim2.new(0, 4, 0, 20);
+                    Size = UDim2.new(1, -4, 1, -20);
+                    ZIndex = 1;
+                    Visible = false;
+                    Parent = BoxInner;
+                });
+
+                Library:Create('UIListLayout', {
+                    FillDirection = Enum.FillDirection.Vertical;
+                    SortOrder = Enum.SortOrder.LayoutOrder;
+                    Parent = Container;
+                });
+
+                function Tab:Show()
+                    for _, Tab in next, Tabbox.Tabs do
+                        Tab:Hide();
+                    end;
+
+                    Container.Visible = true;
+                    Block.Visible = true;
+
+                    Button.BackgroundColor3 = Library.BackgroundColor;
+                    Library.RegistryMap[Button].Properties.BackgroundColor3 = 'BackgroundColor';
+
+                    Tab:Resize();
+                end;
+
+                function Tab:Hide()
+                    Container.Visible = false;
+                    Block.Visible = false;
+
+                    Button.BackgroundColor3 = Library.MainColor;
+                    Library.RegistryMap[Button].Properties.BackgroundColor3 = 'MainColor';
+                end;
+
+                function Tab:Resize()
+                    local TabCount = 0;
+
+                    for _, Tab in next, Tabbox.Tabs do
+                        TabCount = TabCount + 1;
+                    end;
+
+                    for _, Button in next, TabboxButtons:GetChildren() do
+                        if not Button:IsA('UIListLayout') then
+                            Button.Size = UDim2.new(1 / TabCount, 0, 1, 0);
+                        end;
+                    end;
+
+                    if (not Container.Visible) then
+                        return;
+                    end;
+
+                    local Size = 0;
+
+                    for _, Element in next, Tab.Container:GetChildren() do
+                        if (not Element:IsA('UIListLayout')) and Element.Visible then
+                            Size = Size + Element.Size.Y.Offset;
+                        end;
+                    end;
+
+                    BoxOuter.Size = UDim2.new(1, 0, 0, 20 + Size + 2 + 2);
+                end;
+
+                Button.InputBegan:Connect(function(Input)
+                    if Input.UserInputType == Enum.UserInputType.MouseButton1 and not Library:MouseIsOverOpenedFrame() then
+                        Tab:Show();
+                        Tab:Resize();
+                    end;
+                end);
+
+                Tab.Container = Container;
+                Tabbox.Tabs[Name] = Tab;
+
+                setmetatable(Tab, BaseGroupbox);
+
+                Tab:AddBlank(3);
+                Tab:Resize();
+
+                -- Show first tab (number is 2 cus of the UIListLayout that also sits in that instance)
+                if #TabboxButtons:GetChildren() == 2 then
+                    Tab:Show();
+                end;
+
+                return Tab;
+            end;
+
+            Tab.Tabboxes[Info.Name or ''] = Tabbox;
+
+            return Tabbox;
+        end;
+
+        function Tab:AddLeftTabbox(Name)
+            return Tab:AddTabbox({ Name = Name, Side = 1; });
+        end;
+
+        function Tab:AddRightTabbox(Name)
+            return Tab:AddTabbox({ Name = Name, Side = 2; });
+        end;
+
+        TabButton.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+                Tab:ShowTab();
+            end;
+        end);
+
+        -- This was the first tab added, so we show it by default.
+        if #TabContainer:GetChildren() == 1 then
+            Tab:ShowTab();
+        end;
+
+        Window.Tabs[Name] = Tab;
+        return Tab;
+    end;
+
+    local ModalElement = Library:Create('TextButton', {
+        BackgroundTransparency = 1;
+        Size = UDim2.new(0, 0, 0, 0);
+        Visible = true;
+        Text = '';
+        Modal = false;
+        Parent = ScreenGui;
+    });
+
+    local TransparencyCache = {};
+    local Toggled = false;
+    local Fading = false;
+
+    function Library:Toggle()
+        if Fading then
+            return;
+        end;
+
+        local FadeTime = Config.MenuFadeTime;
+        Fading = true;
+        Toggled = (not Toggled);
+        ModalElement.Modal = Toggled;
+
+        if Toggled then
+            -- A bit scuffed, but if we're going from not toggled -> toggled we want to show the frame immediately so that the fade is visible.
+            Outer.Visible = true;
+
+            task.spawn(function()
+                -- TODO: add cursor fade?
+                local State = InputService.MouseIconEnabled;
+
+                local Cursor = Drawing.new('Triangle');
+                Cursor.Thickness = 1;
+                Cursor.Filled = true;
+                Cursor.Visible = true;
+
+                local CursorOutline = Drawing.new('Triangle');
+                CursorOutline.Thickness = 1;
+                CursorOutline.Filled = false;
+                CursorOutline.Color = Color3.new(0, 0, 0);
+                CursorOutline.Visible = true;
+
+                while Toggled and ScreenGui.Parent do
+                    InputService.MouseIconEnabled = false;
+
+                    local mPos = InputService:GetMouseLocation();
+
+                    Cursor.Color = Library.AccentColor;
+
+                    Cursor.PointA = Vector2.new(mPos.X, mPos.Y);
+                    Cursor.PointB = Vector2.new(mPos.X + 16, mPos.Y + 6);
+                    Cursor.PointC = Vector2.new(mPos.X + 6, mPos.Y + 16);
+
+                    CursorOutline.PointA = Cursor.PointA;
+                    CursorOutline.PointB = Cursor.PointB;
+                    CursorOutline.PointC = Cursor.PointC;
+
+                    RenderStepped:Wait();
+                end;
+
+                InputService.MouseIconEnabled = State;
+
+                Cursor:Remove();
+                CursorOutline:Remove();
+            end);
+        end;
+
+        for _, Desc in next, Outer:GetDescendants() do
+            local Properties = {};
+
+            if Desc:IsA('ImageLabel') then
+                table.insert(Properties, 'ImageTransparency');
+                table.insert(Properties, 'BackgroundTransparency');
+            elseif Desc:IsA('TextLabel') or Desc:IsA('TextBox') then
+                table.insert(Properties, 'TextTransparency');
+            elseif Desc:IsA('Frame') or Desc:IsA('ScrollingFrame') then
+                table.insert(Properties, 'BackgroundTransparency');
+            elseif Desc:IsA('UIStroke') then
+                table.insert(Properties, 'Transparency');
+            end;
+
+            local Cache = TransparencyCache[Desc];
+
+            if (not Cache) then
+                Cache = {};
+                TransparencyCache[Desc] = Cache;
+            end;
+
+            for _, Prop in next, Properties do
+                if not Cache[Prop] then
+                    Cache[Prop] = Desc[Prop];
+                end;
+
+                if Cache[Prop] == 1 then
+                    continue;
+                end;
+
+                TweenService:Create(Desc, TweenInfo.new(FadeTime, Enum.EasingStyle.Linear), { [Prop] = Toggled and Cache[Prop] or 1 }):Play();
+            end;
+        end;
+
+        task.wait(FadeTime);
+
+        Outer.Visible = Toggled;
+
+        Fading = false;
+    end
+
+    Library:GiveSignal(InputService.InputBegan:Connect(function(Input, Processed)
+        if type(Library.ToggleKeybind) == 'table' and Library.ToggleKeybind.Type == 'KeyPicker' then
+            if Input.UserInputType == Enum.UserInputType.Keyboard and Input.KeyCode.Name == Library.ToggleKeybind.Value then
+                task.spawn(Library.Toggle)
+            end
+        elseif Input.KeyCode == Enum.KeyCode.RightControl or (Input.KeyCode == Enum.KeyCode.RightShift and (not Processed)) then
+            task.spawn(Library.Toggle)
+        end
+    end))
+
+    if Config.AutoShow then task.spawn(Library.Toggle) end
+
+    Window.Holder = Outer;
+
+    return Window;
+end;
+
+local function OnPlayerChange()
+    local PlayerList = GetPlayersString();
+
+    for _, Value in next, Options do
+        if Value.Type == 'Dropdown' and Value.SpecialType == 'Player' then
+            Value:SetValues(PlayerList);
+        end;
+    end;
+end;
+
+Players.PlayerAdded:Connect(OnPlayerChange);
+Players.PlayerRemoving:Connect(OnPlayerChange);
+
+getgenv().Library = Library
+return Library
+]========]
+assert(runtime.active and runtime.slot.current==runtime,"Initialization cancelled during UI loading")
+-- Extend the pinned keypicker consistently for saved middle-button bindings.
+librarySource=librarySource:gsub("Key == 'MB1' or Key == 'MB2'", "Key == 'MB1' or Key == 'MB2' or Key == 'MB3'")
+librarySource=librarySource:gsub("or Key == 'MB2' and InputService:IsMouseButtonPressed%(Enum.UserInputType.MouseButton2%)", "or Key == 'MB2' and InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) or Key == 'MB3' and InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton3)")
+librarySource=librarySource:gsub("or Key == 'MB2' and Input.UserInputType == Enum.UserInputType.MouseButton2 then", "or Key == 'MB2' and Input.UserInputType == Enum.UserInputType.MouseButton2 or Key == 'MB3' and Input.UserInputType == Enum.UserInputType.MouseButton3 then")
+librarySource=librarySource:gsub("Key = 'MB2';", "Key = 'MB2'; elseif Input.UserInputType == Enum.UserInputType.MouseButton3 then Key = 'MB3';")
 local Linoria = loadstring(librarySource)()
 runtime.library=Linoria
 function runtime.newDrawing(kind)
@@ -207,7 +3961,7 @@ function runtime.parseResetSettings(waveText,timeText)
     return {wave=wave,minutes=hour*60+minute,time=string.format("%02d:%02d",hour,minute),key=wave..":"..(hour*60+minute)}
 end
 runtime.extraSpecs = {
-    Autofarm={false}, AutoNightDrinks={false},
+    Autofarm={false}, AutoNightDrinks={false}, AutoClaimAchievements={false},
     DrinkTimes={"18:15, 00:10"}, DrinkFiveTimes={"18:15, 00:05, 00:40"}, DrinkFirstTimes={"18:15"},
     DrinkWaveSchedules={{}},
     FarmResetWave={"30"}, FarmResetTime={"04:30"},
@@ -328,17 +4082,18 @@ function runtime.validateExtras(source)
     return clean
 end
 
-local fileName = "LearnedZombies.json"
+local fileName = runtime.configRoot.."/LearnedZombies.json"
 local knownZombies = {"ArmouredZombie","HeadlessZombie","GuardianZombie","Assassin","Berserker","Boomer","Boss","Crawler","Destroyer","ElectricZombie","Flamer","HeavyArmourZombie","HelmetZombie","Hunter","LongArm","LongerArm","MinerZombie","RadioactiveZombie","RiotZombie","Slasher","SniperZombie","Spitter","ToxicZombie","Wraith","Zombie","DrenchWraith","Sponger"}
 
 local function loadZombies()
-    if isfile and isfile(fileName) then
+    local path=type(isfile)=="function" and isfile(fileName) and fileName or "LearnedZombies.json"
+    if isfile and isfile(path) then
         local success, result = pcall(function()
-            return HttpService:JSONDecode(readfile(fileName))
+            return HttpService:JSONDecode(readfile(path))
         end)
         if success and type(result) == "table" then
             for _, zombieName in ipairs(result) do
-                if not table.find(knownZombies, zombieName) then
+                if type(zombieName)=="string" and #zombieName>0 and #zombieName<=200 and #knownZombies<2000 and not table.find(knownZombies, zombieName) then
                     table.insert(knownZombies, zombieName)
                 end
             end
@@ -348,7 +4103,8 @@ end
 
 local function saveZombies()
     if writefile then
-        writefile(fileName, HttpService:JSONEncode(knownZombies))
+        local ok=pcall(runtime.ensureConfigFolder)
+        if ok then pcall(writefile,fileName,HttpService:JSONEncode(knownZombies)) end
     end
 end
 loadZombies()
@@ -360,6 +4116,7 @@ local scanWarned = false
 local function invalidateTarget()
     cachedTarget, cachedPosition, cachedAt = nil, nil, 0
     runtime.aimAnchor=nil
+    if runtime.aimSurfaces then runtime.aimSurfaces=setmetatable({}, {__mode="k"}) end
     nextScan = 0
     if runtime.clearFireTargetWatch then runtime.clearFireTargetWatch() end
     if runtime.clearFacingPose then runtime.clearFacingPose() end
@@ -498,7 +4255,6 @@ connect(RunService.Heartbeat,function()
     runtime.modifierNext=os.clock()+1
     if config.NoRecoil then runtime.updateRecoil() end
 end)
-
 local rangeManager, rangeMods
 runtime.gameModules={}
 function runtime.moduleObject(name)
@@ -509,23 +4265,49 @@ function runtime.moduleObject(name)
         local shop=main and main:FindFirstChild("ShopGui")
         return shop and shop:FindFirstChild("ShopPurchase")
     end
+    if name=="LookPosManager" or name=="RotationManager" or name=="NetworkManager" then
+        local scripts=LocalPlayer:FindFirstChild("PlayerScripts");local manager=scripts and scripts:FindFirstChild("LocalManager")
+        return manager and manager:FindFirstChild(name)
+    end
     local modules=game:GetService("ReplicatedStorage"):FindFirstChild("ModuleScripts")
     return modules and modules:FindFirstChild(name)
 end
+runtime.dependencyNames={"CharacterManager","ModOperations","Utility","ShopModule","ShopPurchase","LookPosManager","RotationManager","NetworkManager","AchievementManager","AtlasManager"}
+runtime.dependencyMethods={CharacterManager={"GetValue"},ModOperations={"GetModStats"},Utility={"RoundPrice","GetStructureRepairInfo"},
+    ShopModule={"UpgradeTool"},ShopPurchase={"BuyStructure","RepairStructure"},LookPosManager={"UpdateLocalLookPos"},
+    RotationManager={"RenderStepped"},NetworkManager={"PassDataA","GetPlayerNetworkData"},AchievementManager={"GetProgress"},AtlasManager={}}
 function runtime.refreshDependencies()
-    for _,name in ipairs({"CharacterManager","ModOperations","Utility","ShopModule","ShopPurchase"}) do
-        if not runtime.active then return end
-        local object=runtime.moduleObject(name)
-        local cached=runtime.gameModules[name]
-        if not cached or cached.module~=object or not cached.value then
-            local ok,value=pcall(function() assert(object,name.." is not ready");return require(object) end)
-            if not runtime.active then return end
-            runtime.gameModules[name]={module=object,value=ok and value or nil,error=not ok and tostring(value) or nil}
+    for _,name in ipairs(runtime.dependencyNames) do
+        if not runtime.active or runtime.stopping then return end
+        local object=runtime.moduleObject(name);local cached=runtime.gameModules[name]
+        if not cached or cached.module~=object then
+            runtime.cancelJob("Dependency:"..name,"Module replaced")
+            if name=="CharacterManager" or name=="ModOperations" then
+                if runtime.op then runtime.cleanupStep("Native module replacement",runtime.op.cleanup) end
+                if name=="CharacterManager" then rangeManager=nil else rangeMods=nil end
+            end
+            cached={module=object};runtime.gameModules[name]=cached
+        end
+        if object and not cached.value and not runtime.jobs["Dependency:"..name] and os.clock()>=(cached.retryAt or 0) then
+            cached.error="Loading"
+            runtime.startJob("Dependency:"..name,runtime.limits.responseSeconds,function()
+                return runtime.active and runtime.gameModules[name]==cached and runtime.moduleObject(name)==object
+            end,function(job)
+                local value=require(object)
+                if job.cancelled or runtime.gameModules[name]~=cached or not runtime.active then return end
+                assert(type(value)=="table","Unsupported "..name.." module")
+                for _,method in ipairs(runtime.dependencyMethods[name]) do assert(type(value[method])=="function",name.."."..method.." unavailable") end
+                cached.value=value;cached.error=nil
+                if name=="CharacterManager" or name=="ModOperations" then
+                    local manager=runtime.gameModules.CharacterManager and runtime.gameModules.CharacterManager.value
+                    if manager~=rangeManager and runtime.op then runtime.cleanupStep("Module replacement",runtime.op.cleanup) end
+                    rangeManager=manager;rangeMods=runtime.gameModules.ModOperations and runtime.gameModules.ModOperations.value
+                end
+            end,function(reason)
+                if runtime.gameModules[name]==cached then cached.error=reason;cached.retryAt=os.clock()+runtime.limits.dependencyRetry end
+            end)
         end
     end
-    local manager=runtime.gameModules.CharacterManager.value
-    if manager~=rangeManager and runtime.op then runtime.op.cleanup() end
-    rangeManager,rangeMods=manager,runtime.gameModules.ModOperations.value
 end
 function runtime.moduleValue(name)
     local cached=runtime.gameModules[name]
@@ -635,7 +4417,7 @@ function runtime.zombieModels()
             if index.folder~=folder then return end
             local position=index.positions[model];if not position then return end
             local last=index.models[#index.models];index.models[position]=last;index.positions[last]=position
-            index.models[#index.models]=nil;index.positions[model]=nil;index.records[model]=nil
+            index.models[#index.models]=nil;index.positions[model]=nil;index.records[model]=nil;if runtime.aimSurfaces then runtime.aimSurfaces[model]=nil end
         end
         for _,model in ipairs(folder:GetChildren()) do add(model) end
         index.connections={folder.ChildAdded:Connect(add),folder.ChildRemoved:Connect(remove)}
@@ -723,6 +4505,15 @@ function runtime.immediateThreat(model,root)
     return body and (body.Position-root.Position).Magnitude<=20
         and (model.Name=="Assassin" or body.Position.Y<root.Position.Y-3) or false
 end
+runtime.aimSurfaces=setmetatable({}, {__mode="k"})
+function runtime.targetBroadphase(model,origin,limit)
+    if limit==math.huge then return true end
+    for _,part in ipairs(runtime.aimParts(model)) do
+        local radius=part.Size and part.Size.Magnitude*.5 or 0
+        if (part.Position-origin).Magnitude<=limit+radius+.01 then return true end
+    end
+    return false
+end
 local function exposedPoint(candidate, origin, center, limit)
     local model = candidate.model
     local root=LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
@@ -730,6 +4521,19 @@ local function exposedPoint(candidate, origin, center, limit)
     local contact=config.Triggerbot and root and body and (root.Position-body.Position).Magnitude<=6
     local ignoreFOV=config.Triggerbot
     if contact and not origin then origin=Camera.CFrame.Position end
+    local saved=runtime.aimSurfaces[model]
+    if config.HeadshotConversion and saved and saved.part.Parent and (saved.part.Parent==model or saved.part:IsDescendantOf(model)) and os.clock()<saved.untilAt then
+        local point=saved.part.CFrame and saved.localPoint and saved.part.CFrame:PointToWorldSpace(saved.localPoint) or saved.part.Position
+        local eligible=ignoreFOV
+        if not ignoreFOV then local screen,onScreen=Camera:WorldToViewportPoint(point);eligible=onScreen and (Vector2.new(screen.X,screen.Y)-center).Magnitude<=config.FOVRadius end
+        if eligible and (point-origin).Magnitude>.001 and withinRange(origin,point,limit) then
+            local clear,hit=clearPath(origin,point,model);local actual=hit and hit.Instance or saved.part
+            if clear and actual and not runtime.armouredPart(actual) and (ignoreFOV or clearPath(Camera.CFrame.Position,point,model)) then
+                return actual,hit and hit.Position or point
+            end
+        end
+        runtime.aimSurfaces[model]=nil
+    end
     local parts = runtime.aimParts(model)
     local bestPart,bestPoint,bestDamage,fallbackPart,fallbackPoint
     local damageCache={};local reason="No aimable body parts";local reachedRange=false
@@ -757,7 +4561,11 @@ local function exposedPoint(candidate, origin, center, limit)
                 if hit and hit.Instance and hit.Instance:IsDescendantOf(model) then actual=hit.Instance
                 elseif hit then actual=nil end
                 if actual and not runtime.armouredPart(actual) then
-                    if config.HeadshotConversion then return actual,hit and hit.Position or point end
+                    if config.HeadshotConversion then
+                        local surface=hit and hit.Position or point
+                        runtime.aimSurfaces[model]={part=actual,localPoint=actual.CFrame and actual.CFrame:PointToObjectSpace(surface),untilAt=os.clock()+.1}
+                        return actual,surface
+                    end
                     local damage=damageCache[actual]
                     if damage==nil then
                         local ok,value=pcall(function() return rangeManager:GetDamage(LocalPlayer,actual,equippedGun(),{}) end)
@@ -819,7 +4627,7 @@ local function getTargetHead()
     for _,zombie in ipairs(runtime.zombieModels()) do
         if zombie:IsA("Model") and runtime.targetEligible(zombie,root) then
             local humanoid=zombie:FindFirstChildOfClass("Humanoid")
-            if humanoid and humanoid.Health>0 then
+            if humanoid and humanoid.Health>0 and runtime.targetBroadphase(zombie,origin,limit) then
                 candidates[#candidates+1]={model=zombie,priority=runtime.immediateThreat(zombie,root) and 4
                     or runtime.closeZombie(zombie,root) and 3 or config.SuperPriorityList[zombie.Name] and 2
                     or config.PriorityList[zombie.Name] and 1 or 0,order=#candidates+1}
@@ -1017,7 +4825,7 @@ function runtime.facingFailure(reason)
 end
 function runtime.installFacing()
     local a=runtime.facing
-    if a.available then return end
+    if a.available and a.lookObject==runtime.moduleObject("LookPosManager") and a.rotationObject==runtime.moduleObject("RotationManager") and a.networkObject==runtime.moduleObject("NetworkManager") then return end
     runtime.restoreFacing()
     local ok,err=pcall(function()
         local scripts=LocalPlayer:FindFirstChild("PlayerScripts")
@@ -1025,12 +4833,13 @@ function runtime.installFacing()
         assert(manager,"LocalManager missing; reload after the game loads")
         -- Require once in the executor initialization context, never inside a
         -- Roblox render callback, and never call the modules' Init a second time.
-        a.look=require(assert(manager:FindFirstChild("LookPosManager"),"LookPosManager missing"))
-        a.rotation=require(assert(manager:FindFirstChild("RotationManager"),"RotationManager missing"))
-        a.network=require(assert(manager:FindFirstChild("NetworkManager"),"NetworkManager missing"))
+        a.look=runtime.moduleValue("LookPosManager")
+        a.rotation=runtime.moduleValue("RotationManager")
+        a.network=runtime.moduleValue("NetworkManager")
         assert(runtime.active,"Aim module initialization cancelled")
         assert(type(a.look.UpdateLocalLookPos)=="function" and type(a.rotation.RenderStepped)=="function"
             and type(a.network.PassDataA)=="function" and type(a.network.GetPlayerNetworkData)=="function","Unsupported native aim modules")
+        a.lookObject=runtime.moduleObject("LookPosManager");a.rotationObject=runtime.moduleObject("RotationManager");a.networkObject=runtime.moduleObject("NetworkManager")
         a.originalLook=a.look.UpdateLocalLookPos;a.originalRotation=a.rotation.RenderStepped
         a.lookWrapper=function(self,...)
             local result=table.pack(a.originalLook(self,...))
@@ -1174,22 +4983,31 @@ function runtime.rememberPenetration(original,args,result)
 end
 
 local oldNamecall = runtime.slot.original
+function runtime.observeDispatch(self,args)
+    local job=runtime.checkJob();if job then job.dispatched=true end
+    local state=runtime.extensions;local thread=coroutine.running()
+    local probe=state and state.purchaseProbes and state.purchaseProbes[thread]
+    if probe then
+        local storage=game:GetService("ReplicatedStorage");local events=storage:FindFirstChild("RemoteEvents")
+        if events and (self==events:FindFirstChild("BuyStructure") or self==events:FindFirstChild("BuyPlayerUpgrade")) and args[1]==probe.name then probe.dispatched=true end
+    end
+end
 runtime.slot.handler = function(self, ...)
     local method = getnamecallmethod()
+    if method=="FireServer" then runtime.observeDispatch(self,table.pack(...)) end
     if runtime.active and runtime.op and (runtime.op.any or config.HeadshotConversion or runtime.extra.MeleeAura) and not runtime.op.busy and method=="FireServer" and type(setnamecallmethod)=="function" then
         runtime.op.busy=true
         local ok,result=pcall(runtime.op.namecall,self,method,table.pack(...))
         runtime.op.busy=false;setnamecallmethod(method)
         if not ok then runtime.extensions.message="Weapon request transform failed: "..tostring(result)
         elseif result then
-            if result.blocked then return end
             return oldNamecall(self,table.unpack(result,1,result.n))
         end
     end
     -- Never inspect characters or reset method state for unrelated game calls.
-    if not runtime.active or not (config.SilentAim or config.Triggerbot or config.NoSpread or config.HeadshotConversion or runtime.actionAim) or self ~= Workspace
+    if not runtime.active or not (config.SilentAim or config.Triggerbot or config.NoSpread or config.HeadshotConversion) or self ~= Workspace
         or (method ~= "FindPartOnRayWithIgnoreList" and method ~= "findPartOnRayWithIgnoreList")
-        or (checkcaller() and not runtime.actionAim) then return oldNamecall(self, ...) end
+        or checkcaller() then return oldNamecall(self, ...) end
     if type(setnamecallmethod) ~= "function" then
         if not runtime.methodWarning then
             runtime.methodWarning = true
@@ -1198,17 +5016,6 @@ runtime.slot.handler = function(self, ...)
         return oldNamecall(self, ...)
     end
     local original = table.pack(...)
-    if runtime.actionAim and os.clock()<runtime.actionAim.untilAt then
-        local action=runtime.actionAim
-        local ok,caller=pcall(runtime.callerLookup)
-        local ray=original[1]
-        if ok and caller==action.script and typeof(ray)=="Ray" and ray.Direction.Magnitude>500 and action.part.Parent then
-            local delta=action.part.Position-ray.Origin
-            if delta.Magnitude>.001 then original[1]=Ray.new(ray.Origin,delta.Unit*ray.Direction.Magnitude) end
-            setnamecallmethod(method)
-            return oldNamecall(self,table.unpack(original,1,original.n))
-        end
-    end
     local ok, redirected = pcall(function()
         if not runtime.isEquippedGunCaller() then return end
         local ray = original[1]
@@ -1564,18 +5371,25 @@ function runtime.heatBlocked(tool,current,now)
     return false
 end
 
-function runtime.effectiveMaxClip(tool,current)
-    local mounted=readValue(tool and tool:FindFirstChild("OtherValues"),"MountedWeapon")
-    if mounted then return readValue(mounted:FindFirstChild("CurrentValues"),"MaxClip") end
-    local base=readValue(current,"MaxClip")
-    if not validRange(base) or base<=0 then return base end
-    local perks=LocalPlayer:FindFirstChild("PlayerPerks")
-    local multiplier=1+(readValue(perks,"MaxClip") or 0)
-    if perks and perks:FindFirstChild("MinClip") and readValue(current,"MaxAmmo")~=0 and base>2 then multiplier=multiplier-.25 end
+function runtime.ammoPrefix(tool)
+    return readValue(tool and tool:FindFirstChild("OtherValues"),"ToggledAltValue")==true and "Alt" or ""
+end
+function runtime.weaponMods(tool)
     local saved=_G.ClientPlayerMods and _G.ClientPlayerMods[tool.Name]
     if saved and not rangeMods then return nil end
     local ok,mods=pcall(function() return saved and rangeMods:GetModStats(saved) or {} end)
-    if not ok or type(mods)~="table" then return nil end
+    return ok and type(mods)=="table" and mods or nil
+end
+function runtime.effectiveMaxClip(tool,current,prefix)
+    prefix=prefix or runtime.ammoPrefix(tool)
+    local mounted=readValue(tool and tool:FindFirstChild("OtherValues"),"MountedWeapon")
+    if mounted then return readValue(mounted:FindFirstChild("CurrentValues"),prefix.."MaxClip") end
+    local base=readValue(current,prefix.."MaxClip")
+    if not validRange(base) or base<=0 then return base end
+    local perks=LocalPlayer:FindFirstChild("PlayerPerks")
+    local multiplier=1+(readValue(perks,"MaxClip") or 0)
+    if perks and perks:FindFirstChild("MinClip") and readValue(current,"MaxAmmo")~=0 and (readValue(current,"MaxClip") or 0)>2 then multiplier=multiplier-.25 end
+    local mods=runtime.weaponMods(tool);if not mods then return nil end
     local magazine=mods["Magazine Size"]
     if magazine then
         if type(magazine)~="table" or type(magazine[1])~="number" or magazine[1]~=magazine[1] or math.abs(magazine[1])==math.huge then return nil end
@@ -1595,9 +5409,10 @@ function runtime.challengeReloadReady(tool,current,now)
         if humanoid and humanoid.Health>0 and part and (part.Position-root.Position).Magnitude<=runtime.extra.ReloadClearance then runtime.quietSince=nil;return false end
     end
     runtime.quietSince=runtime.quietSince or now
-    local clip,maxClip=readValue(current,"Clip"),runtime.effectiveMaxClip(tool,current)
+    local prefix=runtime.ammoPrefix(tool)
+    local clip,maxClip=readValue(current,prefix.."Clip"),runtime.effectiveMaxClip(tool,current,prefix)
     if type(clip)~="number" or type(maxClip)~="number" or maxClip<=0 or clip<=0 or clip>=maxClip then return false end
-    if readValue(current,"FeedType")=="None" or readValue(current,"Ammo")==0 or readValue(tool,"Reloading")==true then return false end
+    if (readValue(current,prefix.."FeedType") or readValue(current,"FeedType"))=="None" or readValue(current,prefix.."Ammo")==0 or readValue(tool,"Reloading")==true then return false end
     if now-runtime.quietSince<1.5 or now<(runtime.quietReloadAt or 0) or clip/maxClip*100>runtime.extra.QuietReloadPercent then return false end
     runtime.quietReloadAt=now+3;return true
 end
@@ -1723,20 +5538,30 @@ function runtime.ammoCounts(tool)
     if not tool or not tool:FindFirstChild("GunScript") then return false end
     local current=tool:FindFirstChild("CurrentValues")
     local other=tool:FindFirstChild("OtherValues")
-    local prefix=readValue(other,"ToggledAltValue")==true and "Alt" or ""
+    local prefix=runtime.ammoPrefix(tool)
     local clip,reserve=readValue(current,prefix.."Clip"),readValue(current,prefix.."Ammo")
     local maxClip,maxAmmo=readValue(current,prefix.."MaxClip"),readValue(current,prefix.."MaxAmmo")
     if type(clip)~="number" or clip<0 or clip>=math.huge or clip~=clip
         or type(reserve)~="number" or reserve<0 or reserve>=math.huge or reserve~=reserve
         or type(maxClip)~="number" or maxClip<=0 or maxClip>=math.huge or maxClip~=maxClip
         or type(maxAmmo)~="number" or maxAmmo<=0 or maxAmmo>=math.huge or maxAmmo~=maxAmmo then return end
-    return clip,reserve
+    local effectiveClip=runtime.effectiveMaxClip(tool,current,prefix)
+    local mounted=readValue(other,"MountedWeapon")
+    if mounted then maxAmmo=readValue(mounted:FindFirstChild("CurrentValues"),prefix.."MaxAmmo")
+    else
+        local mods=runtime.weaponMods(tool)
+        local ok,multiplier=pcall(function() return runtime.moduleValue("CharacterManager"):GetMulti("MaxAmmo",LocalPlayer,{Tool=tool,ModStats=mods}) end)
+        if not mods or not ok or not validRange(multiplier) or multiplier<=0 then return end
+        maxAmmo=math.floor(maxAmmo*multiplier+.5)
+    end
+    if not validRange(effectiveClip) or effectiveClip<=0 or not validRange(maxAmmo) or maxAmmo<=0 then return end
+    return clip,reserve,effectiveClip,maxAmmo+effectiveClip-clip
 end
 function runtime.refillNeeded(tool)
-    local clip,reserve=runtime.ammoCounts(tool)
+    local clip,reserve,maxClip,maxReserve=runtime.ammoCounts(tool)
     if type(clip)~="number" then return false end
     local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
-    return (minutes>=360 and minutes<1080) or (clip==0 and reserve==0)
+    return (minutes>=360 and minutes<1080 and reserve<maxReserve) or (clip==0 and reserve==0)
 end
 function runtime.refillSourceAllowed(source,tool,root)
     if not source or not source.Parent or not source.PrimaryPart or not source.PrimaryPart.Parent then return end
@@ -1768,9 +5593,9 @@ function runtime.findRefillSource(tool,root)
         local source=upgrades:FindFirstChild(name);if source then table.insert(sources,source) end
     end end
     local deployables=Workspace:FindFirstChild("Deployables")
-    if deployables then for _,source in ipairs(deployables:GetDescendants()) do
-        if source:IsA("Model") and (source.Name=="DeployableAmmo" or source.Name=="SupplyCrate" or source.Name=="GasCan" or source.Name=="HeavySentry") then table.insert(sources,source) end
-    end end
+    for _,source in ipairs(runtime.indexedObjects("RefillSources",deployables,function(object)
+        return object:IsA("Model") and (object.Name=="DeployableAmmo" or object.Name=="SupplyCrate" or object.Name=="GasCan" or object.Name=="HeavySentry")
+    end)) do sources[#sources+1]=source end
     local best,distance,method,duration
     for _,source in ipairs(sources) do
         local candidate,seconds=runtime.refillSourceAllowed(source,tool,root)
@@ -1779,7 +5604,45 @@ function runtime.findRefillSource(tool,root)
     end
     return best,method,duration
 end
+function runtime.roundIdentity()
+    local storage=game:GetService("ReplicatedStorage");local values=storage:FindFirstChild("Values")
+    local wave=values and readValue(values,"LocalWave");local map=Workspace:FindFirstChild("Map")
+    local saved=runtime.slot.roundContext
+    local context=runtime.roundContext or (saved and saved.server==game.JobId and saved.player==LocalPlayer and saved)
+    if not context or context.map~=map or (type(wave)=="number" and type(context.wave)=="number" and wave<context.wave) then
+        context={map=map,id=(context and context.id or 0)+1};runtime.roundContext=context
+    end
+    if type(wave)=="number" then context.wave=wave end
+    runtime.roundContext=context;context.server=game.JobId;context.player=LocalPlayer;runtime.slot.roundContext=context
+    return context.id
+end
+runtime.slot.quarantine=runtime.slot.quarantine or {}
+function runtime.quarantineCurrent(record)
+    if record.server~=game.JobId or record.player~=LocalPlayer then return false end
+    if record.key=="TransferMoney" then return true end
+    if record.key=="AchievementClaim" then
+        local data=runtime.nativeData();return not (record.achievement and data and data.Achievements and data.Achievements[record.achievement]==true)
+    end
+    if record.map~=Workspace:FindFirstChild("Map") then return false end
+    if record.key=="VoteSkip" then
+        local values=game:GetService("ReplicatedStorage"):FindFirstChild("Values")
+        return readValue(values,"LocalWave")==record.wave and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")~=true
+    end
+    return record.character==LocalPlayer.Character
+end
+function runtime.preserveOperations()
+    for key,operation in pairs(runtime.operations) do
+        local values=game:GetService("ReplicatedStorage"):FindFirstChild("Values")
+        local record={key=key,achievement=operation.achievement,server=game.JobId,player=LocalPlayer,map=Workspace:FindFirstChild("Map"),
+            character=LocalPlayer.Character,wave=readValue(values,"LocalWave")}
+        -- The token is an identity only; do not retain runtime callbacks in the shared slot.
+        record.token=operation.identity
+        runtime.slot.quarantine[key]=record
+    end
+end
 function runtime.startOperation(key,seconds,valid,expire)
+    local record=runtime.slot.quarantine[key]
+    if record then if runtime.quarantineCurrent(record) then return nil else runtime.slot.quarantine[key]=nil end end
     local previous=runtime.operations[key]
     if previous then
         local ok,current=pcall(previous.valid)
@@ -1788,13 +5651,15 @@ function runtime.startOperation(key,seconds,valid,expire)
         if runtime.operations[key]==previous then runtime.operations[key]=nil end
     end
     if runtime.pendingRequests>=runtime.limits.maxPendingRequests then return nil end
-    local operation={key=key,valid=valid,expire=expire,deadline=os.clock()+seconds,counted=true}
+    local operation={key=key,identity={},valid=valid,expire=expire,deadline=os.clock()+seconds,counted=true}
     local thread,main=coroutine.running();if not main then operation.thread=thread end
     runtime.operations[key]=operation;runtime.pendingRequests=runtime.pendingRequests+1
     return operation
 end
 function runtime.finishOperation(operation)
     if not operation then return end
+    local record=runtime.slot.quarantine[operation.key]
+    if record and record.token==operation.identity then runtime.slot.quarantine[operation.key]=nil end
     if operation.counted then runtime.pendingRequests=math.max(0,runtime.pendingRequests-1);operation.counted=false end
     if runtime.operations[operation.key]==operation then runtime.operations[operation.key]=nil end
 end
@@ -1808,6 +5673,8 @@ function runtime.expireOperation(operation,reason)
     end
 end
 function runtime.operationTick()
+    runtime.roundIdentity();runtime.jobTick()
+    for key,record in pairs(runtime.slot.quarantine) do if not runtime.quarantineCurrent(record) then runtime.slot.quarantine[key]=nil end end
     for key,operation in pairs(runtime.operations) do
         local ok,valid=pcall(operation.valid)
         if not runtime.active or not ok or not valid then
@@ -1847,11 +5714,12 @@ function runtime.refillStep()
     if lease and lease.valid() then state.message="Previous refill result is unknown; waiting for its response or a new character.";return end
     local modules=game:GetService("ReplicatedStorage"):FindFirstChild("ModuleScripts")
     local manager=modules and modules:FindFirstChild("CharacterManager")
-    local ok,speed=pcall(function() return require(manager):GetMulti("InteractionSpeed",LocalPlayer,{IgnoreTool=true}) end)
+    local ok,speed=pcall(function() return runtime.moduleValue("CharacterManager"):GetMulti("InteractionSpeed",LocalPlayer,{IgnoreTool=true}) end)
     if not ok or type(speed)~="number" or speed<=0 or speed>=math.huge or speed~=speed then state.message="Refill waiting: interaction speed unavailable.";return end
     local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
     local duration=seconds/speed/(minutes>=360 and minutes<1080 and 5 or 1)
     if not releaseHeld() then return end
+    local beforeClip,beforeAmmo=runtime.ammoCounts(tool)
     local job={tool=tool,enabled=tool.Enabled,cancelled=false}
     state.job=job;runtime.refillBusy=true
     local function valid()
@@ -1900,12 +5768,14 @@ function runtime.refillStep()
             end
             local update=tool:FindFirstChild("UpdateAmmoGui");if update then update:Fire() end
             completed=true
+            local afterClip,afterAmmo=runtime.ammoCounts(tool)
+            if afterClip==beforeClip and afterAmmo==beforeAmmo then job.noGain=true end
             state.message="Refill returned "..tostring(clip).."/"..tostring(ammo).."."
         end)
         runtime.finishOperation(operation)
         if not job.cancelled and tool.Parent and tool.Enabled==false then tool.Enabled=job.enabled end
         if not success and runtime.active then state.message="Refill: "..tostring(err) end
-        if state.job==job then state.job=nil;runtime.refillBusy=false;state.next=os.clock()+(completed and .25 or 3) end
+        if state.job==job then state.job=nil;runtime.refillBusy=false;state.next=os.clock()+(job.noGain and 5 or (completed and .25 or 3)) end
     end)
 end
 
@@ -2143,54 +6013,59 @@ runtime.label(menuGroup,"Show / hide: Right Ctrl", true)
 runtime.label(menuGroup,"Triggerbot: Delete", true)
 local function unloadAssistant()
     if not runtime.active then return true end
-    if runtime.extensions and runtime.extensions.stop then runtime.extensions.stop() end
-    if runtime.cancelInstantConsumables and not runtime.cancelInstantConsumables() then
-        return false
+    runtime.stopping=true
+    local function step(name,fn) return runtime.cleanupStep(name,fn) end
+    if runtime.extensions and runtime.extensions.stop then step("Stop",runtime.extensions.stop) end
+    local released=true
+    if runtime.cancelInstantConsumables then
+        local ok,result=step("Consumables",runtime.cancelInstantConsumables);if not ok or result==false then released=false end
     end
-    runtime.cancelRefill()
-    if runtime.cancelAction then runtime.cancelAction() end
-    config.HeadshotConversion = false
-    config.NoSpread, config.NoRecoil = false, false
-    runtime.restoreRecoil()
-    config.Triggerbot, config.SilentAim, config.ShowFOV = false, false, false
-    invalidateTarget()
-    -- Do not abandon a held synthetic key if Roblox rejects its release.
-    if not releaseHeld() then
-        notifyTrigger("Unload waiting: close Roblox menus/console, then try Unload again.")
-        return false
-    end
+    step("Refill",runtime.cancelRefill)
+    if runtime.cancelAction then step("Item action",runtime.cancelAction) end
+    config.HeadshotConversion,config.NoSpread,config.NoRecoil=false,false,false
+    config.Triggerbot,config.SilentAim,config.ShowFOV=false,false,false
+    step("Recoil",runtime.restoreRecoil);step("Target",invalidateTarget)
+    local ok,result=step("Fire input",releaseHeld);if not ok or result==false then released=false end
     if reloadState.key then
-        local ok = pcall(sendReloadKey, reloadState.key, false)
-        if not ok then
-            notifyTrigger("Unload waiting for reload-key release. Try Unload again.")
-            return false
-        end
-        reloadState.key = nil
+        local success=step("Reload input",function() sendReloadKey(reloadState.key,false) end)
+        if success then reloadState.key=nil else released=false end
     end
-    if pointState.picking then finishPick() end
+    if pointState.picking then step("Picker",finishPick) end
     if runtime.extensions and runtime.extensions.farm then
         local farm=runtime.extensions.farm
-        farm.cancelWalk()
-        if farm.sprintHeld then
-            notifyTrigger("Unload waiting for sprint-key release. Close menus/console, then try Unload again.")
-            return false
+        step("Movement",farm.cancelWalk)
+        if farm.sprintHeld then released=false end
+    end
+    if runtime.extensions then step("Extensions",runtime.extensions.cleanup) end
+    if not released then
+        notifyTrigger("Unload waiting for input release. Close menus/console and try Unload again.")
+        return false
+    end
+    runtime.preserveOperations()
+    if runtime.extensions then
+        local state=runtime.extensions
+        local saved={server=game.JobId,player=LocalPlayer,farmPurchaseUnknown=state.farm and state.farm.purchaseUnknown,
+            c96Attempt=state.farm and state.farm.c96Attempt and state.farm.c96Attempt.dispatched and state.farm.c96Attempt or nil}
+        for _,key in ipairs({"weaponUpgradeFaults","shopUpgradeFaults","purchaseFaults","maintenanceUnknown"}) do
+            saved[key]={};for name,record in pairs(state[key] or {}) do
+                if type(record)=="table" then local copy={};for field,value in pairs(record) do copy[field]=value end;saved[key][name]=copy
+                else saved[key][name]=record end
+            end
         end
+        runtime.slot.safety=saved
     end
-    runtime.active = false
-    runtime.operationTick()
-    if type(task.cancel)=="function" then for _,thread in pairs(runtime.workers) do pcall(task.cancel,thread) end end
-    if runtime.extensions then runtime.extensions.cleanup() end
-    if runtime.slot.current == runtime then
-        runtime.slot.handler, runtime.slot.current = nil, nil
-    end
+    runtime.active=false
+    step("Requests",runtime.operationTick)
+    if runtime.slot.current==runtime then runtime.slot.handler=nil;runtime.slot.current=nil end
     runtime.disposeResources()
-    UIS.MouseIconEnabled = true
-    -- Dispatcher has no reference to this runtime after unload.
+    step("Mouse",function() UIS.MouseIconEnabled=true end)
     return true
 end
+
 runtime.unload = unloadAssistant
 menuGroup:AddButton({Text = "Unload Combat Assistant", Func = unloadAssistant})
-local profileFolder = "CombatAssistantConfigs"
+local profileFolder = runtime.configRoot
+local legacyProfileFolder="CombatAssistantConfigs"
 local autoloadPath = profileFolder .. "/autoload.json"
 local typedProfile, selectedProfile = "Default", nil
 local profileDropdown, autoloadLabel
@@ -2222,10 +6097,7 @@ end
 local function diskReady()
     assert(type(readfile) == "function" and type(writefile) == "function" and type(isfile) == "function",
         "This executor needs readfile, writefile and isfile for profiles.")
-    if type(isfolder) == "function" and isfolder(profileFolder) then return end
-    assert(type(makefolder) == "function", "This executor cannot create the profile folder.")
-    local ok, err = pcall(makefolder, profileFolder)
-    assert(ok or (type(isfolder) == "function" and isfolder(profileFolder)), tostring(err))
+    runtime.ensureConfigFolder()
 end
 local function profilePath(name) return profileFolder .. "/" .. cleanName(name) .. ".json" end
 local function writeJSON(path, data)
@@ -2269,7 +6141,7 @@ local function snapshotProfile()
     settings.LastPoint = serializePoint(pointState.last)
     local learned = {}
     for _, name in ipairs(knownZombies) do table.insert(learned, name) end
-    return {Version = 1, Settings = settings, LearnedZombies = learned}
+    return {Version = 1, GameId=runtime.configGameId, Settings = settings, LearnedZombies = learned}
 end
 local function validateNames(list)
     assert(type(list) == "table" and #list <= 2000, "Invalid zombie list.")
@@ -2298,6 +6170,7 @@ local function validatePoint(point)
 end
 local function validateProfile(data, allowIncomplete)
     assert(type(data) == "table" and data.Version == 1 and type(data.Settings) == "table", "Unsupported or invalid profile format.")
+    assert(data.GameId==nil or data.GameId==runtime.configGameId,"This profile belongs to another game")
     local source, clean = data.Settings, {}
     clean.Extras = runtime.validateExtras(source.Extras)
     for _, key in ipairs({"HeadshotConversion", "NoSpread", "NoRecoil"}) do
@@ -2398,6 +6271,7 @@ end
 local function readProfile(name)
     diskReady()
     local path = profilePath(name)
+    if not isfile(path) and profileFolder~=legacyProfileFolder then path=legacyProfileFolder.."/"..cleanName(name)..".json" end
     assert(isfile(path), "Profile not found: " .. name)
     return validateProfile(HttpService:JSONDecode(readfile(path)))
 end
@@ -2415,9 +6289,13 @@ local function refreshProfiles(preferred)
     diskReady()
     assert(type(listfiles) == "function", "This executor needs listfiles to list saved profiles.")
     local names, seen = {}, {}
-    for _, path in ipairs(listfiles(profileFolder)) do
+    local paths=listfiles(profileFolder)
+    if profileFolder~=legacyProfileFolder and type(isfolder)=="function" and isfolder(legacyProfileFolder) then
+        for _,path in ipairs(listfiles(legacyProfileFolder)) do paths[#paths+1]=path end
+    end
+    for _, path in ipairs(paths) do
         local name = path:match("([^/\\]+)%.json$")
-        if name and string.lower(name) ~= "autoload" then
+        if name and string.lower(name) ~= "autoload" and name~="LearnedZombies" then
             local ok = pcall(cleanName, name)
             if ok and not seen[name] then seen[name] = true table.insert(names, name) end
         end
@@ -2478,12 +6356,12 @@ end
 configButton("Set as autoload", function()
     local name = selectedName()
     readProfile(name)
-    writeJSON(autoloadPath, {Version = 1, Enabled = true, Name = name, HideMenu = hideOnAutoload})
+    writeJSON(autoloadPath, {Version = 1, GameId=runtime.configGameId, Enabled = true, Name = name, HideMenu = hideOnAutoload})
     setAutoloadLabel(name)
     profileNotice("Autoload set: " .. name .. ". Runs the next time you execute this script.")
 end)
 configButton("Disable autoload", function()
-    writeJSON(autoloadPath, {Version = 1, Enabled = false})
+    writeJSON(autoloadPath, {Version = 1, GameId=runtime.configGameId, Enabled = false})
     setAutoloadLabel()
     profileNotice("Autoload disabled.")
 end)
@@ -2493,6 +6371,10 @@ runtime.initializeExtensions = function()
 local e, ui = runtime.extra, runtime.extraUI
 local state = {next=0, catalogAt=0, highlights={}, scavengers={}, jobs={}, cooldowns={}, message="Ready"}
 runtime.extensions = state
+local safety=runtime.slot.safety
+if safety and safety.server==game.JobId and safety.player==LocalPlayer then
+    for _,key in ipairs({"weaponUpgradeFaults","shopUpgradeFaults","purchaseFaults","maintenanceUnknown"}) do state[key]=safety[key] end
+end
 local function child(parent,name) return parent and parent:FindFirstChild(name) end
 local function storage() return game:GetService("ReplicatedStorage") end
 local function alive()
@@ -2540,6 +6422,7 @@ local function control(group,key,text,choices)
     return ui[key]
 end
 local function remote(folder,name,method,...)
+    runtime.checkJob()
     local object=child(child(storage(),folder),name)
     assert(object and object:IsA(method=="InvokeServer" and "RemoteFunction" or "RemoteEvent"),name.." is unavailable")
     return object[method](object,...)
@@ -2742,7 +6625,7 @@ function state.skip()
     local character=LocalPlayer.Character;local map=child(Workspace,"Map");local epoch=state.epoch
     local voteCycle=state.skipCycle
     local operation=runtime.startOperation("VoteSkip",runtime.limits.responseSeconds,function()
-        return runtime.active and state.epoch==epoch and state.skipCycle==voteCycle and LocalPlayer.Character==character
+        return runtime.active and state.skipCycle==voteCycle and readValue(LocalPlayer,"Voted")~=true
             and child(Workspace,"Map")==map and readValue(values,"LocalWave")==wave and readValue(values,"Vote")==true
     end,function(reason)
         if state.skipOperation and state.skipOperation.expired then state.skipBusy=false;state.skipStartedAt=nil;state.skipLastError=reason end
@@ -2755,10 +6638,10 @@ function state.skip()
     runtime.finishOperation(operation)
     if state.skipOperation~=operation then return end
     state.skipOperation=nil;state.skipBusy=false;state.skipStartedAt=nil
-    if operation.expired then return end
+    if operation.expired and not operation.valid() then return end
     if not ok then state.skipLastError=tostring(result);error(result) end
     state.skipLastResult=result==true and "acknowledged" or "not acknowledged"
-    if not runtime.active or state.epoch~=epoch or state.skipCycle~=voteCycle or LocalPlayer.Character~=character or child(Workspace,"Map")~=map
+    if not runtime.active or state.skipCycle~=voteCycle or child(Workspace,"Map")~=map
         or readValue(values,"LocalWave")~=wave or readValue(values,"Vote")~=true then return end
     if type(result)=="boolean" then
         local voted=child(LocalPlayer,"Voted");if voted then voted.Value=result end
@@ -2766,22 +6649,34 @@ function state.skip()
     notice(result==true and "Ready vote acknowledged; waiting for other players." or "Ready vote not acknowledged; will retry.")
 end
 local function shop() return runtime.moduleValue("ShopPurchase") end
+function state.acquireSpending(owner)
+    if state.spendingBusy then return false end
+    state.spendingOwner=owner;state.spendingBusy=true;return true
+end
+function state.releaseSpending(owner)
+    if state.spendingOwner~=owner then return false end
+    state.spendingOwner=nil;state.spendingBusy=false;return true
+end
 function state.stop()
-    state.restoreHipADS()
-    if state.farm then state.farm.stop() end
-    if runtime.cancelInstantConsumables then runtime.cancelInstantConsumables() end
-    for _,definition in ipairs(runtime.opDefinitions) do local key="OP"..definition[1];e[key]=false;if ui[key] then ui[key]:SetValue(false) end end
-    if runtime.op then runtime.op.cleanup() end
-    if runtime.cancelAction then runtime.cancelAction() end
-    runtime.cancelRefill()
     state.epoch=(state.epoch or 0)+1
-    for key,value in pairs(e) do if type(value)=="boolean" then e[key]=false;if ui[key] then ui[key]:SetValue(false) end end end
+    for key,value in pairs(e) do if type(value)=="boolean" then e[key]=false end end
     config.SilentAim,config.Triggerbot,config.NoSpread,config.NoRecoil,config.HeadshotConversion=false,false,false,false,false
-    settingsUI.SilentAim:SetValue(false);triggerToggle:SetValue(false)
-    settingsUI.NoSpread:SetValue(false);settingsUI.NoRecoil:SetValue(false);settingsUI.HeadshotConversion:SetValue(false)
-    restoreFireMode();runtime.restoreRecoil()
+    local step=runtime.cleanupStep
+    step("ADS",state.restoreHipADS)
+    if state.farm then step("Farm",state.farm.stop) end
+    if runtime.cancelInstantConsumables then step("Consumables",runtime.cancelInstantConsumables) end
+    if runtime.op then step("Weapon modifiers",runtime.op.cleanup) end
+    if runtime.cancelAction then step("Item action",runtime.cancelAction) end
+    step("Refill",runtime.cancelRefill)
+    runtime.cancelJob("Maintenance","Stopped")
+    step("Fire mode",restoreFireMode);step("Recoil",runtime.restoreRecoil)
+    for key,value in pairs(e) do if type(value)=="boolean" and ui[key] then step(key,function() ui[key]:SetValue(false) end) end end
+    for _,control in ipairs({settingsUI.SilentAim,triggerToggle,settingsUI.NoSpread,settingsUI.NoRecoil,settingsUI.HeadshotConversion}) do
+        step("Control",function() control:SetValue(false) end)
+    end
     invalidateTarget();notice("Stopped automatic features; pending remote calls cannot be recalled")
 end
+
 local function destroy(object) pcall(function() object:Destroy() end) end
 local function removeDrawing(object) pcall(function() object.Visible=false;object:Remove() end) end
 local function clearVisuals()
@@ -2840,7 +6735,7 @@ function state.visuals()
     elseif os.clock()>=(state.scavengerAt or 0) then
         state.scavengerAt=os.clock()+5
         local found={};local count=0
-        for _,object in ipairs(Workspace:GetDescendants()) do
+        for _,object in ipairs(runtime.indexedObjects("Scavengers",Workspace,function(object) return object.Name=="ScavengerPackage" and (object:IsA("Model") or object:IsA("BasePart")) end)) do
             if object.Name=="ScavengerPackage" and (object:IsA("Model") or object:IsA("BasePart")) and count<6 then
                 found[object]=true;count=count+1;highlight(object,state.scavengers,Color3.fromRGB(80,255,140))
             end
@@ -2892,7 +6787,7 @@ control(equipment,"AutoEquip","Auto equip when unarmed")
 equipment:AddButton({Text="Equip selected now",Func=function() job("Equip",1,state.equip) end})
 local refill=automation:AddLeftGroupbox("Ammo refill")
 control(refill,"AutoRefillAmmo","Auto refill ammo")
-runtime.label(refill,"06:00–17:59: repeat refills. Night: only 0/0. Finite ammo, within 8 studs.",true)
+runtime.label(refill,"06:00–17:59: top up missing ammo; full reserves are left alone. Night: only 0/0. Within 8 studs.",true)
 local refillStatus=runtime.label(refill,runtime.refill.message,true)
 connect(RunService.Heartbeat,function()
     if os.clock()<(runtime.refill.labelAt or 0) then return end
@@ -2900,6 +6795,68 @@ connect(RunService.Heartbeat,function()
     if runtime.refill.displayed~=runtime.refill.message then
         runtime.refill.displayed=runtime.refill.message;refillStatus:SetText(runtime.refill.message)
     end
+end)
+local rewards=automation:AddLeftGroupbox("Achievement rewards")
+control(rewards,"AutoClaimAchievements","Claim completed achievements")
+runtime.label(rewards,"Claims completed, unclaimed rewards using the game controller. Does not buy products or change perks. Off by default.")
+state.achievementLabel=runtime.label(rewards,"Achievement claiming: off")
+state.achievementResults={}
+function state.achievementStep()
+    if not e.AutoClaimAchievements then return end
+    local data=runtime.nativeData()
+    if not data or type(data.Achievements)~="table" then state.achievementMessage="Waiting for achievement data";return end
+    local operation=runtime.operations.AchievementClaim
+    if operation then state.achievementMessage="Waiting for an unresolved achievement response";return end
+    if runtime.jobs.Achievement or os.clock()<(state.achievementAt or 0) then return end
+    local manager=runtime.gameModules.AchievementManager;local atlas=runtime.gameModules.AtlasManager
+    if not manager or not manager.value or not atlas or not atlas.value or type(atlas.value.AchievementAtlas)~="table" then
+        state.achievementMessage="Waiting for native achievement modules";return
+    end
+    local event=child(child(storage(),"RemoteFunctions"),"ClaimAchievement")
+    if not event or not event:IsA("RemoteFunction") then state.achievementMessage="ClaimAchievement unavailable";return end
+    state.achievementAt=os.clock()+10
+    local epoch=state.epoch or 0
+    runtime.startJob("Achievement",runtime.limits.responseSeconds,function() return runtime.active and e.AutoClaimAchievements and (state.epoch or 0)==epoch end,function(job)
+        local keys={};for key in pairs(atlas.value.AchievementAtlas) do if type(key)=="string" then keys[#keys+1]=key end end;table.sort(keys)
+        for _,key in ipairs(keys) do
+            runtime.checkJob()
+            if not e.AutoClaimAchievements then return end
+            if data.Achievements[key]==true then state.achievementResults[key]=nil
+            elseif not state.achievementResults[key] then
+                local ok,progress,maximum=pcall(manager.value.GetProgress,manager.value,LocalPlayer.UserId,key)
+                runtime.checkJob()
+                if ok and finite(progress) and finite(maximum) and maximum>0 and progress>=maximum then
+                    local operation=runtime.startOperation("AchievementClaim",runtime.limits.responseSeconds,function()
+                        local latest=runtime.nativeData()
+                        return runtime.active and not (latest and latest.Achievements and latest.Achievements[key]==true)
+                    end,function(reason) state.achievementMessage="Claim result unknown: "..key..". "..reason end)
+                    if not operation then return end
+                    operation.achievement=key
+                    state.achievementMessage="Claiming "..key
+                    local success,result=pcall(remote,"RemoteFunctions","ClaimAchievement","InvokeServer",key)
+                    if not success or (operation.expired and not operation.valid()) then
+                        runtime.expireOperation(operation,"Claim response unavailable; retry held")
+                        return
+                    end
+                    runtime.finishOperation(operation)
+                    if result==true then
+                        state.achievementResults[key]="acknowledged"
+                        state.achievementMessage="Claim acknowledged: "..key.."; waiting for replicated rewards"
+                        if state.farm then state.farm.wake() end
+                    else state.achievementMessage="Claim rejected: "..key end
+                    state.achievementAt=os.clock()+2
+                    return
+                end
+            end
+        end
+        state.achievementMessage="No completed, unclaimed achievements"
+    end,function(reason) state.achievementMessage="Achievement check paused: "..reason end)
+end
+connect(RunService.Heartbeat,function()
+    if os.clock()<(state.achievementLabelAt or 0) then return end
+    state.achievementLabelAt=os.clock()+.5
+    state.achievementLabel:SetText(e.AutoClaimAchievements and (state.achievementMessage or "Checking completed achievements") or "Achievement claiming: off")
+    local ok,err=pcall(state.achievementStep);if not ok then state.achievementMessage=tostring(err) end
 end)
 local voting=automation:AddRightGroupbox("Voting")
 control(voting,"VoteMap","Preferred map",{})
@@ -2978,9 +6935,7 @@ state.throwStatus=runtime.label(throwInfo,"Enable an item and assign its key. Ne
 function runtime.throwKeyMatches(input)
     for index in ipairs(runtime.throwDefinitions) do
         local suffix=runtime.throwSuffix(index);local key=e["ThrowKey"..suffix]
-        if e["ThrowEnabled"..suffix] and key~="None" and (input.KeyCode.Name==key
-            or key=="MB1" and input.UserInputType==Enum.UserInputType.MouseButton1
-            or key=="MB2" and input.UserInputType==Enum.UserInputType.MouseButton2) then return index end
+        if e["ThrowEnabled"..suffix] and runtime.hotkeyMatches(input,key) then return index end
     end
 end
 connect(UIS.InputBegan,function(input,processed)
@@ -3014,9 +6969,7 @@ function runtime.manualConsumableKey(input,processed)
     local entries={}
     for index,item in ipairs(runtime.consumableDefinitions) do
         local key=e["ItemKey"..index]
-        local matches=key~="None" and (input.KeyCode.Name==key or (key=="MB1" and input.UserInputType==Enum.UserInputType.MouseButton1)
-            or (key=="MB2" and input.UserInputType==Enum.UserInputType.MouseButton2)
-        )
+        local matches=runtime.hotkeyMatches(input,key)
         if e["UseItem"..index] and matches then
             table.insert(entries,{name=item[1],index=index,key=key})
         end
@@ -3166,29 +7119,27 @@ function state.upgradeCost(tool,upgrade)
 end
 function state.upgradeAllowed(folder,upgrade,shopUpgrade)
     local requirement=readValue(upgrade,"UpgradeReq")
-    if requirement and requirement~="" and (readValue(folder,requirement) or 0)<=0 then return false end
+    if requirement and requirement~="" and (readValue(folder,requirement) or 0)<=0 then return false,"Upgrade prerequisite: "..requirement,"waiting" end
     local locks=readValue(upgrade,"UpgradeLock")
     if locks and not (shopUpgrade and readValue(child(storage(),"Values"),"Difficulty")==5) then
         for name in tostring(locks):gmatch("([^,]+)") do
-            if (readValue(folder,name) or 0)>0 then return false end
+            if (readValue(folder,name) or 0)>0 then return false,"Conflicting upgrade path: "..name,"locked" end
         end
     end
-    local data=_G.LocalReplicatedDataStore
-    if type(getrenv)=="function" then
-        local ok,env=pcall(getrenv)
-        if ok and env and env._G and env._G.LocalReplicatedDataStore then data=env._G.LocalReplicatedDataStore end
-    end
-    data=data or {}
+    local data=runtime.nativeData()
     local achievement=readValue(upgrade,"Achievement")
-    if achievement and achievement~="" and not (data.Achievements and data.Achievements[achievement]) then return false end
+    if achievement and achievement~="" then
+        if not data or type(data.Achievements)~="table" then return false,"Achievement data unavailable","waiting" end
+        if not data.Achievements[achievement] then return false,"Unclaimed achievement: "..achievement,"locked" end
+    end
     local perk=readValue(upgrade,"Perk")
     if perk and perk~="" then
         local name,level=tostring(perk):match("^([^:]+):(%d+)$")
-        local levels=name and data.PerkLevels and data.PerkLevels[name]
+        local levels=name and data and data.PerkLevels and data.PerkLevels[name]
         if not name then return false,"Unrecognized perk requirement: "..tostring(perk) end
-        if not child(child(LocalPlayer,"PlayerPerks"),name) then return false,"Equip required perk: "..name end
-        if not levels then return false,"Perk level data unavailable: "..name.." (requires "..level..")" end
-        if (tonumber(levels[1]) or 0)<tonumber(level) then return false,name.." requires level "..level.."; stored level "..tostring(levels[1]) end
+        if not child(child(LocalPlayer,"PlayerPerks"),name) then return false,"Equip required perk: "..name,"locked" end
+        if not levels then return false,"Perk level data unavailable: "..name.." (requires "..level..")","waiting" end
+        if (tonumber(levels[1]) or 0)<tonumber(level) then return false,name.." requires level "..level.."; stored level "..tostring(levels[1]),"locked" end
     end
     return true
 end
@@ -3203,12 +7154,12 @@ function state.shopUpgradeCost(upgrade,structure)
     elseif operator=="*" then cost=base*increase^level
     else error("Unsupported upgrade price operator") end
     local values=child(storage(),"Values")
-    if structure then cost=cost*(readValue(values,"ShopPriceMulti") or 1) end
     cost=math.floor(cost+.5)
     if readValue(values,"Difficulty")==5 then
         local utility=gameModule("Utility")
         cost=utility:RoundPrice(cost*(structure and utility:CareerStructureMulti() or utility:CareerPlayerMulti()),"Upgrade")
     end
+    if structure then cost=cost*(readValue(values,"ShopPriceMulti") or 1) end
     assert(type(cost)=="number" and cost==cost and cost>=0 and cost<math.huge,"Invalid shop upgrade cost")
     return cost
 end
@@ -3216,7 +7167,7 @@ function state.upgradeBlocked(kind,name,identity)
     local faults=state[kind]
     local fault=faults and faults[name]
     local map=child(Workspace,"Map")
-    if type(fault)=="table" and ((identity and fault.identity~=identity) or (map and fault.map~=map)) then
+    if type(fault)=="table" and ((identity and fault.identity~=identity) or (map and fault.map~=map) or (fault.round and fault.round~=runtime.roundIdentity())) then
         faults[name]=nil;fault=nil
     end
     if fault then
@@ -3227,7 +7178,7 @@ function state.upgradeBlocked(kind,name,identity)
 end
 function state.failUpgrade(kind,name,identity,reason)
     state[kind]=state[kind] or {}
-    state[kind][name]={identity=identity,map=child(Workspace,"Map"),reason=tostring(reason)}
+    state[kind][name]={identity=identity,map=child(Workspace,"Map"),round=runtime.roundIdentity(),reason=tostring(reason)}
     notice("Upgrade paused for "..tostring(name)..": "..tostring(reason)..". Partial local changes may exist; this data will not be applied again.")
     if runtime.active then warn("[Combat Assistant] "..state.message) end
 end
@@ -3248,8 +7199,9 @@ function state.upgradeShop(name,structure,owned,budget,selected)
                 -- ShopGui increments this before updating effects; both structure and player upgrades use this remote.
                 local sent=false
                 local ok,err=pcall(function()
-                    upgrade.Value=upgrade.Value+1
+                    runtime.checkJob();upgrade.Value=upgrade.Value+1
                     module:UpgradeStructurePlayer(LocalPlayer,name,upgrade,cost)
+                    runtime.checkJob()
                     if not runtime.active or (state.epoch or 0)~=epoch then error("Stopped after local effects changed, before dispatch") end
                     LocalPlayer.ReplicatedMoney.Value=LocalPlayer.ReplicatedMoney.Value-cost
                     event:FireServer(name,upgrade.Name)
@@ -3314,7 +7266,6 @@ function runtime.cancelAction()
             pcall(function() action.humanoid:EquipTool(action.previous) end)
         end
     end
-    runtime.actionAim=nil
 end
 function state.runAction(tool,enabled,fn)
     if runtime.consumableBusy or runtime.refillBusy or runtime.action or not releaseHeld() then return end
@@ -3334,7 +7285,6 @@ function state.runAction(tool,enabled,fn)
             if valid() then fn(action,valid) end
         end)
         if action.release then pcall(action.release) end
-        runtime.actionAim=nil
         if runtime.active and LocalPlayer.Character==character and humanoid.Health>0 and tool and previous and previous~=tool
             and previous.Parent==child(LocalPlayer,"Backpack") and (character:FindFirstChildOfClass("Tool")==tool or not character:FindFirstChildOfClass("Tool")) then
             pcall(function() humanoid:EquipTool(previous) end)
@@ -3417,16 +7367,16 @@ function state.donate()
     if amount<=0 then return end
     local character,map=LocalPlayer.Character,child(Workspace,"Map")
     local operation=runtime.startOperation("TransferMoney",runtime.limits.responseSeconds,function()
-        return runtime.active and LocalPlayer.Character==character and child(Workspace,"Map")==map
+        return runtime.active
     end,function(reason)
-        if state.donationOperation and state.donationOperation.expired then state.spendingBusy=false;notice("Donation paused: "..reason) end
+        if state.donationOperation and state.donationOperation.expired then state.releaseSpending(state.donationOperation);notice("Donation paused: "..reason) end
     end)
     if not operation then return end
-    state.donationOperation=operation;state.spendingBusy=true
+    state.donationOperation=operation;state.acquireSpending(operation)
     local ok,result=pcall(remote,"RemoteFunctions","TransferMoney","InvokeServer",recipient,amount)
     runtime.finishOperation(operation)
     if state.donationOperation~=operation then return end
-    state.donationOperation=nil;state.spendingBusy=false
+    state.donationOperation=nil;state.releaseSpending(operation)
     if operation.expired then return end
     notice(ok and result~="FAIL" and result~=false and "Donation submitted: "..recipient.Name or "Donation rejected; retrying later.")
 end
@@ -3635,7 +7585,8 @@ function state.upgradeTool(name,upgradeName,farmOwned)
     local wasEquipped=tool.Parent==character
     local epoch=state.epoch or 0
     local ok,err=pcall(function()
-        shopModule:UpgradeTool(LocalPlayer,tool,backgear,upgrade,effect)
+        runtime.checkJob();shopModule:UpgradeTool(LocalPlayer,tool,backgear,upgrade,effect)
+        runtime.checkJob()
         if not runtime.active or (state.epoch or 0)~=epoch or LocalPlayer.Character~=character then error("Character or automation changed after local effects, before dispatch") end
         LocalPlayer.ReplicatedMoney.Value=LocalPlayer.ReplicatedMoney.Value-cost
         event:FireServer(name,upgradeName)
@@ -3654,6 +7605,7 @@ function state.upgradeTool(name,upgradeName,farmOwned)
 end
 function state.purchase(name,farmOwned,buyOnly)
     if not farmOwned and e.Autofarm then return false end
+    if state.upgradeBlocked("purchaseFaults",name,child(child(storage(),"Upgrades"),name)) then return false end
     if name=="Armour" and readValue(LocalPlayer,"InsideShop")~=true then return false end
     local upgrade=child(child(storage(),"Upgrades"),name)
     if not upgrade then return false end
@@ -3679,7 +7631,18 @@ function state.purchase(name,farmOwned,buyOnly)
         state.armourBuyAt=os.clock()+5
         remote("RemoteEvents","BuyPlayerUpgrade","FireServer",name)
         notice("Armour purchase requested; awaiting game update.")
-    else shop():BuyStructure(name);notice("Shop purchase checked: "..name) end
+    else
+        local probe={name=name,dispatched=false};local thread=coroutine.running()
+        state.purchaseProbes=state.purchaseProbes or setmetatable({}, {__mode="k"});state.purchaseProbes[thread]=probe
+        local ok,err=pcall(function() runtime.checkJob();shop():BuyStructure(name);runtime.checkJob() end)
+        state.purchaseProbes[thread]=nil
+        if not ok then state.failUpgrade("purchaseFaults",name,upgrade,err);return false end
+        if not probe.dispatched then
+            if readValue(owned,"UPurchased")==true then state.failUpgrade("purchaseFaults",name,upgrade,"Local ownership changed without an observed purchase dispatch") end
+            notice("Native purchase was not dispatched: "..name);return false
+        end
+        notice("Purchase dispatched: "..name.."; server acceptance unconfirmed.")
+    end
     return true
 end
 function state.repair(name)
@@ -3717,6 +7680,7 @@ end
 -- Uses the same client bookkeeping as ShopGui; local levels are not server acknowledgements.
 state.farm={stage=1,message="Off",next=0,epoch=0}
 local farm=state.farm
+if safety and safety.server==game.JobId and safety.player==LocalPlayer then farm.purchaseUnknown=safety.farmPurchaseUnknown;farm.c96Attempt=safety.c96Attempt end
 farm.healingItems={
     {name="Bandage",excluded={HealOverTime=true}},
     {name="First Aid Kit",excluded={Range=true,StaminaHeal=true}},
@@ -3776,7 +7740,10 @@ end
 function farm.healingBuyInfo(name)
     local template=child(child(storage(),"Tools"),name)
     local playerValues=child(LocalPlayer,"PlayerValues")
-    if not (farm.healingItem(name) or farm.drinkItem(name)) or not template or not child(playerValues,"PerkValues") then return nil,"waiting for item/player data" end
+    if not (farm.healingItem(name) or farm.drinkItem(name) or name=="C96") or not template or not child(playerValues,"PerkValues") then return nil,"waiting for item/player data" end
+    if name=="C96" and not child(child(LocalPlayer,"PlayerPerks"),"StarterPistol") then return nil,"Backup Weapon perk is required" end
+    local values=child(storage(),"Values")
+    if not child(values,"Difficulty") or not child(values,"MutationId") or (readValue(values,"MutationId")==9 and not child(values,"MapName")) then return nil,"waiting for stock data" end
     local utility,manager=gameModule("Utility"),gameModule("CharacterManager")
     if not utility:IsWeaponInStock(name,LocalPlayer) then return nil,"item not in stock" end
     local price=farm.healingPrice(template,utility,manager)
@@ -3822,20 +7789,23 @@ function farm.itemSequence(items,label)
         local folder=toolUpgrades(item.name)
         if not folder then farm.waitStatus(label..": "..item.name.." upgrade data");return false end
         local list=folder:GetChildren();table.sort(list,function(a,b) return a.Name<b.Name end)
-        local count,blocked=0,nil
+        local count,blocked,locked=0,nil,{}
         for _,u in ipairs(list) do
             if child(u,"Cost") and not item.excluded[u.Name] then
                 count=count+1
                 if not finite(u.Value) or not finite(u.MaxValue) then farm.waitStatus(item.name.." / "..u.Name.." level data");return false end
                 if u.Value<u.MaxValue then
-                    local allowed,reason=state.upgradeAllowed(folder,u)
+                    local allowed,reason,classification=state.upgradeAllowed(folder,u)
                     if allowed then return farm.request(u,state.upgradeCost(tools[item.name],u),"UpgradeWeapon",item.name,u.Name) end
-                    blocked=blocked or item.name.." / "..u.Name..": "..(reason or "upgrade prerequisite or path lock")
+                    local message=item.name.." / "..u.Name..": "..(reason or "upgrade prerequisite or path lock")
+                    if classification=="locked" then locked[#locked+1]=message
+                    else blocked=blocked or message end
                 end
             end
         end
         if count==0 then farm.waitStatus(label..": no allowed upgrade data for "..item.name);return false end
         if blocked then farm.waitStatus(label..": "..blocked);return false end
+        if #locked>0 then farm.allowedUpgradeNotice=table.concat(locked,"; ") end
     end
 
     return true
@@ -3881,6 +7851,10 @@ function farm.unlimitedOwned()
     local u=farm.unlimited();return u and type(u.Value)=="number" and u.Value>(u.MinValue or 0) or false
 end
 function farm.confirmed()
+    if farm.purchaseUnknown then
+        if farm.purchaseUnknown.round==runtime.roundIdentity() then farm.fault=farm.purchaseUnknown.reason
+        else farm.purchaseUnknown=nil;farm.fault=nil end
+    end
     if farm.fault then farm.status(farm.fault);return false end
     if farm.inFlight then farm.waitStatus("native farm purchase response");return false end
     return true
@@ -3902,12 +7876,15 @@ function farm.request(object,cost,event,...)
     if runtime.consumableBusy or runtime.refillBusy or reloadState.key then
         farm.waitStatus("item use/refill/reload before "..object.Name.." purchase (available "..math.floor(budget)..", cost "..math.ceil(cost)..")");return false
     end
-    local args={...};local character=LocalPlayer.Character;local run=farm.runId
+    local args={...};local character=LocalPlayer.Character;local run=farm.runId;local round=runtime.roundIdentity()
     farm.purchaseObservation={object=object,before=object.Value,event=event,item=args[1],name=object.Name,state="Queued"}
     local observation=farm.purchaseObservation
     local requestToken={}
+    if not state.acquireSpending(requestToken) then return false end
     farm.requestToken=requestToken;farm.inFlight=true;farm.requestAt=os.clock()+math.max(.5,e.ActionInterval)
-    task.spawn(function()
+    local job=runtime.startJob("FarmPurchase",runtime.limits.responseSeconds,function()
+        return runtime.active and farm.runId==run and LocalPlayer.Character==character and e.Autofarm
+    end,function(job)
         if not runtime.active or LocalPlayer.Character~=character or farm.runId~=run or not e.Autofarm then if farm.requestToken==requestToken then farm.inFlight=false end;return end
         if farm.healthDue() then
             if not (args[1]=="Health" and (event=="BuyPlayerUpgrade" or (event=="UpgradeStructurePlayer" and (args[2]=="Health" or args[2]=="HealthRegen")))) then if farm.requestToken==requestToken then farm.inFlight=false end;return end
@@ -3918,6 +7895,7 @@ function farm.request(object,cost,event,...)
             farm.status("Purchase held: "..object.Name.."; reserve "..tostring(state.purchaseReserve()))
             return
         end
+        observation.started=true
         local ok,result=pcall(function()
             if event=="BuyHealing" then
                 farm.healingBuyAt=os.clock()+3
@@ -3930,12 +7908,24 @@ function farm.request(object,cost,event,...)
             end
             return state.purchase(args[1],true,true)
         end)
+        if job.cancelled then return end
         if farm.requestToken==requestToken then farm.inFlight=false end
         if farm.runId~=run or LocalPlayer.Character~=character then return end
         if not ok then observation.state="Native request failed";farm.fault="Native purchase failed: "..tostring(result);farm.status(farm.fault)
         elseif result then observation.state="Request sent";farm.status("Native purchase sent: "..object.Name..". Waiting for observed ownership/level change.")
         else observation.state="Blocked by native prerequisites";farm.status("Purchase waiting for native prerequisites: "..object.Name) end
-    end)
+    end,function(reason)
+        state.releaseSpending(requestToken)
+        if farm.requestToken==requestToken then
+            farm.inFlight=false;observation.state="Unresolved"
+            if observation.started then
+                local message="Purchase result unknown: "..object.Name..". "..reason
+                farm.purchaseUnknown={round=round,reason=message};farm.fault=message
+            end
+            farm.status(farm.fault or "Purchase deferred: "..reason)
+        end
+    end,function() state.releaseSpending(requestToken) end)
+    if not job then farm.inFlight=false;state.releaseSpending(requestToken) end
     return false
 end
 function farm.upgradeC96(onlyUnlimited)
@@ -4018,7 +8008,7 @@ function farm.cancelWalk()
     farm.retreat=nil;farm.sprintClear=false;farm.clearAt=0;farm.clearPoint=nil;farm.lastGroundAt=nil
     if farm.route and farm.route.blocked then farm.route.blocked:Disconnect() end
     if farm.route and farm.route.path then pcall(function() farm.route.path:Destroy() end) end
-    farm.epoch=farm.epoch+1;farm.route=nil;farm.pathBusy=false;farm.climbDirection=nil
+    farm.epoch=farm.epoch+1;runtime.cancelJob("Path","Route cancelled");farm.route=nil;farm.pathBusy=false;farm.climbDirection=nil;farm.groundCache=nil
     farm.walkPoint=nil;farm.jumpUntil=nil
     local character,humanoid=alive();local root=child(character,"HumanoidRootPart")
     if humanoid and root and farm.moving then humanoid:MoveTo(root.Position) end
@@ -4057,24 +8047,30 @@ function farm.walk(goal,message,tolerance)
         return false
     end
     farm.pathBusy=true;farm.pathAt=os.clock()+3;local epoch=farm.epoch
-    task.spawn(function()
-        local created
+    local created
+    local job=runtime.startJob("Path",runtime.limits.pathSeconds,function()
+        return runtime.active and epoch==farm.epoch and LocalPlayer.Character==character
+    end,function(job)
         local ok,path=pcall(function()
             local p=game:GetService("PathfindingService"):CreatePath({AgentRadius=2.5,AgentHeight=5,AgentCanJump=true,AgentCanClimb=true,WaypointSpacing=2})
             created=p
             p:ComputeAsync(root.Position,goal);return p
         end)
-        local function dispose() if created then pcall(function() created:Destroy() end) end end
-        if epoch~=farm.epoch or LocalPlayer.Character~=character or not runtime.active then dispose();return end
+        local function dispose() if created then local object=created;created=nil;pcall(function() object:Destroy() end) end end
+        if job.cancelled or epoch~=farm.epoch or LocalPlayer.Character~=character or not runtime.active then dispose();return end
         farm.pathBusy=false
         if ok and path.Status==Enum.PathStatus.Success then
             local route={path=path,points=path:GetWaypoints(),index=1,goal=goal,progressAt=os.clock()};farm.route=route
             if path.Blocked then route.blocked=path.Blocked:Connect(function(index)
-                if farm.route==route and index>=route.index then route.obstructed=true end
+                if farm.route==route and index>=route.index then route.obstructed=true;farm.groundCache=nil end
             end) end
             farm.steerRoute(humanoid,root)
         else dispose();farm.status("No walkable path: "..message..". Waiting; no teleport fallback.") end
+    end,function(reason)
+        if created then local object=created;created=nil;pcall(function() object:Destroy() end) end
+        if epoch==farm.epoch then farm.pathBusy=false;farm.pathAt=os.clock()+1;farm.status("Path retry: "..reason) end
     end)
+    if not job then farm.pathBusy=false;farm.pathAt=os.clock()+1 end
     return false
 end
 function farm.leave(which)
@@ -4301,7 +8297,7 @@ function farm.begin()
     farm.healthDone=false
     farm.resetNightReached=false;farm.resetAttempt=nil;farm.resetMessage=nil;farm.resetCount=0
     farm.forwardDone=false
-    farm.pathAt=0;farm.forcePathUntil=0;farm.fault=nil;farm.exitTransit=nil;farm.exitWalking=nil
+    farm.pathAt=0;farm.forcePathUntil=0;farm.fault=farm.purchaseUnknown and farm.purchaseUnknown.round==runtime.roundIdentity() and farm.purchaseUnknown.reason or nil;farm.exitTransit=nil;farm.exitWalking=nil
     farm.savedTrigger=config.Triggerbot;triggerToggle:SetValue(false)
     for _,key in ipairs(conflicts) do if e[key] then e[key]=false;if ui[key] then ui[key]:SetValue(false) end end end
     farm.status("Starting ordered C96 autofarm.")
@@ -4310,6 +8306,8 @@ function farm.stop()
     farm.resetAttempt=nil;farm.resetMessage=nil;farm.resetNightReached=false
     if runtime.cancelInstantConsumables then runtime.cancelInstantConsumables("autofarm") end
     farm.runId=(farm.runId or 0)+1
+    runtime.cancelJob("FarmPurchase","Farm context changed")
+    runtime.cancelJob("C96Recovery","Farm context changed")
     farm.cancelWalk()
     farm.exitTransit=nil;farm.exitWalking=nil
     if farm.active then triggerToggle:SetValue(farm.savedTrigger==true) end
@@ -4351,6 +8349,64 @@ function farm.ongoingSkip()
             and readValue(values,"LocalWave")==wave and (readValue(values,"LocalLives") or 1)>0
             and (readValue(values,"VotingTime") or 0)<=0 and readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==false then state.skip() end
     end)
+end
+function farm.acquireC96()
+    local character,map,round=LocalPlayer.Character,child(Workspace,"Map"),runtime.roundIdentity()
+    local attempt=farm.c96Attempt
+    if attempt and (attempt.character~=character or attempt.map~=map or attempt.round~=round) then farm.c96Attempt=nil;attempt=nil end
+    if attempt then farm.waitStatus(attempt.dispatched and (os.clock()-attempt.at>=runtime.limits.responseSeconds and "C96 request unconfirmed; duplicate purchase held" or "C96 ownership replication") or "C96 purchase eligibility");return end
+    if child(child(LocalPlayer,"Backgear"),"C96") then farm.waitStatus("C96 tool replication");return end
+    local _,humanoid=alive();if not humanoid then return end
+    if state.spendingBusy or runtime.refillBusy or runtime.consumableBusy then farm.waitStatus("C96 purchase waiting for shared resources");return end
+    local owner={};if not state.acquireSpending(owner) then return end
+    attempt={character=character,map=map,round=round,at=os.clock()};farm.c96Attempt=attempt
+    local run=farm.runId
+    local job=runtime.startJob("C96Recovery",runtime.limits.responseSeconds,function()
+        local _,humanoid=alive()
+        return humanoid and e.Autofarm and farm.runId==run and LocalPlayer.Character==character and child(Workspace,"Map")==map and runtime.roundIdentity()==round
+    end,function()
+        local price,reason=farm.healingBuyInfo("C96")
+        runtime.checkJob()
+        if price~=0 then
+            if farm.c96Attempt==attempt then farm.c96Attempt=nil end
+            farm.waitStatus("C96 tool: "..tostring(reason or "automatic recovery supports the native free C96 only"));return
+        end
+        local _,tools=ownedTools()
+        if tools.C96 or child(child(LocalPlayer,"Backgear"),"C96") then
+            if farm.c96Attempt==attempt then farm.c96Attempt=nil end;return
+        end
+        if runtime.refillBusy or runtime.consumableBusy or reloadState.key then
+            if farm.c96Attempt==attempt then farm.c96Attempt=nil end
+            farm.waitStatus("C96 purchase waiting for shared resources");return
+        end
+        attempt.dispatched=true
+        remote("RemoteEvents","BuyWeapon","FireServer","C96")
+        farm.waitStatus("C96 ownership replication")
+    end,function(reason)
+        state.releaseSpending(owner)
+        if farm.c96Attempt==attempt then
+            if not attempt.dispatched then farm.c96Attempt=nil end
+            farm.waitStatus(attempt.dispatched and "C96 request unconfirmed; duplicate purchase held" or "C96 purchase deferred: "..reason)
+        end
+    end,function() state.releaseSpending(owner) end)
+    if not job then farm.c96Attempt=nil;state.releaseSpending(owner) end
+end
+function farm.preflight()
+    if not farm.supported() then return true end
+    local _,tools=ownedTools()
+    if not tools.C96 then
+        local perks=child(LocalPlayer,"PlayerPerks")
+        local reason=not perks and "waiting for perk replication" or (not child(perks,"StarterPistol") and "Backup Weapon perk is required" or "waiting for your C96 tool")
+        if perks and child(perks,"StarterPistol") then farm.acquireC96() else farm.waitStatus(reason) end;return false
+    end
+    farm.c96Attempt=nil
+    local folder=toolUpgrades("C96")
+    if not folder or not farm.unlimited() then farm.waitStatus("C96 Unlimited Ammo upgrade data");return false end
+    for _,name in ipairs({"CharacterManager","Utility","ShopModule","ShopPurchase"}) do
+        local cached=runtime.gameModules[name]
+        if not cached or not cached.value then farm.waitStatus(name.." dependency");return false end
+    end
+    return true
 end
 function farm.step()
     if not e.Autofarm then if farm.active then farm.stop() end;return end
@@ -4396,6 +8452,7 @@ function farm.step()
     end
     if farm.resetTick and farm.resetTick() then return end
     -- Recovery holds ready-up until the character is securely back on the Ammo Box.
+    if not farm.preflight() then return end
     if farm.recovering then
         if farm.recovering<=2 then
             if farm.leave(farm.recovering) then farm.recovering=farm.recovering+1 end
@@ -4477,6 +8534,42 @@ if RunService.BindToRenderStep then
     end)
     table.insert(runtime.connections,{Disconnect=function() RunService:UnbindFromRenderStep(binding) end})
 end
+function farm.wake() farm.next=0 end
+farm.progressWatches={}
+function farm.refreshProgressWatches()
+    local scopes={Money=child(LocalPlayer,"ReplicatedMoney"),Upgrades=child(LocalPlayer,"Upgrades"),Perks=child(LocalPlayer,"PlayerPerks"),
+        Gear=child(LocalPlayer,"Backgear"),Shop=child(storage(),"Upgrades")}
+    for key,root in pairs(scopes) do
+        local old=farm.progressWatches[key]
+        if not old or old.root~=root then
+            if old then old.dispose() end
+            local watch={root=root,connections={},values={}};farm.progressWatches[key]=watch
+            local function remove(object)
+                local connection=watch.values[object];if connection then pcall(function() connection:Disconnect() end);watch.values[object]=nil end
+            end
+            local function add(object)
+                if object.Changed and (object:IsA("ValueBase") or object:IsA("DoubleConstrainedValue")) and not watch.values[object] then
+                    watch.values[object]=object.Changed:Connect(function() if runtime.active then farm.wake() end end)
+                end
+            end
+            function watch.dispose()
+                for _,connection in ipairs(watch.connections) do pcall(function() connection:Disconnect() end) end
+                for object in pairs(watch.values) do remove(object) end
+            end
+            if root then
+                add(root)
+                if root.GetDescendants then for _,object in ipairs(root:GetDescendants()) do add(object) end end
+                if root.DescendantAdded then watch.connections[#watch.connections+1]=root.DescendantAdded:Connect(function(object) add(object);farm.wake() end) end
+                if root.DescendantRemoving then watch.connections[#watch.connections+1]=root.DescendantRemoving:Connect(function(object) remove(object);farm.wake() end) end
+            end
+        end
+    end
+    for key,watch in pairs(farm.progressWatches) do if not scopes[key] then watch.dispose();farm.progressWatches[key]=nil end end
+end
+connect(RunService.Heartbeat,function()
+    if os.clock()>=(farm.progressWatchAt or 0) then farm.progressWatchAt=os.clock()+1;farm.refreshProgressWatches() end
+end)
+table.insert(runtime.connections,{Disconnect=function() for _,watch in pairs(farm.progressWatches) do watch.dispose() end;farm.progressWatches={} end})
 local farmGroup=runtime.extensionTabs.Autofarm:AddLeftGroupbox("C96 autofarm")
 control(farmGroup,"Autofarm","One-click C96 autofarm")
 farm.label=runtime.label(farmGroup,"Off",true)
@@ -4669,8 +8762,7 @@ function farm.drinkSchedule(wave,minutes,map,minimumWave)
     local slots={}
     for _,definition in ipairs(farm.drinkSlots(wave)) do
         local due=night and farm.drinkEligible(wave,minimumWave or 15) and
-            ((minutes>=1080 and definition.minutes>=1080 and minutes>=definition.minutes)
-            or (minutes<360 and definition.minutes<360 and minutes>=definition.minutes))
+            ((minutes+360)%1440 >= (definition.minutes+360)%1440)
         local slot=clock.history[definition.at]
         if due and not slot then
             slot={at=definition.at,items={}};clock.history[definition.at]=slot
@@ -4874,7 +8966,6 @@ function farm.stepName()
     local names={"Leaving spawn","Leaving shop","C96 Unlimited Ammo","Completing first night","Early farming / Ammo Box","C96 / Shop Money","Armour upgrades","Barricade upgrades","Shop upgrades","Night Vision / drinks","Sniper / Handling Speed","Healing items and upgrades","Mortar upgrades"}
     return names[farm.stage] or "Ammo Box damage upgrades"
 end
-
 function farm.grounded(humanoid,root)
     local material=humanoid.FloorMaterial
     local velocity=root.AssemblyLinearVelocity
@@ -4956,6 +9047,14 @@ function farm.sprint(wanted)
     else farm.motionStatus="Walking: sprint input unavailable";farm.stopSprint() end
 end
 function farm.clearGroundSegment(root,destination)
+    local cached=farm.groundCache
+    if cached and cached.root==root and cached.map==child(Workspace,"Map") and os.clock()<cached.untilAt
+        and (root.Position-cached.origin).Magnitude<.35 and (destination-cached.destination).Magnitude<.1 then return cached.clear end
+    local clear=farm.computeGroundSegment(root,destination)
+    farm.groundCache={root=root,map=child(Workspace,"Map"),origin=root.Position,destination=destination,clear=clear,untilAt=os.clock()+.08}
+    return clear
+end
+function farm.computeGroundSegment(root,destination)
     local delta=Vector3.new(destination.X-root.Position.X,0,destination.Z-root.Position.Z)
     if delta.Magnitude<.1 then return false end
     local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
@@ -5147,7 +9246,7 @@ connect(RunService.Heartbeat,function()
         local priority=farm.healthDue() and "Wave 28 health" or (farm.healingDue() and "Post-Handling healing" or "Normal upgrades")
         local purchase=farm.purchaseBudget
         local nextPurchase=purchase and (tostring(purchase.item).." ($"..math.ceil(purchase.cost)..")") or "Waiting for purchase selection"
-        local text="Step: "..farm.stepName().."\nPurchase: "..nextPurchase.."\n"..farm.purchaseSummary().."\nCash reserve: $"..state.purchaseReserve().."\nPriority: "..priority.."\nNext drinks: "..farm.nextDrinkSummary(wave,game:GetService("Lighting"):GetMinutesAfterMidnight()).."\nMovement: "..(farm.motionStatus or "Idle")
+        local text="Step: "..farm.stepName().."\nPurchase: "..nextPurchase.."\n"..farm.purchaseSummary().."\nCash reserve: $"..state.purchaseReserve().."\nPriority: "..priority.."\nNext drinks: "..farm.nextDrinkSummary(wave,game:GetService("Lighting"):GetMinutesAfterMidnight()).."\nMovement: "..(farm.motionStatus or "Idle")..(farm.allowedUpgradeNotice and ("\nLocked optional upgrades: "..farm.allowedUpgradeNotice) or "")
         if farm.detailDisplayed~=text then
             local result=farm.detailLabel:SetText(text)
             if result~=false then farm.detailDisplayed=text end
@@ -5423,19 +9522,32 @@ function state.spending(supportOnly)
     end
     table.sort(actions,function(a,b) return a.name<b.name end)
     if #actions==0 then return end
-    state.spendingBusy=true
-    local epoch=state.epoch or 0
-    task.spawn(function()
+    local owner={};if not state.acquireSpending(owner) then return end
+    state.maintenanceUnknown=state.maintenanceUnknown or {}
+    local epoch=state.epoch or 0;local character=LocalPlayer.Character;local map=child(Workspace,"Map");local round=runtime.roundIdentity()
+    local job=runtime.startJob("Maintenance",runtime.limits.responseSeconds,function()
+        return runtime.active and state.epoch==epoch and LocalPlayer.Character==character and child(Workspace,"Map")==map
+    end,function(job)
         local ok,err=pcall(function()
             for offset=1,#actions do
-                if not runtime.active or (state.epoch or 0)~=epoch then return end
+                if job.cancelled or not runtime.active or (state.epoch or 0)~=epoch then return end
                 local index=((state.spendIndex or 0)+offset-1)%#actions+1
-                if actions[index].run() then state.spendIndex=index;return end
+                local action=actions[index];local blocked=state.maintenanceUnknown[action.name]
+                if blocked and (blocked.map~=map or blocked.round~=round) then state.maintenanceUnknown[action.name]=nil;blocked=nil end
+                if not blocked then
+                    owner.action=action.name;job.action=action.name
+                    if action.run() then state.spendIndex=index;return end
+                    owner.action=nil;job.action=nil
+                end
             end
         end)
-        state.spendingBusy=false
+        state.releaseSpending(owner)
         if not ok then notice("Automatic spending paused: "..tostring(err)) end
+    end,function(reason)
+        if owner.action then state.maintenanceUnknown[owner.action]={map=map,round=round,reason=reason} end
+        state.releaseSpending(owner);notice("Maintenance result uncertain: "..tostring(owner.action)..". "..reason)
     end)
+    if not job then state.releaseSpending(owner) end
 end
 
 connect(UIS.InputBegan,function(input,processed)
@@ -5574,7 +9686,7 @@ function op.detonate()
     op.canAt=os.clock()+1
     local root=child(LocalPlayer.Character,"HumanoidRootPart");if not root then return end
     local best,distance
-    for _,object in ipairs(Workspace:GetDescendants()) do
+    for _,object in ipairs(runtime.indexedObjects("Detonators",Workspace,function(object) return object.Name=="DetonateCan" and object:IsA("RemoteEvent") end)) do
         if object.Name=="DetonateCan" and object:IsA("RemoteEvent") then
             local model=object.Parent;local creator=readValue(model,"Creator");local anchor=model:IsA("Model") and model.PrimaryPart
             local recognized=model.Name=="GasCan" or model.Name=="PropaneCan"
@@ -5597,7 +9709,7 @@ runtime.label(weapons,"Projectile weapons only. Re-equip if the gun caches its v
 connect(UIS.InputBegan,function(input,processed)
     if processed or UIS:GetFocusedTextBox() or not on(6) then return end
     local key=e.OPCanKey
-    if input.KeyCode and input.KeyCode.Name==key then local ok,err=pcall(op.detonate);if not ok then notice(tostring(err)) end end
+    if runtime.hotkeyMatches(input,key) then local ok,err=pcall(op.detonate);if not ok then notice(tostring(err)) end end
 end)
 connect(RunService.Heartbeat,function()
     if os.clock()<(op.next or 0) then return end;op.next=os.clock()+.1
@@ -5606,12 +9718,12 @@ end)
 
 control(utilities,"OPPredictionSeconds","Throw prediction seconds")
 function state.cleanup()
-    state.restoreHipADS()
-    if state.farm then state.farm.stop() end
-    if runtime.op then runtime.op.cleanup() end
     state.epoch=(state.epoch or 0)+1
-    if runtime.cancelAction then runtime.cancelAction() end
-    restoreFireMode();clearVisuals()
+    runtime.cleanupStep("ADS",state.restoreHipADS)
+    if state.farm then runtime.cleanupStep("Farm",state.farm.stop) end
+    if runtime.op then runtime.cleanupStep("Modifiers",runtime.op.cleanup) end
+    if runtime.cancelAction then runtime.cleanupStep("Item action",runtime.cancelAction) end
+    runtime.cleanupStep("Fire mode",restoreFireMode);runtime.cleanupStep("Visuals",clearVisuals)
     for key,value in pairs(e) do if type(value)=="boolean" then e[key]=false end end
 end
 end
@@ -5622,13 +9734,15 @@ function runtime.showReadiness()
     local messages={}
     for _,name in ipairs({"CharacterManager","ModOperations","Utility","ShopModule","ShopPurchase"}) do
         local cached=runtime.gameModules[name]
-        if not cached or not cached.value or cached.module~=runtime.moduleObject(name) then messages[#messages+1]=name..": waiting; retrying automatically" end
+        if not cached or not cached.value or cached.module~=runtime.moduleObject(name) then messages[#messages+1]=name..": "..tostring(cached and cached.error or "waiting for module") end
     end
     if config.Triggerbot and (type(runtime.callerLookup)~="function" or type(setnamecallmethod)~="function") then messages[#messages+1]="Triggerbot: required hook APIs unavailable" end
     if config.Triggerbot and runtime.lastInputError then messages[#messages+1]="Firing: "..runtime.lastInputError end
     if config.NoRecoil and not runtime.recoilPatch then messages[#messages+1]=runtime.modifierStatus or "No recoil: waiting for native callback" end
     if (config.Triggerbot or config.SilentAim) and not runtime.facing.available then messages[#messages+1]="Arm aiming: "..runtime.facing.status end
     for _,operation in pairs(runtime.operations) do if operation.expired then messages[#messages+1]="A request result is unknown; duplicate requests are held";break end end
+    if runtime.cleanupError then messages[#messages+1]="Cleanup: "..runtime.cleanupError end
+    if next(runtime.slot.quarantine) then messages[#messages+1]="An earlier instance left an unresolved request; matching actions are held" end
     local farm=runtime.extensions and runtime.extensions.farm
     if farm and runtime.extra.Autofarm and farm.label and farm.label.renderError then messages[#messages+1]="Autofarm: "..farm.message end
     runtime.capabilityLabel:SetText(#messages>0 and table.concat(messages,"\n") or "Required dependencies ready")
@@ -5642,7 +9756,7 @@ runtime.workers.dependencies=task.spawn(function()
         task.wait(runtime.limits.dependencyRetry)
         if runtime.active and not runtime.loadingProfile then
             pcall(runtime.refreshDependencies)
-            if not runtime.facing.available then runtime.installFacing() end
+            runtime.installFacing()
         end
     end
 end)
@@ -5652,8 +9766,11 @@ task.defer(function()
     profileAction(function() refreshProfiles() end)
     profileAction(function()
         diskReady()
-        if not isfile(autoloadPath) then return end
-        local data = HttpService:JSONDecode(readfile(autoloadPath))
+        local path=autoloadPath
+        if not isfile(path) and profileFolder~=legacyProfileFolder then path=legacyProfileFolder.."/autoload.json" end
+        if not isfile(path) then return end
+        local data = HttpService:JSONDecode(readfile(path))
+        assert(data.GameId==nil or data.GameId==runtime.configGameId,"Autoload belongs to another game")
         assert(type(data) == "table" and data.Version == 1 and type(data.Enabled) == "boolean", "Invalid autoload file.")
         if not data.Enabled then return end
         local name = cleanName(data.Name)
