@@ -1,4 +1,4 @@
--- JoesAAS 5.10 | standalone source | October 2026
+-- JoesAAS 5.11 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -8,7 +8,7 @@ if game.GameId ~= 10502841145 then
     warn("JoesAAS: this build targets the exported game's universe, not this experience.")
     return
 end
-local A = {version="5.10"}
+local A = {version="5.11"}
 environment.JoesAAS = A
 environment.AnimeSuite = A -- Compatibility with older running versions.
 A.Core = (function()
@@ -137,7 +137,8 @@ return function(A)
         gateAutoJoin=false,gateSelection={},gateRanks={S=true,A=true,B=true,C=true,D=true,E=true},
         maxTacAutoJoin=false,maxTacSelection={},maxTacRanks={Low=true,Medium=true,High=true,Extreme=true,Psycho=true},
         dungeonAutoJoin=false,dungeonSelection={},bossRushAutoJoin=false,bossRushSelection={},
-        rename=false,petName='',petPassiveAuto=false,webhook=false,webhookURL='',pingId='',ping=false,sendDisconnect=true,
+        rename=false,petName='',petPassiveAuto=false,accessoryCurseAuto=false,swordPassiveAuto=false,titanPassiveAuto=false,shadowPassiveAuto=false,
+        webhook=false,webhookURL='',pingId='',ping=false,sendDisconnect=true,
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
         blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false,ripperdocAuto=false,ripperdocSlots={},
@@ -362,7 +363,7 @@ return function(A)
         A.status.Gameplay=value and 'Ready: each feature uses its own toggle' or 'Stopped or disconnected; rerun after reconnecting'
         if not value then
             A.saveSettings(true)
-            if A.stopPetPassives then A.stopPetPassives() end
+            if A.stopPassiveQueues then A.stopPassiveQueues() end
             if A.stopFarmMovement then A.stopFarmMovement() end
             if A.stopTrialMovement then A.stopTrialMovement() end
             if A.stopDungeonMovement then A.stopDungeonMovement() end
@@ -1036,272 +1037,580 @@ end
 
 end)()(A);
 
+-- ===== passive_queue =====
+(function()
+return function(A)
+    -- All five systems use the same lifecycle; the native controller owns rolling.
+    local pending,nextWrite,timer,timerId={},0,false,0
+    local pump
+    local function arm(seconds)
+        timer=true; timerId=timerId+1
+        local id=timerId
+        task.delay(seconds,function() if timerId==id then pump() end end)
+    end
+    pump=function()
+        timer=false; timerId=timerId+1
+        if next(pending)==nil then return end
+        if os.clock()<nextWrite then arm(nextWrite-os.clock()); return end
+        local kind,entry=next(pending); pending[kind]=nil
+        local environment=(type(getgenv)=='function' and getgenv()) or _G
+        if (A.alive or environment.JoesAAS==A) and (#entry.keys==0 or entry.valid()) then
+            local ok,err=pcall(entry.util.SetQueue,entry.util,kind,entry.keys)
+            nextWrite=os.clock()+0.3
+            if not ok then A.log('Passive queue',err) end
+        end
+        if next(pending)~=nil then arm(math.max(0.01,nextWrite-os.clock())) end
+    end
+    local function writeQueue(util,kind,keys,valid)
+        pending[kind]={util=util,keys=keys,valid=valid}
+        if not timer or os.clock()>=nextWrite then pump() end
+    end
+    A.passiveQueues={}
+    function A.stopPassiveQueues()
+        for _,queue in pairs(A.passiveQueues) do queue.stop() end
+    end
+    function A.createPassiveQueue(spec)
+        local TARGET=spec.target
+        local title=spec.title
+        local gap=spec.gap or 0.6
+        local controller,queueUI,queueUtil,cfg,discount
+        local owned,current,phase=false,nil,'idle'
+        local rows,byId,passives,retryAfter,failures={},{},{},{},{}
+        local dirty,nextScan,passiveReady=true,0,false
+        local deadline,nextAction,nextState,advanceUntil=0,0,0,0
+        local amount,lastRaw,cost,blockedAmount=nil,nil,nil,nil
+        local function kick()
+            if A.tasks[title] then A.tasks[title].next=0 end
+        end
+        local function wake() dirty=true; kick() end
+        local function passiveId(value) return type(value)=='table' and value.Id or value end
+        local function replacePassives(snapshot)
+            passiveReady=true
+            local previous=passives; passives={}
+            for id,value in pairs(snapshot) do
+                passives[id]=passiveId(value) or false
+                if (previous[id]==TARGET)~=(passives[id]==TARGET) then dirty=true end
+            end
+            for id,value in pairs(previous) do if value==TARGET and passives[id]~=TARGET then dirty=true end end
+        end
+        local function complete(row,data)
+            local key=row.passiveKey or row.id
+            local value=passives[key]
+            if value==nil and row.legacyKey then value=passives[row.legacyKey] end
+            if value==nil then value=spec.retained(data,row) end
+            return passiveId(value)==TARGET
+        end
+        local function stopNative()
+            local stopOK,stopError=pcall(function() if controller then controller:StopAutoRoll() end end)
+            local queueOK,queueError=pcall(function()
+                if queueUtil then
+                    if spec.explicitClear then queueUtil:Clear(spec.kind) end
+                    writeQueue(queueUtil,spec.kind,{},function() return false end)
+                end
+            end)
+            -- Native loops sleep for 0.5s; queue timeouts share a six-second flag.
+            -- An old timeout must expire before a later queue handoff can start.
+            nextAction=math.max(nextAction,os.clock()+gap,advanceUntil)
+            if not stopOK or not queueOK then error(tostring(stopError or queueError)) end
+        end
+        local function stop()
+            if not owned then return end
+            owned=false; current=nil; phase='idle'; dirty=true; blockedAmount=nil
+            lastRaw=nil; amount=nil; passiveReady=false; passives={}
+            local ok,err=pcall(stopNative)
+            A.status[title]=ok and 'OFF' or ('Stop failed: '..tostring(err))
+            if not ok then A.log(title,err) end
+        end
+        local function clearing(wait)
+            stopNative(); phase='clearing'; deadline=os.clock()+8
+            nextAction=math.max(nextAction,os.clock()+(wait or gap))
+        end
+        local function apply(packet)
+            if not owned and not A.settings[spec.setting] then dirty=true; passiveReady=false; return end
+            if type(packet)~='table' then return end
+            if type(packet[spec.passiveField])=='table' then replacePassives(spec.snapshot(packet)) end
+            if spec.patch~=false and type(packet.ChangedKey)=='string' then
+                local id=packet.ChangedKey
+                local value=passiveId(packet.ChangedEntry) or false
+                if (passives[id]==TARGET)~=(value==TARGET) then dirty=true end
+                passives[id]=value
+            end
+            if type(packet.ItemCost)=='table' then cost=A.Core.copy(packet.ItemCost) end
+            if type(packet.ItemAmount)=='number' and packet.ItemAmount==packet.ItemAmount and packet.ItemAmount<math.huge then
+                amount=math.max(0,packet.ItemAmount)
+            end
+            kick()
+        end
+        if spec.state then A.on(spec.state,apply) end
+        A.on(spec.result,function(accepted,reason,packet)
+            if spec.unwrap then accepted,reason,packet=spec.unwrap(accepted,reason,packet) end
+            apply(packet)
+            if not owned or not current then return end
+            local key=type(packet)=='table' and packet.ChangedKey
+            local matches=key==current.id or key==(current.passiveKey or current.id) or key==current.legacyKey
+            if key and not matches then return end
+            if accepted==true then failures[current.id]=nil; return end
+            if reason=='rate_limited' or reason=='processing' then return end
+            if reason=='not_enough_items' then
+                blockedAmount=amount or 0; clearing(); phase='funds'
+            elseif spec.invalid[reason] and key and matches then
+                retryAfter[current.id]=os.clock()+60; current=nil; clearing(5.1); dirty=true
+            else
+                -- Unkeyed failures cannot safely be assigned to an individual item.
+                -- Reconcile first; repeated refusals must not block all other copies.
+                if queueUI.Config.GetActiveKey()==current.id then
+                    failures[current.id]=(failures[current.id] or 0)+1
+                    if failures[current.id]>=3 then
+                        retryAfter[current.id]=os.clock()+60; failures[current.id]=nil; current=nil; dirty=true
+                    end
+                end
+                clearing(5.1); nextAction=math.max(nextAction,os.clock()+10)
+                A.status[title]='Paused after '..tostring(reason)..'; will reconcile and retry'
+            end
+        end)
+        if spec.observe then spec.observe(wake) end
+        if A.container and type(A.container.OnChange)=='function' then
+            local observed={}
+            for _,field in ipairs({spec.inventoryField,spec.passiveField,'RollQueues','AutoRollStates'}) do
+                if not observed[field] then
+                    observed[field]=true
+                    local ok,connection=pcall(A.container.OnChange,A.container,{field},function()
+                        if not owned and not A.settings[spec.setting] then dirty=true; passiveReady=false; return end
+                        if field==spec.inventoryField and field~=spec.passiveField then dirty=true end
+                        if field==spec.passiveField then
+                            local data=A.data()
+                            if field==spec.inventoryField and spec.inventoryChanged and spec.inventoryChanged(data) then dirty=true end
+                            local snapshot=spec.snapshot(data)
+                            if type(snapshot)=='table' then replacePassives(snapshot) end
+                        end
+                        kick()
+                    end)
+                    if ok and connection then A.connections[#A.connections+1]=connection end
+                end
+            end
+        end
+        local function setup()
+            cfg=A.config(spec.config)
+            controller=A.client(spec.controller); queueUtil=A.util('AutoRollStateUtil')
+            discount=spec.discount and A.util('VipDiscountUtil') or nil
+            if not cfg or cfg.Enabled==false or not controller or not queueUtil or not spec.prepare()
+                or type(controller.GetQueueUi)~='function' or type(controller.StopAutoRoll)~='function'
+                or type(controller.BeginQueueAdvance)~='function' or type(queueUtil.SetQueue)~='function'
+                or (spec.explicitClear and type(queueUtil.Clear)~='function')
+                or (spec.sync and type(controller.SyncPlayerData)~='function')
+                or (spec.discount and (not discount or type(discount.GetDiscountedGachaCost)~='function')) then
+                A.status[title]='Waiting for native roll APIs'; return false
+            end
+            local group=spec.curse and cfg.Curses or cfg.Passives
+            local divine=type(group)=='table' and group.Divine
+            local order=cfg.Rarity_Order
+            local count=0
+            if spec.curse then
+                count=type(divine)=='table' and divine.Id==TARGET and 1 or 0
+            elseif type(divine)=='table' then
+                for _ in pairs(divine) do count=count+1 end
+                divine=divine[TARGET]
+            end
+            -- Rarity-only native stopping is safe only with this exact sole Divine.
+            if not (count==1 and type(divine)=='table' and divine.Id==TARGET and divine.Rarity=='Divine'
+                and type(order)=='table' and order[#order]=='Divine'
+                and (not spec.curse or cfg.AutoStopRarity=='Divine')) then
+                A.status[title]='Roll configuration changed; native stop needs review'; return false
+            end
+            queueUI=controller:GetQueueUi()
+            if not queueUI or type(queueUI.Config)~='table' or type(queueUI.Config.IsBusy)~='function'
+                or type(queueUI.Config.GetActiveKey)~='function' then
+                A.status[title]='Native passive queue unavailable'; return false
+            end
+            cost=cost or A.Core.copy(cfg.ItemCost)
+            return true
+        end
+        local function rebuild(data)
+            rows={}; byId={}
+            if spec.inventoryChanged then spec.inventoryChanged(data) end
+            for _,row in ipairs(spec.rows(data)) do
+                byId[row.id]=row
+                if not complete(row,data) then rows[#rows+1]=row end
+            end
+            table.sort(rows,function(a,b)
+                if a.dynamic~=b.dynamic then return a.dynamic end
+                if a.dynamic and a.bonus~=b.bonus then return a.bonus>b.bonus end
+                if a.power~=b.power then return a.power>b.power end
+                if (a.level or 0)~=(b.level or 0) then return (a.level or 0)>(b.level or 0) end
+                return a.id<b.id
+            end)
+            for id in pairs(retryAfter) do if not byId[id] then retryAfter[id]=nil; failures[id]=nil end end
+            for id in pairs(failures) do if not byId[id] then failures[id]=nil end end
+            dirty=false; nextScan=os.clock()+30
+        end
+        local function requestState()
+            if os.clock()<nextState then return end
+            nextState=os.clock()+5
+            if spec.stateRequest then A.fire(spec.stateRequest,cfg.SystemKey) end
+        end
+        local function awaitingReset(data)
+            local saved=type(data.AutoRollStates)=='table' and data.AutoRollStates[spec.kind]
+            local queue=type(data.RollQueues)=='table' and data.RollQueues[spec.kind]
+            return queueUI.Config.IsBusy() or (type(saved)=='table' and saved.Active==true and saved.Key~=nil)
+                or (type(queue)=='table' and #queue>0)
+        end
+        local function step()
+            if not A.alive or not A.running then return end
+            if not A.settings[spec.setting] then stop(); A.status[title]='OFF'; return end
+            local data=spec.data()
+            if not data or type(data[spec.inventoryField])~='table' then
+                if owned then stop() end
+                A.status[title]='Waiting for '..spec.plural..' inventory'; return
+            end
+            if not owned then
+                if not setup() then return end
+                if not A.alive or not A.running or not A.settings[spec.setting] then return end
+                if queueUI.Config.GetActiveKey() or queueUI.Config.IsBusy() then advanceUntil=os.clock()+6.1 end
+                owned=true; dirty=true; if spec.sync then controller:SyncPlayerData() end
+                if not A.alive or not A.running or not A.settings[spec.setting] then stop(); return end
+                local snapshot=spec.snapshot(data)
+                if type(snapshot)=='table' then replacePassives(snapshot) end
+                clearing(1.1); requestState()
+            end
+            if not A.alive or not A.running or not A.settings[spec.setting] then stop(); return end
+            if not passiveReady then
+                requestState(); A.status[title]='ON — waiting for the current passive inventory'; return
+            end
+            if current and not spec.owns(data,current) then dirty=true end
+            if dirty or os.clock()>=nextScan then rebuild(data) end
+            if current and (not byId[current.id] or complete(current,data)) then
+                local deleted=not byId[current.id]
+                current=nil; clearing(deleted and 5.1 or gap)
+            end
+            local raw=type(cost)=='table' and data[cost.ItemId]
+            if raw~=lastRaw then
+                lastRaw=raw
+                local n=tonumber(raw)
+                amount=n and n==n and n<math.huge and math.max(0,n) or 0
+                if blockedAmount and amount<blockedAmount then blockedAmount=amount end
+            end
+            if not current then
+                for _,row in ipairs(rows) do
+                    if not complete(row,data) and (retryAfter[row.id] or 0)<=os.clock() then current=row; break end
+                end
+            end
+            if not current then
+                if phase=='clearing' and awaitingReset(data) then
+                    if os.clock()>=deadline and os.clock()>=nextAction then clearing(1); requestState() end
+                    A.status[title]='ON — waiting for native queue reset'; return
+                end
+                A.status[title]=#rows==0 and 'ON — all eligible '..spec.plural..' have '..spec.targetName..'; watching inventory'
+                    or 'ON — invalid items cooling down; watching inventory'
+                return
+            end
+            local label=tostring(current.name)..' • '..tostring(#rows-1)..' waiting'
+            if cfg.WorldId and not A.unlocked(cfg.WorldId) then
+                if phase~='world' then clearing(); phase='world' end
+                A.status[title]='ON — unlock World '..tostring(cfg.WorldId)..' first'; return
+            elseif phase=='world' then phase='clearing' end
+            local price=type(cost)=='table' and tonumber(cost.Amount)
+            if not price or price<1 or price~=price or price==math.huge or type(cost.ItemId)~='string' then
+                if phase~='cost' then clearing(); phase='cost' end
+                requestState(); A.status[title]='Roll cost unavailable'; return
+            end
+            if spec.discount then price=discount:GetDiscountedGachaCost(price) end
+            if not A.alive or not A.running or not A.settings[spec.setting] then stop(); return end
+            if type(price)~='number' or price<1 or price~=price or price==math.huge then
+                if phase~='cost' then clearing(); phase='cost' end
+                A.status[title]='Discounted roll cost unavailable'; return
+            elseif phase=='cost' then phase='clearing' end
+            if (amount or 0)<price or (blockedAmount and (amount or 0)<=blockedAmount) then
+                if phase~='funds' then clearing(); phase='funds' end
+                A.status[title]='ON — paused: need '..tostring(price)..' '..cost.ItemId..' per roll; '..label
+                return
+            elseif phase=='funds' then blockedAmount=nil; phase='clearing' end
+            if os.clock()<nextAction then A.status[title]='ON — waiting for the previous roller to stop; '..label; return end
+            local busy=queueUI.Config.IsBusy()
+            local active=queueUI.Config.GetActiveKey()
+            local saved=type(data.AutoRollStates)=='table' and data.AutoRollStates[spec.kind]
+            local savedKey=type(saved)=='table' and saved.Active==true and saved.Key or nil
+            local nativeQueue=type(data.RollQueues)=='table' and data.RollQueues[spec.kind] or {}
+            if phase=='clearing' then
+                if busy or savedKey or (type(nativeQueue)=='table' and #nativeQueue>0) then
+                    if os.clock()>=deadline then clearing(1); requestState() end
+                    A.status[title]='ON — waiting for native queue reset; '..label; return
+                end
+                -- Only one key is ever handed to the server. The rest stays locally sorted.
+                if spec.sync then controller:SyncPlayerData() end
+                if not A.alive or not A.running or not A.settings[spec.setting] then stop(); return end
+                phase='starting'; deadline=os.clock()+12
+                advanceUntil=os.clock()+6.1
+                writeQueue(queueUtil,spec.kind,{current.id},function() return owned and A.alive and A.running and A.settings[spec.setting] end)
+            elseif phase=='starting' then
+                if busy then advanceUntil=math.max(advanceUntil,os.clock()+6.1) end
+                -- The native container/result listeners select the queued item. Do not
+                -- call that yielding selection method concurrently with its listeners.
+                if savedKey==current.id and busy and active==current.id then
+                    phase='rolling'; advanceUntil=math.max(advanceUntil,os.clock()+6.1)
+                elseif type(nativeQueue)=='table' and nativeQueue[1]==current.id and not busy and not savedKey then
+                    advanceUntil=os.clock()+6.1
+                    controller:BeginQueueAdvance()
+                elseif os.clock()>=deadline then
+                    retryAfter[current.id]=os.clock()+60; current=nil; dirty=true; clearing(5.1)
+                    A.status[title]='Native queue did not confirm; item deferred for 60 seconds'; return
+                end
+            elseif phase=='rolling' then
+                if active~=current.id or (savedKey and savedKey~=current.id)
+                    or (type(nativeQueue)=='table' and #nativeQueue>0) then
+                    clearing(5.1)
+                    A.status[title]='Native item selection changed; restoring the current item'; return
+                end
+                if not busy then
+                    -- A Divine roll notification alone is not proof that it was retained.
+                    requestState(); clearing(5.1); return
+                end
+            end
+            A.status[title]='ON — '..(phase=='rolling' and 'rolling ' or 'starting ')..label
+        end
+        A.passiveQueues[spec.kind]={stop=stop,wake=kick}
+        A.job(title,0.25,function()
+            local ok,err=pcall(step)
+            if not ok then stop(); error(err) end
+        end)
+    end
+end
+
+end)()(A);
+
 -- ===== pet_passives =====
 (function()
 return function(A)
-    local TARGET='DivinePredator'
+    local stats
     local rarities={Common=true,Uncommon=true,Rare=true,Epic=true,Legendary=true,Mythical=true,Secret=true,Divine=true,Astral=true}
-    local controller,queueUI,queueUtil,cfg,stats,discount
-    local owned,current,phase=false,nil,'idle'
-    local rows,byId,passives,retryAfter={},{},{},{}
-    local dirty,nextScan,passiveReady=true,0,false
-    local deadline,nextAction,nextState,advanceUntil=0,0,0,0
-    local amount,lastRaw,cost,blockedAmount=nil,nil,nil,nil
-    local function kick()
-        if A.tasks['Pet passives'] then A.tasks['Pet passives'].next=0 end
-    end
-    local function wake() dirty=true; kick() end
-    local function passiveId(value) return type(value)=='table' and value.Id or value end
-    local function replacePassives(snapshot)
-        passiveReady=true
-        local previous=passives; passives={}
-        for id,value in pairs(snapshot) do
-            passives[id]=passiveId(value) or false
-            if (previous[id]==TARGET)~=(passives[id]==TARGET) then dirty=true end
-        end
-        for id,value in pairs(previous) do if value==TARGET and passives[id]~=TARGET then dirty=true end end
-    end
-    local function complete(id,data)
-        local value=passives[id]
-        if value==nil and type(data.PetPassives)=='table' then value=data.PetPassives[id] end
-        return passiveId(value)==TARGET
-    end
-    local function stopNative()
-        local stopOK,stopError=pcall(function() if controller then controller:StopAutoRoll() end end)
-        local queueOK,queueError=pcall(function() if queueUtil then queueUtil:SetQueue('PetPassive',{}) end end)
-        -- Native loops sleep for 0.5s; queue timeouts share a six-second flag.
-        -- An old timeout must expire before a later queue handoff can start.
-        nextAction=math.max(nextAction,os.clock()+0.6,advanceUntil)
-        if not stopOK or not queueOK then error(tostring(stopError or queueError)) end
-    end
-    function A.stopPetPassives()
-        if not owned then return end
-        owned=false; current=nil; phase='idle'; dirty=true; blockedAmount=nil
-        local ok,err=pcall(stopNative)
-        A.status['Pet passives']=ok and 'OFF' or ('Stop failed: '..tostring(err))
-        if not ok then A.log('Pet passives',err) end
-    end
-    local function clearing(wait)
-        stopNative(); phase='clearing'; deadline=os.clock()+8
-        nextAction=math.max(nextAction,os.clock()+(wait or 0.6))
-    end
-    local function apply(packet)
-        if type(packet)~='table' then return end
-        if type(packet.PetPassives)=='table' then replacePassives(packet.PetPassives) end
-        if type(packet.ChangedKey)=='string' then
-            local id=packet.ChangedKey
-            local value=passiveId(packet.ChangedEntry) or false
-            if (passives[id]==TARGET)~=(value==TARGET) then dirty=true end
-            passives[id]=value
-        end
-        if type(packet.ItemCost)=='table' then cost=A.Core.copy(packet.ItemCost) end
-        if type(packet.ItemAmount)=='number' and packet.ItemAmount==packet.ItemAmount then
-            amount=math.max(0,packet.ItemAmount)
-        end
-        kick()
-    end
-    A.on('PetPassiveState',apply)
-    A.on('PetPassiveResult',function(accepted,reason,packet)
-        apply(packet)
-        if not owned or not current or accepted==true then return end
-        local key=type(packet)=='table' and packet.ChangedKey
-        if key and key~=current.id then return end
-        if reason=='rate_limited' or reason=='processing' then return end
-        if reason=='not_enough_items' then
-            blockedAmount=amount or 0; clearing(); phase='funds'
-        elseif reason=='pet_not_owned' and key==current.id then
-            retryAfter[current.id]=os.clock()+60; current=nil; clearing(5.1); dirty=true
-        else
-            -- Unkeyed failures cannot safely be assigned to an individual pet.
-            clearing(5.1); nextAction=math.max(nextAction,os.clock()+10)
-            A.status['Pet passives']='Paused after '..tostring(reason)..'; will reconcile and retry'
-        end
-    end)
-    A.onPetInventory(wake)
-    if A.container and type(A.container.OnChange)=='function' then
-        for _,field in ipairs({'PetPassives','RollQueues','AutoRollStates'}) do
-            local ok,connection=pcall(A.container.OnChange,A.container,{field},function()
-                if field=='PetPassives' then
-                    local data=A.data()
-                    if data and type(data.PetPassives)=='table' then replacePassives(data.PetPassives) end
-                end
-                kick()
-            end)
-            if ok and connection then A.connections[#A.connections+1]=connection end
-        end
-    end
-    local function setup()
-        cfg=A.config('PetPassiveConfig'); stats=A.util('PetStatsUtil')
-        controller=A.client('PetPassiveController'); queueUtil=A.util('AutoRollStateUtil')
-        discount=A.util('VipDiscountUtil')
-        if not cfg or not stats or not controller or not queueUtil or not discount
-            or type(stats.GetPetData)~='function' or type(stats.GetRarity)~='function'
-            or type(stats.IsDynamic)~='function' or type(stats.GetBaseMultiplier)~='function'
-            or type(controller.GetQueueUi)~='function' or type(controller.StopAutoRoll)~='function'
-            or type(controller.BeginQueueAdvance)~='function'
-            or type(controller.SyncPlayerData)~='function' or type(queueUtil.SetQueue)~='function'
-            or type(discount.GetDiscountedGachaCost)~='function' then
-            A.status['Pet passives']='Waiting for native passive-roll APIs'; return false
-        end
-        local divine=type(cfg.Passives)=='table' and cfg.Passives.Divine
-        local order=cfg.Rarity_Order
-        -- Do not delegate to a rarity-only stop if another Divine can stop it.
-        local count=0; if type(divine)=='table' then for _ in pairs(divine) do count=count+1 end end
-        if not (count==1 and type(divine[TARGET])=='table' and divine[TARGET].Id==TARGET
-            and divine[TARGET].Rarity=='Divine' and type(order)=='table' and order[#order]=='Divine') then
-            A.status['Pet passives']='Passive configuration changed; native stop needs review'; return false
-        end
-        queueUI=controller:GetQueueUi()
-        if not queueUI or type(queueUI.Config)~='table' or type(queueUI.Config.IsBusy)~='function'
-            or type(queueUI.Config.GetActiveKey)~='function' then
-            A.status['Pet passives']='Native passive queue unavailable'; return false
-        end
-        cost=cost or A.Core.copy(cfg.ItemCost)
-        return true
-    end
-    local function rebuild(data)
-        rows={}; byId={}
-        for id,pet in pairs(data.Pets) do
-            if type(id)=='string' and id~='' and type(pet)=='table' then
-                local ok,row=pcall(function()
-                    local catalog=stats.GetPetData(pet)
-                    if type(catalog)~='table' then return nil end
-                    local dynamic=stats.IsDynamic(pet)==true
-                    if not dynamic and not rarities[stats.GetRarity(pet)] then return nil end
-                    local power=tonumber(stats.GetBaseMultiplier(pet))
-                    if not power or power~=power or power<0 or power==math.huge then return nil end
-                    local bonus=dynamic and type(catalog.DynamicMultiplier)=='table' and tonumber(catalog.DynamicMultiplier.BonusPercent) or 0
-                    if not bonus or bonus~=bonus or math.abs(bonus)==math.huge then bonus=0 end
-                    return {id=id,dynamic=dynamic,power=power,bonus=bonus or 0,name=stats.GetName and stats.GetName(pet) or pet.PetId}
-                end)
-                if ok and row then
-                    byId[id]=row
-                    if not complete(id,data) then rows[#rows+1]=row end
+    A.createPassiveQueue({kind='PetPassive',title='Pet passives',setting='petPassiveAuto',
+        target='DivinePredator',targetName='Divine Predator',plural='pets',
+        config='PetPassiveConfig',controller='PetPassiveController',discount=true,sync=true,
+        inventoryField='Pets',passiveField='PetPassives',data=A.petData,
+        invalid={pet_not_owned=true},state='PetPassiveState',stateRequest='PetPassiveStateRequest',result='PetPassiveResult',
+        observe=A.onPetInventory,
+        snapshot=function(data) return data and data.PetPassives end,
+        retained=function(data,row) return type(data.PetPassives)=='table' and data.PetPassives[row.id] end,
+        owns=function(data,row) return type(data.Pets[row.id])=='table' end,
+        prepare=function()
+            stats=A.util('PetStatsUtil')
+            return stats and type(stats.GetPetData)=='function' and type(stats.GetRarity)=='function'
+                and type(stats.IsDynamic)=='function' and type(stats.GetBaseMultiplier)=='function'
+        end,
+        rows=function(data)
+            local out={}
+            for id,pet in pairs(data.Pets) do
+                if type(id)=='string' and id~='' and type(pet)=='table' then
+                    local ok,row=pcall(function()
+                        local catalog=stats.GetPetData(pet)
+                        if type(catalog)~='table' then return nil end
+                        local dynamic=stats.IsDynamic(pet)==true
+                        if not dynamic and not rarities[stats.GetRarity(pet)] then return nil end
+                        local power=tonumber(stats.GetBaseMultiplier(pet))
+                        if not power or power~=power or power<0 or power==math.huge then return nil end
+                        local bonus=dynamic and type(catalog.DynamicMultiplier)=='table' and tonumber(catalog.DynamicMultiplier.BonusPercent) or 0
+                        if not bonus or bonus~=bonus or math.abs(bonus)==math.huge then bonus=0 end
+                        return {id=id,dynamic=dynamic,power=power,bonus=bonus or 0,name=stats.GetName and stats.GetName(pet) or pet.PetId}
+                    end)
+                    if ok and row then
+                        out[#out+1]=row
+                    end
                 end
             end
-        end
-        table.sort(rows,function(a,b)
-            if a.dynamic~=b.dynamic then return a.dynamic end
-            if a.dynamic and a.bonus~=b.bonus then return a.bonus>b.bonus end
-            if a.power~=b.power then return a.power>b.power end
-            return a.id<b.id
-        end)
-        for id in pairs(retryAfter) do if not data.Pets[id] then retryAfter[id]=nil end end
-        for id in pairs(passives) do if not data.Pets[id] then passives[id]=nil end end
-        dirty=false; nextScan=os.clock()+30
+            return out
+        end,
+    })
+    A.stopPetPassives=A.passiveQueues.PetPassive.stop
+end
+
+end)()(A);
+
+-- ===== equipment_passives =====
+(function()
+return function(A)
+    local rarities={Common=true,Uncommon=true,Rare=true,Epic=true,Legendary=true,Mythical=true,Secret=true,Divine=true,Astral=true}
+    local function number(value)
+        local n=tonumber(value)
+        return n and n==n and n>=0 and n<math.huge and n or nil
     end
-    local function requestState()
-        if os.clock()<nextState then return end
-        nextState=os.clock()+5
-        A.fire('PetPassiveStateRequest',cfg.SystemKey)
+    local function copies(value)
+        local n=number(value)
+        return n and math.floor(n) or 0
     end
-    local function step()
-        if not A.alive or not A.running then return end
-        if not A.settings.petPassiveAuto then A.stopPetPassives(); A.status['Pet passives']='OFF'; return end
-        local data=A.petData()
-        if not data or type(data.Pets)~='table' then
-            if owned then A.stopPetPassives() end
-            A.status['Pet passives']='Waiting for pet inventory'; return
-        end
-        if not owned then
-            if not setup() then return end
-            if not A.alive or not A.running or not A.settings.petPassiveAuto then return end
-            if queueUI.Config.GetActiveKey() or queueUI.Config.IsBusy() then advanceUntil=os.clock()+6.1 end
-            owned=true; dirty=true; controller:SyncPlayerData()
-            if not A.alive or not A.running or not A.settings.petPassiveAuto then A.stopPetPassives(); return end
-            if not passiveReady and type(data.PetPassives)=='table' then replacePassives(data.PetPassives) end
-            clearing(1.1); requestState()
-        end
-        if not A.alive or not A.running or not A.settings.petPassiveAuto then A.stopPetPassives(); return end
-        if not passiveReady then
-            requestState(); A.status['Pet passives']='ON — waiting for the current passive inventory'; return
-        end
-        if current and data.Pets[current.id]==nil then dirty=true end
-        if dirty or os.clock()>=nextScan then rebuild(data) end
-        if current and (not byId[current.id] or complete(current.id,data)) then
-            local deleted=not byId[current.id]
-            current=nil; clearing(deleted and 5.1 or 0.6)
-        end
-        local raw=type(cost)=='table' and data[cost.ItemId]
-        if raw~=lastRaw then lastRaw=raw; amount=math.max(0,tonumber(raw) or 0) end
-        if not current then
-            for _,row in ipairs(rows) do
-                if not complete(row.id,data) and (retryAfter[row.id] or 0)<=os.clock() then current=row; break end
-            end
-        end
-        if not current then
-            A.status['Pet passives']=#rows==0 and 'ON — all eligible pets have Divine Predator; watching for new pets'
-                or 'ON — invalid pets cooling down; watching inventory'
-            return
-        end
-        local label=tostring(current.name)..' • '..tostring(#rows-1)..' waiting'
-        if cfg.WorldId and not A.unlocked(cfg.WorldId) then
-            if phase~='world' then clearing(); phase='world' end
-            A.status['Pet passives']='ON — unlock World '..tostring(cfg.WorldId)..' first'; return
-        elseif phase=='world' then phase='clearing' end
-        local price=type(cost)=='table' and tonumber(cost.Amount)
-        if not price or price<1 or price~=price or price==math.huge or type(cost.ItemId)~='string' then
-            if phase~='cost' then clearing(); phase='cost' end
-            requestState(); A.status['Pet passives']='Roll cost unavailable'; return
-        end
-        price=discount:GetDiscountedGachaCost(price)
-        if not A.alive or not A.running or not A.settings.petPassiveAuto then A.stopPetPassives(); return end
-        if type(price)~='number' or price<1 or price~=price or price==math.huge then
-            if phase~='cost' then clearing(); phase='cost' end
-            A.status['Pet passives']='Discounted roll cost unavailable'; return
-        elseif phase=='cost' then phase='clearing' end
-        if (amount or 0)<price or (blockedAmount and (amount or 0)<=blockedAmount) then
-            if phase~='funds' then clearing(); phase='funds' end
-            A.status['Pet passives']='ON — paused: need '..tostring(price)..' '..cost.ItemId..' per roll; '..label
-            return
-        elseif phase=='funds' then blockedAmount=nil; phase='clearing' end
-        if os.clock()<nextAction then A.status['Pet passives']='ON — waiting for the previous roller to stop; '..label; return end
-        local busy=queueUI.Config.IsBusy()
-        local active=queueUI.Config.GetActiveKey()
-        local saved=type(data.AutoRollStates)=='table' and data.AutoRollStates.PetPassive
-        local savedKey=type(saved)=='table' and saved.Active==true and saved.Key or nil
-        local nativeQueue=type(data.RollQueues)=='table' and data.RollQueues.PetPassive or {}
-        if phase=='clearing' then
-            if busy or savedKey or (type(nativeQueue)=='table' and #nativeQueue>0) then
-                if os.clock()>=deadline then clearing(1); requestState() end
-                A.status['Pet passives']='ON — waiting for native queue reset; '..label; return
-            end
-            -- Only one key is ever handed to the server. The rest stays locally sorted.
-            controller:SyncPlayerData()
-            if not A.alive or not A.running or not A.settings.petPassiveAuto then A.stopPetPassives(); return end
-            phase='starting'; deadline=os.clock()+12
-            advanceUntil=os.clock()+6.1
-            queueUtil:SetQueue('PetPassive',{current.id})
-        elseif phase=='starting' then
-            if busy then advanceUntil=math.max(advanceUntil,os.clock()+6.1) end
-            -- The native container/result listeners select the queued pet. Do not
-            -- call that yielding selection method concurrently with its listeners.
-            if savedKey==current.id and busy and active==current.id then
-                phase='rolling'; advanceUntil=math.max(advanceUntil,os.clock()+6.1)
-            elseif type(nativeQueue)=='table' and nativeQueue[1]==current.id and not busy and not savedKey then
-                advanceUntil=os.clock()+6.1
-                controller:BeginQueueAdvance()
-            elseif os.clock()>=deadline then
-                retryAfter[current.id]=os.clock()+60; current=nil; dirty=true; clearing(5.1)
-                A.status['Pet passives']='Native queue did not confirm; pet deferred for 60 seconds'; return
-            end
-        elseif phase=='rolling' then
-            if active~=current.id or (savedKey and savedKey~=current.id)
-                or (type(nativeQueue)=='table' and #nativeQueue>0) then
-                clearing(5.1)
-                A.status['Pet passives']='Native pet selection changed; restoring the current pet'; return
-            end
-            if not busy then
-                -- A Divine roll notification alone is not proof that it was retained.
-                requestState(); clearing(5.1); return
-            end
-        end
-        A.status['Pet passives']='ON — '..(phase=='rolling' and 'rolling ' or 'starting ')..label
+    local function row(id,item,power,extra)
+        power=number(power)
+        if type(id)~='string' or id=='' or type(item)~='table' or not rarities[item.Rarity] or not power then return nil end
+        local result=extra or {}
+        result.id=id; result.name=item.Name or id; result.dynamic=false; result.power=power
+        return result
     end
-    A.job('Pet passives',0.25,function()
-        local ok,err=pcall(step)
-        if not ok then A.stopPetPassives(); error(err) end
-    end)
+    local function add(out,value) if value then out[#out+1]=value end end
+    local function mapSpec(spec)
+        spec.data=A.data
+        spec.result=spec.kind..'Result'
+        spec.snapshot=function(data) return data and data[spec.passiveField] end
+        spec.retained=function(data,item)
+            local values=data[spec.passiveField]
+            if type(values)~='table' then return nil end
+            local value=values[item.passiveKey or item.id]
+            if value==nil and item.legacyKey then value=values[item.legacyKey] end
+            return value
+        end
+        if not spec.curse then
+            spec.discount=true; spec.sync=true
+            spec.state=spec.kind..'State'; spec.stateRequest=spec.kind..'StateRequest'
+        end
+        return spec
+    end
+    local accessories
+    A.createPassiveQueue(mapSpec({kind='AccessoryCurse',title='Accessory curses',setting='accessoryCurseAuto',
+        config='AccessoryCurseConfig',controller='AccessoryCurseController',target='CalamityCurse',targetName='Calamity Curse',
+        plural='accessories',inventoryField='Accessories',passiveField='AccessoryCurses',curse=true,patch=false,
+        gap=0.7,explicitClear=true,invalid={accessory_not_owned=true},
+        unwrap=function(result)
+            if type(result)~='table' then return nil,nil,nil end
+            return result.Success,result.Reason,result.Payload
+        end,
+        prepare=function()
+            accessories=A.config('AccessoryConfig')
+            return accessories and type(accessories.GetItem)=='function'
+        end,
+        owns=function(data,item) return type(data.Accessories[item.id])=='table' end,
+        rows=function(data)
+            local out={}
+            for uid,owned in pairs(data.Accessories) do
+                if type(owned)=='table' then
+                    local item=accessories:GetItem(owned.Id)
+                    local stats=type(item)=='table' and item.Multiplier
+                    -- Rank native base Power; accessories without Power follow those that have it.
+                    add(out,row(uid,item,type(stats)=='table' and (stats.Power or 0)))
+                end
+            end
+            return out
+        end,
+    }))
+    local swords,keys
+    A.createPassiveQueue(mapSpec({kind='SwordPassive',title='Sword passives',setting='swordPassiveAuto',
+        config='SwordPassiveConfig',controller='SwordPassiveController',target='SunBreathing',targetName='Sun Breathing',
+        plural='swords',inventoryField='ActiveSwords',passiveField='SwordPassives',invalid={sword_not_owned=true},
+        prepare=function()
+            swords=A.config('SwordConfig'); keys=A.util('SwordCopyKeyUtil')
+            return swords and type(swords.GetSword)=='function' and keys and type(keys.Encode)=='function'
+                and type(keys.ToPassiveKey)=='function' and type(keys.Owns)=='function' and type(keys.CountCopies)=='function'
+        end,
+        owns=function(data,item) return keys.Owns(data,item.id)==true end,
+        rows=function(data)
+            local out={}
+            for world,owned in pairs(data.ActiveSwords) do
+                local banner=type(world)=='string' and swords:GetSword(world)
+                if type(banner)=='table' and type(banner.Items)=='table' and type(owned)=='table' then
+                    for rarity,levels in pairs(owned) do
+                        local item=banner.Items[rarity]
+                        if type(item)=='table' and rarities[rarity] then
+                            local function levelRows(level)
+                                local count=copies(keys.CountCopies(data,world,rarity,level))
+                                for index=1,count do
+                                    local id=keys.Encode(world,rarity,level,index)
+                                    add(out,row(id,{Name=item.Name,Rarity=rarity},item.Multiplier,
+                                        {level=level,passiveKey=keys.ToPassiveKey(id),
+                                            legacyKey=index==1 and (world..'_'..rarity..'_'..level) or nil}))
+                                end
+                            end
+                            if type(levels)=='number' then levelRows(0)
+                            elseif type(levels)=='table' then
+                                for level in pairs(levels) do
+                                    local n=number(level)
+                                    if type(level)=='string' and n and n==math.floor(n) and tostring(n)==level then levelRows(n) end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            return out
+        end,
+    }))
+    local titans,titanConfig
+    A.createPassiveQueue(mapSpec({kind='TitanPassive',title='Titan passives',setting='titanPassiveAuto',
+        config='TitanPassiveConfig',controller='TitanPassiveController',target='Rumbling',targetName='Rumbling',
+        plural='titans',inventoryField='ActiveTitans',passiveField='TitanPassives',invalid={titan_not_owned=true},
+        prepare=function()
+            titans=A.config('TitansConfig'); titanConfig=A.config('TitanPassiveConfig')
+            return titans and type(titans.GetTitan)=='function' and titanConfig and type(titanConfig.BuildKey)=='function'
+        end,
+        owns=function(data,item)
+            local owned=data.ActiveTitans[item.world]
+            return type(owned)=='table' and item.index<=copies(owned[item.rarity])
+        end,
+        rows=function(data)
+            local out={}
+            for world,owned in pairs(data.ActiveTitans) do
+                local banner=type(world)=='string' and titans:GetTitan(world)
+                if type(banner)=='table' and type(banner.Items)=='table' and type(owned)=='table' then
+                    for rarity,count in pairs(owned) do
+                        local item=banner.Items[rarity]
+                        if type(item)=='table' and rarities[rarity] then
+                            for index=1,copies(count) do
+                                add(out,row(titanConfig:BuildKey(world,rarity,index),{Name=item.Name,Rarity=rarity},item.Multiplier,
+                                    {world=world,rarity=rarity,index=index}))
+                            end
+                        end
+                    end
+                end
+            end
+            return out
+        end,
+    }))
+    local shadows,skin,fingerprints=nil,nil,{}
+    local shadowSpec=mapSpec({kind='ShadowPassive',title='Shadow passives',setting='shadowPassiveAuto',
+        config='ShadowPassiveConfig',controller='ShadowPassiveController',target='GrandMarshal',targetName='Grand Marshal',
+        plural='shadows',inventoryField='ShadowCopies',passiveField='ShadowCopies',patch=false,
+        invalid={shadow_not_owned=true,skin_cosmetic_only=true},
+        prepare=function()
+            shadows=A.config('ShadowsConfig'); skin=A.util('SkinRarityUtil')
+            return shadows and type(shadows.GetShadow)=='function' and skin and type(skin.IsSkinEntry)=='function'
+        end,
+        owns=function(data,item)
+            local owned=data.ShadowCopies[item.id]
+            return type(owned)=='table' and owned.ShadowKey==item.shadowKey
+        end,
+        rows=function(data)
+            local out={}
+            for uid,owned in pairs(data.ShadowCopies) do
+                if type(owned)=='table' then
+                    local item=shadows:GetShadow(owned.ShadowKey)
+                    if type(item)=='table' and not skin.IsSkinEntry(item) then
+                        -- Shadows grant damage percentage, not a base Power multiplier.
+                        add(out,row(uid,item,item.DamagePercent,{shadowKey=owned.ShadowKey}))
+                    end
+                end
+            end
+            return out
+        end,
+    })
+    shadowSpec.snapshot=function(data)
+        if not data or type(data.ShadowCopies)~='table' then return nil end
+        local out={}
+        for uid,owned in pairs(data.ShadowCopies) do
+            if type(owned)=='table' then out[uid]=owned.Passive or false end
+        end
+        return out
+    end
+    shadowSpec.retained=function(data,item)
+        local owned=data.ShadowCopies[item.id]
+        return type(owned)=='table' and owned.Passive
+    end
+    shadowSpec.inventoryChanged=function(data)
+        if not data or type(data.ShadowCopies)~='table' then return false end
+        local changed=false; local updated={}
+        for uid,owned in pairs(data.ShadowCopies) do
+            updated[uid]=type(owned)=='table' and owned.ShadowKey or false
+            if updated[uid]~=fingerprints[uid] then changed=true end
+        end
+        for uid in pairs(fingerprints) do if updated[uid]==nil then changed=true end end
+        fingerprints=updated
+        return changed
+    end
+    A.createPassiveQueue(shadowSpec)
 end
 
 end)()(A);
@@ -3530,7 +3839,7 @@ return function(A)
         restore.Visible=false
     end
     local tabs={}
-    for _,name in ipairs({'Farm','Modes','Pets','Cyber','Index','Webhook','Settings'}) do
+    for _,name in ipairs({'Farm','Modes','Pets','Passives','Cyber','Index','Webhook','Settings'}) do
         tabs[name]=window:AddTab({Title=name,Icon=''})
     end
     local sync=true; local bindings={}; local statuses={}
@@ -3743,6 +4052,20 @@ return function(A)
     end)
     note('Pets','Passive queue','Uses the game auto roll until Divine Predator. Scaling pets first, then Common–Astral pets by base power. Finishes the current pet before reprioritizing new pets. Pauses when tokens run out and resumes when replenished. This toggle controls the native Pet Passive queue; avoid running another passive roller at the same time.')
     status('Pets','Pet passives')
+    note('Passives','Inventory queues','Uses the game auto roll, strongest base stats first, through Astral rarity. Keeps the current item until its Divine target is retained. New items join automatically; empty currency pauses the queue. Each toggle controls its own native roller; avoid using another script to roll that same type.')
+    for _,item in ipairs({
+        {kind='AccessoryCurse',title='Auto Accessory Curses',key='accessoryCurseAuto',status='Accessory curses',target='Calamity Curse'},
+        {kind='SwordPassive',title='Auto Sword Passives',key='swordPassiveAuto',status='Sword passives',target='Sun Breathing'},
+        {kind='TitanPassive',title='Auto Titan Passives',key='titanPassiveAuto',status='Titan passives',target='Rumbling'},
+        {kind='ShadowPassive',title='Auto Shadow Passives',key='shadowPassiveAuto',status='Shadow passives',target='Grand Marshal'},
+    }) do
+        toggle('Passives',item.title,item.key,function(enabled)
+            if not enabled then A.passiveQueues[item.kind].stop() end
+            A.passiveQueues[item.kind].wake()
+        end)
+        note('Passives',item.target,'Already completed copies are skipped. Rolls each owned copy separately.')
+        status('Passives',item.status)
+    end
     dropdown('Cyber','Ripperdoc slots to upgrade','ripperdocSlots',A.ripperdocRows,
         function(key) return A.settings.ripperdocSlots[key]==true end,
         function(selected) A.settings.ripperdocSlots=selected end,true)
