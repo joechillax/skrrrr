@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v18.
+-- Crack the Egg: lobby + round progression, v19.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -2317,16 +2317,7 @@ do
                 if danger(pos, now + dt, true) < 0 then need = true break end
             end
         end
-        if not need and quake then
-            lease("Bucket", false) lease("Drill", false)
-            local goal = Vector3.new(root.Position.X, math.max(root.Position.Y, quake.goalY), root.Position.Z)
-            success("move:boss-quake")
-            move("evade", "boss-quake", state.lab, goal, 0.05, {goal = goal, air = true})
-            app:updateFlight(root)
-            app.status.farm = "Dodging boss · airborne hazard clearance"
-            return true
-        end
-        if not need then
+        if not need and not quake then
             if app.move and app.move.lane == "evade" then app:release() end
             state.evadeGoal, state.evadeApproach = nil, nil
             return false
@@ -2338,7 +2329,22 @@ do
         if bodyActive and startRadius < bodyRadius and eggBody then table.insert(excludes, eggBody) end
         local fx = workspace:FindFirstChild("EggLocalEffects")
         if fx then table.insert(excludes, fx) end
+        for _, name in ipairs({"WorldEvent", "FloorShells", "Workers"}) do
+            local obj = state.lab:FindFirstChild(name)
+            if obj then table.insert(excludes, obj) end
+        end
         params.FilterDescendantsInstances = excludes
+        local supportParams = RaycastParams.new()
+        supportParams.FilterType, supportParams.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
+        local supportExcludes = table.clone(excludes)
+        if eggBody then table.insert(supportExcludes, eggBody) end
+        supportParams.FilterDescendantsInstances = supportExcludes
+        local function support(position)
+            -- Probe near the native arena plane, below roofs/upper props.
+            return workspace:Raycast(Vector3.new(position.X, config.EggGroundY + 6, position.Z),
+                Vector3.new(0, -40, 0), supportParams)
+        end
+        local rootSupport = support(root.Position)
         local bodyNear = startRadius < bodyRadius + 35
         local escapeDeadline = math.huge
         for _, h in ipairs(list) do
@@ -2346,11 +2352,18 @@ do
                 escapeDeadline = math.min(escapeDeadline, math.max(now, h.at))
             end
         end
-        local function route(goal)
+        local function route(goal, reentry)
             -- Mining recovery may leave us well above ground. Find an actual
             -- floor and plan the descent rather than rejecting every exit.
             if quake then
                 goal = Vector3.new(goal.X, math.max(root.Position.Y, quake.goalY), goal.Z)
+                if reentry then goal = Vector3.new(goal.X, quake.minY, goal.Z) end
+                local floor = support(goal)
+                -- Vertical protection works even before floor geometry streams.
+                -- Lateral exits must not leave observed arena support for void.
+                if rootSupport and (not floor or floor.Normal.Y < 0.65)
+                    and (flat(goal) - flat(root.Position)).Magnitude > 0.5 then return nil end
+                if reentry and (not floor or floor.Normal.Y < 0.65) then return nil end
             else
                 local floor = workspace:Raycast(goal + Vector3.new(0, 5, 0), Vector3.new(0, -200, 0), params)
                 if not floor or floor.Normal.Y < 0.65 then return nil end
@@ -2390,8 +2403,97 @@ do
                     or clearance(h, goal, math.max(now + duration, h.at), margin, true) < 0 then return nil end
             end
             local wall = workspace:Raycast(root.Position, delta, params)
-            if wall and wall.Normal.Y < 0.65 and (wall.Position - root.Position).Magnitude < distance - 0.5 then return nil end
+            if not reentry and wall and wall.Normal.Y < 0.65 and (wall.Position - root.Position).Magnitude < distance - 0.5 then return nil end
+            if quake and not reentry and rootSupport then
+                -- A high flight path can pass over an enclosing wall onto an
+                -- exterior floor. Check its footprint at character height too.
+                local floorOrigin = Vector3.new(root.Position.X,
+                    rootSupport.Position.Y + hum.HipHeight + root.Size.Y * 0.5, root.Position.Z)
+                local horizontal = flat(goal) - flat(root.Position)
+                local boundary = horizontal.Magnitude > 0.5 and workspace:Raycast(floorOrigin, horizontal, supportParams)
+                if boundary and boundary.Normal.Y < 0.65 and (boundary.Position - floorOrigin).Magnitude < horizontal.Magnitude - 0.5 then return nil end
+            end
             return score, worst, goal
+        end
+        if not need and quake then
+            -- A height hold is a constraint, not an indefinite combat pause.
+            -- Re-enter through authorized noclip only toward a supported safe
+            -- endpoint with a real attack ray; dispatch verifies it again.
+            local pursuing = app.move and app.move.key == "boss-air-combat" and app.move
+            if pursuing and now < (state.airPursuitAt or 0) and os.clock() - pursuing.progressAt <= 0.65 then
+                app.status.farm = "Airborne boss pursuit · returning to verified attack range"
+                return true
+            end
+            state.airPursuitAt = now + 0.25
+            local gun = gunUsable()
+            local family = gun and "Gun" or flameOwned(config) and "HandDrill" or "Pickaxe"
+            local range = reach(family, config)
+            local _, _, actualHead = character()
+            local offset = actualHead.Position - root.Position
+            local targets = {}
+            for enemy in pairs(state.enemies or {}) do
+                if enemy.Parent and (enemy:GetAttribute("Health") or 0) > 0 then
+                    local _, pos = aim(enemy, actualHead.Position)
+                    if pos then table.insert(targets, {target = enemy, position = pos,
+                        distance = (pos - actualHead.Position).Magnitude}) end
+                end
+            end
+            if #targets == 0 and phase == "Core" then
+                for _, obj in ipairs(state.targetList) do
+                    if obj.Parent and obj:GetAttribute("EggCore") == true and (obj:GetAttribute("HP") or 0) > 0 then
+                        local _, pos = aim(obj, actualHead.Position)
+                        if pos then table.insert(targets, {target = obj, position = pos,
+                            distance = (pos - actualHead.Position).Magnitude}) end
+                    end
+                end
+            end
+            table.sort(targets, function(a, b) return a.distance < b.distance end)
+            local best, score
+            for i = 1, math.min(12, #targets) do
+                local item = targets[i]
+                local current = contact(item.target, item.position, actualHead, range)
+                if rootSupport and current and (current.Instance == item.target or current.Instance:IsDescendantOf(item.target))
+                    and (current.Position - actualHead.Position).Magnitude <= range then
+                    if app.move and app.move.key == "boss-air-combat" then app:release() end
+                    targets = {} break -- Already in actual range; retain hover and attack.
+                end
+                for side = 0, 7 do
+                    local angle = side * math.pi / 4
+                    local goal = item.position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * math.min(10, range * 0.45)
+                    goal = Vector3.new(goal.X, quake.minY, goal.Z)
+                    local virtualHead = {Position = goal + offset}
+                    local hit = contact(item.target, item.position, virtualHead, range)
+                    if hit and (hit.Instance == item.target or hit.Instance:IsDescendantOf(item.target))
+                        and (hit.Position - virtualHead.Position).Magnitude <= range then
+                        local cost, worst, safe = route(goal, true)
+                        if cost and worst >= 0 and (not score or cost < score) then best, score = safe, cost end
+                    end
+                end
+            end
+            lease("Bucket", false) lease("Drill", false)
+            if #targets > 0 and best then
+                local m = app.move
+                local stalled = m and m.key == "boss-air-combat" and os.clock() - m.progressAt > 0.65
+                if stalled or not rootSupport then
+                    app:release()
+                    if app:updateFlight(root) then
+                        root.CFrame = CFrame.new(best)
+                        root.AssemblyLinearVelocity = Vector3.new()
+                        state.stats.airReentries = (state.stats.airReentries or 0) + 1
+                    end
+                else
+                    success("move:boss-air-combat")
+                    move("evade", "boss-air-combat", state.lab, best, 0.5, {goal = best, air = true})
+                end
+                app.status.farm = "Airborne boss pursuit · returning to verified attack range"
+                return true
+            end
+            local goal = Vector3.new(root.Position.X, math.max(root.Position.Y, quake.goalY), root.Position.Z)
+            success("move:boss-quake")
+            move("evade", "boss-quake", state.lab, goal, 0.05, {goal = goal, air = true})
+            app:updateFlight(root)
+            app.status.farm = #targets > 0 and "Airborne boss · no safe supported attack position" or "Dodging boss · airborne hazard clearance"
+            return true
         end
         local best, bestScore
         local function travelExit(goal, approach)
@@ -3536,6 +3638,7 @@ do
                 .. "; hold until=" .. tostring(state.quakeFlight and state.quakeFlight.finish or "none")
                 .. "; late/stalled vertical corrections=" .. tostring(state.stats.quakeLifts or 0))
             table.insert(lines, "Urgent verified exits=" .. tostring(state.stats.hazardEscapes or 0)
+                .. "; airborne re-entry corrections=" .. tostring(state.stats.airReentries or 0)
                 .. "; scientist pursuit rescues=" .. tostring(state.stats.eventRescues or 0)
                 .. "; menu flag (round continues)=" .. tostring(game:GetService("GuiService").MenuIsOpen)
                 .. "; Auto collect rank=" .. tostring(state.ranks and state.ranks.autoCollect or 0))
@@ -3630,9 +3733,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v18.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v19.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v18 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v19 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -3661,7 +3764,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v18", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v19", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
@@ -3869,6 +3972,7 @@ if app.settings.resume then app:Start() end
 render()
 app:note("Ready. AFK repeat runs, boss warning evasion, scientist priority and Claim All. Lobby walk / round tween. Hatching remains opt-in.")
 return app
+
 
 
 
