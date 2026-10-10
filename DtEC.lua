@@ -1,17 +1,17 @@
 task.wait(7)
 -- ChestFarmAutoLoop.lua: put this complete file in the executor's auto-execute folder.
--- Revision 8 (October 10): stack-aware relic looting/reporting and current native combat contracts.
+-- Revision 9: automatic chest farm with independent Smart loot and timed Church extraction options.
 -- Hides the default Gameplay Paused popup after readiness; streaming pauses still apply.
 -- Includes Discord ending reports, cached discovery, and Blinker / identified boss ranged dodging.
--- Continuous segmented depth travel; independent defense interrupts healing and movement.
+-- Continuous segmented depth travel; no healing, mining, selling, shops or team purchases.
 -- Every fresh execution and queued teleport resume waits seven seconds first.
 -- All additional readiness checks and recovery happen automatically.
 local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 8
-    local BUILD = "r8-oct10-relics"
+    local REVISION = 9
+    local BUILD = "r9-chest-options"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -349,7 +349,7 @@ end
         local live = alive(player, model, humanoid, root)
         if not live then return 'LOSS', 'Died; returning to lobby.' end
         if s.extractionAttempt and s.extractionAttemptAt and now() - s.extractionAttemptAt <= 30 then
-            return 'EXTRACTED', 'Church / altar departure observed. Victory and saved loot are unverified.'
+            return 'RETURNED', 'Departure followed a church prompt, but no game saved-exit state was observed; loot saving is unverified.'
         end
         return 'RETURNED', (s.returnReason or 'Run left for the lobby') .. '; no verified victory or church extraction.'
     end
@@ -570,7 +570,7 @@ end
     end
     local function setup(player, packages)
         local shared = child(RS, "Shared")
-        for _, descriptor in ipairs({ { "achievements", "Achievements" }, { "itemCategories", "ItemCategories" }, { "itemDatabase", "ItemDatabase" }, { "classResolver", "ClassResolver" } }) do
+        for _, descriptor in ipairs({ { "achievements", "Achievements" }, { "itemCategories", "ItemCategories" }, { "itemDatabase", "ItemDatabase" } }) do
             local key, name = descriptor[1], descriptor[2]
             local module = child(shared, name)
             if module and not s[key] and not s[key .. "Loading"] and now() >= (s[key .. "Retry"] or 0) then
@@ -918,8 +918,7 @@ end)()
     F.travelDepth, F.cancelTravel = movement.travel, movement.cancel
     F.syncRoute, F.initializeRoute, F.travelRoute = movement.syncRoute, movement.initializeRoute, movement.travelRoute
     F.hover = movement.hover
-    local DEFAULTS = { chest = true, loot = true, mining = true, minutes = 10, sackPercent = 80 }
-    local COIN_RESERVE, HEAL_BUFFER = 10000, 500
+    local DEFAULTS = { smartLoot = false, extraction = false, minutes = 10 }
     local SETTINGS = 'EarthAutofarm_Settings_v7'
     local FILE = 'EarthAutofarmSettings.json'
     local function clamp(value, low, high, fallback)
@@ -932,15 +931,10 @@ end)()
         return ok and value or nil
     end
     local function validate(data)
-        local cfg = {}
         data = type(data) == 'table' and data or {}
-        for _, key in ipairs({ 'chest', 'loot', 'mining' }) do
-            cfg[key] = type(data[key]) == 'boolean' and data[key] or DEFAULTS[key]
-            if data[key] == false then cfg[key] = false end
-        end
-        cfg.minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes)
-        cfg.sackPercent = DEFAULTS.sackPercent
-        return cfg
+        -- Old loot/mining/chest flags never opt the user into either new option.
+        return { chest = true, smartLoot = data.smartLoot == true, extraction = data.extraction == true,
+            minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), schema = 9 }
     end
     local loaded = s.config
     if not loaded then
@@ -964,20 +958,25 @@ end)()
         end
     end
     local function status(text)
-        if s.featureStatus ~= text then s.featureStatus = text; print('[Earth Autofarm] ' .. text) end
+        if s.featureStatus ~= text then
+            s.featureStatus, s.featureStatusAt = text, now()
+            print('[Earth Autofarm] ' .. text)
+        end
     end
     function F.change(key, value)
         if DEFAULTS[key] == nil then return end
-        if key == 'minutes' then cfg[key] = clamp(value, 0, 180, cfg[key])
-        elseif key == 'sackPercent' then return
+        if key == 'minutes' then cfg.minutes = clamp(value, 0, 180, cfg.minutes)
         elseif type(value) == 'boolean' then cfg[key] = value else return end
         persist()
-        if key == 'chest' or key == 'loot' or key == 'mining' then
-            api.stopFarm(); s.farmRestartAt = now() + 0.2; s.runExhausted = nil
-            status((cfg.chest or cfg.loot) and 'Applying farm modes' or 'Both farm modes are off')
-        end
+        -- An option change never resets chest progress or replaces a live farm.
+        status('Chest farm running; optional settings updated')
         if s.gui then pcall(s.gui.update) end
     end
+    function F.extractionEnabled() return cfg.extraction end
+    function F.extractionReady()
+        return cfg.extraction and s.lootStarted ~= nil and now() - s.lootStarted >= cfg.minutes * 60
+    end
+    function F.smartLootEnabled() return cfg.smartLoot end
     local buildGui = (function()
 return function(api)
     local s, cfg = api.state, api.state.config
@@ -1015,7 +1014,7 @@ return function(api)
     ui.screen = make('ScreenGui', parent, { Name = 'EarthAutofarmPanel', ResetOnSpawn = false,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 1500, IgnoreGuiInset = false })
     local panel = make('Frame', ui.screen, { Name = 'Panel', AnchorPoint = Vector2.new(1, 0),
-        Position = UDim2.new(1, -20, 0, 30), Size = UDim2.new(0, 410, 0, 506),
+        Position = UDim2.new(1, -20, 0, 30), Size = UDim2.new(0, 410, 0, 396),
         BackgroundColor3 = color.bg, BorderSizePixel = 0, Active = true })
     rounded(panel, 16)
     make('UIStroke', panel, { Color = color.edge, Thickness = 1 })
@@ -1024,12 +1023,12 @@ return function(api)
     local mark = label(header, 'E', 18, 16, 32, 32, 22, color.accent, true)
     mark.TextXAlignment = Enum.TextXAlignment.Center
     label(header, 'EARTH / AUTOFARM', 62, 13, 260, 23, 17, color.text, true)
-    label(header, 'Your class. One coordinated run.', 62, 36, 270, 16, 11, color.muted)
+    label(header, 'Chest farm starts automatically.', 62, 36, 270, 16, 11, color.muted)
     local minimize = make('TextButton', header, { Text = '−', Font = bold, TextSize = 24,
         TextColor3 = color.muted, BackgroundTransparency = 1, Position = UDim2.new(1, -46, 0, 13),
         Size = UDim2.new(0, 32, 0, 34), AutoButtonColor = false })
     local body = make('Frame', panel, { Position = UDim2.new(0, 0, 0, 64),
-        Size = UDim2.new(1, 0, 0, 442), BackgroundTransparency = 1 })
+        Size = UDim2.new(1, 0, 0, 332), BackgroundTransparency = 1 })
     local function bind(signal, fn)
         local c = signal:Connect(fn); ui.connections[#ui.connections + 1] = c
         return c
@@ -1043,11 +1042,9 @@ return function(api)
         local detail = label(box, subtitle, 46, 35, 232, 26, 10, color.muted)
         return box, detail
     end
-    local minimum = row(1, 'Minimum run time', 'Wait before a church return · loot farm only', 0)
-    local mining, miningDetail = row(2, 'Mine & batch-process', 'Mineshaft only · metals → bars · gems → sell', 80, 90)
-    miningDetail.Size = UDim2.new(0, 280, 0, 16)
-    local chest = row(3, 'Chest farm', 'The original chest route and discovery sweep', 180)
-    local loot = row(4, 'Loot farm', 'Gear, relics, dungeons and church returns', 260)
+    local smart = row(1, 'Smart loot items', 'Useful gear upgrades, Shards and Void Crystals', 0)
+    local church = row(2, 'Church extraction', 'Search and return after the minimum time', 80)
+    local minimum = row(3, 'Minimum run time', 'Only applies when Church extraction is ON', 160)
     local function input(parentBox, value, x, y, width, changed)
         local box = make('TextBox', parentBox, { Text = tostring(value), Font = bold, TextSize = 14,
             TextColor3 = color.accent, BackgroundColor3 = color.bg, BorderSizePixel = 0,
@@ -1061,26 +1058,23 @@ return function(api)
         return cfg.minutes
     end)
     label(minimum, 'min', 348, 14, 26, 24, 10, color.muted)
-    local percent = label(mining, '80% sack fill · automatic batch threshold', 46, 59, 320, 23, 10, color.muted)
     local function toggle(parentBox, key)
         local button = make('TextButton', parentBox, { Position = UDim2.new(1, -71, 0, 16),
             Size = UDim2.new(0, 57, 0, 29), Font = bold, TextSize = 11, BorderSizePixel = 0,
             AutoButtonColor = false })
         rounded(button, 8)
-        bind(button.Activated, function()
-            if key ~= 'mining' or cfg.loot then api.change(key, not cfg[key]) end
-        end)
+        bind(button.Activated, function() api.change(key, not cfg[key]) end)
         return button
     end
-    local switches = { mining = toggle(mining, 'mining'), chest = toggle(chest, 'chest'), loot = toggle(loot, 'loot') }
-    local status = make('Frame', body, { Position = UDim2.new(0, 16, 0, 340), Size = UDim2.new(1, -32, 0, 85),
+    local switches = { smartLoot = toggle(smart, 'smartLoot'), extraction = toggle(church, 'extraction') }
+    local status = make('Frame', body, { Position = UDim2.new(0, 16, 0, 240), Size = UDim2.new(1, -32, 0, 85),
         BackgroundTransparency = 1 })
     ui.stage = label(status, 'Waiting for readiness…', 0, 0, 378, 31, 12, color.accent, true)
     ui.stats = label(status, '', 0, 34, 378, 37, 11, color.muted)
     local collapsed = false
     bind(minimize.Activated, function()
         collapsed = not collapsed; body.Visible = not collapsed
-        panel.Size = UDim2.new(0, 410, 0, collapsed and 64 or 506); minimize.Text = collapsed and '+' or '−'
+        panel.Size = UDim2.new(0, 410, 0, collapsed and 64 or 396); minimize.Text = collapsed and '+' or '−'
     end)
     local UIS = api.getService('UserInputService')
     if UIS then
@@ -1102,23 +1096,25 @@ return function(api)
     end
     function ui.update()
         for key, button in pairs(switches) do
-            local available = key ~= 'mining' or cfg.loot
             button.Text = cfg[key] and 'ON' or 'OFF'
-            button.BackgroundColor3 = available and cfg[key] and color.accent or color.edge
-            button.TextColor3 = available and cfg[key] and color.bg or color.muted
+            button.BackgroundColor3 = cfg[key] and color.accent or color.edge
+            button.TextColor3 = cfg[key] and color.bg or color.muted
         end
-        minutes.TextEditable = cfg.loot
-        minutes.TextTransparency = cfg.loot and 0 or 0.55
-        percent.TextTransparency = cfg.loot and cfg.mining and 0 or 0.55
-        ui.stage.Text = cfg.loot and s.featureStatus or s.status or 'Waiting for readiness…'
+        minutes.TextEditable = cfg.extraction
+        minutes.TextTransparency = cfg.extraction and 0 or 0.55
         local elapsed = math.max(0, api.now() - (s.lootStarted or api.now()))
+        local ctx = s.farm
+        local optionalActive = cfg.extraction and (s.runExhausted or elapsed >= cfg.minutes * 60)
+            or cfg.smartLoot and (s.lootRequest or ctx and (ctx.featureHold or ctx.gearPickup))
+            or s.featureStatusAt and api.now() - s.featureStatusAt < 3
+        ui.stage.Text = optionalActive and s.featureStatus or s.status or 'Waiting for readiness…'
         local h = api.player.Character and api.player.Character:FindFirstChildOfClass('Humanoid')
         local health = h and h.MaxHealth > 0 and math.floor(100 * h.Health / h.MaxHealth) or 0
         local bag = s.sackSize and string.format('%s/%s', s.sackSize, s.sackCapacity or '?') or '—'
         ui.stats.Text = string.format('%02d:%02d elapsed   ·   HP %d%%   ·   Sack %s\n%d chest removals   ·   %d Cores observed',
             math.floor(elapsed / 60), math.floor(elapsed % 60), health, bag, s.stats.lootObserved or 0, s.stats.coreEarned or 0)
         local camera = workspace.CurrentCamera
-        if camera then scale.Scale = math.min(1, math.max(0.55, math.min((camera.ViewportSize.Y - 60) / 506, (camera.ViewportSize.X - 40) / 410))) end
+        if camera then scale.Scale = math.min(1, math.max(0.55, math.min((camera.ViewportSize.Y - 60) / 396, (camera.ViewportSize.X - 40) / 410))) end
     end
     function ui.dispose()
         for _, c in ipairs(ui.connections) do pcall(function() c:Disconnect() end) end
@@ -1140,9 +1136,8 @@ end)()
         end
         if s.gui then pcall(s.gui.update) end
     end
-    function F.enabled() return cfg.chest or cfg.loot end
-    function F.lootEnabled() return cfg.loot end
-    function F.chestEnabled() return cfg.chest end
+    function F.enabled() return true end
+    function F.chestEnabled() return true end
     local function tag(item, name)
         local ok, value = pcall(function() return api.CollectionService:HasTag(item, name) end)
         return ok and value == true
@@ -1202,20 +1197,6 @@ end)()
         local ok, value = pcall(function() return item:IsDescendantOf(ancestor) end)
         return ok and value
     end
-    local function inMineshaft(item)
-        while item and item ~= workspace do
-            if item.Name == 'Mineshaft' or item.Name == 'VoidMineshaft' or tag(item, 'Mineshaft') then return true end
-            item = item.Parent
-        end
-        return false
-    end
-    function F.mineshaftOre(item, ctx)
-        if F.skipLootArea(item) then return false end
-        if inMineshaft(item) then return true end
-        local visit = ctx and ctx.dungeon
-        return visit and inMineshaft(visit.root) and visit.activeRoom
-            and descendant(item, visit.activeRoom) or false
-    end
     local function ancestry(item, word)
         while item and item ~= workspace do
             if tostring(item.Name):lower():find(word, 1, true) then return item end
@@ -1268,6 +1249,13 @@ end)()
         return #tools(ctx) < 6 or RELICS[id(item)] == true and inventoryCount(ctx, id(item)) > 0
     end
     F.isRelic, F.stackCount, F.hasRoom = isRelic, stackCount, hasRoom
+    local function weaponValue(item)
+        local damage = tonumber(attr(item, 'Damage')) or 0
+        local speed = tonumber(attr(item, 'AttackSpeed')) or 1
+        if damage ~= damage or damage == math.huge or damage < 0 then return 0 end
+        if speed ~= speed or speed == math.huge or speed <= 0 then speed = 1 end
+        return damage * speed
+    end
     local function findTool(ctx, class)
         local best, score
         for _, tool in ipairs(tools(ctx)) do
@@ -1277,7 +1265,7 @@ end)()
             if name == 'Sword_Executioner' then candidate = 'Sword' end
             if candidate == class or class == 'ItemBag' and (name == 'Large_Sack' or name == 'ItemBag') then
                 local value = class == 'ItemBag' and (tonumber(attr(tool, 'MaxSize')) or (name == 'Large_Sack' and 20 or 10))
-                    or (tonumber(attr(tool, 'Damage')) or tonumber(attr(tool, 'Health')) or 0)
+                    or weaponValue(tool)
                 if not best or value > score then best, score = tool, value end
             end
         end
@@ -1311,12 +1299,13 @@ end)()
         ctx.check(); task.wait(seconds or 0.1); ctx.check()
         ctx.featurePulse = now()
         if ctx.pendingThreat and ctx.pendingThreat.expires > now()
-            and ctx.featureOperation ~= 'dodge' and ctx.featureOperation ~= 'healing' then
+            and ctx.featureOperation ~= 'dodge' then
             error('__EARTH_DEFENSE_RETRY', 0)
         end
-        if cfg.loot and ctx.featureOperation ~= 'healing' and ctx.featureOperation ~= 'dodge'
-            and ctx.humanoid.Health / ctx.humanoid.MaxHealth < 0.65 then error('__EARTH_HEAL_RETRY', 0) end
-        if not cfg.loot and ctx.featureOperation ~= 'dodge' then error('__EARTH_MODE_CHANGED', 0) end
+        if ctx.featureOperation == 'gear' and not cfg.smartLoot
+            or (ctx.featureOperation == 'extract' or ctx.featureOperation == 'discovery') and not F.extractionReady() then
+            error('__EARTH_MODE_CHANGED', 0)
+        end
     end
     local function safeToWork(ctx)
         return ctx.active and not s.request and not s.awaiting and not s.teleporting and not s.departureAt
@@ -1357,61 +1346,21 @@ end)()
         if not safeToWork(ctx) then return false end
         return api.request('loot-action', service, method, api.pack(argument), callback)
     end
-    local function resources(item)
-        local name = id(item)
-        if name == 'Ore_Coal' or name == 'Coal' or name:lower():find('coal', 1, true) then return nil end
-        if name == 'Ore_Iron' or name == 'Ore_Gold' then return 'metal' end
-        if name == 'Ore_Diamond' or name == 'Ore_Ruby' or name == 'Ore_Emerald' then return 'salegem' end
-        if name == 'Heartgem' then return 'gem' end
-        if name == 'PhantomEssence' then return 'sale' end
-        if name == 'IronBar' or name == 'GoldBar' or name:find('Pristine_', 1, true) == 1 then return 'processed' end
-    end
-    function F.coal(item)
-        local oreModel = item:GetAttribute('Ore_Model') or id(item)
-        return tostring(oreModel):lower():find('coal', 1, true) ~= nil
-    end
     local function index(ctx)
+        if ctx.featureIndex and now() < (ctx.indexAt or 0) and not next(ctx.indexPending or {}) then return ctx.featureIndex end
         local refresh = not ctx.featureIndex or now() >= (ctx.fullIndexAt or 0)
-        if not refresh and now() < (ctx.indexAt or 0) then return ctx.featureIndex end
-        local data = refresh and { ores = {}, dungeons = {}, church = {}, furnaces = {}, refineries = {}, sellers = {}, prompts = {} }
-            or ctx.featureIndex
-        local seen = {}
-        local function add(kind, item)
-            seen[kind] = seen[kind] or {}
-            if item and item.Parent and not F.skipLootArea(item) and not seen[kind][item] then
-                seen[kind][item] = true; data[kind][#data[kind] + 1] = item
-            end
-        end
-        -- Prune streamed-out instances and build membership sets without rescanning Workspace.
-        if not refresh then
-            for kind, list in pairs(data) do
-                data[kind] = {}
-                for _, item in ipairs(list) do add(kind, item) end
-            end
-        end
-        for _, item in ipairs(tagged('Ore')) do if not F.coal(item) then add('ores', item) end end
-        for _, key in ipairs({ 'DungeonDoor', 'DungeonQueueSpot' }) do for _, item in ipairs(tagged(key)) do add('dungeons', item) end end
+        local data, seen = { church = {} }, {}
         local function classify(item)
-            local lower = item.Name:lower()
-            if item:IsA('ProximityPrompt') then
-                add('prompts', item)
-                local text = (tostring(item.ActionText or '') .. ' ' .. item.Name):lower()
-                if (ancestry(item, 'church') or ancestry(item, 'altar'))
-                    and (text:find('lobby', 1, true) or text:find('extract', 1, true) or text:find('return', 1, true)) then add('church', item) end
-                if item.Name == 'DungeonPrompt' or item.Name == 'DungeonEnterPrompt' or item.Name == 'DungeonDoorPrompt' then add('dungeons', item) end
-            elseif item:IsA('Attachment') and lower == 'sellarea' then add('sellers', item)
-            elseif item:IsA('Model') or item:IsA('BasePart') then
-                if not descendant(item, ctx.drill) then
-                    if lower == 'furnace' then add('furnaces', item) end
-                    if lower == 'gemrefinery' then add('refineries', item) end
-                end
-                if lower == 'sellarea' and item:IsA('BasePart') then add('sellers', item) end
+            if not item or not item.Parent or not item:IsA('ProximityPrompt') or seen[item] or F.skipLootArea(item) then return end
+            local action = (tostring(item.ActionText or '') .. ' ' .. item.Name):lower()
+            if (ancestry(item, 'church') or ancestry(item, 'altar')) and F.chestFallbackAllowed(item)
+                and (action:find('lobby', 1, true) or action:find('extract', 1, true) or action:find('return', 1, true)) then
+                seen[item] = true; data.church[#data.church + 1] = item
             end
         end
+        for _, item in ipairs(ctx.featureIndex and ctx.featureIndex.church or {}) do classify(item) end
         if refresh then
-            -- Incremental walk avoids a giant GetDescendants allocation/classification burst after movement.
-            local queue, cursor = {workspace}, 1
-            local processed = 0
+            local queue, cursor, processed = {workspace}, 1, 0
             while cursor <= #queue do
                 local parent = queue[cursor]; cursor = cursor + 1
                 for _, item in ipairs(parent:GetChildren()) do
@@ -1421,7 +1370,7 @@ end)()
             end
             ctx.fullIndexAt = now() + 30
         end
-        for item in pairs(ctx.indexPending or {}) do if item.Parent then classify(item) end end
+        for item in pairs(ctx.indexPending or {}) do classify(item) end
         ctx.indexPending = {}
         ctx.featureIndex, ctx.indexAt = data, now() + 2
         return data
@@ -1454,9 +1403,16 @@ end)()
     end
     local function firePrompt(ctx, prompt)
         if not prompt or not prompt.Parent or prompt.Enabled == false then return false end
+        if not F.chestFallbackAllowed(prompt) then return false end
         local ready = prompt:GetAttribute('DungeonDoorReady')
         if ready == false then return false end
         if not move(ctx, prompt, Vector3.new(0, 0, 2)) then return false end
+        local paused = api.Players.LocalPlayer.GameplayPaused
+        local point = position(prompt)
+        local radius = tonumber(prompt.MaxActivationDistance) or 10
+        if paused or not point or (point - ctx.root.Position).Magnitude > radius then
+            status('Prompt waiting for loaded content and its actual activation range'); return false
+        end
         local original = prompt.HoldDuration
         ctx.instantPrompts = ctx.instantPrompts or {}; ctx.instantPrompts[prompt] = original
         prompt.HoldDuration = 0
@@ -1490,7 +1446,7 @@ end)()
         local speed = tonumber(attr(item, 'SpeedBoost')) or 0
         local existingSpeed = 0
         for _, equipped in ipairs(children(ctx.character)) do
-            if equipped:GetAttribute('ArmorName') and equipped:GetAttribute('ArmorType') == slot then existingSpeed = tonumber(equipped:GetAttribute('SpeedBoost')) or 0 end
+            if equipped:GetAttribute('ArmorName') and armorSlot(equipped) == slot then existingSpeed = tonumber(equipped:GetAttribute('SpeedBoost')) or 0 end
         end
         return armor > current or armor == current and slot == 'Boots' and speed > existingSpeed
     end
@@ -1499,36 +1455,17 @@ end)()
         if class ~= 'Sword' and class ~= 'Pickaxe' and class ~= 'ItemBag' then return false end
         local current = findTool(ctx, class)
         if not current then return true end
-        local key = class == 'ItemBag' and 'MaxSize' or 'Damage'
-        local value, existing = tonumber(attr(item, key)) or 0, tonumber(attr(current, key)) or 0
+        local value = class == 'ItemBag' and (tonumber(attr(item, 'MaxSize')) or 0) or weaponValue(item)
+        local existing = class == 'ItemBag' and (tonumber(attr(current, 'MaxSize')) or 0) or weaponValue(current)
         return value > existing or value == existing and (rarity[attr(item, 'Rarity')] or 0) > (rarity[attr(current, 'Rarity')] or 0)
     end
-    local function protected(ctx, item)
-        if item == ctx.reservedDrop or item == ctx.equipIntent then return true end
-        local name, class = id(item), attr(item, 'Class')
-        if isRelic(item) or name == 'VampirePendant' then return true end
-        if class == 'Medkit' or class == 'ItemBag' or name == 'Large_Sack' or name == 'ItemBag' then return true end
-        if class == 'Sword' or class == 'Pickaxe' then return findTool(ctx, class) == item end
-        if armorSlot(item) then return armorBetter(ctx, item) end
-        if name:lower():find('key', 1, true) or class == 'RPG' or class == 'BlackholeGun' then return true end
-        return false
-    end
-    local function obsolete(ctx, item)
-        if protected(ctx, item) then return false end
-        if armorSlot(item) then return not armorBetter(ctx, item) end
-        local class = attr(item, 'Class')
-        if class == 'Sword' or class == 'Pickaxe' then
-            local best = findTool(ctx, class)
-            return best and best ~= item and (tonumber(attr(best, 'Damage')) or 0) >= (tonumber(attr(item, 'Damage')) or 0)
-        end
-        -- No generic rarity-only disposal: unknown/passive tools stay protected.
-        return resources(item) ~= nil
-    end
-    local function interact(ctx, item)
+    local function interact(ctx, item, callback)
+        if not F.chestFallbackAllowed(item) then return false end
         if not move(ctx, item) then return false end
-        return operation(ctx, 'InteractionService', 'Interact', item)
+        return operation(ctx, 'InteractionService', 'Interact', item, callback)
     end
     local function upgradeGear(ctx)
+        if not cfg.smartLoot then return false end
         local pending = ctx.gearPickup
         if pending then
             local received = pending.relic and inventoryCount(ctx, pending.id) > pending.beforeCount or false
@@ -1557,7 +1494,7 @@ end)()
                 and now() >= (ctx.itemRetry[item] or 0) and hasRoom(ctx, item)
         end, 180)
         target = target or nearest(ctx, worldItems(), function(item)
-            return not tag(item, 'ShopItem') and (armorBetter(ctx, item) or weaponBetter(ctx, item))
+            return F.chestFallbackAllowed(item) and not tag(item, 'ShopItem') and (armorBetter(ctx, item) or weaponBetter(ctx, item))
                 and now() >= (ctx.itemRetry[item] or 0)
                 and (#tools(ctx) < 6 or armorSlot(item))
         end, 180)
@@ -1579,61 +1516,6 @@ end)()
             end
         end)
         if not issued then ctx.gearPickup = nil; ctx.itemRetry[target] = now() + 5 end
-        release(ctx); return issued
-    end
-    local function availableCoins()
-        return math.max(0, (tonumber(s.featureCoins) or 0) - (s.pendingUpgradeCost or 0)
-            - (s.pendingHealCost or 0) - (s.pendingShopCost or 0))
-    end
-    local function coinShop(item)
-        local cost = item:GetAttribute('Cost')
-        return tag(item, 'ShopItem') and type(cost) == 'number' and cost > 0
-            and item:GetAttribute('Robux') ~= true and item:GetAttribute('ProductId') == nil
-            and item:GetAttribute('RobuxProductId') == nil
-    end
-    local function shopGear(ctx)
-        local pending = s.gearPurchase
-        if pending then
-            local received = false
-            for _, tool in ipairs(tools(ctx)) do
-                if id(tool) == pending.id and not pending.inventory[tool] then received = true end
-            end
-            if pending.slot then
-                for _, piece in ipairs(children(ctx.character)) do
-                    if piece:GetAttribute('ArmorName') == pending.id and not pending.inventory[piece] then received = true end
-                end
-            end
-            if received then s.gearPurchase = nil
-            else status('Waiting for the purchased gear receipt; purchase will not repeat'); return false end
-        end
-        local budget = math.max(0, availableCoins() - HEAL_BUFFER)
-        local target, score
-        for _, item in ipairs(worldItems()) do
-            if coinShop(item) and ((rarity[attr(item, 'Rarity')] or 0) >= rarity.Legendary or id(item):find('Phoenix', 1, true))
-                and (armorBetter(ctx, item) or weaponBetter(ctx, item))
-                and item:GetAttribute('Cost') <= budget and now() >= (ctx.itemRetry[item] or 0)
-                and position(item) and (position(item) - ctx.root.Position).Magnitude <= 150
-                and (#tools(ctx) < 6 or armorSlot(item)) then
-                local value = (rarity[attr(item, 'Rarity')] or 0) * 100000
-                    + (tonumber(attr(item, 'Damage')) or tonumber(attr(item, 'Armor')) or 0) * 100 - item:GetAttribute('Cost')
-                if not target or value > score then target, score = item, value end
-            end
-        end
-        if not target or not acquire(ctx, 'shop-gear') then return false end
-        if not move(ctx, target) then release(ctx); return false end
-        -- Receipt evidence is recorded before dispatch; an uncertain reply never causes a second purchase.
-        local record = { id = id(target), slot = armorSlot(target), inventory = {} }
-        for _, tool in ipairs(tools(ctx)) do record.inventory[tool] = true end
-        for _, piece in ipairs(children(ctx.character)) do record.inventory[piece] = true end
-        ctx.itemRetry[target] = now() + 15
-        s.gearPurchase = record
-        local issued = operation(ctx, 'InteractionService', 'Interact', target, function(result)
-            if not api.accepted(result) and s.gearPurchase == record then s.gearPurchase = nil; s.pendingShopCost = nil end
-        end)
-        if issued then
-            s.pendingShopCost = target:GetAttribute('Cost'); s.spendingEpoch = (s.spendingEpoch or 0) + 1
-            status('Buying a useful high-tier upgrade: ' .. id(target))
-        else s.gearPurchase = nil end
         release(ctx); return issued
     end
     local function bag(ctx)
@@ -1688,62 +1570,6 @@ end)()
         end
         return false
     end
-    local function inputPart(machine)
-        if machine:IsA('BasePart') then return machine end
-        -- Only a loaded, explicitly named input is a usable physical adapter.
-        -- The exports do not include station input geometry or a processing RPC.
-        for _, name in ipairs({ 'Input', 'SmeltArea' }) do
-            local candidate = machine:FindFirstChild(name, true)
-            if candidate and candidate:IsA('BasePart') then return candidate end
-        end
-    end
-    local function deposit(ctx, item, destination)
-        local drag = controller('DragController')
-        if not drag or type(drag.TryLockTarget) ~= 'function' or type(drag.Toggle) ~= 'function'
-            or type(drag.ResolveLockedTargetPosition) ~= 'function' or type(drag.ReleaseLockedTarget) ~= 'function' then
-            status('Waiting for the native item drag handler'); return false
-        end
-        if drag.LockedTarget and drag.LockedTarget ~= item then return false end
-        if not move(ctx, item) then return false end
-        drag:TryLockTarget(item)
-        local untilAt = now() + 3
-        while item.Parent and drag.LockedTarget ~= item and now() < untilAt do wait(ctx, 0.1) end
-        if drag.LockedTarget ~= item then return false end
-        ctx.draggedItem, ctx.dragController = item, drag
-        if not move(ctx, destination, Vector3.new(0, 3, 5)) then return false end
-        local target = position(destination); if not target then return false end
-        local original = drag.ResolveLockedTargetPosition
-        local wrapper = function(self, p, hit)
-            if self == drag and self.LockedTarget == item and ctx.active then return target end
-            return original(self, p, hit)
-        end
-        ctx.dragEdit = { controller = drag, original = original, wrapper = wrapper }
-        drag.ResolveLockedTargetPosition = wrapper
-        for _ = 1, 8 do
-            if not item.Parent then break end
-            drag:Toggle(item, target, nil)
-            wait(ctx, 0.1)
-        end
-        if drag.ResolveLockedTargetPosition == wrapper then drag.ResolveLockedTargetPosition = original end
-        ctx.dragEdit = nil
-        if drag.LockedTarget == item then drag:ReleaseLockedTarget() end
-        ctx.draggedItem, ctx.dragController = nil, nil
-        wait(ctx, 0.3)
-        return not item.Parent
-    end
-    local function collectMoney(ctx)
-        local money = nearest(ctx, worldItems(), function(item)
-            return item.Name == 'Money_Sack' and not tag(item, 'ShopItem') and now() >= (ctx.itemRetry[item] or 0)
-        end, 50)
-        if money then
-            local owner = not ctx.featureHold
-            if owner and not acquire(ctx, 'collecting') then return false end
-            ctx.itemRetry[money] = now() + 3; interact(ctx, money); wait(ctx, 0.2)
-            if owner then release(ctx) end
-            return true
-        end
-        return false
-    end
     local function dropSackItem(ctx, active)
         if ctx.sackDrop then
             local item = ctx.sackDrop.item or newlyDropped(ctx.sackDrop.snapshot, ctx)
@@ -1758,105 +1584,6 @@ end)()
         active.Execute:Fire({ 'Drop' }); wait(ctx, 0.35)
         ctx.sackDrop.item = newlyDropped(ctx.sackDrop.snapshot, ctx)
         return ctx.sackDrop.item
-    end
-    local function batch(ctx, data)
-        if not cfg.mining then return false end
-        local sack = findTool(ctx, 'ItemBag')
-        if not sack then status('Mining waits for an owned sack; no sack purchase is made'); return false end
-        if not ctx.batchActive and not s.runExhausted and s.sackSize and s.sackCapacity
-            and s.sackSize < math.ceil(s.sackCapacity * cfg.sackPercent / 100) then return false end
-        if now() < (ctx.bagCheckAt or 0) and not ctx.batchActive then return false end
-        ctx.bagCheckAt = now() + 3
-        if now() < (ctx.batchRetryAt or 0) then return false end
-        if not acquire(ctx, 'batch') then return false end
-        local active = bag(ctx)
-        if not active then release(ctx); return false end
-        local size, capacity = tonumber(active.Size), tonumber(active.MaxSize)
-        if not size or not capacity or capacity <= 0 then status('Waiting for replicated sack quantity'); release(ctx); return false end
-        if size == 0 and not ctx.sackDrop then ctx.batchActive = nil; release(ctx); return false end
-        if not ctx.batchActive and size < math.ceil(capacity * cfg.sackPercent / 100) and not s.runExhausted then release(ctx); return false end
-        ctx.batchActive = true
-        local seller = nearest(ctx, data.sellers)
-        if not seller then status('Sack threshold reached; looking for a loaded SellArea'); ctx.batchRetryAt = now() + 10; release(ctx); return false end
-        local furnace = nearest(ctx, data.furnaces, inputPart)
-        local refinery = nearest(ctx, data.refineries, inputPart)
-        -- Drop one item, inspect it, then process or restore it. Never blindly empty a mixed sack.
-        if not readyAction(active) then release(ctx); return false end
-        local item = dropSackItem(ctx, active)
-        if not item then status('Waiting for dropped sack item replication'); ctx.batchRetryAt = now() + 3; release(ctx); return true end
-        local kind = resources(item)
-        local destination = kind == 'metal' and furnace and inputPart(furnace) or kind == 'gem' and refinery and inputPart(refinery)
-        if kind == 'processed' or kind == 'salegem' or kind == 'sale' then
-            status(kind == 'salegem' and 'Selling raw diamond / emerald / ruby without refining'
-                or kind == 'sale' and 'Selling Phantom Essence without refining' or 'Selling a processed resource batch')
-            local consumed = deposit(ctx, item, seller); collectMoney(ctx)
-            if not consumed then
-                ctx.batchRetryAt = now() + 5
-                status('SellArea did not consume the resource; retaining the exact item for retry')
-            end
-        elseif destination then
-            status('Batch processing: ' .. id(item))
-            local snapshot = worldSnapshot()
-            local consumed = deposit(ctx, item, destination)
-            if consumed then
-                local deadline, output = now() + 8
-                repeat output = nearest(ctx, worldItems(), function(candidate) return not snapshot[candidate] and resources(candidate) == 'processed' end, 45)
-                    if not output then wait(ctx, 0.2) end
-                until output or now() >= deadline
-                if output then
-                    local sackActive = bag(ctx)
-                    if sackActive then store(ctx, sackActive, output) end
-                    -- Processed output stays in the sack until its turn in this batch.
-                    ctx.batchActive = true
-                else status('Input consumed; waiting for station output (no reward assumed)') end
-            else
-                local sackActive = bag(ctx); if sackActive and item.Parent then store(ctx, sackActive, item) end
-                ctx.batchRetryAt = now() + 10
-                status('Station did not consume the input; restored it and will retry')
-            end
-        else
-            local sackActive = bag(ctx); if sackActive then store(ctx, sackActive, item) end
-            ctx.batchRetryAt = now() + 15
-            status('Sack item needs a loaded processing input or a verified selling path; keeping it')
-        end
-        if not item.Parent then ctx.sackDrop, s.pendingSackDrop = nil, nil end
-        release(ctx); return true
-    end
-    local function mine(ctx, data)
-        if not cfg.mining or ctx.batchActive or not findTool(ctx, 'ItemBag') then return false end
-        local pickaxe = findTool(ctx, 'Pickaxe'); if not pickaxe then return false end
-        local ore = nearest(ctx, data.ores, function(item)
-            local health = item:FindFirstChild('Health')
-            return F.mineshaftOre(item, ctx) and not F.coal(item) and (not health or health.Value > 0) and now() >= (ctx.oreRetry[item] or 0)
-        end, 130)
-        if not ore then return false end
-        if not acquire(ctx, 'mining') then return false end
-        ctx.equipIntent = pickaxe
-        local active = equip(ctx, pickaxe)
-        if not active then release(ctx); return false end
-        status('Mining a non-coal vein')
-            local before = worldSnapshot()
-        move(ctx, ore, Vector3.new(0, 2, 5))
-        local deadline = now() + 15
-        while ore.Parent and now() < deadline and ctx.humanoid.Health / ctx.humanoid.MaxHealth >= 0.65 do
-            local health = ore:FindFirstChild('Health')
-            if health and health.Value <= 0 then break end
-            if readyAction(active) then
-                F.swing(ctx, active)
-            end
-            wait(ctx, 0.15)
-        end
-        ctx.oreRetry[ore] = now() + 15
-        local sack = bag(ctx)
-        if sack then
-            for _, item in ipairs(worldItems()) do
-                if not before[item] and resources(item) and position(item) and (position(item) - ctx.root.Position).Magnitude < 35 then
-                    if (sack.Size or 0) >= (sack.MaxSize or 0) then break end
-                    store(ctx, sack, item)
-                end
-            end
-        end
-        release(ctx); return true
     end
     local function npcHealth(npc)
         local h = npc:FindFirstChildOfClass('Humanoid')
@@ -1907,7 +1634,7 @@ end)()
     end
     function F.usePendant(ctx)
         -- Only an already-owned pendant; use its native lifecycle/cooldown handler.
-        if ctx.featureHold or ctx.currentChest or not safeToWork(ctx) or ctx.healing then return false end
+        if ctx.featureHold or ctx.currentChest or not safeToWork(ctx) then return false end
         local serverNow = workspace:GetServerTimeNow()
         local ending = tonumber(api.Players.LocalPlayer:GetAttribute('VampirePendantCooldownEndsAt')) or 0
         if ending > serverNow then ctx.pendantAttempt = nil; return false end
@@ -1956,15 +1683,6 @@ end)()
             local hp = auraHealth(target)
             if not seen[target] and finite(hp) and hp > 0 then
                 seen[target] = true; targets[#targets + 1] = target
-            end
-        end
-        local canMine = cfg.loot and cfg.mining and class == 'Pickaxe' and not ctx.batchActive
-            and findTool(ctx, 'ItemBag') and (not s.sackSize or not s.sackCapacity
-                or s.sackSize < math.ceil(s.sackCapacity * cfg.sackPercent / 100))
-        if canMine then
-            for _, ore in ipairs(tagged('Ore')) do
-                local p = position(ore)
-                if p and (p - ctx.root.Position).Magnitude <= range and not F.coal(ore) and F.mineshaftOre(ore, ctx) then add(ore) end
             end
         end
         if bounds and type(bounds.GetModelHitPosition) == 'function' then
@@ -2044,299 +1762,6 @@ end)()
             ctx.pickaxeTargets[target] = true
             status('Sword attacks show no health change; trying an owned pickaxe')
         end
-    end
-    local function safeZone(ctx)
-        if ctx.safePosition then return ctx.safePosition end
-        local p = ctx.root.Position
-        return p
-    end
-    local function heal(ctx)
-        if not cfg.loot then
-            ctx.healing, ctx.healRetreated = nil, nil
-            ctx.flags.SafeMode = false
-            if ctx.featureOperation == 'healing' then release(ctx) end
-            return false
-        end
-        local ratio = ctx.humanoid.Health / ctx.humanoid.MaxHealth
-        if not ctx.healing and not ctx.reservedDrop and ratio >= 0.65 then return false end
-        if ratio >= 0.9 and not ctx.reservedDrop then ctx.healing, ctx.healRetreated = nil, nil; ctx.flags.SafeMode = false; release(ctx); return false end
-        ctx.healing = true
-        if not acquire(ctx, 'healing') then return false end
-        status(ctx.character:FindFirstChildOfClass('ForceField')
-            and 'Recovery: ForceField pauses passive regen; checking medical healing'
-            or 'Recovery: healing to 90% HP')
-        ctx.flags.SafeMode = true
-        -- Recovery never repeatedly snaps back to an elevated point after a dodge.
-        if not ctx.healRetreated then
-            ctx.healRetreated = true
-            local closest = nearest(ctx, F.enemies(), function(npc) return npcHealth(npc) > 0 end, 100)
-            local destination = closest and F.escapePosition(ctx, {origin = position(closest)})
-            if destination then ctx.root.CFrame = CFrame.new(destination) end
-            ctx.safePosition = ctx.root.CFrame.Position or ctx.root.Position
-        end
-        local medkit = findTool(ctx, 'Medkit')
-        if medkit then
-            ctx.equipIntent = medkit
-            local active = equip(ctx, medkit)
-            if active and readyAction(active) and type(active.Consume) == 'function' and now() >= (ctx.healUseAt or 0) then
-                ctx.healUseAt = now() + 3; active:Consume()
-            end
-            ctx.healPurchasePending, s.healPurchasePending = nil, nil
-        elseif now() >= (ctx.healBuyAt or 0) and not ctx.healPurchasePending then
-            -- Shop-item interactions are the game's native E action; only coin-priced healing items.
-            local coins, shop, score = availableCoins(), nil, nil
-            for _, item in ipairs(worldItems()) do
-                if coinShop(item) and attr(item, 'Class') == 'Medkit' and item:GetAttribute('Cost') <= coins
-                    and position(item) and (position(item) - ctx.root.Position).Magnitude <= 150 then
-                    local health = tonumber(attr(item, 'Health')) or 0.1
-                    local useful = math.min(0.9 - ratio, health)
-                    local value = ratio < 0.35 and useful * 1000 - item:GetAttribute('Cost') * 0.01
-                        or useful / item:GetAttribute('Cost')
-                    if not shop or value > score then shop, score = item, value end
-                end
-            end
-            if shop then
-                if #tools(ctx) >= 6 and not ctx.reservedDrop then
-                    local temporary = nil
-                    for _, tool in ipairs(tools(ctx)) do
-                        if not protected(ctx, tool) and (not temporary or (tonumber(attr(tool, 'Value')) or 0) < (tonumber(attr(temporary, 'Value')) or 0)) then temporary = tool end
-                    end
-                    if temporary then
-                        ctx.reservedDrop, ctx.reservedDropId = temporary, id(temporary)
-                        ctx.reservedDropCount = 0
-                        for _, tool in ipairs(tools(ctx)) do if id(tool) == ctx.reservedDropId then ctx.reservedDropCount = ctx.reservedDropCount + 1 end end
-                        ctx.dropRequestedAt = now()
-                        ctx.dropSnapshot = worldSnapshot()
-                        if not operation(ctx, 'ToolService', 'DropSpecificItem', temporary, function(result)
-                            if not api.accepted(result) and ctx.reservedDrop == temporary then ctx.reservedDrop, ctx.dropSnapshot = nil, nil end
-                        end) then
-                            ctx.reservedDrop, ctx.dropSnapshot = nil, nil
-                        end
-                        wait(ctx, 0.3)
-                        ctx.droppedWorldItem = newlyDropped(ctx.dropSnapshot, ctx, ctx.reservedDropId)
-                    end
-                end
-                if #tools(ctx) < 6 then
-                    ctx.healBuyAt = now() + 15
-                    if move(ctx, shop) then
-                        local issued = operation(ctx, 'InteractionService', 'Interact', shop, function(result)
-                            if not api.accepted(result) then ctx.healPurchasePending, s.healPurchasePending, s.pendingHealCost = nil, nil, nil end
-                        end)
-                        if issued then
-                            ctx.healPurchasePending, s.healPurchasePending = true, true
-                            s.pendingHealCost = shop:GetAttribute('Cost'); s.spendingEpoch = (s.spendingEpoch or 0) + 1
-                        end
-                    end
-                    wait(ctx, 0.25)
-                end
-            end
-        end
-        if ctx.reservedDrop and not ctx.droppedWorldItem and ctx.dropSnapshot then
-            ctx.droppedWorldItem = newlyDropped(ctx.dropSnapshot, ctx, ctx.reservedDropId)
-        end
-        if not ctx.healPurchasePending and #tools(ctx) < 6 and ctx.reservedDrop and ctx.droppedWorldItem and ctx.droppedWorldItem.Parent then
-            interact(ctx, ctx.droppedWorldItem)
-            wait(ctx, 0.2)
-        end
-        if ctx.reservedDrop and ctx.droppedWorldItem and not ctx.droppedWorldItem.Parent then
-            local count = 0
-            for _, tool in ipairs(tools(ctx)) do if id(tool) == ctx.reservedDropId then count = count + 1 end end
-            if count >= (ctx.reservedDropCount or 1) then
-                ctx.reservedDrop, ctx.droppedWorldItem, s.recoverDroppedItem = nil, nil, nil
-            else status('Waiting for the temporarily dropped item to reappear in the hotbar') end
-        end
-        wait(ctx, 0.3)
-        -- Hold until recovered; the worker continues checking health without restarting the farm.
-        return true
-    end
-    local function dungeonRoot(item)
-        while item and item ~= workspace do
-            if item.Name == 'SpiderTunnel' or item.Name == 'Mineshaft' or item.Name == 'VoidMineshaft'
-                or item.Name == 'VampireMansion' or item.Name == 'Goblin_Ring' or item.Name == 'GoblinRing'
-                or item:GetAttribute('SessionDungeonId') or item:GetAttribute('SpiderPitId') or tag(item, 'Dungeon')
-                or tag(item, 'SpiderPit') or tag(item, 'Mineshaft') or tag(item, 'VampireMansion')
-                or item:FindFirstChild('Wave') or item:FindFirstChild('QueueSpot') then return item end
-            item = item.Parent
-        end
-    end
-    local function entryPrompt(item)
-        local prompt = item:IsA('ProximityPrompt') and item or item:FindFirstChild('ProximityPrompt', true)
-            or item:FindFirstChild('DungeonEnterPrompt', true) or item:FindFirstChild('DungeonDoorPrompt', true)
-            or item:FindFirstChild('DungeonPrompt', true)
-        if not prompt or not prompt:IsA('ProximityPrompt') or prompt.Enabled == false
-            or prompt:GetAttribute('DungeonDoorReady') == false then return nil end
-        local text = (prompt.Name .. ' ' .. tostring(prompt.ActionText or '')):lower()
-        if text:find('exit', 1, true) or text:find('leave', 1, true) or text:find('return', 1, true) then return nil end
-        return prompt
-    end
-    local function abandonDungeon(ctx, state, reason)
-        -- Back off this root, but leave other dungeons and the chest sweep runnable.
-        ctx.dungeonRetry[state.root] = now() + 300
-        ctx.dungeon, ctx.combatTarget = nil, nil
-        release(ctx); status(reason .. '; continuing the farm (dungeon cooldown: 5 minutes)')
-    end
-    local function dungeon(ctx, data)
-        local player = api.Players.LocalPlayer
-        local state = ctx.dungeon
-        if state and F.skipLootArea(state.root) then
-            ctx.dungeon = nil; ctx.combatTarget = nil; release(ctx); return false
-        end
-        if state and not state.root.Parent then ctx.dungeon = nil; release(ctx); return false end
-        -- Check before every target/room branch, not just the idle branch at the bottom.
-        if state and (now() >= state.deadline or now() - state.lastProgress > 45) then
-            local exit = state.root:FindFirstChild('DungeonExitPrompt', true)
-            abandonDungeon(ctx, state, 'Dungeon stopped making progress')
-            if exit and exit.Enabled ~= false and acquire(ctx, 'dungeon-exit') then
-                firePrompt(ctx, exit); release(ctx)
-            end
-            return false
-        end
-        if not state then
-            local ui = controller('DungeonUIController')
-            local bound = ui and ui._BoundDungeon
-            local boundRoot = bound and bound.Parent and (dungeonRoot(bound) or bound)
-            if boundRoot and not F.skipLootArea(boundRoot) and player:GetAttribute('InDungeon') ~= false
-                and now() >= (ctx.dungeonRetry[boundRoot] or 0) and not ctx.completedDungeons[boundRoot] then
-                ctx.dungeon = { root = boundRoot, enteredAt = now(), deadline = now() + 180,
-                    lastProgress = now(), confirmed = true }
-                return true
-            end
-            local doorway = nearest(ctx, data.dungeons, function(item)
-                local root = dungeonRoot(item) or item.Parent
-                return root and not F.skipLootArea(root) and not ctx.completedDungeons[root] and now() >= (ctx.dungeonRetry[root] or 0)
-                    and (entryPrompt(item) ~= nil or tag(item, 'DungeonQueueSpot'))
-            end, 160)
-            if not doorway then return false end
-            local root = dungeonRoot(doorway) or doorway.Parent
-            if not acquire(ctx, 'dungeon') then return false end
-            status('Entering a loaded dungeon / lair')
-            local prompt = entryPrompt(doorway)
-            local pending = { root = root, enteredAt = now(), deadline = now() + 180, lastProgress = now(),
-                wasInDungeon = player:GetAttribute('InDungeon') == true }
-            local transition = doorway:FindFirstChild('DungeonDoorTransition', true) or root:FindFirstChild('DungeonDoorTransition', true)
-            if transition and transition:IsA('RemoteEvent') then
-                ctx.connect(transition.OnClientEvent, function(action)
-                    if ctx.dungeon == pending then pending.confirmed = action == 'Enter'; pending.exited = action == 'Exit' end
-                end)
-            end
-            ctx.dungeon = pending
-            local sent = false
-            if prompt and prompt.Enabled ~= false then sent = firePrompt(ctx, prompt)
-            elseif tag(doorway, 'DungeonQueueSpot') then sent = move(ctx, doorway, Vector3.new(0, 2, 0))
-            else ctx.dungeon = nil; ctx.dungeonRetry[root] = now() + 15; release(ctx); return false end
-            if not sent then ctx.dungeon = nil; ctx.dungeonRetry[root] = now() + 15; release(ctx); return false end
-            wait(ctx, 0.5); return true
-        end
-        if not acquire(ctx, 'dungeon') then return false end
-        local room = state.root
-        if state.exited then ctx.completedDungeons[room] = true; ctx.dungeon = nil; release(ctx); return false end
-        local ui = controller('DungeonUIController')
-        local bound = ui and ui._BoundDungeon
-        local boundMatches = bound and (bound == room or descendant(bound, room))
-        local newEntry = not state.wasInDungeon and player:GetAttribute('InDungeon') == true
-        if not state.confirmed and not boundMatches and not newEntry then
-            if now() - state.enteredAt > 12 then
-                abandonDungeon(ctx, state, 'Dungeon entry did not confirm'); return false
-            end
-            wait(ctx, 0.2); return true
-        end
-        state.confirmed = true
-        local activeRoom, activeId = room, player:GetAttribute('ActiveDungeonWaveRoomId')
-        if type(activeId) == 'string' and activeId ~= '' then
-            for _, candidate in ipairs(tagged('Wave')) do
-                -- Native active-room identity survives a teleport to a separately
-                -- parented room; portal ancestry alone does not establish membership.
-                if candidate.Parent and candidate:GetAttribute('SessionDungeonId') == activeId then activeRoom = candidate.Parent; break end
-            end
-        end
-        if bound and bound.Parent and (boundMatches or activeId ~= nil and bound:GetAttribute('SessionDungeonId') == activeId
-            or bound:FindFirstChild('Wave') and bound:FindFirstChild('Wave'):GetAttribute('SessionDungeonId') == activeId and activeId ~= nil) then
-            activeRoom = bound
-        end
-        if F.skipLootArea(activeRoom) then abandonDungeon(ctx, state, 'Active room is an excluded dungeon'); return false end
-        if state.activeRoom ~= activeRoom then state.activeRoom, state.lastProgress = activeRoom, now() end
-        local candidates = ctx.helpers[9164528] and ctx.helpers[9164528]() or {}
-        for _, entry in ipairs(candidates) do
-            local session = activeRoom:GetAttribute('SessionDungeonId') or activeRoom:FindFirstChild('Wave') and activeRoom:FindFirstChild('Wave'):GetAttribute('SessionDungeonId')
-            if not F.skipLootArea(entry.Model) and (descendant(entry.Model, activeRoom) or descendant(entry.Model, room)
-                or (entry.Model:GetAttribute('SessionDungeonId') and entry.Model:GetAttribute('SessionDungeonId') == session)) then
-                status('Looting dungeon rooms before engaging the boss')
-                local before = s.stats.lootObserved
-                ctx.helpers[16361397](entry)
-                if not entry.Model.Parent or s.stats.lootObserved > before then state.lastProgress = now() end
-                return true
-            end
-        end
-        local target = nearest(ctx, F.enemies(), function(npc)
-            local session = activeRoom:GetAttribute('SessionDungeonId') or activeRoom:FindFirstChild('Wave') and activeRoom:FindFirstChild('Wave'):GetAttribute('SessionDungeonId')
-            local pit = room:GetAttribute('SpiderPitId')
-            local p, r = position(npc), position(activeRoom)
-            return npc:IsA('Model') and npc:GetAttribute('NpcFaction') ~= 'FriendlyCompanion' and npcHealth(npc) > 0
-                and ((session and npc:GetAttribute('SessionDungeonId') == session) or (pit and npc:GetAttribute('SpiderPitId') == pit)
-                    or not session and not pit and p and r and (p - r).Magnitude < 180)
-        end)
-        if target then
-            local hp = npcHealth(target)
-            if target ~= state.target or hp ~= state.targetHealth then state.lastProgress = now(); state.target, state.targetHealth = target, hp end
-            if now() - state.lastProgress > 90 then
-                local escape = room:FindFirstChild('DungeonExitPrompt', true)
-                if escape and escape.Enabled ~= false then firePrompt(ctx, escape); ctx.dungeonRetry[room] = now() + 60; ctx.dungeon = nil; release(ctx); return false end
-                status('Dungeon enemy health is not changing; exit unavailable, preserving the run')
-            end
-            status('Fighting dungeon enemies with native weapon attacks')
-            ctx.combatTarget = target
-            move(ctx, target, Vector3.new(0, 0, 7))
-            wait(ctx, 0.25)
-            return true
-        end
-        ctx.combatTarget = nil
-        if cfg.mining and inMineshaft(room) and not ctx.batchActive then
-            local localOres = {}
-            for _, ore in ipairs(data.ores or {}) do
-                if descendant(ore, activeRoom) or descendant(ore, room) then localOres[#localOres + 1] = ore end
-            end
-            if mine(ctx, { ores = localOres }) then return true end
-        end
-        local wave = activeRoom:FindFirstChild('Wave') or room:FindFirstChild('Wave')
-        local complete = room:GetAttribute('SpiderPitCompleted') == true or wave and wave:GetAttribute('WaveCompleted') == true
-        if not complete then
-            local any, all = false, true
-            for _, candidate in ipairs(room:GetDescendants()) do
-                if candidate.Name == 'Wave' and candidate:GetAttribute('SessionDungeonId') then
-                    any = true; if candidate:GetAttribute('WaveCompleted') ~= true then all = false end
-                end
-            end
-            complete = any and all
-        end
-        if not complete then
-            -- Walk through loaded wave-room triggers using the native active-room identity.
-            local roomId = player:GetAttribute('ActiveDungeonWaveRoomId')
-            state.visitedRooms = state.visitedRooms or {}
-            if roomId then state.visitedRooms[roomId] = true end
-            for _, loaded in ipairs(room:GetDescendants()) do
-                if loaded.Name == 'Wave' and loaded:GetAttribute('SessionDungeonId')
-                    and not state.visitedRooms[loaded:GetAttribute('SessionDungeonId')]
-                    and loaded:GetAttribute('WaveCompleted') ~= true and position(loaded.Parent) then
-                    local key = loaded:GetAttribute('SessionDungeonId')
-                    state.roomAttempts = state.roomAttempts or {}
-                    if now() >= (state.roomAttempts[key] or 0) then
-                        state.roomAttempts[key] = now() + 5
-                        move(ctx, loaded.Parent, Vector3.new(0, 3, 0)); wait(ctx, 0.4); return true
-                    end
-                end
-            end
-        end
-        if not complete and now() - state.enteredAt < 8 then wait(ctx, 0.2); return true end
-        local exit = activeRoom:FindFirstChild('DungeonExitPrompt', true) or room:FindFirstChild('DungeonExitPrompt', true)
-        if complete and exit and exit.Enabled ~= false then
-            firePrompt(ctx, exit); ctx.completedDungeons[room] = true; ctx.dungeon = nil; release(ctx); return true
-        end
-        if now() > state.deadline or not player:GetAttribute('InDungeon') and now() - state.lastProgress > 20 then
-            ctx.dungeonRetry[room] = now() + 30; ctx.dungeon = nil; release(ctx)
-            status('Dungeon progress / exit did not confirm; continuing discovery and retrying later')
-            return false
-        end
-        wait(ctx, 0.3); return true
     end
     function F.watcher(ctx)
         if now() >= (ctx.watcherSearchAt or 0) then
@@ -2551,107 +1976,28 @@ end)()
         end)
     end
 
-    local upgradePriority = { HealthRegen = 5, TeamMeleeDamage = 4, TeamPickaxeDamage = 3, TeamHealth = 2, SackStorage = 1 }
-    function F.chooseUpgrade(options, owned, coins)
-        local highest = 0
-        for key in pairs(upgradePriority) do highest = math.max(highest, tonumber(owned[key]) or 0) end
-        local best, score
-        for _, offer in ipairs(options or {}) do
-            local priority = upgradePriority[offer.UpgradeName]
-            if priority and offer.Type == 'Coins' and type(offer.Cost) == 'number' and offer.Cost >= 0 and offer.Cost <= coins then
-                local level = tonumber(owned[offer.UpgradeName]) or 0
-                local catchUp = highest >= level + 3 and 1000 or 0
-                local value = catchUp + (rarity[offer.Rarity] or 0) * 100 + priority * 10 - level
-                if not best or value > score then best, score = offer, value end
+    local function packingReceipt(ctx, pending)
+        if not pending or not pending.expected or not pending.inventory then return false end
+        if pending.item and isRelic(pending.item)
+            and inventoryCount(ctx, pending.expected) > (pending.beforeCount or 0) then return true end
+        for _, tool in ipairs(tools(ctx)) do
+            if not pending.inventory[tool] and id(tool) == pending.expected then return true end
+        end
+        if pending.item and armorSlot(pending.item) then
+            for _, piece in ipairs(children(ctx.character)) do
+                if not pending.inventory[piece] and piece:GetAttribute('ArmorName') == pending.expected
+                    and piece:GetAttribute('ArmorType') then return true end
             end
         end
-        return best
-    end
-    function F.refreshCoins(ctx)
-        if not F.enabled() or not safeToWork(ctx) then return end
-        if now() >= (s.coinReadAt or 0) then
-            local epoch = s.spendingEpoch or 0
-            local afterMutation = not s.upgradeRequest and not s.lootRequest
-            if api.request('loot-query', 'CurrencyService', 'GetCurrency', api.pack(), function(result)
-                if result[1] and type(result[2]) == 'number' then
-                    s.featureCoins = result[2]
-                    if afterMutation and epoch == (s.spendingEpoch or 0) and not s.upgradeRequest and not s.lootRequest then
-                        s.pendingUpgradeCost, s.pendingHealCost, s.pendingShopCost = nil, nil, nil
-                    end
-                end
-            end) then s.coinReadAt = now() + 5 end
-        end
-    end
-    function F.upgrades(ctx)
-        if not F.enabled() or not safeToWork(ctx) then return end
-        F.refreshCoins(ctx)
-        local c = controller('DrillUpgradeController')
-        if not c or c.CardsLocked or c.PurchasePending or c.RerollPending then return end
-        if now() < (s.upgradeRetryAt or 0) then return end
-        if c.ActiveClassReward then
-            local reward = c.ActiveClassReward
-            if type(reward.Id) ~= 'number' or type(reward.Options) ~= 'table' then return end
-            s.classUpgradeOffers = s.classUpgradeOffers or {}
-            if s.classUpgradeOffers[reward.Id] then return end
-            local eligible = {}
-            for _, option in ipairs(reward.Options) do
-                if option.Type == 'ClassReward' and upgradePriority[option.UpgradeName] then
-                    eligible[#eligible + 1] = { UpgradeName = option.UpgradeName, Type = 'Coins', Cost = 0, Rarity = option.Rarity }
-                end
-            end
-            local choice = F.chooseUpgrade(eligible, c.Owned or {}, 0)
-            if choice and api.request('team-upgrade', 'DrillService', 'ChooseClassReward', api.pack(reward.Id, choice.UpgradeName), function(result)
-                local reply = result[2]
-                if result[1] and type(reply) == 'table' and reply.Success == true and reply.ClaimedOfferId == reward.Id then
-                    if type(c.HandleClassRewardChoiceResult) == 'function' then pcall(c.HandleClassRewardChoiceResult, c, reply, reward.Id) end
-                else s.classUpgradeOffers[reward.Id] = nil; s.upgradeRetryAt = now() + 5 end
-            end) then s.classUpgradeOffers[reward.Id] = true; status('Claiming earned team upgrade: ' .. choice.UpgradeName) end
-            return
-        end
-        if (not c.OptionsVersion or c.OptionsVersion <= 0 or type(c.Options) ~= 'table' or #c.Options == 0)
-            and type(c.FetchUpgradeOptions) == 'function' and not c.OptionsFetchPending then
-            c:FetchUpgradeOptions(); return
-        end
-        local version = c.OptionsVersion
-        if not version or version <= 0 or s.upgradeVersion == version then return end
-        local options = c.Options
-        if type(options) ~= 'table' then return end
-        -- The native rendered Cost includes current-class discounts; keep the full price as fallback.
-        local frame = c.UpgradeUI and c.UpgradeUI:FindFirstChild('Frame')
-        local cards = frame and frame:FindFirstChild('Cards')
-        local priced = {}
-        for _, offer in ipairs(options) do
-            local copy = {}; for key, value in pairs(offer) do copy[key] = value end
-            if copy.Type == 'Coins' then
-                for _, card in ipairs(children(cards)) do
-                    if card:GetAttribute('UpgradeName') == copy.UpgradeName and not card:GetAttribute('RobuxCard')
-                        and type(card:GetAttribute('Cost')) == 'number' then copy.Cost = card:GetAttribute('Cost'); break end
-                end
-            end
-            priced[#priced + 1] = copy
-        end
-        local best = F.chooseUpgrade(priced, c.Owned or {}, math.max(0, availableCoins() - COIN_RESERVE))
-        if best then
-            if api.request('team-upgrade', 'DrillService', 'UpgradeDrill', api.pack(best.UpgradeName, version), function(result)
-                if result[1] and result[2] == true then s.upgradeVersion = version
-                elseif result[1] and result[2] == 'prompted' then
-                    s.upgradeVersion = version; status('Upgrade returned a purchase prompt; waiting without buying or repeating it')
-                else s.upgradeVersion, s.pendingUpgradeCost = nil, nil; s.upgradeRetryAt = now() + 5 end
-            end) then
-                s.upgradeVersion, s.pendingUpgradeCost = version, best.Cost
-                s.spendingEpoch = (s.spendingEpoch or 0) + 1
-                status('Buying team upgrade: ' .. best.UpgradeName)
-            end
-        elseif (api.Players.LocalPlayer:GetAttribute('Rerolls') or 0) > 0 and now() >= (s.upgradeRetryAt or 0) then
-            local useful = false; for _, offer in ipairs(options) do if upgradePriority[offer.UpgradeName] then useful = true end end
-            if not useful and api.request('team-upgrade', 'DrillService', 'Reroll', api.pack(version), function(result)
-                if not result[1] or result[2] ~= true then s.upgradeVersion = nil; s.upgradeRetryAt = now() + 10 end
-            end) then s.upgradeVersion = version; status('Rerolling drill-only offers with an existing reroll') end
-        end
+        return false
     end
     local function packForReturn(ctx, data)
-        if ctx.reservedDrop or s.recoverDroppedItem or s.healPurchasePending or s.gearPurchase then
-            status('Return waits for the pending shop or temporary healing item transaction'); return false
+        -- Waiting for replication never repeatedly equips the sack or moves its dropped item.
+        if packingReceipt(ctx, ctx.sackDrop) then ctx.sackDrop, s.pendingSackDrop = nil, nil; return false end
+        if ctx.sackDrop and ctx.sackDrop.interactIssued
+            and (not ctx.sackDrop.interactSettled or ctx.sackDrop.interactAccepted) then
+            status('Church packing waits for the original pickup receipt; that item is not moved or requested again')
+            return false
         end
         if not findTool(ctx, 'ItemBag') then return true end
         local active = bag(ctx)
@@ -2667,102 +2013,79 @@ end)()
             pending.expected = id(item)
             pending.beforeCount = inventoryCount(ctx, pending.expected)
             for _, tool in ipairs(tools(ctx)) do pending.inventory[tool] = true end
+            for _, piece in ipairs(children(ctx.character)) do pending.inventory[piece] = true end
         end
-        local previous, expected = pending.inventory, pending.expected
-        local function confirmed()
-            if isRelic(item) and inventoryCount(ctx, expected) > (pending.beforeCount or 0) then return true end
-            for _, tool in ipairs(tools(ctx)) do if not previous[tool] and id(tool) == expected then return true end end
-            if armorSlot(item) then
-                for _, piece in ipairs(children(ctx.character)) do
-                    if piece:GetAttribute('ArmorName') == expected and piece:GetAttribute('ArmorType') then return true end
-                end
-            end
-            return false
-        end
+        local function confirmed() return packingReceipt(ctx, pending) end
         if confirmed() then ctx.sackDrop, s.pendingSackDrop = nil, nil; return false end
         -- Only actual hotbar replication is evidence that a sack item can be carried home.
-        if hasRoom(ctx, item) or armorSlot(item) and armorBetter(ctx, item) then
+        if not armorSlot(item) and hasRoom(ctx, item) or armorSlot(item) and armorBetter(ctx, item) then
             status('Packing a remaining sack item into the hotbar / equipped armor')
-            interact(ctx, item); wait(ctx, 0.5)
+            if not pending.interactIssued then
+                pending.interactAt = now()
+                pending.interactIssued = interact(ctx, item, function(result)
+                    pending.interactSettled, pending.interactAccepted = true, api.accepted(result)
+                end)
+                wait(ctx, 0.5)
+            end
             if confirmed() then ctx.sackDrop, s.pendingSackDrop = nil, nil; return false end
+            if pending.interactIssued and (not pending.interactSettled or pending.interactAccepted) then
+                status('Church packing waits for the original pickup receipt; that item is not moved or requested again')
+                return false
+            end
         end
         if item.Parent then
-            local seller = nearest(ctx, data.sellers)
-            if seller and obsolete(ctx, item) and resources(item) ~= 'metal' and resources(item) ~= 'gem' then
-                status('Selling surplus that cannot fit in the return inventory')
-                deposit(ctx, item, seller); collectMoney(ctx)
-                if not item.Parent then ctx.sackDrop = nil; return false end
-            end
             if readyAction(active) then store(ctx, active, item) end
             if not item.Parent then ctx.sackDrop = nil end
             ctx.packRetryAt = now() + 10
-            status('Return paused: remaining sack loot needs a confirmed hotbar slot or processing path')
+            status('Church return waiting: sack item cannot fit in the hotbar; no owned gear is dropped or sold')
         else
             status('Return waits for carried-item replication; no saved loot is assumed')
         end
         return false
     end
     local function extract(ctx, data)
-        if not s.runExhausted then return false end
-        if not s.sweepComplete and not (ctx.discoveryPasses and ctx.discoveryPasses > 0) then return false end
-        local elapsed = now() - s.lootStarted
-        if elapsed < cfg.minutes * 60 then
-            status(string.format('Loot run complete; minimum-time gate has %.0fs remaining', cfg.minutes * 60 - elapsed))
-            return false
-        end
-        local prompt = nearest(ctx, data.church, function(item) return item.Enabled ~= false end)
-        if not prompt then status('No loaded church return prompt; searching without using the loss-return action'); return false end
-        if now() < (ctx.extractAt or 0) then return false end
-        if now() < (ctx.packRetryAt or 0) then return false end
+        if not F.extractionReady() then return false end
+        local prompt = nearest(ctx, data.church, function(item)
+            return item.Enabled ~= false and F.chestFallbackAllowed(item)
+        end)
+        if not prompt then status('Minimum time met; searching for a loaded church return prompt'); return false end
+        if now() < (ctx.extractAt or 0) or now() < (ctx.packRetryAt or 0) then return false end
+        if s.lootRequest then status('Church return waits for the outstanding item reply; chest work continues'); return false end
         if not acquire(ctx, 'extract') then return false end
-        if not packForReturn(ctx, data) then release(ctx); return true end
-        status('Using the loaded church / altar return prompt; awaiting the game’s departure confirmation')
-        if firePrompt(ctx, prompt) then
-            ctx.extractAt = now() + 15; s.extractionAttempt, s.forceFresh = true, true
-            s.extractionAttemptAt = now()
-            pcall(function() api.TeleportService:SetTeleportSetting('ChestFarmAutoLoop_FreshRun', true) end)
+        if not packForReturn(ctx, data) then
+            ctx.packRetryAt = math.max(ctx.packRetryAt or 0, now() + 1)
+            release(ctx); return true
         end
-        release(ctx); return true
-    end
-    local function surplus(ctx, data)
-        local seller = nearest(ctx, data.sellers)
-        if not seller or now() < (ctx.sellAt or 0) then return false end
-        local item = nearest(ctx, worldItems(), function(candidate)
-            return not tag(candidate, 'ShopItem') and obsolete(ctx, candidate) and not resources(candidate)
-                and now() >= (ctx.itemRetry[candidate] or 0)
-        end, 90)
-        if not item then return false end
-        if not acquire(ctx, 'selling') then return false end
-        ctx.itemRetry[item], ctx.sellAt = now() + 20, now() + 1
-        status('Selling a replaced armor / weapon item')
-        deposit(ctx, item, seller); collectMoney(ctx)
+        if not F.extractionReady() then release(ctx); return false end
+        status('Using church return; awaiting the game saved-exit state')
+        -- Set the attempt before dispatch: a synchronous departure can happen during the prompt.
+        ctx.extractAt = now() + 15
+        s.extractionAttempt, s.extractionAttemptAt = true, now()
+        local fired = firePrompt(ctx, prompt)
+        if fired then
+            local deadline = now() + 1
+            while safeToWork(ctx) and now() < deadline and api.Players.LocalPlayer:GetAttribute('SavedExitTeleportLocked') ~= true do wait(ctx, 0.05) end
+            if api.Players.LocalPlayer:GetAttribute('SavedExitTeleportLocked') == true then
+                s.forceFresh = true
+                pcall(function() api.TeleportService:SetTeleportSetting('ChestFarmAutoLoop_FreshRun', true) end)
+                status('Game saved-exit state confirmed; awaiting lobby transfer')
+            else status('Church prompt sent; save is unconfirmed, checking again after the retry interval') end
+        else
+            s.extractionAttempt, s.extractionAttemptAt = nil, nil
+        end
         release(ctx); return true
     end
     local function discover(ctx)
-        if not s.runExhausted or now() < (ctx.discoveryAt or 0) then return false end
+        if not F.extractionReady() or not s.runExhausted or now() < (ctx.discoveryAt or 0) then return false end
+        movement.initializeRoute(ctx)
+        local checkpoint = s.routeScanX or (ctx.root.CFrame.Position or ctx.root.Position).X
+        local limit = ctx.scanEnd or 36000
+        if checkpoint >= limit then return false end
         if not acquire(ctx, 'discovery') then return false end
         ctx.discoveryAt = now() + 0.5
-        movement.initializeRoute(ctx)
-        local limit = ctx.scanEnd or 36000
-        local checkpoint = s.routeScanX or (ctx.root.CFrame.Position or ctx.root.Position).X
-        local nextX = math.min(checkpoint + 150, limit)
-        local reached = F.travelRoute(ctx, nextX)
-        if reached and nextX >= limit then ctx.discoveryPasses = math.max(1, ctx.discoveryPasses or 0) end
-        wait(ctx, 0.35) -- Allow streaming to settle; stream events feed the cached index.
+        F.travelRoute(ctx, math.min(checkpoint + 150, limit))
+        wait(ctx, 0.15)
         release(ctx); return true
-    end
-    local function collectResources(ctx)
-        if not cfg.mining or ctx.batchActive or not findTool(ctx, 'ItemBag') then return false end
-        local item = nearest(ctx, worldItems(), function(candidate)
-            return resources(candidate) and not tag(candidate, 'ShopItem') and now() >= (ctx.itemRetry[candidate] or 0)
-        end, 80)
-        if not item or not acquire(ctx, 'collecting') then return false end
-        local active = bag(ctx)
-        if not active then release(ctx); return false end
-        if (active.Size or 0) >= (active.MaxSize or 0) then ctx.batchActive = true; release(ctx); return false end
-        ctx.itemRetry[item] = now() + 5
-        status('Storing loose resources until the sack threshold is reached')
-        store(ctx, active, item); release(ctx); return true
     end
     function F.cleanup(ctx)
         movement.cleanup(ctx)
@@ -2782,11 +2105,6 @@ end)()
             ctx.bagObserver.active.UpdateSackSize = ctx.bagObserver.original
         end end)
         ctx.bagObserver = nil
-        -- Keep a record for recovery rather than silently forgetting a temporary dropped item.
-        if ctx.droppedWorldItem and ctx.droppedWorldItem.Parent and not ctx.reservedDrop then s.recoverDroppedItem = ctx.droppedWorldItem end
-        if ctx.reservedDrop then
-            s.healDrop = { tool = ctx.reservedDrop, id = ctx.reservedDropId, count = ctx.reservedDropCount, snapshot = ctx.dropSnapshot, item = ctx.droppedWorldItem }
-        end
         s.pendingSackDrop = ctx.sackDrop
     end
     function F.watchdog(ctx)
@@ -2798,10 +2116,9 @@ end)()
         if not dead then
             pcall(task.cancel, worker)
             if coroutine.status(worker) ~= 'dead' then
-                status('Stalled loot worker could not be cancelled; waiting to avoid duplicate workers'); return
+                status('Stalled optional worker could not be cancelled; waiting to avoid duplicate workers'); return
             end
         end
-        if ctx.dungeon then abandonDungeon(ctx, ctx.dungeon, 'Recovering a stalled dungeon action') end
         if ctx.lootThread == worker then
             if ctx.currentChest then ctx.currentChest.retryAt = now() + 30 end
             ctx.currentChest, ctx.lootThread, ctx.defenseAbort = nil, nil, nil
@@ -2809,33 +2126,22 @@ end)()
         F.cleanup(ctx)
         ctx.featureThread = nil
         ctx.featureRecoveries = (ctx.featureRecoveries or 0) + 1
-        status('Recovered stalled loot worker; resuming discovery')
+        status('Recovered optional worker; preserving chest route')
         F.runWorker(ctx)
     end
     function F.start(ctx)
         s.equipRecords = s.equipRecords or setmetatable({}, { __mode = 'k' })
         s.lootStarted = s.lootStarted or now()
         s.sackSize, s.sackCapacity = nil, nil
-        ctx.itemRetry, ctx.oreRetry, ctx.dungeonRetry = {}, {}, {}
-        s.lootDungeons = s.lootDungeons or setmetatable({}, { __mode = 'k' })
-        ctx.completedDungeons, ctx.damageChecks, ctx.pickaxeTargets = s.lootDungeons, {}, {}
-        ctx.sackDrop, ctx.healPurchasePending = s.pendingSackDrop, s.healPurchasePending
-        if s.healDrop then
-            ctx.reservedDrop, ctx.reservedDropId, ctx.reservedDropCount, ctx.dropSnapshot, ctx.droppedWorldItem = s.healDrop.tool, s.healDrop.id, s.healDrop.count, s.healDrop.snapshot, s.healDrop.item
-            s.healDrop = nil
-        end
+        ctx.itemRetry, ctx.damageChecks, ctx.pickaxeTargets = {}, {}, {}
+        ctx.sackDrop = s.pendingSackDrop
         ctx.safePosition = ctx.root.Position
         if workspace.DescendantAdded then
             ctx.connect(workspace.DescendantAdded, function(item)
-                if item:IsA('ProximityPrompt') or item.Name == 'Furnace' or item.Name == 'GemRefinery' or item.Name == 'SellArea' then
+                if item:IsA('ProximityPrompt') and cfg.extraction and F.extractionReady() then
                     ctx.indexPending = ctx.indexPending or {}; ctx.indexPending[item] = true
                 end
             end)
-        end
-        if type(api.CollectionService.GetInstanceAddedSignal) == 'function' then
-            for _, name in ipairs({ 'Ore', 'DungeonDoor', 'DungeonQueueSpot' }) do
-                ctx.connect(api.CollectionService:GetInstanceAddedSignal(name), function() ctx.indexAt = 0 end)
-            end
         end
         if type(api.RunService.BindToRenderStep) == 'function' then
             ctx.watcherBinding = 'EarthAutofarmWatcher_' .. tostring(api.Players.LocalPlayer.UserId)
@@ -2857,57 +2163,39 @@ end)()
                     ctx.check()
                     F.watcher(ctx)
                     if not safeToWork(ctx) then release(ctx); return end
-                    F.refreshCoins(ctx)
                     if not ctx.defenseThread and F.dodge(ctx) then return end
                     if ctx.dodgeUntil and now() < ctx.dodgeUntil then return end
                     if ctx.pendantAttempt and now() - ctx.pendantAttempt.started < 5 then release(ctx); return end
-                    if not cfg.loot then release(ctx); return end
-                    if heal(ctx) then return end
-                    F.upgrades(ctx)
-                    if not s.itemDatabase then status('Waiting for item definitions'); return end
-                    local data = index(ctx)
-                    -- A confirmed visit owns the stage; off-room gear must not pull it
-                    -- back out, and a pending item RF must not freeze dungeon combat/prompts.
-                    if ctx.dungeon and dungeon(ctx, data) then return end
-                    if s.lootRequest then
-                        -- Interact can remain unresolved without owning translation.
-                        -- Prompts and discovery can continue; item RFs remain deduplicated.
-                        if dungeon(ctx, data) then return end
-                        release(ctx); status('Item reply pending; continuing discovery without repeating it')
-                        if not cfg.chest then s.runExhausted = true; discover(ctx) end
-                        return
+                    if not cfg.smartLoot and not cfg.extraction then release(ctx); return end
+                    if (cfg.smartLoot or F.extractionReady()) and not s.itemDatabase then
+                        status('Waiting for item definitions before smart loot / church packing'); return
                     end
-                    if s.recoverDroppedItem and s.recoverDroppedItem.Parent then
-                        if acquire(ctx, 'recover-item') then interact(ctx, s.recoverDroppedItem); wait(ctx, 0.2); release(ctx) end
-                        if not s.recoverDroppedItem.Parent then s.recoverDroppedItem = nil end
-                        return
+                    -- Church return takes priority as soon as the minimum time is met.
+                    if F.extractionReady() then
+                        local data = index(ctx)
+                        if extract(ctx, data) then return end
+                        if discover(ctx) then return end
+                    elseif cfg.extraction and s.runExhausted then
+                        status(string.format('Chest route complete; church extraction unlocks in %.0fs', cfg.minutes * 60 - (now() - s.lootStarted)))
                     end
-                    if upgradeGear(ctx) then return end
-                    if shopGear(ctx) then return end
-                    if dungeon(ctx, data) then return end
-                    if batch(ctx, data) then return end
-                    if collectResources(ctx) then return end
-                    if mine(ctx, data) then return end
-                    if surplus(ctx, data) then return end
-                    if collectMoney(ctx) then return end
-                    if extract(ctx, data) then return end
-                    if not cfg.chest then s.runExhausted = true end
-                    discover(ctx)
+                    if cfg.smartLoot then
+                        if s.lootRequest then release(ctx); status('Item reply pending; chest work continues without repeating it'); return end
+                        upgradeGear(ctx)
+                    end
                 end)
                 if not ok then
                     F.cleanup(ctx)
                     if tostring(why):find('__CHESTFARM_CANCELLED', 1, true) then return end
                     if tostring(why):find('__EARTH_DEFENSE_RETRY', 1, true)
-                        or tostring(why):find('__EARTH_HEAL_RETRY', 1, true) then task.wait(0.05)
-                    else status('Loot worker recovering: ' .. tostring(why)); task.wait(2) end
+                        or tostring(why):find('__EARTH_MODE_CHANGED', 1, true) then task.wait(0.05)
+                    else status('Optional worker recovering: ' .. tostring(why)); task.wait(2) end
                 else task.wait(0.1) end
             end
             F.cleanup(ctx)
         end)
     end
-    F.validate, F.armorBetter, F.resources, F.findTool = validate, armorBetter, resources, findTool
-    F.equip, F.batch, F.extract, F.mine, F.heal, F.dungeon = equip, batch, extract, mine, heal, dungeon
-    F.shopGear, F.availableCoins, F.upgradeGear = shopGear, availableCoins, upgradeGear
+    F.validate, F.armorBetter, F.weaponBetter, F.findTool = validate, armorBetter, weaponBetter, findTool
+    F.equip, F.extract, F.upgradeGear = equip, extract, upgradeGear
     F.index = index
     persist()
     return F
@@ -3012,9 +2300,8 @@ end
             local scene = controller("CutSceneController")
             if workspace:GetAttribute("InCutScene") or workspace:GetAttribute("InfiniteRebasing")
                 or (scene and (scene.CurrentCutScene or scene.AbortingCutScene))
-                or s.request or s.awaiting or s.departureAt or (features.lootEnabled() and ctx.flags.SafeMode)
-                or (ctx.featureHold and ctx.featureOperation ~= "dungeon")
-                or (features.lootEnabled() and humanoid.MaxHealth > 0 and humanoid.Health / humanoid.MaxHealth < 0.65) then
+                or s.request or s.awaiting or s.departureAt
+                or ctx.featureHold then
                 combat.holdUntil, combat.burstUntil = nil, nil
                 return
             end
@@ -3202,8 +2489,7 @@ end
                 wrapped = function(...)
                     -- The recovered chest helper also invokes recovery internally.
                     -- Chest-only mode must not enter that legacy wait-for-HP loop.
-                    if not features.lootEnabled() then ctx.flags.SafeMode = false; return end
-                    return fn(...)
+                    ctx.flags.SafeMode = false; return
                 end
             elseif id == 9164528 then
                 wrapped = function(...)
@@ -3214,7 +2500,8 @@ end
                     end
                     local list = {}
                     for _, entry in ipairs(ctx.candidates) do
-                        if entry.Model.Parent and not features.skipLootArea(entry.Model) then
+                        if entry.Model.Parent and not features.skipLootArea(entry.Model)
+                            and features.chestFallbackAllowed(entry.Model) then
                             local record = chestRecord(entry)
                             if not record.locked and not record.retired and now() >= (record.retryAt or 0)
                                 and not ((record.failures or 0) >= 3 and entry.Pos.X < (s.routeScanX or entry.Pos.X) - 300) then
@@ -3228,7 +2515,7 @@ end
                 end
             elseif id == 16361397 then
                 wrapped = function(entry, ...)
-                    if features.skipLootArea(entry.Model) then return "skipped" end
+                    if features.skipLootArea(entry.Model) or not features.chestFallbackAllowed(entry.Model) then return "skipped" end
                     if ctx.awaitCombat then ctx.awaitCombat() end
                     if not features.chestEnabled() and coroutine.running() ~= ctx.featureThread then return "disabled" end
                     local record = chestRecord(entry)
@@ -3300,8 +2587,7 @@ end
         end
         captureParts()
         function ctx.check()
-            if not features.lootEnabled() then ctx.flags.SafeMode = false end
-            if ctx.currentChest and (ctx.healing or ctx.flags.SafeMode) then ctx.chestStarted = now() end
+            ctx.flags.SafeMode = false
             if not ctx.active or not owned() or s.farm ~= ctx or s.teleporting
                 or player.Character ~= model or not model.Parent or not root.Parent
                 or not drill.Parent or humanoid.Health <= 0
@@ -3530,7 +2816,7 @@ end
         end
         -- Prevent an older standalone copy of the supplied farm from continuing beside this owner.
         _G.ChestFarm, _G.TrackScan = false, false
-        status("Starting optimized chest route with preserved loot and safety routines")
+        status("Starting chest route with optional smart loot and church extraction")
         taskApi.spawn(function()
             factory(ctx)
             ctx.initialized = true
@@ -3600,7 +2886,7 @@ end
                     taskApi.wait(0.2)
                 else
                     ctx.flags.ChestFarm = true
-                    if not features.lootEnabled() then ctx.flags.SafeMode = false end
+                    ctx.flags.SafeMode = false
                     -- Do not move/fire from a seat that rejected the original dismount.
                     if humanoid.SeatPart or humanoid.Sit then
                         s.seatBlockedSince = s.seatBlockedSince or now()
@@ -3792,27 +3078,7 @@ end
                 return
                 end
             end
-            local coinRevive = false
-            if not (s.freeRevive or kit or credits) and features.lootEnabled() and s.classResolver
-                and type(s.classResolver.GetCoinReviveCost) == 'function' then
-                local ok, cost = pcall(s.classResolver.GetCoinReviveCost, player, workspace)
-                if ok and type(cost) == 'number' and cost > 0 and cost < math.huge then
-                    if s.deathCoinIdentity ~= deadIdentity then
-                        s.deathCoinProbeAt = s.deathCoinProbeAt or now()
-                        if now() - s.deathCoinProbeAt < 10 then
-                            request('probe', 'CurrencyService', 'GetCurrency', pack(), function(result)
-                                s.deathCoinIdentity = deadIdentity
-                                s.deathCoins = result[1] and tonumber(result[2]) or nil
-                            end)
-                            status('Checking coin balance for native Princess revive'); return
-                        end
-                    end
-                    local coins = s.deathCoinIdentity == deadIdentity and s.deathCoins
-                    coinRevive = type(coins) == 'number' and coins - cost >= 10000
-                        and not s.lootRequest and not s.upgradeRequest
-                end
-            end
-            if s.freeRevive or kit or credits or coinRevive then
+            if s.freeRevive or kit or credits then
                 request("revive", "PlayerService", "SelfRevive", pack(), function(result)
                     s.reviveIdentity = deadIdentity
                     if result[1] and result[2] == true and not result[3] then waitTransition("revive", deadIdentity, 20) end
@@ -3955,6 +3221,20 @@ end
             s.freeReviveProbeAt = nil
             s.deathCoinIdentity, s.deathCoinProbeAt, s.deathCoins = nil, nil, nil
         end
+        if player:GetAttribute('SavedExitTeleportLocked') == true then
+            stopFarm()
+            if not s.forceFresh then
+                s.forceFresh = true
+                pcall(function() TeleportService:SetTeleportSetting(FRESH_SETTING, true) end)
+            end
+            local savedUI = controller('DeathScreenController')
+            if player:GetAttribute('SavedExitRetryAvailable') == true and not (savedUI and savedUI.SavedExitRetryRequest) then
+                request('saved-return', 'PlayerService', 'SaveGear', pack(), function(result)
+                    if accepted(result) then waitTransition('saved-return') end
+                end)
+            else status('Game saved-exit state confirmed; waiting for lobby transfer') end
+            return
+        end
         local drill = workspace:FindFirstChild("Drill")
         if not drill then
             stopFarm()
@@ -3983,7 +3263,8 @@ end
             s.runExhausted = true
             status("Seat did not release after 30 seconds; recovering through a fresh solo run")
         end
-        if s.runExhausted and not features.lootEnabled() then
+        if s.runExhausted and (not features.extractionEnabled()
+            or s.seatBlockedSince and now() - s.seatBlockedSince >= 30) then
             s.returnReason = s.seatBlockedSince and 'Seat recovery started a fresh chest run' or 'Chest route exhausted; starting a fresh run'
             s.forceFresh = true
             local ok = pcall(function() TeleportService:SetTeleportSetting(FRESH_SETTING, true) end)
@@ -3994,7 +3275,7 @@ end
             returnToLobby(); return
         end
         local ctx = s.farm
-        if ctx and ctx.currentChest and ctx.chestStarted and not ctx.healing and not ctx.flags.SafeMode
+        if ctx and ctx.currentChest and ctx.chestStarted
             and now() - ctx.chestStarted > 15 then
             local old, record = ctx.lootThread, ctx.currentChest
             if old and old ~= coroutine.running() then pcall(task.cancel, old) end
