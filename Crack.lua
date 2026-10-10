@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v17.
+-- Crack the Egg: lobby + round progression, v18.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -522,7 +522,7 @@ local function gate()
     end
     if player:GetAttribute("ProfileReady") ~= true then return "Waiting for ProfileReady" end
     if player:GetAttribute("LoadingScreenFinished") ~= true then return "Waiting for loading screen" end
-    if game:GetService("GuiService").MenuIsOpen then return "Roblox menu open" end
+    if game.PlaceId == 137477934962022 and game:GetService("GuiService").MenuIsOpen then return "Roblox menu open" end
     for _, name in ipairs(busyAttributes) do
         if player:GetAttribute(name) == true then return "Waiting for " .. name end
     end
@@ -849,7 +849,7 @@ do
         local _, root, head, hum = character()
         if not root then return false, "Waiting for living character" end
         app:updateSpeed()
-        local origin = (lane == "mine" or lane == "collect" or lane == "sell" or lane == "shop") and head.Position or root.Position
+        local origin = (lane == "mine" or lane == "event" or lane == "collect" or lane == "sell" or lane == "shop") and head.Position or root.Position
         if not hum.SeatPart and not hum.Sit and (origin - position).Magnitude <= range
             and (not approach or (root.Position - approach.goal).Magnitude <= 0.75) then
             if app.move then app:release() end
@@ -879,7 +879,7 @@ do
         local destination = position + (direction.Magnitude > 0.1 and direction.Unit or Vector3.new(1, 0, 0)) * math.max(1, range * 0.45)
         if lane == "evade" then destination = position end
         if approach then destination = approach.goal end
-        local directFlight = policy == "Tween" and (lane == "mine" or lane == "collect" or lane == "shop") and not approach
+        local directFlight = policy == "Tween" and (lane == "mine" or lane == "event" or lane == "collect" or lane == "shop") and not approach
         m.air = directFlight or approach and approach.air or false
         if directFlight then
             -- Fly straight into real head/tool range in all three dimensions.
@@ -914,7 +914,9 @@ do
             if not floor and not m.air then destination = Vector3.new(destination.X, root.Position.Y, destination.Z) end
             if lane ~= "evade" then
                 local config = module("BreakTheEgg", "Config")
-                local ground = lane == "shop" and config.EggGroundY or flightGround(destination, target, config)
+                -- Shops and scientist combat can be below a raised platform.
+                -- An overhead prop is not the floor at the attack position.
+                local ground = (lane == "shop" or lane == "event") and config.EggGroundY or flightGround(destination, target, config)
                 local minY = ground + hum.HipHeight + root.Size.Y * 0.5 + 0.25
                 if destination.Y < minY then
                     destination = Vector3.new(destination.X, minY, destination.Z)
@@ -1231,10 +1233,10 @@ do
                 state.ranks, state.won, state.pending = nil, nil, {}
                 state.chests, state.offers, state.done = {}, {}, {}
                 state.workerAttempt, state.activity, state.hold, state.evadeGoal, state.bagSince, state.needScaffold = nil, nil, nil, nil, nil, nil
-                state.evadeApproach, state.knockUntil, state.quakeFlight = nil, nil, nil
+                state.evadeApproach, state.knockUntil, state.quakeFlight, state.physicsEvadeAt = nil, nil, nil, nil
                 state.gun, state.explosive, state.gunRoute = nil, nil, nil
                 state.frontierAt, state.upperTarget, state.passiveVisit, state.passiveNextAt = nil, nil, nil, nil
-                state.inspection, state.inspections = nil, nil
+                state.inspection, state.inspections, state.eventRecoveries = nil, nil, nil
                 state.approach, state.obstruction, state.saleRoute, state.saleRetryAt, state.salePreference = nil, nil, nil, nil, nil
                 -- These keys name objects/tokens in the departed world, never a
                 -- persistent purchase or inventory outcome.
@@ -1560,8 +1562,7 @@ do
             for field, weight in pairs({Reload = 1, Spread = 1}) do gain += math.max(0, from[field] / math.max(0.05, to[field]) - 1) * weight end
             return gain
         end
-        if def.Family == "autoCollect" and player:GetAttribute("VIPOwned_vip_magnet") == true
-            or def.Family == "chute" and player:GetAttribute("VIPOwned_vip_autoSell") == true then return 0 end
+        if def.Family == "chute" and player:GetAttribute("VIPOwned_vip_autoSell") == true then return 0 end
         for field, weight in pairs({Damage = 3, Reach = 0.5, HandReach = 0.5, ScoopRadius = 0.5, WalkSpeed = 0.2,
             DrillRadius = 0.5, DrillDuration = 0.4, WorkerMultiplier = 0.5, SaleBonus = 1, Fracture = 1, Teamwork = 1,
             BlastDamage = 1, BlastEdge = 0.4}) do
@@ -1760,7 +1761,7 @@ do
         end
         return first
     end
-    local function approachPosition(target, position, head, root, hum, range, guardian)
+    local function approachPosition(target, position, head, root, hum, range, guardian, airOnly)
         -- A short, bounded search for a verified attack ray. Distance alone
         -- cannot prove arrival: a wedge, guardian or wall may still block it.
         local offset = head.Position - root.Position
@@ -1776,10 +1777,15 @@ do
                 local dir = Vector3.new(radial.X * math.cos(a) - radial.Z * math.sin(a), 0,
                     radial.X * math.sin(a) + radial.Z * math.cos(a))
                 local goal = Vector3.new(position.X, level == 1 and root.Position.Y or position.Y - offset.Y, position.Z)
-                    + dir * math.max(2, range * 0.65)
+                    + dir * math.max(2, range * (airOnly and 0.35 or 0.65))
+                if airOnly then
+                    local config = module("BreakTheEgg", "Config")
+                    local minY = config.EggGroundY + hum.HipHeight + root.Size.Y * 0.5 + 0.25
+                    goal = Vector3.new(goal.X, math.max(goal.Y, minY), goal.Z)
+                end
                 local floor = workspace:Raycast(goal + Vector3.new(0, 4, 0), Vector3.new(0, -12, 0), params)
                 local air = true
-                if floor and floor.Normal.Y > 0.65 then
+                if not airOnly and floor and floor.Normal.Y > 0.65 then
                     local grounded = floor.Position + Vector3.new(0, hum.HipHeight + root.Size.Y * 0.5, 0)
                     if (grounded + offset - position).Magnitude < range then goal, air = grounded, false end
                 end
@@ -1789,7 +1795,7 @@ do
                         and (result.Position - goal - offset).Magnitude <= range
                         and (not result.Guardian or (result.Distance or 1) > 0.5) then
                         local value = (goal - root.Position).Magnitude + (air and 10 or 0)
-                        if not score or value < score then best, score = {target = target, goal = goal, air = air, at = os.clock()}, value end
+                        if not score or value < score then best, score = {target = target, goal = goal, air = air, at = os.clock(), position = position}, value end
                     end
                 end
             end
@@ -2077,6 +2083,7 @@ do
             h.duration = math.max(0, number(a, "Duration", def.Duration or 0))
             if kind == "Lane" and vector(a.From) and vector(a.To) then
                 h.from, h.to, h.radius = flat(a.From), flat(a.To), math.max(0, number(a, "Width", def.Width or 7)) * 0.5
+                h.ground, h.height = math.max(config.EggGroundY, a.From.Y, a.To.Y), math.max(0, number(a, "Height", def.Height))
                 h.finish = at + math.clamp(h.duration > 0 and h.duration or 0.45, 0.3, 2) + 0.2
             elseif (kind == "Glob" or kind == "Puddle" or kind == "Grab" or kind == "Slam") and vector(a.Point) then
                 h.point, h.radius = flat(a.Point), math.max(0, number(a, "Radius", def.Radius or (kind == "Puddle" and defaults.Goo.Puddle or kind == "Slam" and boss.Slam.Radius or 5)))
@@ -2094,6 +2101,7 @@ do
                 h.finish = at + math.max(0, (h.max - h.r0) / h.speed) + 0.4
             elseif kind == "Beam" and vector(a.Center) and finite(a.A0) and finite(a.A1) then
                 h.point, h.a0, h.a1 = flat(a.Center), a.A0, a.A1
+                h.ground, h.height = math.max(config.EggGroundY, a.Center.Y), math.max(0, number(a, "Height", def.Height))
                 h.radius, h.length = math.max(0, number(a, "Width", def.Width)) * 0.5, math.max(0, number(a, "Length", def.Length))
                 h.duration = h.duration > 0 and h.duration or def.Duration
                 h.finish = at + h.duration + 0.3
@@ -2201,10 +2209,10 @@ do
     end
     local function clearance(h, position, at, margin, warning)
         if at > h.finish or at < h.at - (warning and h.warn or 0.1) then return math.huge end
+        if h.safeY and position.Y >= h.safeY then return math.huge end
         local pos = flat(position)
         if h.kind == "Lane" then return segmentDistance(pos, h.from, h.to) - h.radius - margin end
         if h.kind == "Quake" then
-            if h.safeY and position.Y >= h.safeY then return math.huge end
             if at < h.at then return math.huge end
             local radius = h.r0 + (at - h.at) * h.speed
             if radius > h.max then return math.huge end
@@ -2230,7 +2238,7 @@ do
         local contactAt = math.huge
         local margin = math.max(root.Size.X, root.Size.Z) * 0.5 + boss.HazardBody + 0.65
         for _, h in ipairs(list) do
-            if h.kind == "Quake" then
+            if h.kind == "Quake" or h.kind == "Lane" or h.kind == "Beam" then
                 -- Keep the feet, not just the root, above the exported wave
                 -- height. Retain this floor until the entire ring expires so
                 -- a lateral exit cannot descend across a second crossing.
@@ -2238,11 +2246,15 @@ do
                 if not q then q = {root = root, minY = h.safeY, finish = h.finish + 0.2,
                     y = root.Position.Y, progressAt = now} end
                 q.minY, q.finish = math.max(q.minY, h.safeY), math.max(q.finish, h.finish + 0.2)
-                local radius = (flat(root.Position) - h.point).Magnitude
-                local arrival = h.at + math.max(0, (radius - h.r0 - h.radius - margin) / h.speed)
-                local passed = h.at + (radius - h.r0 + h.radius + margin) / h.speed
-                if radius <= h.max + margin and radius >= h.r0 - h.radius - margin and now <= passed then
-                    contactAt = math.min(contactAt, arrival)
+                if h.kind == "Quake" then
+                    local radius = (flat(root.Position) - h.point).Magnitude
+                    local arrival = h.at + math.max(0, (radius - h.r0 - h.radius - margin) / h.speed)
+                    local passed = h.at + (radius - h.r0 + h.radius + margin) / h.speed
+                    if radius <= h.max + margin and radius >= h.r0 - h.radius - margin and now <= passed then
+                        contactAt = math.min(contactAt, arrival)
+                    end
+                elseif clearance(h, root.Position, math.max(now, h.at), margin, true) < 0 then
+                    contactAt = math.min(contactAt, h.at)
                 end
             end
         end
@@ -2311,7 +2323,7 @@ do
             success("move:boss-quake")
             move("evade", "boss-quake", state.lab, goal, 0.05, {goal = goal, air = true})
             app:updateFlight(root)
-            app.status.farm = "Dodging shockwave · flying above ring"
+            app.status.farm = "Dodging boss · airborne hazard clearance"
             return true
         end
         if not need then
@@ -2328,6 +2340,12 @@ do
         if fx then table.insert(excludes, fx) end
         params.FilterDescendantsInstances = excludes
         local bodyNear = startRadius < bodyRadius + 35
+        local escapeDeadline = math.huge
+        for _, h in ipairs(list) do
+            if h.kind ~= "Quake" and clearance(h, root.Position, math.max(now, h.at), margin, true) < 0 then
+                escapeDeadline = math.min(escapeDeadline, math.max(now, h.at))
+            end
+        end
         local function route(goal)
             -- Mining recovery may leave us well above ground. Find an actual
             -- floor and plan the descent rather than rejecting every exit.
@@ -2342,6 +2360,7 @@ do
             local distance = delta.Magnitude
             local duration = distance / math.max(1, hum.WalkSpeed)
             local score, worst = distance, math.huge
+            local urgent = escapeDeadline - now < duration + 0.18
             local previousRadius = startRadius
             for i = 1, 16 do
                 local fraction = i / 16
@@ -2357,19 +2376,44 @@ do
                 worst = math.min(worst, c)
                 -- Weight exposure by travel time. Fixed penalties per sample
                 -- made long retreats look safer and abandoned attack range.
-                if c < 0 then score += (500 + (-c) * 100) * duration / 16 end
+                -- An urgent correction doesn't traverse these samples in
+                -- physics. Prefer the nearest verified safe endpoint instead
+                -- of fleeing farther to reduce a hypothetical tween exposure.
+                if c < 0 and not urgent then score += (500 + (-c) * 100) * duration / 16 end
             end
             if bodyNear and (flat(goal) - center).Magnitude < bodyRadius then return nil end
             -- Reject unsafe destinations even when every alternative scores
             -- poorly. Include the announced impact after arrival as well.
             for _, h in ipairs(list) do
-                if clearance(h, goal, math.max(now + duration, h.at), margin, true) < 0 then return nil end
+                if clearance(h, goal, now, margin, true) < 0
+                    or clearance(h, goal, math.max(now, h.at), margin, true) < 0
+                    or clearance(h, goal, math.max(now + duration, h.at), margin, true) < 0 then return nil end
             end
             local wall = workspace:Raycast(root.Position, delta, params)
             if wall and wall.Normal.Y < 0.65 and (wall.Position - root.Position).Magnitude < distance - 0.5 then return nil end
             return score, worst, goal
         end
         local best, bestScore
+        local function travelExit(goal, approach)
+            local distance = (goal - root.Position).Magnitude
+            local duration = distance / math.max(1, hum.WalkSpeed)
+            local m = app.move
+            local stalled = m and m.lane == "evade" and os.clock() - m.progressAt > 0.35
+            if distance > 0.5 and (escapeDeadline - now < duration + 0.18 or stalled) then
+                -- The caller has just verified the full route and endpoint.
+                -- Do not spend the warning window on an impossible/frozen tween.
+                app:release()
+                if app:updateFlight(root) then
+                    local facing = Vector3.new(config.EggCenter.X, goal.Y, config.EggCenter.Z)
+                    if (facing - goal).Magnitude < 0.01 then facing = goal + Vector3.new(0, 0, -1) end
+                    root.CFrame = CFrame.lookAt(goal, facing)
+                    root.AssemblyLinearVelocity = Vector3.new()
+                    state.stats.hazardEscapes = (state.stats.hazardEscapes or 0) + 1
+                    return true, "Urgent verified escape"
+                end
+            end
+            return move("evade", "boss-evade", state.lab, goal, 0.5, approach)
+        end
         -- Keep a previously verified exit while it remains safe. This avoids
         -- alternating sides on symmetric warning geometry every heartbeat.
         local old = state.evadeGoal
@@ -2382,7 +2426,7 @@ do
                 local approach = {goal = goal, air = math.abs(goal.Y - root.Position.Y) > 4}
                 state.evadeGoal, state.evadeApproach = goal, approach
                 if not app.move then success("move:boss-evade") end
-                local _, reason = move("evade", "boss-evade", state.lab, goal, 0.5, approach)
+                local _, reason = travelExit(goal, approach)
                 app.status.farm = "Dodging boss · verified exit" .. (reason and " · " .. reason or "")
                 return true
             end
@@ -2403,7 +2447,7 @@ do
                 success("move:boss-quake")
                 move("evade", "boss-quake", state.lab, goal, 0.05, {goal = goal, air = true})
                 app:updateFlight(root)
-                app.status.farm = "Shockwave flight · no clear lateral exit"
+                app.status.farm = "Airborne hazard dodge · no clear lateral exit"
                 return true
             end
             app:release()
@@ -2414,7 +2458,7 @@ do
         local approach = {goal = best, air = math.abs(best.Y - root.Position.Y) > 4}
         state.evadeGoal, state.evadeApproach = best, approach
         success("move:boss-evade") -- A newly verified exit can recover an earlier frozen route.
-        local _, reason = move("evade", "boss-evade", state.lab, best, 0.5, approach)
+        local _, reason = travelExit(best, approach)
         app.status.farm = "Dodging boss · " .. tostring(#list) .. " warnings" .. (reason and " · " .. reason or "")
         return true
     end
@@ -2879,6 +2923,13 @@ do
             return
         end
         if not part and mode ~= "guardian" or not position then state.target, state.selectAt = nil, 0 return end
+        if mode == "event" then
+            -- MotionFrame/rig presentation can move thieves between scans.
+            -- Chase and attack their current physical queryable surface.
+            local livePart, livePosition = aim(target, head.Position)
+            if not livePart then state.target, state.selectAt = nil, 0 return end
+            part, position, state.position = livePart, livePosition, livePosition
+        end
         local family, cooldown = "Bucket", player:GetAttribute("ScoopCooldown") or config.ScoopCooldown
         if mode ~= "collect" then
             local best
@@ -2914,10 +2965,10 @@ do
         if not equip(family, config) then app.status.farm = "Equipping " .. family return end
         local m = mechanics(family)
         local range = reach(family, config)
-        local lane = mode == "collect" and "collect" or "mine"
+        local lane = mode == "collect" and "collect" or mode == "event" and "event" or "mine"
         local rayGuardian = mode ~= "collect" and guardian or nil
         local result = contact(target, position, head, range, rayGuardian)
-        if mode ~= "collect" and result and result.Instance ~= target and not result.Instance:IsDescendantOf(target) then
+        if mode ~= "collect" and mode ~= "event" and result and result.Instance ~= target and not result.Instance:IsDescendantOf(target) then
             local blocker = result.Instance
             while blocker and blocker ~= state.lab do
                 local hp, layer = blocker:GetAttribute("HP"), blocker:GetAttribute("Layer") or 1
@@ -2942,6 +2993,7 @@ do
             and (result.Instance == target or result.Instance:IsDescendantOf(target))
         local approach = state.approach
         if approach and (approach.target ~= target or os.clock() - approach.at > 8
+            or mode == "event" and approach.position and (approach.position - position).Magnitude > 0.8
             or (approach.goal + head.Position - root.Position - position).Magnitude > range) then
             state.approach, approach = nil, nil
         end
@@ -2955,7 +3007,7 @@ do
             if (position - head.Position).Magnitude <= range + 2 or os.clock() - obstructed.at > 0.8 then
                 if (obstructed.probeAt or 0) <= os.clock() then
                     obstructed.probeAt = os.clock() + 0.8
-                    approach = approachPosition(target, position, head, root, hum, range, rayGuardian)
+                    approach = approachPosition(target, position, head, root, hum, range, rayGuardian, mode == "event")
                     state.approach = approach
                     if not approach and (position - head.Position).Magnitude <= range + 2 then
                         fail("hit:" .. targetId(target), hitFingerprint(target, family), "No clear attack position; trying another target")
@@ -2974,6 +3026,34 @@ do
             state.obstruction = nil
         else
             local arrived, reason = move(lane, "target:" .. targetId(target), target, position, math.max(2, range - 1), approach)
+            local travel = app.move
+            if mode == "event" and not arrived and travel and travel.root == root and os.clock() - travel.progressAt > 0.65 then
+                state.eventRecoveries = state.eventRecoveries or setmetatable({}, {__mode = "k"})
+                local recovery = state.eventRecoveries[target]
+                if not recovery or recovery.root ~= root or recovery.tries < 3 and os.clock() >= recovery.nextAt then
+                    -- A recovery is useful only if it reaches a fresh real
+                    -- scientist/limb contact below the platform. Never hit the
+                    -- carried egg as a substitute for its attackers.
+                    local exit = approachPosition(target, position, head, root, hum, range, nil, true)
+                    if exit then
+                        app:release()
+                        if app:updateFlight(root) then
+                            root.CFrame = CFrame.lookAt(exit.goal, exit.goal + Vector3.new(0, 0, -1))
+                            root.AssemblyLinearVelocity = Vector3.new()
+                            recovery = recovery and recovery.root == root and recovery or {root = root, tries = 0}
+                            recovery.tries, recovery.nextAt = recovery.tries + 1, os.clock() + 3
+                            state.eventRecoveries[target] = recovery
+                            state.approach, state.obstruction = nil, nil
+                            state.stats.eventRescues = (state.stats.eventRescues or 0) + 1
+                            -- Head transforms follow the assembly in physics;
+                            -- dispatch rechecks the actual ray on the next tick.
+                            state.target, state.selectAt = nil, 0
+                            app.status.farm = "Scientist pursuit · recovered to clear attack position"
+                            return
+                        end
+                    end
+                end
+            end
             if not arrived then
                 app.status.farm = mode .. " " .. string.format("%.1f/%.1f studs", (position - head.Position).Magnitude, range)
                     .. " · " .. tostring(reason)
@@ -3241,7 +3321,8 @@ do
     end
     local function repeatRound()
         if not app.settings.repeatRuns then return end
-        if game:GetService("GuiService").MenuIsOpen or player:GetAttribute("PurchasePromptOpen") == true then return end
+        if (game.PlaceId == 137477934962022 and game:GetService("GuiService").MenuIsOpen)
+            or player:GetAttribute("PurchasePromptOpen") == true then return end
         local p = state.pending.returnLobby
         if p then
             app.status.queue = "ReturnLobby pending"
@@ -3409,6 +3490,12 @@ do
             if config and boss then
                 local now = workspace:GetServerTimeNow()
                 quakeFlight(config, boss, root, hum, now, hazards(config, boss, now))
+                local slamAt = state.lab:GetAttribute("BossSlamAt")
+                if (state.lab:FindFirstChild("BossHazards") or finite(slamAt) and now >= slamAt - boss.Slam.Warn and now <= slamAt + 0.35)
+                    and now >= (state.physicsEvadeAt or 0) then
+                    state.physicsEvadeAt = now + 0.05
+                    evasion(config)
+                end
             end
         end
         if blocked or not self.settings.farm or state.pending.chest or player:GetAttribute("ChestPickerOpen") == true
@@ -3424,7 +3511,7 @@ do
                 .. "; acknowledged=" .. tostring(state.queueAccepted or "none"),
             "Pass attributes: InfiniteBucket=" .. tostring(player:GetAttribute("InfiniteBucket")) .. "; DoubleChest=" .. tostring(player:GetAttribute("DoubleChest"))
             .. "; ClaimAllUpgrades=" .. tostring(player:GetAttribute("ClaimAllUpgrades")),
-            "Boss evasion: replicated slams/lanes/globs/puddles/grabs/beams + upward shockwave flight; active records=" .. tostring(state.hazardCount or 0)
+            "Boss evasion: replicated slams/globs/puddles/grabs + upward quake/lane/beam flight; active records=" .. tostring(state.hazardCount or 0)
                 .. "; melee avoidance zones=" .. tostring(state.meleeCount or 0)
                 .. "; native boss strikes=" .. tostring(state.stats.bossStrikes or 0) .. "; confirmed win receipts=" .. tostring(state.stats.wins or 0),
             "AFK watchdog=" .. tostring(self.watch and math.floor(os.clock() - self.watch.at) or 0) .. " seconds without measurable progress; resume queued=" .. tostring(self.resumeQueued == true)}
@@ -3445,9 +3532,13 @@ do
             .. "; bag age=" .. tostring(state.bagSince and math.floor(os.clock() - state.bagSince) or 0) .. "s; batch threshold=8 / age=6s")
         local _, root, head, hum = character()
         if root then
-            table.insert(lines, "Shockwave clearance Y=" .. tostring(state.quakeFlight and state.quakeFlight.minY or "inactive")
+            table.insert(lines, "Airborne hazard clearance Y=" .. tostring(state.quakeFlight and state.quakeFlight.minY or "inactive")
                 .. "; hold until=" .. tostring(state.quakeFlight and state.quakeFlight.finish or "none")
                 .. "; late/stalled vertical corrections=" .. tostring(state.stats.quakeLifts or 0))
+            table.insert(lines, "Urgent verified exits=" .. tostring(state.stats.hazardEscapes or 0)
+                .. "; scientist pursuit rescues=" .. tostring(state.stats.eventRescues or 0)
+                .. "; menu flag (round continues)=" .. tostring(game:GetService("GuiService").MenuIsOpen)
+                .. "; Auto collect rank=" .. tostring(state.ranks and state.ranks.autoCollect or 0))
             table.insert(lines, "Noclip/vertical hold=" .. tostring(self.flight ~= nil)
                 .. "; alternate attack position=" .. tostring(state.approach and state.approach.goal or "none"))
             table.insert(lines, "Character root=" .. tostring(root.Position) .. "; head=" .. tostring(head.Position)
@@ -3539,9 +3630,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v17.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v18.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v17 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v18 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -3570,7 +3661,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v17", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v18", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
