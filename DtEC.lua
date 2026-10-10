@@ -10,8 +10,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 11
-    local BUILD = "r11-native-church-save"
+    local REVISION = 12
+    local BUILD = "r12-sack-ready-church"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -939,7 +939,7 @@ end)()
         data = type(data) == 'table' and data or {}
         -- Old loot/mining/chest flags never opt the user into either new option.
         return { chest = true, smartLoot = data.smartLoot == true, extraction = data.extraction == true,
-            minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), schema = 11 }
+            minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), schema = 12 }
     end
     local loaded = s.config
     if not loaded then
@@ -1327,6 +1327,19 @@ end)()
         if active then s.equipRecords[tool] = nil; return active end
         if tool.Parent == ctx.character then return nil end
         local record = s.equipRecords[tool]
+        -- Recover a sack request superseded by another confirmed active tool.
+        -- EquipTool toggles: never resend while the sack is represented on the character.
+        if record and record.accepted and attr(tool, 'Class') == 'ItemBag'
+            and now() >= (record.retryAt or 0) then
+            local c = controller('ToolController')
+            local other = c and c.ActiveTool
+            local represented = false
+            for _, piece in ipairs(children(ctx.character)) do
+                if id(piece) == id(tool) or piece.Name == id(tool) .. tostring(api.Players.LocalPlayer.UserId) then represented = true end
+            end
+            if not represented and other and not other._Destroyed and other.Tool
+                and other.Tool.Parent == ctx.character then record.accepted = nil end
+        end
         if record and (record.pending or record.accepted or now() < (record.retryAt or 0)) then return nil end
         record = record or {}; s.equipRecords[tool] = record
         local issued = api.request('equip-weapon', 'ToolService', 'EquipTool', api.pack(tool), function(result)
@@ -1627,30 +1640,70 @@ end)()
         while issued and ctx.gearPickup == record and now() < deadline and not gearReceipt(ctx, record) do wait(ctx, 0.05) end
         release(ctx); return issued
     end
+    local function sendBag(ctx, active, payload)
+        local c = controller('ToolController')
+        if not c or c.ActiveTool ~= active or active._Destroyed then return false end
+        local signal = active.Execute
+        local count; pcall(function() count = #signal:GetConnections() end)
+        if count == 0 then
+            local ok, service = pcall(function() return s.knit.GetService('ToolService') end)
+            if ok and service and service.Update and type(service.Update.Fire) == 'function' and c.ActiveTool == active then
+                service.Update:Fire(payload); return true
+            end
+        elseif signal and type(signal.Fire) == 'function' then signal:Fire(payload); return true end
+        return false
+    end
     local function bag(ctx)
         local tool = findTool(ctx, 'ItemBag'); if not tool then return nil end
         ctx.equipIntent = tool
         local active = equip(ctx, tool)
+        -- EquipTool is asynchronous. Keep the route/combat hold until its native
+        -- handler arrives, rather than releasing it on every feature-worker pass.
+        local deadline = now() + 4
+        while not active and now() < deadline do
+            status('Church packing: waiting for the sack to equip')
+            wait(ctx, 0.05); active = activeFor(ctx, tool)
+        end
         if active then
-            s.sackSize, s.sackCapacity = tonumber(active.Size), tonumber(active.MaxSize)
+            s.equipRecords[tool] = nil
+            s.sackCapacity = tonumber(active.MaxSize)
+            s.sackSize = ctx.bagConfirmed == active and tonumber(active.Size) or nil
             if not ctx.bagObserver or ctx.bagObserver.active ~= active then
-                if ctx.bagObserver and ctx.bagObserver.active.UpdateSackSize == ctx.bagObserver.wrapper then
-                    ctx.bagObserver.active.UpdateSackSize = ctx.bagObserver.original
+                if ctx.bagObserver and ctx.bagObserver.controller.UpdateSackSize == ctx.bagObserver.wrapper then
+                    ctx.bagObserver.controller.UpdateSackSize = ctx.bagObserver.original
                 end
-                local original = active.UpdateSackSize
-                if type(original) == 'function' then
+                local c = controller('ToolController')
+                local original = c and c.UpdateSackSize
+                if c and type(active.UpdateSackSize) == 'function' and (original == nil or type(original) == 'function') then
+                    -- Native ToolService.Update dispatches controller methods first,
+                    -- then ActiveTool methods. Observe that server dispatch only:
+                    -- local capacity refreshes also call active:UpdateSackSize(0).
                     local wrapper = function(self, quantity, ...)
-                        local result = original(self, quantity, ...)
-                        if self == active and type(quantity) == 'number' then
+                        local current = self.ActiveTool
+                        local result
+                        if original then result = original(self, quantity, ...)
+                        elseif current and type(current.UpdateSackSize) == 'function' then result = current:UpdateSackSize(quantity, ...) end
+                        if current == active and not active._Destroyed and active.Tool and active.Tool.Parent == ctx.character
+                            and type(quantity) == 'number' and quantity >= 0 and quantity < math.huge and quantity == math.floor(quantity) then
                             ctx.bagConfirmed = active; s.sackSize, s.sackCapacity = quantity, active.MaxSize
                         end
                         return result
                     end
-                    ctx.bagObserver = { active = active, original = original, wrapper = wrapper }
-                    active.UpdateSackSize = wrapper
-                    -- This is the same request used by the native bag initialization.
-                    if active.Execute then active.Execute:Fire({ 'GetStoredItems' }) end
+                    ctx.bagObserver = { active = active, controller = c, original = original, wrapper = wrapper }
+                    c.UpdateSackSize = wrapper
                 end
+            end
+            local observer = ctx.bagObserver
+            if observer and observer.active == active and ctx.bagConfirmed ~= active
+                and now() >= (observer.queryAt or 0) then
+                observer.queryAt = now() + 2
+                -- Read-only native request, safe to retry after a lost response.
+                -- Match ToolController's forwarding when Execute has no listener.
+                local sent = sendBag(ctx, active, { 'GetStoredItems' })
+                status(sent and 'Church packing: waiting for the sack quantity response'
+                    or 'Church packing: waiting for the native sack request listener')
+                deadline = now() + 2
+                while sent and ctx.bagConfirmed ~= active and activeFor(ctx, tool) == active and now() < deadline do wait(ctx, 0.05) end
             end
         end
         return active, tool
@@ -1690,7 +1743,10 @@ end)()
             status('Waiting for a native sack quantity update before unloading'); return nil
         end
         ctx.sackDrop = { snapshot = worldSnapshot(), at = now() }
-        active.Execute:Fire({ 'Drop' }); wait(ctx, 0.35)
+        if not sendBag(ctx, active, { 'Drop' }) then
+            ctx.sackDrop = nil; status('Church packing: waiting for the native sack drop listener'); return nil
+        end
+        wait(ctx, 0.35)
         ctx.sackDrop.item = newlyDropped(ctx.sackDrop.snapshot, ctx)
         return ctx.sackDrop.item
     end
@@ -2109,9 +2165,10 @@ end)()
             return false
         end
         if not findTool(ctx, 'ItemBag') then return true end
-        local active = bag(ctx)
-        if not active or ctx.bagConfirmed ~= active then
-            status('Return waits for confirmed sack contents'); return false
+        local active, bagTool = bag(ctx)
+        if not active or ctx.bagConfirmed ~= active or activeFor(ctx, bagTool) ~= active then
+            if active and not ctx.bagObserver then status('Church packing: native sack quantity handler is not ready') end
+            return false
         end
         if active.Size == 0 and not ctx.sackDrop then return true end
         local item = dropSackItem(ctx, active)
@@ -2310,8 +2367,8 @@ end)()
         pcall(function() if camera and camera.CFrame == ctx.watcherFrame and ctx.cameraBeforeWatcher then camera.CFrame = ctx.cameraBeforeWatcher end end)
         if ctx.watcherBinding and not ctx.active then pcall(function() api.RunService:UnbindFromRenderStep(ctx.watcherBinding) end) end
         ctx.swingEdit, ctx.dragEdit, ctx.instantPrompts = nil, nil, nil
-        pcall(function() if ctx.bagObserver and ctx.bagObserver.active.UpdateSackSize == ctx.bagObserver.wrapper then
-            ctx.bagObserver.active.UpdateSackSize = ctx.bagObserver.original
+        pcall(function() if ctx.bagObserver and ctx.bagObserver.controller.UpdateSackSize == ctx.bagObserver.wrapper then
+            ctx.bagObserver.controller.UpdateSackSize = ctx.bagObserver.original
         end end)
         ctx.bagObserver = nil
         s.pendingSackDrop = ctx.sackDrop
