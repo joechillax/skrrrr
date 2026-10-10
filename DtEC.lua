@@ -1,6 +1,6 @@
 task.wait(7)
 -- ChestFarmAutoLoop.lua: put this complete file in the executor's auto-execute folder.
--- Revision 9: automatic chest farm with independent Smart loot and timed Church extraction options.
+-- Revision 10: fixes native loot Cost filtering and waits for chest-drop / inventory replication.
 -- Hides the default Gameplay Paused popup after readiness; streaming pauses still apply.
 -- Includes Discord ending reports, cached discovery, and Blinker / identified boss ranged dodging.
 -- Continuous segmented depth travel; no healing, mining, selling, shops or team purchases.
@@ -10,8 +10,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 9
-    local BUILD = "r9-chest-options"
+    local REVISION = 10
+    local BUILD = "r10-smart-loot-receipts"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -772,6 +772,7 @@ return function(api)
     end
     function M.paused(ctx)
         if ctx.dungeon then return true end
+        if ctx.smartLootWindow and now() < ctx.smartLootWindow.untilAt and coroutine.running() ~= ctx.featureThread then return true end
         if ctx.defenseMoving or ctx.pendingThreat or now() < (ctx.dodgeUntil or 0) then return true end
         if ctx.featureHold and coroutine.running() ~= ctx.featureThread then return true end
         local read, paused = pcall(function() return api.Players.LocalPlayer.GameplayPaused end)
@@ -934,7 +935,7 @@ end)()
         data = type(data) == 'table' and data or {}
         -- Old loot/mining/chest flags never opt the user into either new option.
         return { chest = true, smartLoot = data.smartLoot == true, extraction = data.extraction == true,
-            minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), schema = 9 }
+            minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), schema = 10 }
     end
     local loaded = s.config
     if not loaded then
@@ -968,6 +969,7 @@ end)()
         if key == 'minutes' then cfg.minutes = clamp(value, 0, 180, cfg.minutes)
         elseif type(value) == 'boolean' then cfg[key] = value else return end
         persist()
+        if key == 'smartLoot' and not value and s.farm then s.farm.smartLootWindow = nil end
         -- An option change never resets chest progress or replaces a live farm.
         status('Chest farm running; optional settings updated')
         if s.gui then pcall(s.gui.update) end
@@ -1113,6 +1115,9 @@ return function(api)
         local bag = s.sackSize and string.format('%s/%s', s.sackSize, s.sackCapacity or '?') or '—'
         ui.stats.Text = string.format('%02d:%02d elapsed   ·   HP %d%%   ·   Sack %s\n%d chest removals   ·   %d Cores observed',
             math.floor(elapsed / 60), math.floor(elapsed % 60), health, bag, s.stats.lootObserved or 0, s.stats.coreEarned or 0)
+        if cfg.smartLoot then
+            ui.stats.Text = ui.stats.Text .. string.format('\n%d loot pickups · %s', s.stats.smartPickups or 0, s.smartLootStatus or 'Checking loose items')
+        end
         local camera = workspace.CurrentCamera
         if camera then scale.Scale = math.min(1, math.max(0.55, math.min((camera.ViewportSize.Y - 60) / 396, (camera.ViewportSize.X - 40) / 410))) end
     end
@@ -1216,6 +1221,38 @@ end)()
             if found then return fallback end
         end
         return type(item) ~= 'string' and item:GetAttribute(key) or nil
+    end
+    function F.freeWorldItemAllowed(item)
+        -- Native ItemDatabase.Apply copies Cost onto ordinary loot templates.
+        -- DragController identifies purchasable stock with ShopItem instead.
+        -- Only accept that base Cost on a recognized top-level loose item;
+        -- keep price overrides, paid ancestors and premium markers excluded.
+        local container = workspace:FindFirstChild('Items')
+        if not item or item.Parent ~= container or not (item:IsA('Model') or item:IsA('BasePart')) then return false end
+        local root = item
+        while item and item ~= workspace do
+            if tag(item, 'ShopItem') or item:GetAttribute('Robux') == true
+                or item:GetAttribute('ProductId') ~= nil or item:GetAttribute('RobuxProductId') ~= nil then return false end
+            local cost = tonumber(item:GetAttribute('Cost')) or 0
+            if cost > 0 then
+                if item ~= root or not s.itemDatabase then return false end
+                local ok, base = pcall(s.itemDatabase.GetAttribute, id(root), 'Cost')
+                if not ok or tonumber(base) ~= cost then return false end
+            end
+            item = item.Parent
+        end
+        return true
+    end
+    function F.chestLootWindow(ctx, point)
+        if cfg.smartLoot then
+            ctx.smartLootWindow = { position = point, untilAt = now() + 1.5, expires = now() + 7 }
+            s.smartLootStatus = 'Waiting for chest drops'
+        end
+    end
+    function F.smartLootPending(ctx)
+        local window = ctx.smartLootWindow
+        if not cfg.smartLoot or window and now() >= window.untilAt then ctx.smartLootWindow = nil; return false end
+        return window ~= nil
     end
     local function tools(ctx)
         local list, seen = {}, {}
@@ -1460,62 +1497,92 @@ end)()
         return value > existing or value == existing and (rarity[attr(item, 'Rarity')] or 0) > (rarity[attr(current, 'Rarity')] or 0)
     end
     local function interact(ctx, item, callback)
-        if not F.chestFallbackAllowed(item) then return false end
+        if not F.freeWorldItemAllowed(item) then return false end
         if not move(ctx, item) then return false end
         return operation(ctx, 'InteractionService', 'Interact', item, callback)
     end
+    local function gearReceipt(ctx, pending)
+        if pending.relic and inventoryCount(ctx, pending.id) > pending.beforeCount then return true end
+        for _, tool in ipairs(tools(ctx)) do
+            if id(tool) == pending.id and not pending.inventory[tool] then return true end
+        end
+        if pending.slot then
+            for _, piece in ipairs(children(ctx.character)) do
+                if piece:GetAttribute('ArmorName') == pending.id and not pending.inventory[piece] then return true end
+            end
+        end
+        return false
+    end
     local function upgradeGear(ctx)
         if not cfg.smartLoot then return false end
+        F.smartLootPending(ctx)
         local pending = ctx.gearPickup
         if pending then
-            local received = pending.relic and inventoryCount(ctx, pending.id) > pending.beforeCount or false
-            for _, tool in ipairs(tools(ctx)) do
-                if id(tool) == pending.id and not pending.inventory[tool] then received = true end
-            end
-            if pending.slot then
-                for _, piece in ipairs(children(ctx.character)) do
-                    if piece:GetAttribute('ArmorName') == pending.id and not pending.inventory[piece] then received = true end
-                end
-            end
-            if received then
+            if gearReceipt(ctx, pending) then
                 ctx.gearPickup = nil; ctx.itemRetry[pending.item] = math.huge
+                s.stats.smartPickups = (s.stats.smartPickups or 0) + 1
+                s.smartLootStatus = 'Confirmed ' .. pending.id
                 status('Gear pickup confirmed: ' .. pending.id)
             elseif now() - pending.started < 5 or not pending.settled then
-                -- Never hold translation or repeat an uncertain native interaction.
+                s.smartLootStatus = 'Awaiting inventory receipt: ' .. pending.id
+                -- A bounded settle window has ended; never repeat an uncertain interaction.
                 return false
             else
                 ctx.itemRetry[pending.item] = now() + 300; ctx.gearPickup = nil
+                s.smartLootStatus = 'No pickup receipt: ' .. pending.id
                 status('No gear receipt for ' .. pending.id .. '; skipping that item for 5 minutes')
             end
         end
         if s.lootRequest then return false end
-        local target = nearest(ctx, worldItems(), function(item)
-            return isRelic(item) and F.chestFallbackAllowed(item) and not tag(item, 'ShopItem')
+        local items = worldItems()
+        local target = nearest(ctx, items, function(item)
+            return isRelic(item) and F.freeWorldItemAllowed(item)
                 and now() >= (ctx.itemRetry[item] or 0) and hasRoom(ctx, item)
         end, 180)
-        target = target or nearest(ctx, worldItems(), function(item)
-            return F.chestFallbackAllowed(item) and not tag(item, 'ShopItem') and (armorBetter(ctx, item) or weaponBetter(ctx, item))
+        target = target or nearest(ctx, items, function(item)
+            return F.freeWorldItemAllowed(item) and (armorBetter(ctx, item) or weaponBetter(ctx, item))
                 and now() >= (ctx.itemRetry[item] or 0)
                 and (#tools(ctx) < 6 or armorSlot(item))
         end, 180)
-        if not target then return false end
-        if not acquire(ctx, 'gear') then return false end
+        if not target then
+            if not ctx.smartLootWindow then
+                local nearby = nearest(ctx, items, nil, 180)
+                local blocked = nearest(ctx, items, function(item)
+                    return F.freeWorldItemAllowed(item) and (isRelic(item) or weaponBetter(ctx, item))
+                        and not hasRoom(ctx, item)
+                end, 180)
+                s.smartLootStatus = blocked and 'Toolbar full; useful loot skipped'
+                    or nearby and 'No eligible upgrades nearby' or 'No loose gear nearby'
+            end
+            return false
+        end
+        if not acquire(ctx, 'gear') then s.smartLootStatus = 'Waiting for chest movement to yield'; return false end
         status((isRelic(target) and 'Collecting a relic: ' or 'Equipping a useful upgrade: ') .. id(target))
+        s.smartLootStatus = 'Picking up ' .. id(target)
         if not move(ctx, target) then release(ctx); return false end
         local record = { item = target, id = id(target), slot = armorSlot(target), inventory = {}, started = now(),
             relic = isRelic(target), beforeCount = inventoryCount(ctx, id(target)) }
         for _, item in ipairs(tools(ctx)) do record.inventory[item] = true end
         for _, item in ipairs(children(ctx.character)) do record.inventory[item] = true end
         ctx.gearPickup = record; ctx.itemRetry[target] = now() + 300
+        if ctx.smartLootWindow then
+            ctx.smartLootWindow.untilAt = math.min(ctx.smartLootWindow.expires, now() + 2)
+        end
         local issued = operation(ctx, 'InteractionService', 'Interact', target, function(result)
             record.settled = true
             if not api.accepted(result) then
                 ctx.itemRetry[target] = now() + 300
                 if ctx.gearPickup == record then ctx.gearPickup = nil end
+                s.smartLootStatus = 'Pickup rejected: ' .. record.id
                 status('Gear interaction rejected: ' .. record.id .. '; continuing the farm')
             end
         end)
         if not issued then ctx.gearPickup = nil; ctx.itemRetry[target] = now() + 5 end
+        -- Keep the replicated character near the item while its one native
+        -- request and inventory update settle. An uncertain reply cannot stall
+        -- the chest route indefinitely, and only a real receipt counts as loot.
+        local deadline = now() + 1.5
+        while issued and ctx.gearPickup == record and now() < deadline and not gearReceipt(ctx, record) do wait(ctx, 0.05) end
         release(ctx); return issued
     end
     local function bag(ctx)
@@ -2179,7 +2246,6 @@ end)()
                         status(string.format('Chest route complete; church extraction unlocks in %.0fs', cfg.minutes * 60 - (now() - s.lootStarted)))
                     end
                     if cfg.smartLoot then
-                        if s.lootRequest then release(ctx); status('Item reply pending; chest work continues without repeating it'); return end
                         upgradeGear(ctx)
                     end
                 end)
@@ -2555,6 +2621,7 @@ end
                         end)
                         if not checked then result = pack(false, why) end
                     end
+                    if result[1] and (record.pending or record.removalRecorded) then features.chestLootWindow(ctx, entry.Pos) end
                     ctx.currentChest, ctx.lootThread, ctx.chestStarted = nil, nil, nil
                     if not result[1] and tostring(result[2]):find('__EARTH_DEFENSE_RETRY', 1, true) then
                         ctx.defenseAbort = nil
@@ -2604,6 +2671,7 @@ end
         function ctx.awaitCombat()
             while ctx.active and ((ctx.combat and now() < (ctx.combat.holdUntil or 0) and coroutine.running() ~= ctx.featureThread)
                 or (ctx.featureHold and coroutine.running() ~= ctx.featureThread)
+                or (features.smartLootPending(ctx) and coroutine.running() ~= ctx.featureThread)
                 or ctx.defenseMoving
                 or (ctx.dodgeUntil and now() < ctx.dodgeUntil)) do
                 ctx.routeParked = true
