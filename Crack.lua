@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v13.
+-- Crack the Egg: lobby + round progression, v14.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -831,7 +831,7 @@ do
         local _, root, head, hum = character()
         if not root then return false, "Waiting for living character" end
         app:updateSpeed()
-        local origin = (lane == "mine" or lane == "collect" or lane == "sell") and head.Position or root.Position
+        local origin = (lane == "mine" or lane == "collect" or lane == "sell" or lane == "shop") and head.Position or root.Position
         if not hum.SeatPart and not hum.Sit and (origin - position).Magnitude <= range
             and (not approach or (root.Position - approach.goal).Magnitude <= 0.75) then
             if app.move then app:release(approach and approach.air or app.move.air) end
@@ -861,13 +861,18 @@ do
         local destination = position + (direction.Magnitude > 0.1 and direction.Unit or Vector3.new(1, 0, 0)) * math.max(1, range * 0.45)
         if lane == "evade" then destination = position end
         if approach then destination = approach.goal end
-        local directFlight = policy == "Tween" and (lane == "mine" or lane == "collect") and not approach
+        local directFlight = policy == "Tween" and (lane == "mine" or lane == "collect" or lane == "shop") and not approach
         m.air = directFlight or approach and approach.air or false
         if directFlight then
             -- Fly straight into real head/tool range in all three dimensions.
             -- Ground/platform projection must not erase an upper target's Y.
             local delta = head.Position - position
             local outward = delta.Magnitude > 0.01 and delta.Unit or Vector3.new(1, 0, 0)
+            if lane == "collect" then
+                local radial = Vector3.new(delta.X, 0, delta.Z)
+                radial = radial.Magnitude > 0.01 and radial.Unit or Vector3.new(1, 0, 0)
+                outward = (radial * 0.35 + Vector3.new(0, 0.75, 0)).Unit
+            end
             destination = position + outward * math.max(2, range * 0.45) - (head.Position - root.Position)
             state.needScaffold = nil
         end
@@ -1050,6 +1055,13 @@ do
             local p = state.pending.upgrade
             if p and (ranks[p.id] or 0) > 0 then state.pending.upgrade = nil success("run-buy:" .. p.id) end
         elseif kind == "MiningResult" then
+            local blast = state.pending.blast
+            if blast and blast.serial == a then
+                state.pending.blast = nil
+                if b == true then state.stats.explosives = (state.stats.explosives or 0) + 1
+                else fail("explosive", blast.fingerprint, "Explosive rejected") end
+                return
+            end
             local p = state.pending.hit
             if p and p.serial == a then
                 state.pending.hit = nil
@@ -1060,6 +1072,20 @@ do
                         or finite(p.quantity) and (quantity or 0) < p.quantity
                         or not finite(p.hp) and not finite(p.quantity) then success(p.key) end
                 else fail(p.key, p.fingerprint, "MiningResult rejected") end
+            end
+        elseif kind == "GunShopBought" and type(a) == "table" and a.Buyer == player.UserId then
+            local p = state.pending.gunBuy
+            if p and p.id == a.Gun and p.slot == a.Slot then p.received = true end
+        elseif kind == "GunShopDenied" and type(a) == "table" then
+            local p = state.pending.gunBuy
+            -- Denials don't identify a buyer in this export. Retain ownership
+            -- until a fresh shop snapshot or replicated gun resolves it.
+            if p and p.id == a.Gun and p.slot == a.Slot then p.denied = true end
+        elseif kind == "GunShot" and type(a) == "table" and a.Owner == player.UserId then
+            local g = state.gun
+            if g and g.shots[a.Id] then
+                g.shots[a.Id] = nil
+                state.stats.gunShots = (state.stats.gunShots or 0) + 1
             end
         elseif kind == "Collected" then
             if finite(b) and b > 0 then state.stats.collected += b end
@@ -1188,6 +1214,8 @@ do
                 state.chests, state.offers, state.done = {}, {}, {}
                 state.workerAttempt, state.activity, state.hold, state.evadeGoal, state.bagSince, state.needScaffold = nil, nil, nil, nil, nil, nil
                 state.evadeApproach, state.knockUntil = nil, nil
+                state.gun, state.explosive, state.gunRoute = nil, nil, nil
+                state.frontierAt, state.upperTarget, state.passiveVisit, state.passiveNextAt = nil, nil, nil, nil
                 state.approach, state.obstruction, state.saleRoute, state.saleRetryAt, state.salePreference = nil, nil, nil, nil, nil
                 -- These keys name objects/tokens in the departed world, never a
                 -- persistent purchase or inventory outcome.
@@ -1227,11 +1255,12 @@ do
         local c = player.Character
         local tool = c and c:FindFirstChild(family)
         return player:GetAttribute("EquippedTool") == family and tool and tool:IsA("Tool") and tool:GetAttribute("EggTool") == family
+            and (family ~= "Gun" or tool:GetAttribute("GunId") == player:GetAttribute("GunId"))
     end
     local function equip(family, config)
         local p = state.pending.equip
         if p then
-            if equipped(p.family) then
+            if equipped(p.family) and (p.family ~= "Gun" or p.gunId == player:GetAttribute("GunId")) then
                 state.pending.equip = nil
                 success("equip-tool:" .. p.family)
             elseif os.clock() - p.at > 4 then
@@ -1244,9 +1273,13 @@ do
         if not owns(family, config) then return false end
         local drillReleased, bucketReleased = lease("Drill", false), lease("Bucket", false)
         if not drillReleased or not bucketReleased or state.leases.Drill or state.leases.Bucket then return false end
-        local fingerprint = family .. ":" .. tostring(player.Character)
-        if eligible("equip-tool:" .. family, fingerprint) and send(refs.action, "Equip", family, nil) then
-            state.pending.equip = {at = os.clock(), family = family, fingerprint = fingerprint}
+        local gunId = family == "Gun" and player:GetAttribute("GunId") or nil
+        local gunCatalog = family == "Gun" and module("BreakTheEgg", "GunCatalog")
+        if family == "Gun" and (not gunCatalog or not gunCatalog.Get(gunId)) then return false end
+        local fingerprint = family .. ":" .. tostring(player.Character) .. ":" .. tostring(gunId)
+        if eligible("equip-tool:" .. family, fingerprint) and send(refs.action, "Equip", family, gunId) then
+            state.pending.equip = {at = os.clock(), family = family, fingerprint = fingerprint, gunId = gunId}
+            if family == "Gun" then state.gunEquipAt = os.clock() end
         end
         return false
     end
@@ -1255,6 +1288,11 @@ do
         return m and m.ForPlayer(player, family) or nil
     end
     local function reach(family, config)
+        if family == "Gun" then
+            local catalog = module("BreakTheEgg", "GunCatalog")
+            local gun = catalog and catalog.Get(player:GetAttribute("GunId"))
+            return gun and gun.Range or 0
+        end
         local value = player:GetAttribute("MiningReach")
         local base = finite(value) and value > 0 and value or config.Reach
         if family == "Bucket" then
@@ -1289,26 +1327,195 @@ do
         elseif family == "HandDrill" and tier == 3 and mode ~= "event" and mode ~= "guardian" and mode ~= "core" then total *= 1.5 end
         return total, cooldown, m
     end
+    local function ownedGun()
+        local catalog = module("BreakTheEgg", "GunCatalog")
+        return player:GetAttribute("Owns_Gun") == true and catalog and catalog.Get(player:GetAttribute("GunId")) or nil
+    end
+    local function gunState(gun)
+        local ammo = player:GetAttribute("GunAmmo")
+        if not finite(ammo) then return nil end
+        local g = state.gun
+        if not g or g.id ~= gun.Id then
+            g = {id = gun.Id, ammo = math.max(0, ammo), seenAmmo = ammo, shots = {}, nextAt = 0, burst = 0}
+            state.gun = g
+        end
+        local now, reloadAt = workspace:GetServerTimeNow(), player:GetAttribute("GunReloadAt") or 0
+        if g.reload and finite(reloadAt) and reloadAt > 0 then g.reload.observed = reloadAt end
+        if g.reload and not g.reload.observed and os.clock() >= (g.reloadRetryAt or math.huge) and (g.reloadTries or 0) < 3 then
+            g.reload = nil -- Bounded retries of the native idempotent reload, never a shot refill guess.
+        end
+        if g.reload and g.reload.observed and now >= g.reload.observed
+            and ammo > 0 and (ammo > g.seenAmmo or ammo == (player:GetAttribute("GunMag") or gun.Magazine)) then
+            g.ammo, g.reload, g.shots, g.burst, g.reloadTries = ammo, nil, {}, 0, 0
+        elseif ammo ~= g.seenAmmo then
+            -- A replicated refill can follow an unobserved short reload.
+            g.ammo = ammo > g.seenAmmo and ammo or math.min(g.ammo, math.max(0, ammo))
+            if ammo > g.seenAmmo then g.reload, g.shots, g.burst, g.reloadTries = nil, {}, 0, 0 end
+        end
+        g.seenAmmo = ammo
+        for id, at in pairs(g.shots) do if os.clock() - at > 5 then g.shots[id] = nil end end
+        return g
+    end
+    local function gunUsable()
+        local gun = ownedGun()
+        if not gun then return nil end
+        if gun and not equipped("Gun") then
+            local fp = "Gun:" .. tostring(player.Character) .. ":" .. tostring(gun.Id)
+            if not eligible("equip-tool:Gun", fp) then return nil end
+        end
+        if not module("BreakTheEgg", "GunBallistics") then return nil end
+        local g = gun and gunState(gun)
+        if not g then return nil end
+        local reloadAt = player:GetAttribute("GunReloadAt") or 0
+        if finite(reloadAt) and reloadAt > workspace:GetServerTimeNow() or g.reload then return nil end
+        return gun -- An empty magazine is selected once to request native reload.
+    end
+    local function shopStock()
+        local folder = folderAt("BreakTheEgg")
+        if not folder or folder:GetAttribute("GunShopOpen") ~= true then return nil end
+        local ids, prices = {}, {}
+        for id in string.gmatch(tostring(folder:GetAttribute("GunShopSlots") or ""), "[^,]+") do table.insert(ids, id) end
+        for price in string.gmatch(tostring(folder:GetAttribute("GunShopPrices") or ""), "[^,]+") do table.insert(prices, tonumber(price) or false) end
+        local cash = folder:GetAttribute("TeamCashCents")
+        if not finite(cash) then cash = player:GetAttribute("CashCents") end
+        local serial, rolled = folder:GetAttribute("GunShopSerial"), folder:GetAttribute("GunShopRolledAt")
+        if serial == nil or not finite(cash) or not finite(rolled) or workspace:GetServerTimeNow() < rolled + 1.25 then return nil end
+        return folder, ids, prices, cash, serial
+    end
+    local function gunReserve()
+        if ownedGun() then return 0 end
+        local _, ids, prices = shopStock()
+        local catalog, reserve = module("BreakTheEgg", "GunCatalog"), nil
+        for i, id in ipairs(ids or {}) do
+            local price = prices[i]
+            if catalog and catalog.Get(id) and finite(price) and price >= 0 then reserve = math.min(reserve or price, price) end
+        end
+        return reserve or 0
+    end
+    local function buyGun(config)
+        local function leaveShop()
+            state.gunRoute = nil
+            if app.move and app.move.key == "gun-shop" then app:release(true) end
+        end
+        local gun = ownedGun()
+        local p = state.pending.gunBuy
+        if p then
+            if gun then
+                state.pending.gunBuy, state.gunRoute = nil, nil
+                state.stats.gunBuys = (state.stats.gunBuys or 0) + 1
+                success("gun-buy")
+                app.status.gun = "Owned gun: " .. gun.Name
+            else
+                local folder = folderAt("BreakTheEgg")
+                if p.denied and folder and folder:GetAttribute("GunShopSerial") ~= p.serial then
+                    fail("gun-buy", p.fingerprint, "Matching denial followed by refreshed stock")
+                    state.pending.gunBuy, state.gunRoute = nil, nil
+                else
+                    app.status.gun = p.received and "Gun bought; waiting for ownership" or "Gun purchase unresolved; farming continues"
+                    return false -- Never repeat uncertain spending or monopolize movement.
+                end
+            end
+        end
+        if gun then leaveShop() app.status.gun = "Owned gun: " .. gun.Name return false end
+        if not app.settings.farm or state.pending.upgrade then leaveShop() return false end
+        local phase = state.lab:GetAttribute("BossPhase") or "Idle"
+        if state.combat or phase == "Wave" or phase == "Intermission" or phase == "Core" then leaveShop() return false end
+        if (player:GetAttribute("EggTutorialStep") or 0) < 8 then leaveShop() return false end
+        local folder, ids, prices, cash, serial = shopStock()
+        local catalog, prompts = module("BreakTheEgg", "GunCatalog"), workspace:FindFirstChild("GunShopPrompts")
+        if not folder or not catalog or not prompts then leaveShop() app.status.gun = "Waiting for cash gun stock/prompts" return false end
+        if type(fireproximityprompt) ~= "function" then leaveShop() app.status.gun = "Auto-buy gun needs fireproximityprompt" return false end
+        local _, root, head = character()
+        if not root then return false end
+        local best, score
+        for i, id in ipairs(ids) do
+            local def, price = catalog.Get(id), prices[i]
+            local slot = prompts:FindFirstChild("Slot" .. i)
+            local prompt = slot and slot:FindFirstChild("BuyPrompt")
+            local anchor = prompt and prompt.Parent
+            if anchor and anchor:IsA("Attachment") then anchor = anchor.Parent end
+            if def and finite(price) and price >= 0 and price <= cash and prompt and prompt:IsA("ProximityPrompt")
+                and prompt.Enabled and prompt:GetAttribute("GunShopSlot") == i and anchor and anchor:IsA("BasePart") then
+                local rate = catalog.CycleRate(id)
+                local value = (def.FoeDamage or 1) * def.Pellets * rate * def.Magazine / (def.Magazine + rate * def.Reload)
+                if not best or value > score then best, score = {id = id, slot = i, price = price, prompt = prompt, anchor = anchor}, value end
+            end
+        end
+        if not best then leaveShop() app.status.gun = "Saving cash for stocked gun" return false end
+        local fp = tostring(serial) .. ":" .. best.slot .. ":" .. best.id .. ":" .. best.price
+        if not eligible("gun-buy", fp) then return false end
+        local route = state.gunRoute
+        if not route or route.fingerprint ~= fp or route.prompt ~= best.prompt then
+            route = {fingerprint = fp, prompt = best.prompt, at = os.clock()}
+            state.gunRoute = route
+        end
+        local range = best.prompt.MaxActivationDistance
+        if not finite(range) or range <= 0 then return false end
+        local arrived, reason = move("shop", "gun-shop", best.anchor, best.anchor.Position, range * 0.8)
+        app.status.farm, app.status.gun = "Buying boss gun · " .. tostring(reason or best.id), "Buying " .. best.id .. " for " .. best.price .. " cents"
+        if not arrived then
+            if not app.move or os.clock() - route.at > 20 then
+                fail("gun-buy", fp, "Gun shop travel timed out") state.gunRoute = nil
+                if app.move and app.move.key == "gun-shop" then app:release() end
+                return false
+            end
+            return true
+        end
+        -- Re-read shared cash and stock immediately before committing the prompt.
+        local fresh, freshIds, freshPrices, freshCash, freshSerial = shopStock()
+        if not fresh or freshSerial ~= serial or freshIds[best.slot] ~= best.id or freshPrices[best.slot] ~= best.price
+            or freshCash < best.price or not best.prompt.Parent or not best.prompt.Enabled
+            or (head.Position - best.anchor.Position).Magnitude > range then state.gunRoute = nil return false end
+        if best.prompt.RequiresLineOfSight then
+            local params = RaycastParams.new()
+            params.FilterType, params.FilterDescendantsInstances = Enum.RaycastFilterType.Exclude, {player.Character}
+            local delta = best.anchor.Position - head.Position
+            local wall = workspace:Raycast(head.Position, delta, params)
+            if wall and wall.Instance ~= best.anchor and (wall.Position - head.Position).Magnitude < delta.Magnitude - 0.5 then
+                fail("gun-buy", fp, "Buy prompt line of sight obstructed") state.gunRoute = nil return false
+            end
+        end
+        local bucketReleased, drillReleased = lease("Bucket", false), lease("Drill", false)
+        if not bucketReleased or not drillReleased then return true end
+        state.pending.gunBuy = {id = best.id, slot = best.slot, price = best.price, serial = serial, at = os.clock(), fingerprint = fp}
+        local ok, err = pcall(fireproximityprompt, best.prompt, best.prompt.HoldDuration)
+        if not ok then app:note("Gun buy prompt: " .. tostring(err) .. "; checking ownership before retry") end
+        state.gunRoute = nil
+        return true
+    end
     local function upgradeScore(def, catalog, ranks)
         local before = catalog.Stats(ranks, player:GetAttribute("PickaxeTier"))
         local copy = table.clone(ranks)
         copy[def.Id] = 1
         local after = catalog.Stats(copy, player:GetAttribute("PickaxeTier"))
         local gain = 0
+        if def.Tree == "weapons" then
+            local guns = module("BreakTheEgg", "GunCatalog")
+            if not ownedGun() or not guns then return 0 end
+            local from, to = guns.Upgrades(ranks), guns.Upgrades(copy)
+            for field, weight in pairs({Damage = 3, Rate = 2, Mag = 0.6, Shell = 1, Pierce = 0.7, Ricochet = 0.3, Explosive = 3}) do
+                gain += math.max(0, to[field] - from[field]) / math.max(1, math.abs(from[field])) * weight
+            end
+            for field, weight in pairs({Reload = 1, Spread = 1}) do gain += math.max(0, from[field] / math.max(0.05, to[field]) - 1) * weight end
+            return gain
+        end
+        if def.Family == "autoCollect" and player:GetAttribute("VIPOwned_vip_magnet") == true
+            or def.Family == "chute" and player:GetAttribute("VIPOwned_vip_autoSell") == true then return 0 end
         for field, weight in pairs({Damage = 3, Reach = 0.5, HandReach = 0.5, ScoopRadius = 0.5, WalkSpeed = 0.2,
-            DrillRadius = 0.5, DrillDuration = 0.4, WorkerMultiplier = 0.5, SaleBonus = 1, Fracture = 1, Teamwork = 1}) do
+            DrillRadius = 0.5, DrillDuration = 0.4, WorkerMultiplier = 0.5, SaleBonus = 1, Fracture = 1, Teamwork = 1,
+            BlastDamage = 1, BlastEdge = 0.4}) do
             if finite(after[field]) and finite(before[field]) then
                 gain += math.max(0, after[field] - before[field]) / math.max(1, math.abs(before[field])) * weight
             end
         end
-        for field, weight in pairs({ScoopCooldown = 1, DrillRecharge = 0.4, WorkerInterval = 0.5}) do
+        for field, weight in pairs({ScoopCooldown = 1, DrillRecharge = 0.4, WorkerInterval = 0.5, Fuse = 0.5}) do
             if finite(after[field]) and finite(before[field]) then gain += math.max(0, before[field] / math.max(0.05, after[field]) - 1) * weight end
         end
         if after.AutoCollect and not before.AutoCollect then gain += 4 end
         if after.Chute and not before.Chute then gain += 2 end
         if def.Family == "capacity" then return 0 end -- User owns Infinite Bucket.
         if def.Family == "scaffold" then return 0 end -- Direct flight reaches upper targets without buying platforms.
-        if def.Family == "handdrill" or def.Family == "drill" or def.Family == "worker" then gain += 2 end
+        if def.Family == "handdrill" or def.Family == "drill" or def.Family == "worker" or def.Family == "dynamite" then gain += 2 end
         if finite(after.Tier) and after.Tier > before.Tier then
             local required = state.requiredLayer or 1
             gain += after.Tier <= required and 100 or 0.05
@@ -1317,6 +1524,7 @@ do
     end
     local function upgrades(config)
         if not app.settings.runUpgrades then return end
+        if state.pending.gunBuy or state.gunRoute then app.status.upgrades = "Cash reserved for pending gun purchase" return end
         local catalog = module("BreakTheEgg", "UpgradeCatalog")
         if not catalog or not state.ranks then
             app.status.upgrades = "Waiting for round rank State"
@@ -1339,16 +1547,19 @@ do
         if (state.buyAt or 0) > os.clock() then return end
         local cash = player:GetAttribute("CashCents")
         if not finite(cash) then app.status.upgrades = "CashCents unavailable" return end
+        local budget = math.max(0, cash - gunReserve())
         local best, score, cost, fingerprint
         for _, def in ipairs(catalog.Nodes) do
-            if not def.Product and not def.ProductId and not def.premium and not def.Gate
+            local gateOpen = not def.Gate or def.Gate == catalog.WeaponGate and ownedGun()
+                and folderAt("BreakTheEgg"):GetAttribute("GunShopOpen") == true
+            if not def.Product and not def.ProductId and not def.premium and gateOpen
                 and (def.Currency == nil or def.Currency == "cash") and (state.ranks[def.Id] or 0) <= 0
                 and (def.StandalonePurchase or def.Id == catalog.PersonalStarterId or (state.ranks[catalog.PersonalStarterId] or 0) > 0)
                 and catalog.Unlocked(def, state.ranks) then
                 local price = catalog.PurchaseCost(def, cash, player:GetAttribute("EggTutorialStep"), false)
                 local fp = tostring(price) .. ":" .. tostring(state.requiredLayer) .. ":" .. tostring(player:GetAttribute("EggTutorialStep"))
                 local value = upgradeScore(def, catalog, state.ranks) / math.max(1, price)
-                if finite(price) and price >= 0 and price <= cash and eligible("run-buy:" .. def.Id, fp)
+                if finite(price) and price >= 0 and price <= budget and eligible("run-buy:" .. def.Id, fp)
                     and value > 0 and (not best or value > score) then best, score, cost, fingerprint = def, value, price, fp end
             end
         end
@@ -1554,6 +1765,137 @@ do
         end
         return false
     end
+    local function explosiveReady(config)
+        if not owns("Dynamite", config) then return false end
+        local now = workspace:GetServerTimeNow()
+        local charges = player:GetAttribute("ToolCharges_Dynamite")
+        local ready, reloadAt = player:GetAttribute("ToolReadyAt_Dynamite"), player:GetAttribute("ToolReloadAt_Dynamite") or 0
+        if not finite(charges) or not finite(ready) or not finite(reloadAt) then
+            app.status.explosive = "Waiting for native explosive charge/cooldown state"
+            return false
+        end
+        local e = state.explosive
+        if not e then e = {left = charges, seen = charges, nextAt = ready, reloadAt = reloadAt, seenReady = ready, seenReload = reloadAt} state.explosive = e end
+        if ready ~= e.seenReady or reloadAt ~= e.seenReload then
+            -- Replicated recharge incorporates Quick Reload and evolution/stat
+            -- changes. It supersedes the conservative local dispatch estimate.
+            e.nextAt, e.reloadAt = math.max(ready, (e.lastSent or -math.huge) + 0.2), reloadAt
+            e.seenReady, e.seenReload = ready, reloadAt
+        end
+        if charges ~= e.seen then
+            e.left = charges > e.seen and charges or math.min(e.left, charges)
+            e.seen = charges
+        end
+        if now >= e.reloadAt and now >= e.nextAt and e.left == 0 and charges > 0 then e.left = charges end
+        local p = state.pending.blast
+        if p and os.clock() - p.at > 4 then state.pending.blast = nil end
+        app.status.explosive = "Explosive charges=" .. e.left .. "; ready in " .. math.ceil(math.max(0, ready - now, e.nextAt - now)) .. "s"
+        return not state.pending.blast and not state.pending.hit and e.left > 0 and now >= ready
+            and now >= reloadAt and now >= e.nextAt and now >= (state.blastRetryAt or 0)
+    end
+    local function throwExplosive(target, result, config)
+        if not explosiveReady(config) or not result or not result.Instance or not equipped("Dynamite") then return false end
+        local _, _, head = character()
+        if not head or (result.Position - head.Position).Magnitude > reach("Dynamite", config) then return false end
+        local e, now = state.explosive, workspace:GetServerTimeNow()
+        state.serial += 1
+        local fp = hitFingerprint(target, "Dynamite")
+        -- Own a separate receipt: a fuse or lost blast receipt must not block
+        -- ordinary mining, collection, selling or emergency combat.
+        state.pending.blast = {serial = state.serial, at = os.clock(), target = target, fingerprint = fp}
+        if not send(refs.action, "Hit", result.Instance, result.Position, state.serial, nil) then state.pending.blast = nil return false end
+        e.left = math.max(0, e.left - 1)
+        e.lastSent = now
+        local m = mechanics("Dynamite")
+        local gap = math.max(0.2, m and m.UseGap or 0.3)
+        local cooldown = player:GetAttribute("ToolCooldown_Dynamite") or config.ToolById.Dynamite.Cooldown
+        e.nextAt = now + (e.left > 0 and gap or math.max(gap, cooldown))
+        if e.left == 0 then e.reloadAt = e.nextAt end
+        state.hitAt = os.clock() + 0.2
+        return true
+    end
+    local function shoot(target, result, gun)
+        local _, root, head = character()
+        local ballistics = module("BreakTheEgg", "GunBallistics")
+        local g = gunState(gun)
+        if not root or not head or not g or not ballistics or not equipped("Gun") then return false end
+        local now, reloadAt = workspace:GetServerTimeNow(), player:GetAttribute("GunReloadAt") or 0
+        if g.reload or reloadAt > now then return false end
+        if g.ammo <= 0 then
+            if os.clock() >= (g.reloadRetryAt or 0) then
+                if send(refs.action, "GunReload") then
+                    g.reload = {at = os.clock()}
+                    g.reloadTries = (g.reloadTries or 0) + 1
+                    g.reloadRetryAt = os.clock() + math.max(3, gun.Reload + 1)
+                end
+            end
+            return false
+        end
+        if os.clock() < g.nextAt or os.clock() - (state.gunEquipAt or -math.huge) < 0.16 + (gun.SpinUp or 0) then return false end
+        if not result or (result.Position - head.Position).Magnitude > gun.Range
+            or (result.Instance ~= target and not result.Instance:IsDescendantOf(target)) then return false end
+        local direction = result.Position - head.Position
+        if direction.Magnitude < 0.01 then return false end
+        -- Aim from our actual head. Rotation changes no position, tween goal or
+        -- evasion ownership, so firing cannot stop a dodge to chase an enemy.
+        local facing = Vector3.new(direction.X, 0, direction.Z)
+        if facing.Magnitude > 0.01 then root.CFrame = CFrame.lookAt(root.Position, root.Position + facing) end
+        local folder = folderAt("BreakTheEgg")
+        local spreadMul = folder and folder:GetAttribute("GunSpreadMul") or 1
+        local dirs = ballistics.Spread(direction.Unit, gun.Spread * spreadMul, nil, gun.Pellets)
+        local params = ballistics.Params(state.lab)
+        local egg, guardian = state.lab:FindFirstChild("Egg"), module("BreakTheEgg", "LayerGuardian")
+        local unlocked = player:GetAttribute("UnlockedLayer") or 1
+        local foes = {}
+        for obj in pairs(state.enemies or {}) do if obj.Parent and (obj:GetAttribute("Health") or 0) > 0 then table.insert(foes, obj) end end
+        local claims = {}
+        local pierce = gun.Class == "Explosive" and 1 or math.max(0, math.floor((gun.Pierce or 0) + (folder:GetAttribute("GunPierce") or 0))) + 1
+        local bounces = gun.Class == "Explosive" and 0 or math.max(0, math.floor((gun.Ricochet or 0) + (folder:GetAttribute("GunRicochet") or 0)))
+        for pellet, dir in ipairs(dirs) do
+            local trace = ballistics.Trace(head.Position, dir, {Range = gun.Range, Bounces = bounces, Params = params,
+                Guardian = egg and guardian and function(origin, delta, actual) return guardian.Raycast(egg, player, origin, delta, actual) end or nil,
+                OnHit = function(actual)
+                    local instance, parent = actual.Instance, actual.Instance and actual.Instance.Parent
+                    if instance == egg or parent and parent:GetAttribute("EggCore") then return "stop" end
+                    if parent and egg and parent:GetAttribute("HP") and parent:IsDescendantOf(egg) then
+                        local layer = parent:GetAttribute("Layer") or 1
+                        return (layer > unlocked or guardian.Covers(egg, layer, player)) and "stop" or "bounce"
+                    end
+                    return ballistics.Passable(instance) and "pass" or "bounce"
+                end})
+            local remaining, claimed = table.clone(foes), 0
+            local foeParams = RaycastParams.new()
+            foeParams.FilterType = Enum.RaycastFilterType.Include
+            for segment = 1, #trace.Points - 1 do
+                local from, to = trace.Points[segment], trace.Points[segment + 1]
+                while claimed < pierce and #remaining > 0 and (to - from).Magnitude >= 0.05 do
+                    foeParams.FilterDescendantsInstances = remaining
+                    local actual = workspace:Spherecast(from, 0.5, (to - from).Unit * math.min(1000, (to - from).Magnitude), foeParams)
+                    if not actual then break end
+                    local index
+                    for i, foe in ipairs(remaining) do if actual.Instance == foe or actual.Instance:IsDescendantOf(foe) then index = i break end end
+                    if not index then break end
+                    table.remove(remaining, index)
+                    claimed += 1
+                    table.insert(claims, {Part = actual.Instance, Point = actual.Position, Pellet = pellet, Segment = segment})
+                    from = actual.Position
+                end
+                if claimed >= pierce then break end
+            end
+        end
+        state.gunSerial = (state.gunSerial or 10000000) + 1
+        if not send(refs.action, "Shoot", {Id = state.gunSerial, At = now, Gun = gun.Id, Origin = head.Position, Dirs = dirs, Claims = claims}) then return false end
+        g.ammo -= 1
+        g.shots[state.gunSerial] = os.clock()
+        local rate = (folder:GetAttribute("GunRate") or 1) * gun.FireRate
+        local interval = 1 / math.max(0.05, rate)
+        if gun.Mode == "Burst" then
+            g.burst = (g.burst > 0 and g.burst or gun.Burst) - 1
+            if g.burst == 0 then interval = math.max(interval, gun.BurstGap) end
+        end
+        g.nextAt = os.clock() + interval
+        return true
+    end
     local function chests(config, evolution)
         if not app.settings.chests or not refs.chest then return false end
         -- Use the actual native button, including a picker opened before this
@@ -1716,7 +2058,7 @@ do
     end
     local function attackDuringEvasion(config, evolution)
         local _, _, head = character()
-        if not head or not state.combat then return end
+        if not head then return end
         local family, score, cooldown
         -- Dodge travel releases held inputs. Use tools which can deliver a
         -- discrete strike while moving instead of selecting an unheld drill.
@@ -1727,6 +2069,8 @@ do
             end
         end
         if not family then return end
+        local gun = gunUsable()
+        if gun then family, cooldown = "Gun", 0 end
         local best, result, distance
         for obj in pairs(state.enemies or {}) do
             if obj.Parent and (obj:GetAttribute("Health") or 0) > 0 then
@@ -1743,9 +2087,22 @@ do
                 end
             end
         end
+        if gun and not best then
+            for _, obj in ipairs(state.targetList) do
+                if obj.Parent and obj:GetAttribute("EggCore") == true and (obj:GetAttribute("HP") or 0) > 0 then
+                    local _, pos = aim(obj, head.Position)
+                    local actual = pos and contact(obj, pos, head, gun.Range)
+                    if actual and actual.Instance:IsDescendantOf(obj) and (actual.Position - head.Position).Magnitude <= gun.Range then
+                        best, result = obj, actual break
+                    end
+                end
+            end
+        end
         -- The evasion route keeps movement ownership. Attacking an enemy already
         -- in reach doesn't rotate or replace that route, or chase an unsafe one.
-        if best and equip(family, config) then hit(best, result, family, cooldown, true) end
+        if best and equip(family, config) then
+            if gun then shoot(best, result, gun) else hit(best, result, family, cooldown, true) end
+        end
     end
     local function clearance(h, position, at, margin, warning)
         if at > h.finish or at < h.at - (warning and h.warn or 0.1) then return math.huge end
@@ -1979,6 +2336,10 @@ do
         local count = player:GetAttribute("ShellCount")
         if not head or not finite(count) then return false end
         if count <= 0 then state.bagSince = nil else state.bagSince = state.bagSince or os.clock() end
+        if player:GetAttribute("VIPOwned_vip_autoSell") == true then
+            app.status.sale = "Native Auto Sell active; no cart detour"
+            return false
+        end
         local urgent = false
         local dangerRange = math.max(reach("Pickaxe", config), owns("HandDrill", config) and reach("HandDrill", config) or 0) + 4
         for enemy in pairs(state.enemies or {}) do
@@ -2049,6 +2410,13 @@ do
             end
         end
         local tutorialStep = player:GetAttribute("EggTutorialStep")
+        local magnet = player:GetAttribute("VIPOwned_vip_magnet") == true
+        local visit = state.passiveVisit
+        if visit and (not visit.target.Parent or (visit.target:GetAttribute("Quantity") or 0) < visit.quantity) then
+            state.passiveVisit, state.passiveNextAt, state.selectAt = nil, os.clock() + 8, 0
+            if app.move and app.move.lane == "collect" then app:release(true) end
+        end
+        if magnet then state.passiveNextAt = state.passiveNextAt or os.clock() + 8 end
         local due, selected, range = salePolicy(config)
         if due and not state.pending.sale then
             if selected then
@@ -2123,6 +2491,28 @@ do
             local target, part, position, score, mode = nil, nil, nil, nil, nil
             local unlocked = player:GetAttribute("UnlockedLayer") or 1
             local candidates = {}
+            if (state.frontierAt or 0) <= os.clock() then
+                local layer, upper, height, remaining = nil, nil, nil, 0
+                local covered = {}
+                for _, model in ipairs(state.targetList) do
+                    local hp, level = model:GetAttribute("HP"), model:GetAttribute("Layer") or 1
+                    local surface = model.PrimaryPart
+                    if model.Parent and finite(hp) and hp > 0 and not model:GetAttribute("EggCore")
+                        and eggGeometry and model:IsDescendantOf(eggGeometry) and level <= unlocked and surface then
+                        if covered[level] == nil then covered[level] = guardian.Covers(eggGeometry, level, player) end
+                        if not covered[level] and not eggGeometry:GetAttribute("EventCarried") then
+                            remaining += 1
+                            if not layer or level < layer or level == layer and surface.Position.Y > height then
+                                layer, upper, height = level, model, surface.Position.Y
+                            end
+                        end
+                    end
+                end
+                state.frontierLayer, state.upperTarget, state.remainingChunks, state.frontierAt = layer, upper, remaining, os.clock() + 1
+            end
+            -- Nominate the highest outer chunk even when it occurs beyond this
+            -- tick's bounded rotating discovery window. Compaction can't hide it.
+            if state.upperTarget and state.upperTarget.Parent then candidates[state.upperTarget] = true end
             local overlap = OverlapParams.new()
             overlap.FilterType = Enum.RaycastFilterType.Include
             overlap.FilterDescendantsInstances = {state.lab}
@@ -2157,7 +2547,7 @@ do
                         local kind, utility
                         if model:GetAttribute("FloorShell") == true and not full and (model:GetAttribute("Quantity") or 0) > 0
                             and (model:GetAttribute("Settled") == true or fallingVacuum) then
-                            kind, utility = "collect", 3
+                            kind, utility = magnet and "passive" or "collect", magnet and 0.5 or 3
                         elseif eventTarget.Find(p) == model then kind, utility = "event", model:GetAttribute("Variant") == "Medic" and 35 or 20
                         elseif finite(model:GetAttribute("HP")) and model:GetAttribute("HP") > 0 then
                             local layer = model:GetAttribute("Layer") or 1
@@ -2167,12 +2557,20 @@ do
                                 kind, utility = "mine", 1 + math.min(1, (player:GetAttribute("PickaxeDamage") or 10) / model:GetAttribute("HP"))
                             end
                         end
-                        if tutorialStep == 1 and kind == "collect" then kind = nil end
-                        if tutorialStep == 2 and kind == "collect" then utility = 50 end
-                        if tutorialStep == 2 and kind ~= "collect" and kind ~= "event" then kind = nil end
+                        if tutorialStep == 1 and (kind == "collect" or kind == "passive") then kind = nil end
+                        if tutorialStep == 2 and (kind == "collect" or kind == "passive") then utility = 50 end
+                        if tutorialStep == 2 and kind ~= "collect" and kind ~= "passive" and kind ~= "event" then kind = nil end
                         if state.combat and kind ~= "event" then kind = nil end
                         if kind and eligible("hit:" .. targetId(model), hitFingerprint(model, state.family)) then
                             local rank = kind == "event" and (model:GetAttribute("EventScientist") == true and 3 or 2) or 1
+                            if kind == "mine" then
+                                if (model:GetAttribute("Layer") or 1) == state.frontierLayer then rank = 1.1 end
+                                utility += math.max(0, pos.Y - (config.EggGroundY or 0)) * 0.4
+                            elseif kind == "passive" then
+                                local visitDue = tutorialStep == 2 or state.passiveVisit and state.passiveVisit.target == model
+                                    or os.clock() >= (state.passiveNextAt or math.huge) and (state.passiveRetryAt or 0) <= os.clock()
+                                rank = visitDue and 1.2 or 0
+                            end
                             local value = utility / (1 + d * 0.04)
                             local visible = kind == "event" and contact(model, pos, head, miningRange)
                             local reachable = visible and visible.Instance:IsDescendantOf(model)
@@ -2181,7 +2579,8 @@ do
                             -- NPC while a nearby visible scientist can be hit now.
                             if reachable then value += 200000
                             elseif model == state.target and kind == state.mode and kind ~= "event" then value += 100000 end
-                            local movementReady = reachable or eligible("move:target:" .. targetId(model), movementFingerprint(model, kind == "collect" and "collect" or "mine"))
+                            if kind == "mine" and model == state.upperTarget and (state.target ~= model or state.mode ~= "mine") then value += 200000 end
+                            local movementReady = reachable or eligible("move:target:" .. targetId(model), movementFingerprint(model, (kind == "collect" or kind == "passive") and "collect" or "mine"))
                             if movementReady and (not target or rank > bestRank or rank == bestRank and value > score) then
                                 target, part, position, score, mode, bestRank = model, p, pos, value, kind, rank
                             end
@@ -2220,13 +2619,53 @@ do
             end
         end
         if not target or not target.Parent then
-            app:release()
+            -- Between airborne drops keep the owned hold briefly, rather than
+            -- free-falling every time replication leaves an empty scan.
+            if app.flight and not state.combat then
+                state.hoverWaitAt = state.hoverWaitAt or os.clock()
+                app:release(os.clock() - state.hoverWaitAt < 3)
+            else app:release() end
             state.approach, state.obstruction = nil, nil
             lease("Bucket", false) lease("Drill", false)
             state.needSale = count > 0
             local phase = state.lab:GetAttribute("BossPhase") or "Idle"
             if tutorialStep == 2 and not state.combat then equip("Bucket", config) end
             app.status.farm = tutorialStep == 2 and "Tutorial: waiting for ready shells to collect" or state.combat and "Event target obstructed or cooling down; keeping mining tool" or full and "Bucket full; waiting for sale" or phase ~= "Idle" and ("Boss " .. phase .. ": waiting for damage target; evasion active") or "Waiting for eligible geometry/drops or layer unlock"
+            return
+        end
+        state.hoverWaitAt = nil
+        if mode == "passive" then
+            local scoop = player:GetAttribute("ScoopRadius")
+            scoop = finite(scoop) and scoop > 0 and scoop or config.ScoopRadius
+            local center = target.PrimaryPart and target.PrimaryPart.Position or position
+            local p = state.passiveVisit
+            if not p or p.target ~= target then
+                p = {target = target, quantity = target:GetAttribute("Quantity") or 0, at = os.clock()}
+                state.passiveVisit = p
+            end
+            -- Shell Magnet works without a bucket: move the actual root into a
+            -- conservative scoop-radius neighbourhood and observe real drops.
+            if (root.Position - center).Magnitude <= scoop then
+                if app.move then app:release(true) end
+                lease("Bucket", false) lease("Drill", false)
+                p.arrivedAt = p.arrivedAt or os.clock()
+                app.status.farm = "In Shell Magnet range; waiting for native pickup"
+                if os.clock() - p.arrivedAt > 1.5 then
+                    fail("hit:" .. targetId(target), hitFingerprint(target, "Magnet"), "Native magnet pickup unchanged")
+                    state.passiveVisit, state.target, state.selectAt = nil, nil, 0
+                    state.passiveNextAt, state.passiveRetryAt = os.clock() + 8, os.clock() + 3
+                end
+            else
+                local radial = root.Position - center
+                local goal = center + (radial.Magnitude > 0.01 and radial.Unit or Vector3.new(0, 1, 0)) * math.max(0.3, scoop * 0.25)
+                local approach = {target = target, goal = goal, air = true, at = os.clock()}
+                local _, reason = move("collect", "target:" .. targetId(target), target, center, math.max(0.5, scoop * 0.5), approach)
+                app.status.farm = "Flying into Shell Magnet range · " .. tostring(reason)
+                if os.clock() - p.at > 20 or not app.move and (root.Position - center).Magnitude > scoop then
+                    state.passiveVisit, state.target, state.selectAt = nil, nil, 0
+                    state.passiveNextAt, state.passiveRetryAt = os.clock() + 8, os.clock() + 3
+                end
+            end
             return
         end
         if not part and mode ~= "guardian" or not position then state.target, state.selectAt = nil, 0 return end
@@ -2243,6 +2682,18 @@ do
             end
             if not best then app.status.farm = "No ready owned mining tool in range" app:release() return end
             if tutorialStep == 1 then family, cooldown = "Pickaxe", player:GetAttribute("ToolCooldown_Pickaxe") or config.ToolById.Pickaxe.Cooldown end
+        end
+        local gun = (mode == "event" or mode == "core") and gunUsable()
+        if gun then family, cooldown = "Gun", 0 end
+        local blastReady = mode == "mine" and tutorialStep ~= 1 and explosiveReady(config)
+        local continuingBlast = mode == "mine" and equipped("Dynamite") and state.explosive and state.explosive.left > 0
+            and (not state.pending.blast or os.clock() - state.pending.blast.at < 0.5)
+            and state.explosive.nextAt <= workspace:GetServerTimeNow() + 0.4
+            and (player:GetAttribute("ToolReadyAt_Dynamite") or math.huge) <= workspace:GetServerTimeNow() + 0.4
+        if (blastReady or continuingBlast) and egg and target:IsDescendantOf(egg) and not target:GetAttribute("EggCore") then
+            local blastContact = contact(target, position, head, reach("Dynamite", config), guardian)
+            if blastContact and (blastContact.Position - head.Position).Magnitude <= reach("Dynamite", config)
+                and (blastContact.Instance == target or blastContact.Instance:IsDescendantOf(target)) then family, cooldown = "Dynamite", 0.2 end
         end
         state.family = family
         if not equip(family, config) then app.status.farm = "Equipping " .. family return end
@@ -2343,7 +2794,16 @@ do
             local weakResult = ray(weak.Position, head)
             if weakResult and weakResult.Instance:IsDescendantOf(target) then result = weakResult end
         end
-        if family == "Bucket" and m and m.Input == "Hold" then
+        if family == "Gun" then
+            lease("Bucket", false) lease("Drill", false)
+            shoot(target, result, gun)
+        elseif family == "Dynamite" then
+            lease("Bucket", false) lease("Drill", false)
+            -- Re-check native coverage after movement/streaming before a blast.
+            local layer = target:GetAttribute("Layer") or 1
+            if mode == "mine" and egg and target:IsDescendantOf(egg) and not guardian.Covers(egg, layer, player)
+                and not egg:GetAttribute("EventCarried") and not target:GetAttribute("EggCore") then throwExplosive(target, result, config) end
+        elseif family == "Bucket" and m and m.Input == "Hold" then
             local delta = result.Position - root.Position
             local facing = Vector3.new(delta.X, 0, delta.Z)
             if facing.Magnitude > 0.01 then root.CFrame = CFrame.lookAt(root.Position, root.Position + facing) end
@@ -2679,7 +3139,7 @@ do
         if (state.compactAt or 0) <= os.clock() then
             local list = {}
             for model in pairs(state.targets) do if model.Parent then table.insert(list, model) else state.targets[model] = nil end end
-            state.targetList, state.targetCursor, state.compactAt = list, 0, os.clock() + 5
+            state.targetList, state.targetCursor, state.compactAt = list, #list > 0 and (state.targetCursor or 0) % #list or 0, os.clock() + 5
             local liveFaults = {}
             for obj, id in pairs(state.targetIds) do
                 if obj.Parent then liveFaults["hit:" .. id], liveFaults["move:target:" .. id] = true, true end
@@ -2699,8 +3159,12 @@ do
         if chestOwnsMovement or player:GetAttribute("ChestPickerOpen") == true then lease("Bucket", false) lease("Drill", false) end
         if not blocked then
             local tutorialOwnsMovement = not state.combat and not chestOwnsMovement and app.settings.farm and tutorial(config)
+            local gunOwnsMovement = not saleFirst and not tutorialOwnsMovement and not chestOwnsMovement and buyGun(config)
+            -- Always reconcile delayed gun ownership even while cashout/modal
+            -- owns movement; uncertain purchases stay singular across reloads.
+            if state.pending.gunBuy and ownedGun() then buyGun(config) end
             upgrades(config)
-            if not chestOwnsMovement and not tutorialOwnsMovement and player:GetAttribute("ChestPickerOpen") ~= true then
+            if not chestOwnsMovement and not tutorialOwnsMovement and not gunOwnsMovement and player:GetAttribute("ChestPickerOpen") ~= true then
                 local workerOwnsEquipment = not saleFirst and worker(config)
                 if not workerOwnsEquipment then farm(config, evolution) end
             end
@@ -2722,6 +3186,13 @@ do
         table.insert(lines, "Confirmed cashouts=" .. tostring(state.stats.sales or 0)
             .. "; sale method=" .. tostring(state.saleRoute and state.saleRoute.method or "none")
             .. "; sale retry=" .. tostring(state.saleRoute and state.saleRoute.tries or 0))
+        table.insert(lines, "Gun: " .. tostring(self.status.gun or "not checked") .. "; confirmed buys=" .. tostring(state.stats.gunBuys or 0)
+            .. "; acknowledged shots=" .. tostring(state.stats.gunShots or 0) .. "; ammo=" .. tostring(state.gun and state.gun.ammo))
+        table.insert(lines, tostring(self.status.explosive or "Explosives: waiting for owned ready charges")
+            .. "; acknowledged throws=" .. tostring(state.stats.explosives or 0))
+        table.insert(lines, "Shell Magnet=" .. tostring(player:GetAttribute("VIPOwned_vip_magnet"))
+            .. "; Auto Sell=" .. tostring(player:GetAttribute("VIPOwned_vip_autoSell"))
+            .. "; outer mining layer=" .. tostring(state.frontierLayer) .. "; eligible chunks remaining=" .. tostring(state.remainingChunks or 0))
         table.insert(lines, "Native sell cart=" .. tostring(nativeCart ~= nil)
             .. "; prompt ready=" .. tostring(state.nativeSellPrompt and state.nativeSellPrompt.Parent and state.nativeSellPrompt.Enabled == true)
             .. "; busy=" .. tostring(nativeCart and nativeCart:GetAttribute("SellBusy"))
@@ -2819,9 +3290,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v13.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v14.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v13 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v14 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -3049,6 +3520,7 @@ if app.settings.resume then app:Start() end
 render()
 app:note("Ready. AFK repeat runs, boss warning evasion, scientist priority and Claim All. Lobby walk / round tween. Hatching remains opt-in.")
 return app
+
 
 
 
