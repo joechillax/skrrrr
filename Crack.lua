@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v14.
+-- Crack the Egg: lobby + round progression, v15.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -673,7 +673,9 @@ do
         if observed then self.safeFloor = {root = root, position = Vector3.new(root.Position.X,
             ground + hum.HipHeight + root.Size.Y * 0.5 + 0.25, root.Position.Z)} end
         local destroyY = workspace.FallenPartsDestroyHeight
-        local tooLow = root.Position.Y < ground - 0.5
+        -- A shop roof/prop above the root isn't evidence that we fell below
+        -- the arena. Keep the native arena baseline as the upper safety bound.
+        local tooLow = root.Position.Y < math.min(ground, config.EggGroundY or ground) - 0.5
             or finite(destroyY) and root.Position.Y < destroyY + 40
         if not tooLow then return false end
         self:release(true)
@@ -788,18 +790,31 @@ do
                 part.CanCollide = false
             end
         end
+        if f.hover and f.hover.Parent ~= root then
+            f.hover:Destroy()
+            f.hover = nil
+        end
         if not f.hover then
             local hover = Instance.new("BodyVelocity")
             f.hover = hover -- Record before setting properties so partial startup is recoverable.
             hover.Name = "CrackEggTravelHold"
-            hover.MaxForce, hover.Velocity, hover.P = Vector3.new(0, 1000000, 0), Vector3.new(), 10000
+            hover.MaxForce, hover.Velocity, hover.P = Vector3.new(1000000, 1000000, 1000000), Vector3.new(), 10000
             hover.Parent = root
             local velocity = root.AssemblyLinearVelocity
-            if velocity then root.AssemblyLinearVelocity = Vector3.new(velocity.X, 0, velocity.Z) end
+            if velocity then root.AssemblyLinearVelocity = Vector3.new() end
         end
+        f.hover.MaxForce, f.hover.Velocity = Vector3.new(1000000, 1000000, 1000000), Vector3.new()
         return true
     end
     function app:release(keepFlight)
+        -- Default release cancels travel/held tools, while active round hover
+        -- persists. Explicit false permits native jump/knockback and teardown.
+        if keepFlight == nil then
+            local _, root = character()
+            keepFlight = self.running and self.alive and not self.teleporting
+                and game.PlaceId == 104087083666671 and root ~= nil
+                and self.flight ~= nil and self.flight.root == root
+        end
         local complete = true
         for _, family in ipairs({"Bucket", "Drill"}) do
             local ok, result = pcall(lease, family, false)
@@ -834,7 +849,7 @@ do
         local origin = (lane == "mine" or lane == "collect" or lane == "sell" or lane == "shop") and head.Position or root.Position
         if not hum.SeatPart and not hum.Sit and (origin - position).Magnitude <= range
             and (not approach or (root.Position - approach.goal).Magnitude <= 0.75) then
-            if app.move then app:release(approach and approach.air or app.move.air) end
+            if app.move then app:release() end
             return true
         end
         local policy = travelPolicy()
@@ -896,7 +911,7 @@ do
             if not floor and not m.air then destination = Vector3.new(destination.X, root.Position.Y, destination.Z) end
             if lane ~= "evade" then
                 local config = module("BreakTheEgg", "Config")
-                local ground = flightGround(destination, target, config)
+                local ground = lane == "shop" and config.EggGroundY or flightGround(destination, target, config)
                 local minY = ground + hum.HipHeight + root.Size.Y * 0.5 + 0.25
                 if destination.Y < minY then
                     destination = Vector3.new(destination.X, minY, destination.Z)
@@ -1101,7 +1116,7 @@ do
             state.stats.bossStrikes = (state.stats.bossStrikes or 0) + 1
             state.evadeGoal, state.evadeApproach = nil, nil
             state.knockUntil = os.clock() + 0.35
-            app:release() -- Let the native knockback move the character, then replan.
+            app:release(false) -- Let the native knockback move the character, then replan.
         elseif kind == "LobbyReturned" then
             state.pending.returnLobby = nil
             state.won = nil
@@ -1196,7 +1211,7 @@ do
         local lab = workspace:FindFirstChild("BreakTheEgg")
         local worldChanged = lab ~= state.lab
         if worldChanged or lab and installed.boundLab ~= lab then
-            app:release()
+            app:release(false)
             for _, field in ipairs({"labAdded", "labRemoving"}) do
                 local connection = installed[field]
                 if connection then
@@ -1331,6 +1346,12 @@ do
         local catalog = module("BreakTheEgg", "GunCatalog")
         return player:GetAttribute("Owns_Gun") == true and catalog and catalog.Get(player:GetAttribute("GunId")) or nil
     end
+    local function preferredGun(gun)
+        return gun and (gun.Id == "Minigun" or gun.Id == "Vulcan")
+    end
+    local function flameOwned(config)
+        return owns("HandDrill", config) and player:GetAttribute("Evolution_HandDrill") == 3
+    end
     local function gunState(gun)
         local ammo = player:GetAttribute("GunAmmo")
         if not finite(ammo) then return nil end
@@ -1359,6 +1380,8 @@ do
     local function gunUsable()
         local gun = ownedGun()
         if not gun then return nil end
+        local config = module("BreakTheEgg", "Config")
+        if not preferredGun(gun) and config and flameOwned(config) then return nil end
         if gun and not equipped("Gun") then
             local fp = "Gun:" .. tostring(player.Character) .. ":" .. tostring(gun.Id)
             if not eligible("equip-tool:Gun", fp) then return nil end
@@ -1383,12 +1406,12 @@ do
         return folder, ids, prices, cash, serial
     end
     local function gunReserve()
-        if ownedGun() then return 0 end
+        if preferredGun(ownedGun()) then return 0 end
         local _, ids, prices = shopStock()
         local catalog, reserve = module("BreakTheEgg", "GunCatalog"), nil
         for i, id in ipairs(ids or {}) do
             local price = prices[i]
-            if catalog and catalog.Get(id) and finite(price) and price >= 0 then reserve = math.min(reserve or price, price) end
+            if catalog and preferredGun(catalog.Get(id)) and finite(price) and price >= 0 then reserve = math.min(reserve or price, price) end
         end
         return reserve or 0
     end
@@ -1400,7 +1423,7 @@ do
         local gun = ownedGun()
         local p = state.pending.gunBuy
         if p then
-            if gun then
+            if gun and gun.Id == p.id then
                 state.pending.gunBuy, state.gunRoute = nil, nil
                 state.stats.gunBuys = (state.stats.gunBuys or 0) + 1
                 success("gun-buy")
@@ -1416,10 +1439,10 @@ do
                 end
             end
         end
-        if gun then leaveShop() app.status.gun = "Owned gun: " .. gun.Name return false end
+        if preferredGun(gun) then leaveShop() app.status.gun = "Owned gun: " .. gun.Name return false end
         if not app.settings.farm or state.pending.upgrade then leaveShop() return false end
         local phase = state.lab:GetAttribute("BossPhase") or "Idle"
-        if state.combat or phase == "Wave" or phase == "Intermission" or phase == "Core" then leaveShop() return false end
+        if (state.combat or phase == "Wave" or phase == "Intermission" or phase == "Core") and not flameOwned(config) then leaveShop() return false end
         if (player:GetAttribute("EggTutorialStep") or 0) < 8 then leaveShop() return false end
         local folder, ids, prices, cash, serial = shopStock()
         local catalog, prompts = module("BreakTheEgg", "GunCatalog"), workspace:FindFirstChild("GunShopPrompts")
@@ -1431,27 +1454,54 @@ do
         for i, id in ipairs(ids) do
             local def, price = catalog.Get(id), prices[i]
             local slot = prompts:FindFirstChild("Slot" .. i)
-            local prompt = slot and slot:FindFirstChild("BuyPrompt")
+            local prompt = slot and slot:FindFirstChild("BuyPrompt", true)
             local anchor = prompt and prompt.Parent
+            local point = anchor and anchor:IsA("Attachment") and anchor.WorldPosition or anchor and anchor:IsA("BasePart") and anchor.Position
             if anchor and anchor:IsA("Attachment") then anchor = anchor.Parent end
-            if def and finite(price) and price >= 0 and price <= cash and prompt and prompt:IsA("ProximityPrompt")
+            if preferredGun(def) and finite(price) and price >= 0 and price <= cash and prompt and prompt:IsA("ProximityPrompt")
                 and prompt.Enabled and prompt:GetAttribute("GunShopSlot") == i and anchor and anchor:IsA("BasePart") then
                 local rate = catalog.CycleRate(id)
                 local value = (def.FoeDamage or 1) * def.Pellets * rate * def.Magazine / (def.Magazine + rate * def.Reload)
-                if not best or value > score then best, score = {id = id, slot = i, price = price, prompt = prompt, anchor = anchor}, value end
+                if not best or value > score then best, score = {id = id, slot = i, price = price, prompt = prompt, anchor = anchor, point = point}, value end
             end
         end
-        if not best then leaveShop() app.status.gun = "Saving cash for stocked gun" return false end
+        if not best then leaveShop() app.status.gun = "Waiting for affordable Minigun/Vulcan restock · owned flamethrower fallback" return false end
         local fp = tostring(serial) .. ":" .. best.slot .. ":" .. best.id .. ":" .. best.price
-        if not eligible("gun-buy", fp) then return false end
+        if not eligible("gun-buy", fp) then leaveShop() return false end
         local route = state.gunRoute
         if not route or route.fingerprint ~= fp or route.prompt ~= best.prompt then
-            route = {fingerprint = fp, prompt = best.prompt, at = os.clock()}
+            success("move:gun-shop") -- A new native stock/slot is a new route attempt.
+            route = {fingerprint = fp, prompt = best.prompt, at = os.clock(), attempt = 0}
             state.gunRoute = route
         end
         local range = best.prompt.MaxActivationDistance
         if not finite(range) or range <= 0 then return false end
-        local arrived, reason = move("shop", "gun-shop", best.anchor, best.anchor.Position, range * 0.8)
+        if route.goal and not route.recovered and app.move and app.move.key == "gun-shop"
+            and os.clock() - app.move.progressAt > 2 and not root.Anchored then
+            -- One bounded recovery for a stalled owned tween; purchase still
+            -- requires fresh stock, actual head distance and native LOS below.
+            app:release(true)
+            if app:updateFlight(root) then
+                root.CFrame = CFrame.new(route.goal)
+                root.AssemblyLinearVelocity = Vector3.new()
+                route.recovered = true
+            end
+        end
+        if (head.Position - best.point).Magnitude > range * 0.8 then
+            if not route.goal or os.clock() - (route.goalAt or 0) > 2.5 or (route.point - best.point).Magnitude > 1 then
+                route.attempt += 1
+                local offset = head.Position - best.point
+                local angle = route.attempt == 1 and math.atan2(offset.Z, offset.X) or route.attempt * math.pi * 0.5
+                local radius = math.min(range * 0.35, 3)
+                local headGoal = best.point + Vector3.new(math.cos(angle) * radius, math.min(2, range * 0.2), math.sin(angle) * radius)
+                route.goal = headGoal - (head.Position - root.Position)
+                route.goalAt, route.point = os.clock(), best.point
+                if app.move and app.move.key == "gun-shop" then app:release(true) end
+            end
+        end
+        local approach = route.goal and {goal = route.goal, air = true}
+        local arrived, reason = move("shop", "gun-shop", best.anchor, best.point, range * 0.8, approach)
+        if approach then route.goal = approach.goal end -- Retain the floor-safe endpoint for stalled recovery too.
         app.status.farm, app.status.gun = "Buying boss gun · " .. tostring(reason or best.id), "Buying " .. best.id .. " for " .. best.price .. " cents"
         if not arrived then
             if not app.move or os.clock() - route.at > 20 then
@@ -1465,14 +1515,21 @@ do
         local fresh, freshIds, freshPrices, freshCash, freshSerial = shopStock()
         if not fresh or freshSerial ~= serial or freshIds[best.slot] ~= best.id or freshPrices[best.slot] ~= best.price
             or freshCash < best.price or not best.prompt.Parent or not best.prompt.Enabled
-            or (head.Position - best.anchor.Position).Magnitude > range then state.gunRoute = nil return false end
+            or (head.Position - best.point).Magnitude > range then state.gunRoute = nil return false end
         if best.prompt.RequiresLineOfSight then
             local params = RaycastParams.new()
             params.FilterType, params.FilterDescendantsInstances = Enum.RaycastFilterType.Exclude, {player.Character}
-            local delta = best.anchor.Position - head.Position
+            local delta = best.point - head.Position
             local wall = workspace:Raycast(head.Position, delta, params)
             if wall and wall.Instance ~= best.anchor and (wall.Position - head.Position).Magnitude < delta.Magnitude - 0.5 then
-                fail("gun-buy", fp, "Buy prompt line of sight obstructed") state.gunRoute = nil return false
+                route.goal, route.goalAt = nil, 0
+                if os.clock() - route.at > 12 then fail("gun-buy", fp, "Buy prompt line of sight obstructed") leaveShop() return false end
+                -- Move to another real prompt side rather than waiting at a wall.
+                local angle = (route.attempt + 1) * math.pi * 0.5
+                route.attempt += 1
+                route.point, route.goalAt = best.point, os.clock()
+                route.goal = best.point + Vector3.new(math.cos(angle) * range * 0.4, 2, math.sin(angle) * range * 0.4) - (head.Position - root.Position)
+                return true
             end
         end
         local bucketReleased, drillReleased = lease("Bucket", false), lease("Drill", false)
@@ -2056,7 +2113,7 @@ do
         local alpha = math.clamp((pos - from):Dot(d) / math.max(0.001, d:Dot(d)), 0, 1)
         return (pos - (from + d * alpha)).Magnitude
     end
-    local function attackDuringEvasion(config, evolution)
+    local function attackDuringEvasion(config, evolution, triggerOnly)
         local _, _, head = character()
         if not head then return end
         local family, score, cooldown
@@ -2068,12 +2125,19 @@ do
                 if value and interval and (not score or value > score) then family, score, cooldown = name, value, interval end
             end
         end
-        if not family then return end
+        if flameOwned(config) then
+            family = "HandDrill"
+            local _, interval = power(family, 3, config, evolution, "event")
+            cooldown = interval
+        end
+        if not family then return false end
         local gun = gunUsable()
+        if triggerOnly and not gun and not flameOwned(config) then return false end
         if gun then family, cooldown = "Gun", 0 end
         local best, result, distance
         for obj in pairs(state.enemies or {}) do
-            if obj.Parent and (obj:GetAttribute("Health") or 0) > 0 then
+            if obj.Parent and (obj:GetAttribute("Health") or 0) > 0
+                and eligible("hit:" .. targetId(obj), hitFingerprint(obj, family)) then
                 local _, pos = aim(obj, head.Position)
                 if pos and (pos - head.Position).Magnitude <= reach(family, config) then
                     local contactResult = contact(obj, pos, head, reach(family, config))
@@ -2087,12 +2151,14 @@ do
                 end
             end
         end
-        if gun and not best then
+        if not best and (gun or state.lab:GetAttribute("BossPhase") == "Core") then
             for _, obj in ipairs(state.targetList) do
-                if obj.Parent and obj:GetAttribute("EggCore") == true and (obj:GetAttribute("HP") or 0) > 0 then
+                if obj.Parent and obj:GetAttribute("EggCore") == true and (obj:GetAttribute("HP") or 0) > 0
+                    and eligible("hit:" .. targetId(obj), hitFingerprint(obj, family)) then
                     local _, pos = aim(obj, head.Position)
-                    local actual = pos and contact(obj, pos, head, gun.Range)
-                    if actual and actual.Instance:IsDescendantOf(obj) and (actual.Position - head.Position).Magnitude <= gun.Range then
+                    local range = reach(family, config)
+                    local actual = pos and contact(obj, pos, head, range)
+                    if actual and actual.Instance:IsDescendantOf(obj) and (actual.Position - head.Position).Magnitude <= range then
                         best, result = obj, actual break
                     end
                 end
@@ -2100,9 +2166,24 @@ do
         end
         -- The evasion route keeps movement ownership. Attacking an enemy already
         -- in reach doesn't rotate or replace that route, or chase an unsafe one.
-        if best and equip(family, config) then
-            if gun then shoot(best, result, gun) else hit(best, result, family, cooldown, true) end
+        if best then
+            local hp = best:GetAttribute("HP") or best:GetAttribute("Health")
+            local watch = state.triggerWatch
+            if not watch or watch.target ~= best or watch.family ~= family or watch.hp ~= hp then
+                state.triggerWatch = {target = best, family = family, hp = hp, at = os.clock()}
+            elseif os.clock() - watch.at > 5 then
+                fail("hit:" .. targetId(best), hitFingerprint(best, family), "Trigger target made no damage progress; trying another enemy")
+                state.triggerWatch = nil
+                return false
+            end
+            if equip(family, config) then
+                if gun then shoot(best, result, gun) else hit(best, result, family, cooldown, best:GetAttribute("EggCore") ~= true) end
+            end
+            -- Keep combat equipment through spin-up/reload/receipt gaps. This
+            -- owns equipment only; shop/dodge travel continues independently.
+            return true
         end
+        return false
     end
     local function clearance(h, position, at, margin, warning)
         if at > h.finish or at < h.at - (warning and h.warn or 0.1) then return math.huge end
@@ -2134,7 +2215,7 @@ do
         local boss = module("BreakTheEgg", "BossConfig")
         if not boss then return false end
         if (state.knockUntil or 0) > os.clock() then
-            app:release()
+            app:release(false)
             app.status.farm = "Boss knockback · letting native motion settle"
             return true
         end
@@ -2152,7 +2233,7 @@ do
             end
         end
         if crossing and (state.jumpAt or -math.huge) + 0.55 < now then
-            app:release()
+            app:release(false)
             hum.Jump = true
             state.jumpAt, state.jumpUntil = now, now + 0.65
         end
@@ -2619,12 +2700,8 @@ do
             end
         end
         if not target or not target.Parent then
-            -- Between airborne drops keep the owned hold briefly, rather than
-            -- free-falling every time replication leaves an empty scan.
-            if app.flight and not state.combat then
-                state.hoverWaitAt = state.hoverWaitAt or os.clock()
-                app:release(os.clock() - state.hoverWaitAt < 3)
-            else app:release() end
+            -- Active round hover survives empty scans and streaming delays.
+            app:release()
             state.approach, state.obstruction = nil, nil
             lease("Bucket", false) lease("Drill", false)
             state.needSale = count > 0
@@ -2685,6 +2762,11 @@ do
         end
         local gun = (mode == "event" or mode == "core") and gunUsable()
         if gun then family, cooldown = "Gun", 0 end
+        if not gun and (mode == "event" or mode == "core") and flameOwned(config) then
+            family = "HandDrill"
+            local _, interval = power(family, 3, config, evolution, mode)
+            cooldown = interval
+        end
         local blastReady = mode == "mine" and tutorialStep ~= 1 and explosiveReady(config)
         local continuingBlast = mode == "mine" and equipped("Dynamite") and state.explosive and state.explosive.left > 0
             and (not state.pending.blast or os.clock() - state.pending.blast.at < 0.5)
@@ -2755,7 +2837,7 @@ do
         if ready then
             -- A valid native ray hit is the attack condition; a path waypoint
             -- or estimated mesh surface is not an additional prerequisite.
-            if app.move then app:release(approach and approach.air or app.move.air) end
+            if app.move then app:release() end
             state.obstruction = nil
         else
             local arrived, reason = move(lane, "target:" .. targetId(target), target, position, math.max(2, range - 1), approach)
@@ -3123,7 +3205,7 @@ do
         if self.teleporting then self:release() self:restoreSpeed() return end
         refresh()
         repeatRound()
-        if game.PlaceId ~= 104087083666671 then if not gate() then self:updateSpeed() else self:restoreSpeed() end return end
+        if game.PlaceId ~= 104087083666671 then self:restoreFlight() if not gate() then self:updateSpeed() else self:restoreSpeed() end return end
         if not refs.action or not state.lab then self:release() self:restoreSpeed() self.status.farm = "Waiting for BreakTheEgg world + Action" return end
         local safetyConfig = module("BreakTheEgg", "Config")
         if safetyConfig and self:flightSafety(safetyConfig) then return end
@@ -3149,7 +3231,8 @@ do
             end
         end
         self:updateSpeed()
-        if self.flight then self:updateFlight(self.flight.root) end
+        local _, flightRoot = character()
+        if flightRoot and (state.knockUntil or 0) <= os.clock() and (state.jumpUntil or 0) <= workspace:GetServerTimeNow() then self:updateFlight(flightRoot) end
         refreshCombat()
         if not blocked and capture(config, evolution) then return end
         if not blocked and evasion(config) then attackDuringEvasion(config, evolution) return end
@@ -3164,11 +3247,24 @@ do
             -- owns movement; uncertain purchases stay singular across reloads.
             if state.pending.gunBuy and ownedGun() then buyGun(config) end
             upgrades(config)
+            local triggerOwnsEquipment = not chestOwnsMovement and not tutorialOwnsMovement and not saleFirst
+                and app.settings.farm and player:GetAttribute("ChestPickerOpen") ~= true and attackDuringEvasion(config, evolution, true)
             if not chestOwnsMovement and not tutorialOwnsMovement and not gunOwnsMovement and player:GetAttribute("ChestPickerOpen") ~= true then
-                local workerOwnsEquipment = not saleFirst and worker(config)
-                if not workerOwnsEquipment then farm(config, evolution) end
+                local workerOwnsEquipment = not triggerOwnsEquipment and not saleFirst and worker(config)
+                if not triggerOwnsEquipment and not workerOwnsEquipment then farm(config, evolution) end
             end
         end
+    end
+    function app:physicsRound()
+        if not self.running or self.teleporting or game.PlaceId ~= 104087083666671 or not state.lab or not refs.action then return end
+        local _, root = character()
+        if not root or (state.knockUntil or 0) > os.clock() or (state.jumpUntil or 0) > workspace:GetServerTimeNow() then return end
+        if player:GetAttribute("SlimeCutscene") == true or player:GetAttribute("BossCutscene") == true then return end
+        if self.flight then self:updateFlight(root) end
+        if gate() or not self.settings.farm or state.pending.chest or player:GetAttribute("ChestPickerOpen") == true
+            or (player:GetAttribute("EggTutorialStep") or 0) < 8 or state.leases.Bucket then return end
+        local config, evolution = module("BreakTheEgg", "Config"), module("BreakTheEgg", "ToolEvolutions")
+        if config and evolution then attackDuringEvasion(config, evolution, true) end
     end
     function app:roundDiagnostics()
         local lines = {"Round accepted hits=" .. state.stats.hits .. "; shells=" .. state.stats.collected .. "; chest receipts=" .. state.stats.chests,
@@ -3290,9 +3386,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v14.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v15.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v14 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v15 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -3476,6 +3572,15 @@ if teleportService.TeleportInitFailed then
 end
 
 local lastTick, lastRender, lastTeardown = 0, 0, 0
+if RunService.PreSimulation then
+    connect(RunService.PreSimulation, function()
+        local ok, err = pcall(app.physicsRound, app)
+        if not ok and (app.retries.physicsNote or 0) <= os.clock() then
+            app:note("Physics contract error: " .. tostring(err))
+            app.retries.physicsNote = os.clock() + 10
+        end
+    end)
+end
 connect(RunService.Heartbeat, function()
     local now = os.clock()
     if now - lastTick < 0.1 then return end
