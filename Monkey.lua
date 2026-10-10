@@ -1,8 +1,21 @@
+-- Explicit allowlist before cleanup, settings, modules, hooks or UI are installed.
+local PLACES = { Lobby = 99409088950210, Game = 115317125060158 }
+if game.PlaceId ~= PLACES.Lobby and game.PlaceId ~= PLACES.Game then
+    local message = "MonkeyHorde does not support place " .. tostring(game.PlaceId)
+    warn(message)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "MonkeyHorde", Text = message, Duration = 8,
+        })
+    end)
+    return
+end
+
 pcall(function() game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false) end)
 
 if not game:IsLoaded() then game.Loaded:Wait() end
 
-local VERSION = 1.3
+local VERSION = 1.4
 local env = getgenv()
 if (env.MonkeyVersion or 0) > VERSION then return end
 env.MonkeyVersion = VERSION
@@ -28,6 +41,7 @@ env.MonkeyCleanup = cleanup
 local RS = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local PathfindingService = game:GetService("PathfindingService")
 local VirtualUser = game:GetService("VirtualUser")
 local HttpService = game:GetService("HttpService")
@@ -36,7 +50,8 @@ local TeleportService = game:GetService("TeleportService")
 local LocalPlayer = Players.LocalPlayer
 
 local CONFIG = {
-    LobbyPlace = 99409088950210,
+    LobbyPlace = PLACES.Lobby,
+    GamePlace = PLACES.Game,
     Map = "Cove",
     DeathSpot = Vector3.new(64, 5, 20),
     SourceFile = "MonkeyHorde/MonkeyHorde.lua",
@@ -167,7 +182,7 @@ end
 local function loadMod(...) return requireNode(waitPath(RS, 10, ...)) end
 
 local GunRig, TargetWorld, UnitView, Ballistics
-local Catalog, Progression, BulletProfiles, WeaponData, WeaponGeometry
+local Catalog, Progression, BulletProfiles, WeaponData, WeaponGeometry, Crosshair
 if not IN_LOBBY then
     GunRig = loadMod("GunKit", "Controllers", "GunRigController")
     TargetWorld = loadMod("GunKit", "Shared", "Weapons", "TargetWorld")
@@ -177,6 +192,7 @@ if not IN_LOBBY then
     Progression = loadMod("Shared", "Content", "Progression")
     BulletProfiles = loadMod("GunKit", "Shared", "Weapons", "BulletVisualProfiles")
     WeaponGeometry = loadMod("GunKit", "Shared", "Weapons", "WeaponGeometry")
+    Crosshair = loadMod("GunKit", "Controllers", "CrosshairController")
     WeaponData = requireNode(findPath(LocalPlayer, "PlayerScripts", "Client", "Controllers", "DataController"))
     local ch = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
     ch:WaitForChild("HumanoidRootPart", 15)
@@ -835,18 +851,58 @@ conns[#conns + 1] = LocalPlayer.CharacterAdded:Connect(function(ch)
     if S.AutoKill and not suspended then equipOnce() end
 end)
 
--- Ground pursuit owns one path at a time and leaves normal movement physics intact.
+-- Drive after normal player input: MoveTo alone is cancelled by PlayerModule's Move calls.
 local travel = { generation = 0, busy = false, points = nil, index = 1, goal = nil,
-    lastPlan = -math.huge, lastPos = nil, progressAt = 0, hum = nil, status = "Idle", blocked = nil }
+    lastPlan = -math.huge, lastPos = nil, progressAt = 0, hum = nil, status = "Idle",
+    blocked = nil, direction = nil, steeringRoot = nil }
+travel.binding = "MonkeyHordeMovement_" .. tostring(gen)
 local function stopTravel()
     travel.generation = travel.generation + 1
-    travel.points, travel.goal = nil, nil
+    travel.points, travel.goal, travel.direction, travel.steeringRoot = nil, nil, nil, nil
     if travel.blocked then travel.blocked:Disconnect(); travel.blocked = nil end
-    if travel.hum and travel.hum.Parent then travel.hum:Move(Vector3.zero) end
+    if travel.hum and travel.hum.Parent then travel.hum:Move(Vector3.zero, false) end
     travel.hum = nil
 end
 teardown[#teardown + 1] = stopTravel
-loop(0.2, function()
+do
+teardown[#teardown + 1] = function() RunService:UnbindFromRenderStep(travel.binding) end
+RunService:BindToRenderStep(travel.binding, Enum.RenderPriority.Input.Value + 1, function()
+    if not alive() or IN_LOBBY or not S.AutoKill or suspended or S.Movement ~= "Ground pursuit" then return end
+    local hum, root = getHumanoid(), getRoot()
+    if hum and hum == travel.hum and root == travel.steeringRoot and hum.Health > 0 and travel.direction then
+        hum:Move(travel.direction, false)
+    end
+end)
+local groundParams = RaycastParams.new()
+groundParams.IgnoreWater = true
+local function firingPositions(target, root, stand, info)
+    local world = TargetWorld and TargetWorld.current
+    local surfaces = world and (world.floor or world.ground)
+    if surfaces and #surfaces > 0 then
+        groundParams.FilterType = Enum.RaycastFilterType.Include
+        groundParams.FilterDescendantsInstances = surfaces
+    else
+        groundParams.FilterType = Enum.RaycastFilterType.Exclude
+        groundParams.FilterDescendantsInstances = getIgnore()
+    end
+    local delta = root.Position - target.Position
+    local base = math.atan2(delta.Z, delta.X)
+    local candidates = {}
+    for _, rotation in ipairs({ 0, math.pi / 4, -math.pi / 4, math.pi / 2, -math.pi / 2, math.pi }) do
+        local angle = base + rotation
+        local destination = target.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * stand
+        local hit = workspace:Raycast(destination + Vector3.new(0, 60, 0), Vector3.new(0, -180, 0), groundParams)
+        if hit and hit.Normal.Y >= 0.55 then
+            local point = hit.Position
+            local clear = reachable(target.Position, point + Vector3.new(0, 3, 0), info)
+            candidates[#candidates + 1] = { position = point,
+                score = (point - root.Position).Magnitude + (clear and 0 or 100) }
+        end
+    end
+    table.sort(candidates, function(a, b) return a.score < b.score end)
+    return candidates
+end
+loop(0.15, function()
     local hum, root = getHumanoid(), getRoot()
     if IN_LOBBY or not S.AutoKill or suspended or S.Movement ~= "Ground pursuit"
         or not hum or hum.Health <= 0 or not root then
@@ -854,83 +910,117 @@ loop(0.2, function()
         return
     end
     if safeActive then setSafe(false); return end
+    local now = os.clock()
     local target = combat.pursuit
-    if target and combat.pathRejected and (combat.pathRejected[target.id] or 0) > os.clock() then target = nil end
+    if target and combat.pathRejected and (combat.pathRejected[target.id] or 0) > now then target = nil end
     if not validUnit(target) then
         collectUnits(unitBuf)
-        local _, t = chooseUnit(root.Position + Vector3.new(0, 1, 0), toolInfo(currentTool()))
-        target = t
+        local _, candidate = chooseUnit(aimPivot(root, currentTool()), toolInfo(currentTool()))
+        target = candidate
     end
     if not validUnit(target) then stopTravel(); travel.status = "Waiting for targets"; return end
-    local info, now = toolInfo(currentTool()), os.clock()
-    local delta = root.Position - target.Position
-    local distance = delta.Magnitude
+    if travel.hum and travel.hum ~= hum then stopTravel() end
+    travel.hum, travel.steeringRoot = hum, root
+    if hum.Sit then
+        travel.direction = Vector3.zero
+        hum.Sit, hum.Jump = false, true
+        travel.status = "Leaving seat"
+        return
+    end
+    if hum.WalkSpeed <= 0 then
+        travel.direction = Vector3.zero
+        travel.status = "Waiting for game movement to unlock"
+        return
+    end
+    local info = toolInfo(currentTool())
+    local offset = root.Position - target.Position
+    local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
     local stand = math.min(info.range * 0.65, info.blast and math.max(28, (info.blastRadius or 0) + 12) or 45)
-    if distance <= stand + 6 and reachable(target.Position, root.Position + Vector3.new(0, 1, 0), info) then
-        if travel.goal or travel.hum then stopTravel() end
+    if distance <= stand + 6 and reachable(target.Position, aimPivot(root, currentTool()), info) then
+        if travel.points or travel.goal then stopTravel() end
+        travel.hum, travel.steeringRoot, travel.direction = hum, root, Vector3.zero
         travel.status = "Holding firing position"
         return
     end
-    if travel.hum and travel.hum ~= hum then stopTravel() end
-    travel.hum = hum
-    if hum.Sit then hum.Sit = false; hum.Jump = true; travel.status = "Leaving seat"; return end
-    local horizontal = Vector3.new(delta.X, 0, delta.Z)
-    local outward = horizontal.Magnitude > 0.1 and horizontal.Unit or Vector3.xAxis
-    local destination = target.Position + outward * stand
-    getIgnore()
-    local floor = workspace:Raycast(destination + Vector3.new(0, 60, 0), Vector3.new(0, -160, 0), rayParams)
-    if not floor or floor.Normal.Y < 0.55 then travel.status = "No walkable firing position"; stopTravel(); return end
-    destination = floor.Position
-    local needsPath = not travel.points or not travel.goal or (destination - travel.goal).Magnitude > 14
-    if needsPath and not travel.busy and now - travel.lastPlan >= 1 then
-        travel.lastPlan, travel.busy = now, true
-        local token, character = travel.generation, LocalPlayer.Character
+    local needsPath = not travel.points or not travel.targetPosition
+        or (target.Position - travel.targetPosition).Magnitude > 14
+    if needsPath and not travel.busy and now - travel.lastPlan >= 0.75 then
+        local candidates = firingPositions(target, root, stand, info)
+        travel.lastPlan = now
+        if #candidates == 0 then
+            travel.direction = Vector3.zero
+            travel.status = "No walkable firing position; selecting another group"
+            combat.pathRejected = combat.pathRejected or {}
+            combat.pathRejected[target.id] = now + 4
+            combat.pursuit, combat.targetAt = nil, 0
+            return
+        end
+        travel.busy = true
+        local token, character, targetPosition = travel.generation, LocalPlayer.Character, target.Position
         task.spawn(function()
-            local path
-            local ok, err = pcall(function()
-                path = PathfindingService:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })
-                path:ComputeAsync(root.Position, destination)
-            end)
+            local chosen, destination, lastError
+            for i = 1, math.min(#candidates, 3) do
+                if not alive() or token ~= travel.generation or character ~= LocalPlayer.Character then break end
+                local path
+                local ok, err = pcall(function()
+                    path = PathfindingService:CreatePath({ AgentRadius = 2, AgentHeight = 5,
+                        AgentCanJump = true, WaypointSpacing = 4 })
+                    path:ComputeAsync(root.Position, candidates[i].position)
+                end)
+                if ok and path.Status == Enum.PathStatus.Success then
+                    chosen, destination = path, candidates[i].position
+                    break
+                end
+                if not ok then lastError = tostring(err) end
+            end
             travel.busy = false
             if not alive() or token ~= travel.generation or character ~= LocalPlayer.Character
                 or not S.AutoKill or suspended or S.Movement ~= "Ground pursuit" then return end
-            if ok and path.Status == Enum.PathStatus.Success then
+            if chosen then
                 if travel.blocked then travel.blocked:Disconnect() end
-                travel.points, travel.index, travel.goal = path:GetWaypoints(), 2, destination
+                travel.points, travel.index, travel.goal = chosen:GetWaypoints(), 1, destination
+                travel.targetPosition = targetPosition
                 travel.lastPos, travel.progressAt = root.Position, os.clock()
-                travel.blocked = path.Blocked:Connect(function(index)
-                    if token == travel.generation and index >= travel.index then travel.points = nil end
+                travel.blocked = chosen.Blocked:Connect(function(index)
+                    if token == travel.generation and index >= travel.index then
+                        travel.points, travel.direction = nil, Vector3.zero
+                    end
                 end)
                 travel.status = "Walking to firing position"
             else
-                travel.points = nil
+                travel.points, travel.direction = nil, Vector3.zero
                 travel.status = "No path; selecting another group"
                 combat.pathRejected = combat.pathRejected or {}
                 combat.pathRejected[target.id] = os.clock() + 6
                 combat.pursuit, combat.targetAt = nil, 0
-                if not ok then combat.lastError = "Path: " .. tostring(err) end
+                if lastError then combat.lastError = "Path: " .. lastError end
             end
         end)
     end
-    if not travel.points then return end
+    if not travel.points then travel.direction = Vector3.zero; return end
     local waypoint = travel.points[travel.index]
-    if not waypoint then stopTravel(); return end
-    if (root.Position - waypoint.Position).Magnitude < 4 then
+    while waypoint do
+        local delta = waypoint.Position - root.Position
+        if Vector3.new(delta.X, 0, delta.Z).Magnitude > 2.8 or math.abs(delta.Y) > 6 then break end
         travel.index = travel.index + 1
         waypoint = travel.points[travel.index]
-        if not waypoint then stopTravel(); return end
     end
-    if travel.lastPos and (root.Position - travel.lastPos).Magnitude > 2 then
+    if not waypoint then stopTravel(); return end
+    if travel.lastPos and (root.Position - travel.lastPos).Magnitude > 1.5 then
         travel.lastPos, travel.progressAt = root.Position, now
-    elseif now - travel.progressAt > 3 then
+    elseif now - travel.progressAt > 2.5 then
         hum.Jump = true
         stopTravel()
         travel.status = "Stuck; replanning"
         return
     end
     if waypoint.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
-    hum:MoveTo(waypoint.Position)
+    local delta = waypoint.Position - root.Position
+    local direction = Vector3.new(delta.X, 0, delta.Z)
+    travel.direction = direction.Magnitude > 0.05 and direction.Unit or Vector3.zero
 end)
+end
+
 
 local function setAutoSkip(on)
     local vote = findPath(RS, "Shared", "Waves", "Vote")
@@ -1144,7 +1234,7 @@ local function queueReexec()
         return
     end
     local okRead, src = pcall(readfile, CONFIG.SourceFile)
-    if not okRead or type(src) ~= "string" or not src:find("local VERSION = 1.3", 1, true) then
+    if not okRead or type(src) ~= "string" or not src:find("local VERSION = " .. tostring(VERSION), 1, true) then
         combat.lastError = "Resume file missing or outdated: " .. CONFIG.SourceFile
         return
     end
@@ -1649,12 +1739,61 @@ if #initialOptions == 0 then initialOptions = { "Waiting for abilities" } end
 
 local Window = Rayfield:CreateWindow({
     Name = "Survive a Million Monkeys",
+    ToggleUIKeybind = "RightShift",
     LoadingTitle = "Survive a Million Monkeys",
     LoadingSubtitle = "youtube.com/@robloxvibecoder",
     ConfigurationSaving = { Enabled = true, FolderName = "MonkeyHorde", FileName = "Config" },
     KeySystem = false,
 })
 
+do
+local function configureCursor()
+-- Coordinate with the game's crosshair controller rather than permanently forcing cursor settings.
+local menuCursor = { active = false, icon = nil, behavior = nil }
+local cursorBinding = "MonkeyHordeCursor_" .. tostring(gen)
+local cursorReason = "MonkeyHordeMenu_" .. tostring(gen)
+local function setMenuCursor(visible)
+    visible = visible == true
+    if visible ~= menuCursor.active then
+        if visible then
+            menuCursor.icon, menuCursor.behavior = UserInputService.MouseIconEnabled, UserInputService.MouseBehavior
+            menuCursor.active = true
+            if Crosshair and type(Crosshair.SetHidden) == "function" then
+                pcall(Crosshair.SetHidden, Crosshair, cursorReason, true)
+            end
+        else
+            menuCursor.active = false
+            if menuCursor.icon ~= nil then UserInputService.MouseIconEnabled = menuCursor.icon end
+            if menuCursor.behavior ~= nil then UserInputService.MouseBehavior = menuCursor.behavior end
+            if Crosshair and type(Crosshair.SetHidden) == "function" then
+                pcall(Crosshair.SetHidden, Crosshair, cursorReason, false)
+            end
+            menuCursor.icon, menuCursor.behavior = nil, nil
+        end
+    end
+    if menuCursor.active then
+        if not UserInputService.MouseIconEnabled then UserInputService.MouseIconEnabled = true end
+        if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        end
+    end
+end
+teardown[#teardown + 1] = function()
+    RunService:UnbindFromRenderStep(cursorBinding)
+    setMenuCursor(false)
+end
+RunService:BindToRenderStep(cursorBinding, Enum.RenderPriority.Last.Value + 10, function()
+    if not alive() then return end
+    local ok, visible = pcall(Rayfield.IsVisible, Rayfield)
+    if ok then setMenuCursor(visible) end
+end)
+setMenuCursor(Rayfield:IsVisible())
+
+end
+configureCursor()
+end
+
+do
 local Combat = Window:CreateTab("Combat", 4483362458)
 killToggle = Combat:CreateToggle({
     Name = "Auto Kill Monkeys", CurrentValue = S.AutoKill,
@@ -1705,6 +1844,8 @@ abilityDropdown = Combat:CreateDropdown({
     end,
 })
 
+end
+do
 local Upgrades = Window:CreateTab("Upgrades", 4483362458)
 Upgrades:CreateDropdown({
     Name = "Auto Upgrade",
@@ -1719,6 +1860,8 @@ Upgrades:CreateDropdown({
     end,
 })
 
+end
+do
 local Autofarm = Window:CreateTab("Autofarm", 4483362458)
 autofarmToggle = Autofarm:CreateToggle({
     Name = "Start / Stop Autofarm", CurrentValue = S.Autofarm,
@@ -1773,6 +1916,8 @@ Autofarm:CreateInput({
 })
 statusLabel = Autofarm:CreateLabel("Status: " .. afStatus)
 
+end
+do
 local Misc = Window:CreateTab("Misc", 4483362458)
 Misc:CreateButton({
     Name = "Print weapon diagnostics (console)",
@@ -1808,6 +1953,8 @@ Misc:CreateButton({
         if env.MonkeyCleanup then env.MonkeyCleanup() end
     end,
 })
+
+end
 
 pcall(function() Rayfield:LoadConfiguration() end)
 task.delay(3, function()
