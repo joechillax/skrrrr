@@ -1,4 +1,4 @@
--- JoesAAS 5.13 | standalone source | October 2026
+-- JoesAAS 5.14 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -8,7 +8,7 @@ if game.GameId ~= 10502841145 then
     warn("JoesAAS: this build targets the exported game's universe, not this experience.")
     return
 end
-local A = {version="5.13"}
+local A = {version="5.14"}
 environment.JoesAAS = A
 environment.AnimeSuite = A -- Compatibility with older running versions.
 A.Core = (function()
@@ -800,19 +800,6 @@ return function(A)
         if type(key)=='string' then remember(prefix,instance,key) end
         return key
     end
-    for prefix,field in pairs(fields) do
-        local name,keyField=prefix,field
-        A.on(name..'State',function(packet)
-            if type(packet)=='table' and type(packet.InstanceKey)=='string' and type(packet[keyField])=='string' then
-                remember(name,packet.InstanceKey,packet[keyField],packet.ModeId)
-            end
-        end)
-        if name~='Tower' and name~='TimeTrial' and name~='Dungeon' then
-            A.on(name..'MapReady',function(instance,key,variant)
-                if type(instance)=='string' and type(key)=='string' then remember(name,instance,key,variant) end
-            end)
-        end
-    end
     function A.endPacket(first,second)
         return type(second)=='table' and second or (type(first)=='table' and first or nil)
     end
@@ -831,6 +818,25 @@ return function(A)
         if (prefix=='TimeTrial' or prefix=='Dungeon') and declared and declared~=instance then return false end
         if key and declared and declared~=key then return false end
         return true
+    end
+    for prefix,field in pairs(fields) do
+        local name,keyField=prefix,field
+        A.on(name..'State',function(packet)
+            if type(packet)=='table' and type(packet.InstanceKey)=='string' and type(packet[keyField])=='string' then
+                remember(name,packet.InstanceKey,packet[keyField],packet.ModeId)
+            elseif name=='BossRush' and type(packet)=='table' and (packet.ModeId=='V1' or packet.ModeId=='V2')
+                and A.runEventMatches(name,packet) then
+                -- Wire deltas omit unchanged identifiers; use the established
+                -- current run only, never infer a requested variant as accepted.
+                local raw=A.player:GetAttribute('VisibilityContext'); local key=A.runKey(raw)
+                if key then remember(name,raw:match('^[^:]+:(.+)$'),key,packet.ModeId) end
+            end
+        end)
+        if name~='Tower' and name~='TimeTrial' and name~='Dungeon' then
+            A.on(name..'MapReady',function(instance,key,variant)
+                if type(instance)=='string' and type(key)=='string' then remember(name,instance,key,variant) end
+            end)
+        end
     end
     local stateContext,hasFull,enteredAt,nextResync,attempts=nil,false,0,0,0
     for prefix in pairs(fields) do
@@ -2652,7 +2658,10 @@ return function(A)
         if type(raw)=='string' and raw:match('^World:') and not A.inMode() and not loading then
             locked=nil; returning=nil; leaving=nil
         end
-        if pending and not pending.accepted and not loading and not protected[current] then
+        -- An accepted request is not a run lock. Once its interruptible mode is
+        -- entered, missing variant metadata must not block a higher-tier opening.
+        if pending and (not pending.accepted or (current==pending.mode and raw~=pending.fromContext))
+            and not loading and not protected[current] then
             local waiting=pending
             local nextMode=selectCandidate()
             if not A.alive or not A.running or A.epoch~=epoch then return end
@@ -2807,7 +2816,7 @@ return function(A)
         if mode~='Tower' then
             A.on(mode..'Join',function(accepted,reason,replyKey)
                 A.joinTrace('server reply',{mode=mode,accepted=accepted==true,reason=tostring(reason)})
-                if not pending or nativeMode(pending.mode)~=mode then return end
+                if not pending or (pending.mode~=mode and not (mode=='BossRush' and pending.mode=='Rush')) then return end
                 local requested=pending.mode
                 if (mode=='TimeTrial' or mode=='Dungeon') and type(replyKey)=='string' and replyKey~=pending.key then
                     A.joinTrace('ignored reply',{mode=mode,key=replyKey,reason='Reply belongs to a different selected run'}); return
@@ -2843,6 +2852,24 @@ return function(A)
     end)
     A.on('RaidMapReady',A.coordinateActivities)
     A.on('RaidState',A.coordinateActivities)
+    A.on('RaidGateTeleport',function(accepted,reason,replyKey)
+        A.joinTrace('portal reply',{mode=pending and pending.mode,key=replyKey,accepted=accepted==true,reason=tostring(reason)})
+        if not pending or not definitions[pending.mode].ranks then return end
+        if type(replyKey)=='string' and replyKey~=pending.key then return end
+        if accepted==true then pending.accepted=true; return end
+        if accepted~=false then return end
+        local mode,key=pending.mode,pending.key
+        if reason=='gate_closed' then
+            local opening=available[mode][key]
+            if opening then opening.consumed=true; opening.deadline=math.max(opening.deadline,os.clock()+60) end
+        end
+        backoff[mode..':'..key]=os.clock()+(reason=='world_locked' and 30 or 5)
+        pending=nil
+        A.status['Activity error']=mode..' teleport refused: '..tostring(reason)
+        status(A.status['Activity error'])
+        -- Keep selection/toggles unchanged. The coordinator retries only after
+        -- backoff while a still-open, selected announcement remains eligible.
+    end)
     A.on('BossRushMapReady',A.coordinateActivities)
     A.on('BossRushState',A.coordinateActivities)
     A.on('TowerState',function(p)
@@ -2932,7 +2959,8 @@ return function(A)
         for mode,entries in pairs(available) do
             openings[mode]={}
             for key,entry in pairs(entries) do
-                openings[mode][key]={open=entry.deadline>os.clock(),remaining=entry.deadline==math.huge and 'until schedule closes' or math.max(0,entry.deadline-os.clock()),rank=entry.rank}
+                openings[mode][key]={open=not entry.consumed and entry.deadline>os.clock(),consumed=entry.consumed==true,
+                    remaining=entry.deadline==math.huge and 'until schedule closes' or math.max(0,entry.deadline-os.clock()),rank=entry.rank}
             end
         end
         return {pending=pending and {mode=pending.mode,key=pending.key,accepted=pending.accepted==true,
