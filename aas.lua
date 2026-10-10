@@ -1,4 +1,4 @@
--- JoesAAS 5.12 | standalone source | October 2026
+-- JoesAAS 5.13 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -8,13 +8,16 @@ if game.GameId ~= 10502841145 then
     warn("JoesAAS: this build targets the exported game's universe, not this experience.")
     return
 end
-local A = {version="5.12"}
+local A = {version="5.13"}
 environment.JoesAAS = A
 environment.AnimeSuite = A -- Compatibility with older running versions.
 A.Core = (function()
 local Core = {}
 Core.defaultPriority={'MaxTac','Tower','TimeTrial','Dungeon','Gate','Combat','BossRush'}
-Core.priorityLabels={MaxTac='MaxTac',Tower='Tower',TimeTrial='Time Trials',Dungeon='Dungeon',Gate='Gate',Combat='Raid / Defense',BossRush='Boss Rush'}
+Core.priorityLabels={MaxTac='MaxTac',Tower='Tower',TimeTrial='Time Trials',Dungeon='Dungeon',Gate='Gate',Combat='Raid / Defense / Rush',BossRush='Boss Rush'}
+-- Both Cursed Rush variants (including King of Curses) share the Rush tier.
+local rushKeys={CursedRush=true,ZabanRush=true,StandRush=true}
+function Core.isRush(key) return rushKeys[key]==true end
 function Core.copy(t)
     if type(t) ~= 'table' then return t end
     local out = {}; for k,v in pairs(t) do out[k] = Core.copy(v) end; return out
@@ -161,17 +164,17 @@ return function(A)
     A.player=A.S.Players.LocalPlayer
     A.logs={}; A.status={}; A.connections={}; A.tasks={}; A.cache={}; A.cooldowns={}
     A.alive=true; A.running=false; A.epoch=0
-    A.defaults={version=5,priority=Core.copy(Core.defaultPriority),world='0',mobsByWorld={},mobSelectionModeByWorld={},target='Nearest',farm=false,trialFollow=false,trialAutoJoin=false,trialJoinSelection={},
+    A.defaults={version=6,priority=Core.copy(Core.defaultPriority),world='0',mobsByWorld={},mobSelectionModeByWorld={},target='Nearest',farm=false,trialFollow=false,trialAutoJoin=false,trialJoinSelection={},
         towerAutoJoin=false,towerSelection={},raidAutoJoin=false,raidSelection={},defenseAutoJoin=false,defenseSelection={},
         gateAutoJoin=false,gateSelection={},gateRanks={S=true,A=true,B=true,C=true,D=true,E=true},
         maxTacAutoJoin=false,maxTacSelection={},maxTacRanks={Low=true,Medium=true,High=true,Extreme=true,Psycho=true},
-        dungeonAutoJoin=false,dungeonSelection={},bossRushAutoJoin=false,bossRushSelection={},
+        dungeonAutoJoin=false,dungeonSelection={},rushAutoJoin=false,rushSelection={},bossRushAutoJoin=false,bossRushSelection={},
         rename=false,petName='',petPassiveAuto=false,accessoryCurseAuto=false,swordPassiveAuto=false,titanPassiveAuto=false,shadowPassiveAuto=false,
         webhook=false,webhookURL='',pingId='',ping=false,sendDisconnect=true,
         webhookEvents={Disconnect=true,Mode=true,Progress=true,Error=true,Inventory=true},
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
         blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false,ripperdocAuto=false,ripperdocSlots={},
-        autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20,fixerAutoClaim=false,fixerAutoDeploy=false,fixerPreference='Board order',guildAutoClaim=false,overclockAuto=false,overclockSelection={},
+        autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20,fixerAutoClaim=false,fixerAutoDeploy=false,fixerPreference='Board order',pendingGuildAutoClaim=false,overclockAuto=false,overclockSelection={},
         cyberPlanAuto=false,cyberPlanOrder={},cyberPlanTargets={},loadoutAuto=false,loadoutStat='Power'}
     A.legacyFolder='AnimeSuite_'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.folder='JoesAAS/'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
@@ -199,6 +202,7 @@ return function(A)
     end
     function A.validate(saved)
         local s=Core.merge(A.defaults,saved)
+        if type(saved)=='table' and saved.guildAutoClaim==true then s.pendingGuildAutoClaim=true end
         local legacyMobs=type(saved)=='table' and next(saved)~=nil and (tonumber(saved.version) or 0)<5
         if type(saved)=='table' and saved.dungeonFollow==true then s.trialFollow=true end
         local n=tonumber(s.distance); s.distance=(n and n==n and n<math.huge) and n or 5
@@ -210,7 +214,7 @@ return function(A)
         if not Core.contains({'Nearest','Highest HP','Lowest HP'},s.target) then s.target='Nearest' end
         if not Core.contains({'Board order','Big Jobs first'},s.fixerPreference) then s.fixerPreference='Board order' end
         if not Core.contains({'Walk','Teleport'},s.moveStyle) then s.moveStyle='Walk' end
-        for _,k in ipairs({'webhookEvents','pingEvents','trialJoinSelection','towerSelection','raidSelection','defenseSelection','dungeonSelection','gateSelection','gateRanks','maxTacSelection','maxTacRanks','bossRushSelection','ripperdocSlots'}) do
+        for _,k in ipairs({'webhookEvents','pingEvents','trialJoinSelection','towerSelection','raidSelection','defenseSelection','dungeonSelection','gateSelection','gateRanks','maxTacSelection','maxTacRanks','rushSelection','bossRushSelection','ripperdocSlots'}) do
             for id,v in pairs(s[k]) do if type(id)~='string' or type(v)~='boolean' then s[k][id]=nil end end
         end
         for world,selection in pairs(s.mobsByWorld) do
@@ -267,7 +271,7 @@ return function(A)
         if legacyMobs and not s.mobSelectionModeByWorld[tostring(s.world)] then
             s.mobSelectionModeByWorld[tostring(s.world)]='all'
         end
-        s.version=5; return s
+        s.version=6; return s
     end
     function A.setCombatEnabled(mode,value)
         local own=mode=='Raid' and 'raidAutoJoin' or 'defenseAutoJoin'
@@ -367,6 +371,16 @@ return function(A)
     function A.config(name) return A.module('Config',name) end
     function A.util(name) return A.module('Utils',name) end
     function A.client(name) return A.module('Client',name) end
+    function A.serverNow()
+        local clock=A.util('ServerClockUtil')
+        local ok,n
+        if clock and type(clock.Now)=='function' then ok,n=pcall(clock.Now) end
+        if (not ok or type(n)~='number' or n~=n or n<=0 or n==math.huge) and type(workspace.GetServerTimeNow)=='function' then
+            ok,n=pcall(workspace.GetServerTimeNow,workspace)
+        end
+        if ok and type(n)=='number' and n==n and n>0 and n<math.huge then return n end
+        return os.time()
+    end
     function A.data()
         if A.container and A.container.Ready and type(A.container.Data)=='table' then return A.container.Data end
         return nil
@@ -763,14 +777,16 @@ end)()(A);
 return function(A)
     local fields={Raid='RaidKey',Defense='DefenseKey',Tower='TowerKey',TimeTrial='TrialKey',Dungeon='DungeonKey',BossRush='RushKey'}
     local folders={Raid='RaidArenas',Defense='DefenseArenas',Tower='TowerArenas',TimeTrial='TimeTrialArenas',Dungeon='DungeonArenas',BossRush='BossRushArenas'}
-    local known,order={},{}
-    local function remember(prefix,instance,key)
+    local known,variants,order={},{},{}
+    local function remember(prefix,instance,key,variant)
         local id=prefix..':'..instance
         if not known[id] then order[#order+1]=id end
         known[id]=key
-        while #order>64 do known[table.remove(order,1)]=nil end
+        if variant=='V1' or variant=='V2' then variants[id]=variant end
+        while #order>64 do local expired=table.remove(order,1); known[expired]=nil; variants[expired]=nil end
     end
     A.rememberRun=remember
+    function A.runVariant(raw) return variants[raw] end
     function A.runKey(raw)
         if type(raw)~='string' then return nil end
         local prefix,instance=raw:match('^([^:]+):(.+)$')
@@ -788,12 +804,12 @@ return function(A)
         local name,keyField=prefix,field
         A.on(name..'State',function(packet)
             if type(packet)=='table' and type(packet.InstanceKey)=='string' and type(packet[keyField])=='string' then
-                remember(name,packet.InstanceKey,packet[keyField])
+                remember(name,packet.InstanceKey,packet[keyField],packet.ModeId)
             end
         end)
         if name~='Tower' and name~='TimeTrial' and name~='Dungeon' then
-            A.on(name..'MapReady',function(instance,key)
-                if type(instance)=='string' and type(key)=='string' then remember(name,instance,key) end
+            A.on(name..'MapReady',function(instance,key,variant)
+                if type(instance)=='string' and type(key)=='string' then remember(name,instance,key,variant) end
             end)
         end
     end
@@ -816,6 +832,32 @@ return function(A)
         if key and declared and declared~=key then return false end
         return true
     end
+    local stateContext,hasFull,enteredAt,nextResync,attempts=nil,false,0,0,0
+    for prefix in pairs(fields) do
+        local name=prefix
+        A.on(name..'State',function(packet)
+            if type(packet)=='table' and packet.Full==true and A.runEventMatches(name,packet) then
+                stateContext=A.player:GetAttribute('VisibilityContext'); hasFull=true
+            end
+        end)
+        A.on(name..'Ended',function(first,second)
+            if A.runEventMatches(name,A.endPacket(first,second)) then stateContext=nil; hasFull=false end
+        end)
+    end
+    A.job('Mode state recovery',1,function()
+        local raw=A.player:GetAttribute('VisibilityContext')
+        local prefix=type(raw)=='string' and raw:match('^([^:]+):')
+        if prefix=='Trial' then prefix='TimeTrial' end
+        if not fields[prefix] then stateContext=nil; hasFull=false; return end
+        if stateContext~=raw then
+            stateContext=raw; hasFull=false; enteredAt=os.clock(); nextResync=enteredAt+1; attempts=0
+        end
+        if hasFull or os.clock()<nextResync then return end
+        attempts=attempts+1; nextResync=os.clock()+(attempts<=3 and 5 or 30)
+        if A.fire('GamemodeStateResync',prefix..'State') then
+            A.status['Mode state']='Requested missing full '..prefix..' state'
+        end
+    end)
 end
 
 end)()(A);
@@ -2257,7 +2299,7 @@ return function(A)
             eventError=A.status.Event,activityJobFailures=activityJob and activityJob.failures,settings={}}
         for _,key in ipairs({'towerAutoJoin','towerSelection','trialAutoJoin','trialJoinSelection','dungeonAutoJoin',
             'dungeonSelection','gateAutoJoin','gateSelection','gateRanks','maxTacAutoJoin','maxTacSelection','maxTacRanks','priority','raidAutoJoin','raidSelection',
-            'defenseAutoJoin','defenseSelection','bossRushAutoJoin','bossRushSelection',
+            'defenseAutoJoin','defenseSelection','rushAutoJoin','rushSelection','bossRushAutoJoin','bossRushSelection',
             'autoLeaveStuck','stuckSeconds','trialDungeonStuckSeconds'}) do snapshot.settings[key]=A.settings[key] end
         local ok,err=pcall(function()
             if type(makefolder)=='function' then pcall(makefolder,'JoesAAS'); pcall(makefolder,A.folder) end
@@ -2288,9 +2330,15 @@ return function(A)
         Raid={config='RaidConfig',method='GetAllRaids',toggle='raidAutoJoin',selection='raidSelection'},
         Defense={config='DefenseConfig',method='GetAllDefenses',toggle='defenseAutoJoin',selection='defenseSelection'},
         Dungeon={config='DungeonConfig',method='GetAllDungeons',toggle='dungeonAutoJoin',selection='dungeonSelection'},
+        Rush={config='BossRushConfig',method='GetAllRushes',toggle='rushAutoJoin',selection='rushSelection'},
         BossRush={config='BossRushConfig',method='GetAllRushes',toggle='bossRushAutoJoin',selection='bossRushSelection'}
     }
-    local order={'MaxTac','Tower','TimeTrial','Dungeon','Gate','Raid','Defense','BossRush'}
+    local order={'MaxTac','Tower','TimeTrial','Dungeon','Gate','Raid','Defense','Rush','BossRush'}
+    local function nativeMode(mode)
+        if mode=='Gate' or mode=='MaxTac' then return 'Raid' end
+        return mode=='Rush' and 'BossRush' or mode
+    end
+    local function leaveBridge(mode) return nativeMode(mode)..'Leave' end
     local protected={MaxTac=true,Tower=true,TimeTrial=true,Dungeon=true}
     local available,backoff={},{}
     local pending,leaving,locked,returning,returningContext,waitingReason,stuckExit
@@ -2310,13 +2358,13 @@ return function(A)
     function A.activityOrder()
         local result={}
         for _,mode in ipairs(priorityList()) do
-            if mode=='Combat' then result[#result+1]='Raid'; result[#result+1]='Defense'
+            if mode=='Combat' then result[#result+1]='Raid'; result[#result+1]='Defense'; result[#result+1]='Rush'
             else result[#result+1]=mode end
         end
         return result
     end
     local function priority(mode)
-        mode=(mode=='Raid' or mode=='Defense') and 'Combat' or mode
+        mode=(mode=='Raid' or mode=='Defense' or mode=='Rush') and 'Combat' or mode
         for i,key in ipairs(priorityList()) do if key==mode then return 8-i end end
         return 0
     end
@@ -2348,10 +2396,10 @@ return function(A)
         local cached=choiceCache[mode]
         if cached and cached.config==cfg and cached.getter==(cfg and cfg[def.method]) and cached.revision==A.catalogRevision then return cached.value end
         local choices=cfg and type(cfg[def.method])=='function' and cfg[def.method](cfg) or {}
-        if mode=='BossRush' then
+        if mode=='BossRush' or mode=='Rush' then
             local rows={}
             for key,rush in pairs(choices) do
-                if type(rush.Modes)=='table' then
+                if type(rush.Modes)=='table' and (A.Core.isRush(key)==(mode=='Rush')) then
                     for variant,entry in pairs(rush.Modes) do
                         if (variant=='V1' or variant=='V2') and type(entry)=='table' then
                             rows[key..':'..variant]={Name=entry.Name or rush.Name or key,WorldId=rush.WorldId,
@@ -2375,16 +2423,23 @@ return function(A)
         return choices
     end
     -- Older profiles stored only the rush key. Keep the same V1 choice when declared.
-    local rushChoices=A.activityChoices('BossRush')
-    for key,selected in pairs(A.Core.copy(A.settings.bossRushSelection)) do
-        if selected and not rushChoices[key] then
-            local migrated=key..':V1'
-            if rushChoices[migrated] then
-                A.settings.bossRushSelection[key]=nil; A.settings.bossRushSelection[migrated]=true
-                A.settingsChanged()
+    local settingsMigrated=false
+    for _,mode in ipairs({'Rush','BossRush'}) do
+        local selection=A.settings[definitions[mode].selection]
+        for key,selected in pairs(A.Core.copy(selection)) do
+            local base=key:match('^([^:]+)')
+            local destination=A.Core.isRush(base) and 'Rush' or 'BossRush'
+            local choices=A.activityChoices(destination)
+            local migrated=choices[key] and key or key..':V1'
+            if selected and choices[migrated] and (destination~=mode or migrated~=key) then
+                selection[key]=nil; A.settings[definitions[destination].selection][migrated]=true
+                if A.settings[definitions[mode].toggle] then A.settings[definitions[destination].toggle]=true end
+                settingsMigrated=true
             end
         end
+        if mode=='BossRush' and next(selection)==nil then A.settings.bossRushAutoJoin=false end
     end
+    if settingsMigrated then A.settingsChanged() end
     local rankOrders={Gate={'S','A','B','C','D','E'},MaxTac={'Low','Medium','High','Extreme','Psycho'}}
     local rankWeight={S=6,A=5,B=4,C=3,D=2,E=1,Low=5,Medium=4,High=3,Extreme=2,Psycho=1}
     local function rankRows(mode)
@@ -2438,6 +2493,11 @@ return function(A)
         local raw=A.player:GetAttribute('VisibilityContext')
         local mode=type(raw)=='string' and raw:match('^([^:]+):') or nil
         if mode=='Trial' then mode='TimeTrial' end
+        if mode=='BossRush' then
+            local key=A.runKey(raw)
+            if A.Core.isRush(key) then mode='Rush'
+            elseif not key then mode='UnidentifiedRush' end
+        end
         if mode=='Raid' then
             local instance=raw:match('^Raid:(.+)$')
             local key=A.runKey(raw) or instance
@@ -2475,14 +2535,14 @@ return function(A)
                         local cfg=A.config('TowerConfig'); local util=A.util('TowerStateUtil'); local d=A.data()
                         local tower=choices[key]
                         if cfg and cfg.Enabled~=false and util and d and A.unlocked(tower.WorldId)
-                            and util.GetCooldownRemaining(d,tower)<=0 then return mode,key,{} end
+                            and util.GetCooldownRemaining(d,tower,A.serverNow())<=0 then return mode,key,{} end
                     elseif mode=='Gate' or mode=='MaxTac' then
-                        if entry and entry.deadline>os.clock() then
+                        if entry and not entry.consumed and entry.deadline>os.clock() then
                             if not entry.rank then waitingReason=mode..' rank not provided; waiting for a ranked announcement'
                             elseif A.settings[definitions[mode].ranks][entry.rank]==true then return mode,key,A.Core.copy(entry) end
                         end
-                    elseif mode~='Raid' and mode~='Defense' and mode~='BossRush' and entry and entry.deadline>os.clock() then return mode,key,entry
-                    elseif mode=='Raid' or mode=='Defense' or mode=='BossRush' then
+                    elseif mode~='Raid' and mode~='Defense' and mode~='BossRush' and mode~='Rush' and entry and entry.deadline>os.clock() then return mode,key,entry
+                    elseif mode=='Raid' or mode=='Defense' or mode=='BossRush' or mode=='Rush' then
                         local cfg=choices[key]
                         local data=A.data()
                         local progress=data and type(data.BossRushProgress)=='table' and data.BossRushProgress[cfg.RushKey]
@@ -2532,7 +2592,7 @@ return function(A)
         if mode=='Gate' or mode=='MaxTac' then return A.fire('RaidGateTeleport',key) end
         if mode=='Tower' then return A.fire('TowerJoin',{TowerKey=key}) end
         if mode=='Raid' or (mode=='Defense' and entry.action=='Create') then return A.fire(mode..'Join','Create',key,true) end
-        if mode=='BossRush' then return A.fire('BossRushJoin','Create',entry.rushKey or key,entry.modeId or 'V1') end
+        if mode=='BossRush' or mode=='Rush' then return A.fire('BossRushJoin','Create',entry.rushKey or key,entry.modeId or 'V1') end
         return A.fire(mode..'Join',entry.action or 'Join',key)
     end
     local function sendJoin(mode,key,entry)
@@ -2581,8 +2641,7 @@ return function(A)
                         status(A.status['Activity error']); return
                     end
                     exit.attempts=exit.attempts+1; exit.lastSent=os.clock()
-                    local bridge=(exit.mode=='Gate' or exit.mode=='MaxTac') and 'RaidLeave' or exit.mode..'Leave'
-                    local sent=A.fire(bridge)
+                    local sent=A.fire(leaveBridge(exit.mode))
                     A.joinTrace('stuck leave request',{mode=exit.mode,sent=sent,retry=exit.attempts>1})
                     A.status['Stuck recovery']='Leaving stuck '..exit.mode..' · attempt '..exit.attempts..'/3'
                 end
@@ -2609,7 +2668,14 @@ return function(A)
             end
         end
         if pending then
-            if current==pending.mode and (A.runKey(raw)==pending.key or (current~='Gate' and current~='MaxTac' and current~='TimeTrial' and current~='Dungeon')) then
+            local rushEntered=(current=='Rush' or current=='BossRush') and A.runKey(raw)==pending.entry.rushKey
+                and A.runVariant(raw)==pending.entry.modeId
+            if current==pending.mode and (rushEntered or A.runKey(raw)==pending.key or
+                (current~='Gate' and current~='MaxTac' and current~='TimeTrial' and current~='Dungeon' and current~='Rush' and current~='BossRush')) then
+                if definitions[pending.mode].ranks then
+                    local opening=available[pending.mode][pending.key]
+                    if opening then opening.consumed=true; opening.deadline=math.max(opening.deadline,os.clock()+60) end
+                end
                 pending=nil; returning=nil
             elseif protected[current] and returning~=current then pending=nil
             elseif not loading and (not current or definitions[current]) then
@@ -2647,7 +2713,7 @@ return function(A)
             if os.clock()-leaveAt>=5 then
                 if leaveAttempts<3 then
                     leaveAttempts=leaveAttempts+1; leaveAt=os.clock()
-                    A.fire((leaving=='Gate' or leaving=='MaxTac') and 'RaidLeave' or leaving..'Leave')
+                    A.fire(leaveBridge(leaving))
                 else
                     A.status['Activity error']='No '..leaving..' exit confirmation; retrying later'
                     backoff[mode..':'..key]=os.clock()+30; leaving=nil; status(A.status['Activity error']); return
@@ -2663,7 +2729,7 @@ return function(A)
             if not direct then
                 if returning==current then status('Waiting for '..current..' return teleport'); return end
                 leaving=current; leaveAt=os.clock(); leaveAttempts=1; suspendFarm(); status('Leaving '..current..' for '..mode)
-                if not A.fire((current=='Gate' or current=='MaxTac') and 'RaidLeave' or current..'Leave') then leaving=nil; status('Leave bridge unavailable: '..current) end
+                if not A.fire(leaveBridge(current)) then leaving=nil; status('Leave bridge unavailable: '..current) end
                 return
             end
         elseif returning then status('Waiting for '..returning..' return teleport'); return
@@ -2693,15 +2759,17 @@ return function(A)
     A.tryTrialJoin=A.coordinateActivities
     for _,name in ipairs(order) do
         local mode=name
-        if mode~='Gate' and mode~='MaxTac' then
+        if mode~='Gate' and mode~='MaxTac' and mode~='Rush' then
         if mode~='Raid' then A.on(mode..'Announcement',function(p)
             if type(p)~='table' or p.NotifyKind~='GamemodeOpen' or p.GamemodeType~=mode or type(p.Key)~='string' then return end
             -- A raid gate announcement is a world gate teleport, not a joinable raid.
             if p.GateTeleport then return end
-            A.joinTrace('opening',{mode=mode,key=p.Key,selected=enabled(mode,p.Key),duration=tonumber(p.ExpiresIn),source='bridge'})
+            local target=mode=='BossRush' and A.Core.isRush(p.Key) and 'Rush' or mode
+            local key=mode=='BossRush' and (p.Key..':'..(p.ModeId or 'V1')) or p.Key
+            A.joinTrace('opening',{mode=target,key=key,selected=enabled(target,key),duration=tonumber(p.ExpiresIn),source='bridge'})
             local duration=tonumber(p.ExpiresIn) or 10
             if duration<=0 or duration~=duration then return end
-            available[mode][p.Key]={deadline=os.clock()+math.min(duration,600),modeId=p.ModeId}
+            available[target][key]={deadline=os.clock()+math.min(duration,600),modeId=p.ModeId}
             A.coordinateActivities()
         end) end
         A.on(mode..'Ended',function(first,second)
@@ -2715,7 +2783,7 @@ return function(A)
             if mode=='Raid' and type(packet)=='table' and packet.AutoGateTransfer==true
                 and (current=='MaxTac' or locked=='MaxTac') then A.coordinateActivities(); return end
             local ended=mode=='Raid' and ((current=='MaxTac' or locked=='MaxTac') and 'MaxTac'
-                or ((current=='Gate' or locked=='Gate') and 'Gate')) or mode
+                or ((current=='Gate' or locked=='Gate') and 'Gate')) or (mode=='BossRush' and current=='Rush' and 'Rush') or mode
             if (current==ended or locked==ended) and A.settings.webhook then
                 A.notify('Mode',ended..' run ended'..(type(packet)=='table' and packet.AutoRetry==true and ' (native auto retry)' or ''))
             end
@@ -2739,7 +2807,8 @@ return function(A)
         if mode~='Tower' then
             A.on(mode..'Join',function(accepted,reason,replyKey)
                 A.joinTrace('server reply',{mode=mode,accepted=accepted==true,reason=tostring(reason)})
-                if not pending or pending.mode~=mode then return end
+                if not pending or nativeMode(pending.mode)~=mode then return end
+                local requested=pending.mode
                 if (mode=='TimeTrial' or mode=='Dungeon') and type(replyKey)=='string' and replyKey~=pending.key then
                     A.joinTrace('ignored reply',{mode=mode,key=replyKey,reason='Reply belongs to a different selected run'}); return
                 end
@@ -2747,10 +2816,10 @@ return function(A)
                 if accepted==false then
                     local key=pending.key
                     if mode=='Defense' and reason=='defense_already_active' then
-                        backoff[mode..':'..key]=os.clock()+30
+                        backoff[requested..':'..key]=os.clock()+30
                     else
-                        if reason=='no_active_raid' or reason=='no_active_defense' or reason=='join_closed' or reason=='trial_closed' or reason=='dungeon_closed' then available[mode][key]=nil end
-                        backoff[mode..':'..key]=os.clock()+(mode=='Raid' and 30 or 5)
+                        if reason=='no_active_raid' or reason=='no_active_defense' or reason=='join_closed' or reason=='trial_closed' or reason=='dungeon_closed' then available[requested][key]=nil end
+                        backoff[requested..':'..key]=os.clock()+(mode=='Raid' and 30 or 5)
                     end
                     pending=nil
                     A.status['Activity error']=mode..' refused: '..tostring(reason)
@@ -2774,6 +2843,8 @@ return function(A)
     end)
     A.on('RaidMapReady',A.coordinateActivities)
     A.on('RaidState',A.coordinateActivities)
+    A.on('BossRushMapReady',A.coordinateActivities)
+    A.on('BossRushState',A.coordinateActivities)
     A.on('TowerState',function(p)
         if type(p)=='table' and p.Refused then A.joinTrace('server reply',{mode='Tower',accepted=false,reason=tostring(p.Refused)}) end
         if type(p)=='table' and p.Refused and pending and pending.mode=='Tower' then
@@ -2814,6 +2885,7 @@ return function(A)
             local base,variant=key:match('^(.*)_(%w+)$') -- Native Boss Rush setting-key format.
             if base then key=base..':'..variant; modeId=variant end
         end
+        if mode=='BossRush' and A.Core.isRush(key and key:match('^([^:]+)')) then mode='Rush' end
         if not definitions[mode] or mode=='Raid' or not key or not enabled(mode,key) then return end
         if mode=='TimeTrial' and hasTrialSchedule and not trialScheduleOpen then return end
         local cfg=A.activityChoices(mode)[key]; if not cfg then return end
@@ -2821,6 +2893,9 @@ return function(A)
         local rank=ranked and portalRank(mode,key,{GateRank=card:GetAttribute('GamemodePopupGateRank')}) or nil
         if ranked and not rank then return end
         local entry=available[mode][key]
+        -- Native wave-based Auto Leave must not be undone by this same opening.
+        -- A fresh bridge announcement (next portal) replaces the consumed entry.
+        if ranked and entry and entry.consumed and entry.deadline>os.clock() then return end
         if not entry or entry.deadline<=os.clock() or (ranked and entry.rank~=rank) then
             available[mode][key]={deadline=os.clock()+1,rank=rank,modeId=modeId,source='popup'}
             A.joinTrace('opening',{mode=mode,key=key,rank=rank,selected=true,source='native popup'})
@@ -2901,7 +2976,7 @@ end)()(A);
 return function(A)
     local specs={MaxTac={bridge='Raid',folder='RaidArenas',key='RaidKey'},Gate={bridge='Raid',folder='RaidArenas',key='RaidKey'},
         Raid={bridge='Raid',folder='RaidArenas',key='RaidKey'},Defense={bridge='Defense',folder='DefenseArenas',key='DefenseKey'},
-        Tower={bridge='Tower',folder='TowerArenas',key='TowerKey'},BossRush={bridge='BossRush',folder='BossRushArenas',key='RushKey'},
+        Tower={bridge='Tower',folder='TowerArenas',key='TowerKey'},Rush={bridge='BossRush',folder='BossRushArenas',key='RushKey'},BossRush={bridge='BossRush',folder='BossRushArenas',key='RushKey'},
         TimeTrial={bridge='TimeTrial',folder='TimeTrialArenas',key='TrialKey'},Dungeon={bridge='Dungeon',folder='DungeonArenas',key='DungeonKey'}}
     local watch
     local observed={'Wave','Room','Floor','EnemyCount','Alive','Phase','ShieldBoss','JoinTimeLeft','LandingTimeLeft'}
@@ -3118,6 +3193,12 @@ return function(A)
             A.status['Fixer gigs']='Waiting for the gig board'; return
         end
         local board=util.GetBoard(d)
+        local now=A.serverNow()
+        local auto=type(d.FixerGigs.Auto)=='table' and d.FixerGigs.Auto or {}
+        local function autoPet(i)
+            local uid=auto[tostring(i)]
+            return type(uid)=='string' and uid or nil
+        end
         if gigPending then
             local current=board[gigPending.index]
             local confirmed=gigPending.action=='Claim' and type(current)=='table' and current.Id==gigPending.id
@@ -3159,12 +3240,18 @@ return function(A)
         local index,gig,action,pet,rank
         if A.settings.fixerAutoClaim then
             for i,value in ipairs(board) do
-                if util.IsReady(value,os.time()) and allowed('Claim',i,value) then index=i; gig=value; action='Claim'; break end
+                if not autoPet(i) and util.IsReady(value,now) and allowed('Claim',i,value) then index=i; gig=value; action='Claim'; break end
             end
         end
         if not action and A.settings.fixerAutoDeploy then
             local slots=tonumber(d.FixerGigs.Slots) or cfg:GetSlots(d)
-            if util.CountActive(d)<slots then
+            local reserved,autoPets=0,{}
+            for i,value in ipairs(board) do
+                local uid=autoPet(i)
+                if uid then reserved=reserved+1; autoPets[uid]=true
+                elseif type(value.PetUid)=='string' then reserved=reserved+1 end
+            end
+            if reserved<slots then
                 local indices={}
                 for i in ipairs(board) do indices[#indices+1]=i end
                 if A.settings.fixerPreference=='Big Jobs first' then
@@ -3176,7 +3263,7 @@ return function(A)
                 end
                 for _,i in ipairs(indices) do
                     local value=board[i]
-                    if type(value)=='table' and type(value.PetUid)~='string' and allowed('Send',i,value) then
+                    if type(value)=='table' and not autoPet(i) and type(value.PetUid)~='string' and allowed('Send',i,value) then
                         index=i; gig=value; break
                     end
                 end
@@ -3196,7 +3283,8 @@ return function(A)
                     end
                     for position=4,6 do
                         local uid=ranked[position]
-                        if type(uid)=='string' and type(d.Pets[uid])=='table' and not util.IsPetOnGig(d,uid) and (petBackoff[uid] or 0)<=os.clock() then
+                        if type(uid)=='string' and type(d.Pets[uid])=='table' and not autoPets[uid]
+                            and not util.IsPetOnGig(d,uid) and (petBackoff[uid] or 0)<=os.clock() then
                             pet=uid; rank=position; action='Send'; break
                         end
                     end
@@ -3207,7 +3295,7 @@ return function(A)
         if not action then
             local wait=30
             for _,row in ipairs(board) do
-                if type(row.EndsAt)=='number' and row.EndsAt>os.time() then wait=math.min(wait,row.EndsAt-os.time()) end
+                if type(row.EndsAt)=='number' and row.EndsAt>now then wait=math.min(wait,row.EndsAt-now) end
             end
             A.tasks['Fixer gigs'].next=os.clock()+math.max(.2,wait)
             A.status['Fixer gigs']='Waiting for completed gigs or available slots'; return
@@ -3435,7 +3523,8 @@ return function(A)
     if A.container and type(A.container.OnChange)=='function' then
         for _,field in ipairs({'Accessories','AccessoryCurses','PetAccessories','NamedPets','PetPassives','ActiveSwords','SwordPassives',
             'ActiveTitans','TitanPassives','ShadowCopies','Mounts','PrimordialCopies','ActivePrimordials','RipperdocLevels','FixerGigs',
-            'NamedTitans','NamedShadows','NamedPrimordials','MultiplierUpgrades','AchievementPrimordialSlots'}) do
+            'NamedTitans','NamedShadows','NamedPrimordials','MultiplierUpgrades','AchievementPrimordialSlots',
+            'ActiveGachas','ActiveGrimoires','GrimoirePassives','KaguneUpgrades','StandMastery'}) do
             local ok,c=pcall(A.container.OnChange,A.container,{field},function() if A.alive then A.wakeLoadout() end end)
             if ok and c then A.connections[#A.connections+1]=c end
         end
@@ -3444,63 +3533,25 @@ end
 
 end)()(A);
 
--- ===== guild_claim =====
+-- ===== native_preferences =====
 (function()
 return function(A)
-    local pending,nextAttempt=nil,0
-    local function missions() local d=A.data(); return d and d.GuildMissions end
-    local function rowFor(state,slot)
-        return slot=='w' and state.Weekly or (type(state.Daily)=='table' and state.Daily[tonumber(slot:sub(2))])
-    end
-    A.on('GuildResult',function(action,accepted,reason)
-        if action~='missionClaim' or not pending then return end
-        -- This reply has no slot ID. Only replication can prove OUR slot was claimed.
-        if accepted==false then A.status['Guild quests']='Claim reply: '..tostring(reason)..'; checking mission data' end
+    -- The native server now claims personal missions. Transfer an old ON choice
+    -- once, confirm replication, then leave future control to the game's button.
+    local nextAttempt=0
+    A.job('Native preference migration',1,function()
+        if not A.settings.pendingGuildAutoClaim then return end
+        local d=A.data()
+        if not d or type(d.AutoClaimGuildMissions)~='boolean' then return end
+        if d.AutoClaimGuildMissions then
+            A.settings.pendingGuildAutoClaim=false; A.settingsChanged()
+            A.status['Native migration']='Guild Auto Claim moved to the game Personal tab'
+        elseif os.clock()>=nextAttempt then
+            nextAttempt=os.clock()+30
+            A.fire('GuildAction','missionAutoClaim',true)
+            A.status['Native migration']='Waiting for native guild Auto Claim confirmation'
+        end
     end)
-    A.job('Guild quests',1,function()
-        if not A.settings.guildAutoClaim and not pending then return end
-        local state=missions()
-        if type(state)~='table' then A.status['Guild quests']='Waiting for guild mission data'; return end
-        if pending then
-            local row=rowFor(state,pending.slot)
-            if type(row)=='table' and row.K==pending.key and row.C==true then
-                A.status['Guild quests']='Claimed '..pending.slot..' · '..pending.key
-                pending=nil
-            elseif state.Day~=pending.day or state.Week~=pending.week or not row or row.K~=pending.key then
-                pending=nil; nextAttempt=os.clock()+1
-            elseif os.clock()-pending.at>=15 then
-                pending=nil; nextAttempt=os.clock()+30
-                A.status['Guild quests']='Claim unconfirmed; retrying in 30s'; return
-            else A.status['Guild quests']='Waiting for claim confirmation · '..pending.slot; return end
-        end
-        if not A.settings.guildAutoClaim or os.clock()<nextAttempt then return end
-        local cfg=A.config('GuildMissionConfig'); local util=A.util('GuildMissionUtil')
-        local daily=A.config('CloverDailyConfig')
-        if not cfg or not util or not daily then A.status['Guild quests']='Mission configuration unavailable'; return end
-        local slots={}
-        if tonumber(state.Day)==daily:GetDayNumber() then
-            for i=1,cfg.DailyCount do slots[#slots+1]='d'..i end
-        end
-        if tonumber(state.Week)==util.Week() then slots[#slots+1]='w' end
-        for _,slot in ipairs(slots) do
-            local row=rowFor(state,slot)
-            local info=type(row)=='table' and cfg.ByKey[row.K]
-            if info and row.C~=true and (tonumber(row.P) or 0)>=util.PersonalGoal(info,row,tonumber(state.Week)) then
-                pending={slot=slot,key=row.K,day=state.Day,week=state.Week,at=os.clock()}
-                if not A.fire('GuildAction','missionClaim',slot) then
-                    pending=nil; nextAttempt=os.clock()+10; A.status['Guild quests']='Guild claim bridge unavailable'
-                end
-                return
-            end
-        end
-        A.status['Guild quests']='ON · waiting for completed daily / weekly missions'
-    end)
-    if A.container and type(A.container.OnChange)=='function' then
-        local ok,c=pcall(A.container.OnChange,A.container,{'GuildMissions'},function()
-            if A.alive and A.tasks['Guild quests'] then A.tasks['Guild quests'].next=0 end
-        end)
-        if ok and c then A.connections[#A.connections+1]=c end
-    end
 end
 
 end)()(A);
@@ -4215,7 +4266,7 @@ return function(A)
         restore.Visible=false
     end
     local tabs={}
-    for _,name in ipairs({'Farm','Modes','Pets','Passives','Cyber','Guild','Index','Webhook','Settings'}) do
+    for _,name in ipairs({'Farm','Modes','Pets','Passives','Cyber','Index','Webhook','Settings'}) do
         tabs[name]=window:AddTab({Title=name,Icon=''})
     end
     local sync=true; local bindings={}; local statuses={}
@@ -4390,13 +4441,12 @@ return function(A)
     toggle('Modes','Auto leave stuck runs','autoLeaveStuck',function() A.coordinateActivities() end)
     input('Modes','Stuck timeout · other modes (seconds)','stuckSeconds',true,1,3600)
     input('Modes','Stuck timeout · Trial + Dungeon (seconds)','trialDungeonStuckSeconds',true,1,3600)
-    note('Modes','Stuck detection','Defaults: 10 seconds for MaxTac, Tower, Gate, Raid, Defense and Boss Rush; 20 seconds shared by Time Trials and Dungeon. Kills, fewer remaining enemies, new waves/rooms/floors and run/boss phase changes reset the timer. Damage never resets it. Normal Tower join/choice timers, Gate ARISE delays and up to 30 seconds for a new Trial/Dungeon room handshake are allowed first. Walking and countdown updates do not reset it. Normal world mob farming is unaffected. Failed modes wait 30 seconds before this script rejoins.')
+    note('Modes','Stuck detection','Defaults: 10 seconds for MaxTac, Tower, Gate, Raid, Defense, Rush and Boss Rush; 20 seconds shared by Time Trials and Dungeon. Kills, fewer remaining enemies, new waves/rooms/floors and run/boss phase changes reset the timer. Damage never resets it. Normal Tower join/choice timers, Gate ARISE delays and up to 30 seconds for a new Trial/Dungeon room handshake are allowed first. Walking and countdown updates do not reset it. Normal world mob farming is unaffected. Failed modes wait 30 seconds before this script rejoins.')
     status('Modes','Stuck recovery')
     note('Modes','Transfers','MaxTac, Tower, Trials and Dungeons use direct native entry. Other destinations wait for normal exit. MaxTac, Gate and Tower stay at their join position.')
     note('Modes','Movement','Time Trials and Dungeons follow mobs with continuous anti-stuck steps. Tower opens your own tower. Turn off competing auto-join / movement in your other script to let this coordinator control switching.')
     for _,entry in ipairs({{'MaxTac','maxTacAutoJoin','maxTacSelection'},{'Tower','towerAutoJoin','towerSelection'},{'Dungeon','dungeonAutoJoin','dungeonSelection'},{'Gate','gateAutoJoin','gateSelection'},{'Raid','raidAutoJoin','raidSelection'},
-        {'Defense','defenseAutoJoin','defenseSelection'},
-        {'BossRush','bossRushAutoJoin','bossRushSelection'}}) do
+        {'Defense','defenseAutoJoin','defenseSelection'},{'Rush','rushAutoJoin','rushSelection'}}) do
         local mode,toggleKey,selectionKey=entry[1],entry[2],entry[3]
         dropdown('Modes',mode..' selection',selectionKey,function()
             return A.activityRows(mode)
@@ -4413,11 +4463,17 @@ return function(A)
             note('Modes',mode..' rank order',mode=='Gate' and 'S > A > B > C > D > E. Only declared ranks are listed.'
                 or 'Low → Medium → High → Extreme → Psycho. MaxTac stays at its join position. Only enabled stuck recovery can leave a stalled unfinished run.')
         end
-        toggle('Modes',mode=='Raid' and 'Auto start my own Raid' or (mode=='BossRush' and 'Auto start my own Boss Rush' or ('Auto join '..mode)),toggleKey,function(value)
+        toggle('Modes',mode=='Raid' and 'Auto start my own Raid' or (mode=='Rush' and 'Auto start my own Rush' or ('Auto join '..mode)),toggleKey,function(value)
             if mode=='Raid' or mode=='Defense' then A.setCombatEnabled(mode,value) else A.coordinateActivities() end
         end)
     end
-    note('Modes','Boss Rush entry','Choose the exact variant, such as Cursed Rush or King of Curses. Creates your own run after checking the world unlock and key cost. Old base-only choices migrate to the declared V1 variant.')
+    if next(A.activityChoices('BossRush')) then
+        dropdown('Modes','Boss Rush selection','bossRushSelection',function() return A.activityRows('BossRush') end,
+            function(key) return A.settings.bossRushSelection[key]==true end,
+            function(selected) A.settings.bossRushSelection=selected; A.coordinateActivities() end,true)
+        toggle('Modes','Auto start my own Boss Rush','bossRushAutoJoin',A.coordinateActivities)
+    end
+    note('Modes','Rush entry','Cursed Rush, King of Curses, Zaban Rush and Stand Rush share the Raid / Defense / Rush priority. Choose exact variants; creates your own run after world/key checks. Old choices migrate here. At equal priority the current run stays; otherwise Raid, Defense, then Rush are checked. This export has no separate lower-tier Boss Rush entry.')
     input('Pets','Name for unnamed Astral pets','petName')
     toggle('Pets','Auto rename Astral pets ONLY','rename')
     note('Pets','Astral naming','Only verified Astral rarity is eligible. Already named and percentage pets are skipped. Uses the normal Magicule cost. Check the status below for blockers.')
@@ -4456,9 +4512,8 @@ return function(A)
     choose('Cyber','Fixer deployment order','fixerPreference',choices({'Board order','Big Jobs first'}))
     status('Cyber','Fixer gigs')
     note('Cyber','Fixer deployment','Uses your 4th, 5th and 6th strongest non-scaling pets, filling available gigs in your chosen order. Pets already on gigs stay in the ranking and are skipped. Enable auto claim too to collect rewards and keep deploying. Sending a pet makes it unavailable for combat until claimed.')
-    toggle('Guild','Auto Claim Guild Quests','guildAutoClaim',function() A.tasks['Guild quests'].next=0 end)
-    note('Guild','Completed missions','Claims completed personal daily and weekly guild missions only. Does not perform mission objectives, spend guild points, or change guild membership. Waits for the claimed flag before moving on.')
-    status('Guild','Guild quests')
+    note('Settings','Native automation in Update 18','Guild → Personal now has Auto Claim. Fixer Auto repeats its assigned pet; ranked Fixer deployment here leaves native Auto slots alone. Native Grimoire Passives already advances both slots. Auto Rejoin is handled by the game; your executor must still run JoesAAS after reconnecting.')
+    status('Settings','Native migration')
     choose('Settings','Automatic loadout objective','loadoutStat',choices({'Power','Damage','Yen','XP','Drop','Luck','Kill','CritChance','CritDamage','ShinyChance'}))
     toggle('Settings','Auto Equip Best Loadout','loadoutAuto',A.wakeLoadout)
     note('Settings','Equipment ownership','Uses native Equip Best after inventory / upgrade changes. This can replace your equipped items. Enable only if JoesAAS should control your loadout; disable competing equipment automation. Active gig pets follow the game restrictions.')
