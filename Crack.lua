@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v16.
+-- Crack the Egg: lobby + round progression, v17.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -1231,7 +1231,7 @@ do
                 state.ranks, state.won, state.pending = nil, nil, {}
                 state.chests, state.offers, state.done = {}, {}, {}
                 state.workerAttempt, state.activity, state.hold, state.evadeGoal, state.bagSince, state.needScaffold = nil, nil, nil, nil, nil, nil
-                state.evadeApproach, state.knockUntil = nil, nil
+                state.evadeApproach, state.knockUntil, state.quakeFlight = nil, nil, nil
                 state.gun, state.explosive, state.gunRoute = nil, nil, nil
                 state.frontierAt, state.upperTarget, state.passiveVisit, state.passiveNextAt = nil, nil, nil, nil
                 state.inspection, state.inspections = nil, nil
@@ -2086,6 +2086,8 @@ do
                 if kind == "Grab" then h.radius = math.max(h.radius, defaults.Grab.WhipRadius) end
             elseif kind == "Quake" and vector(a.Center) then
                 h.point = flat(a.Center)
+                h.ground = math.max(config.EggGroundY, a.Center.Y)
+                h.height = math.max(0, number(a, "Height", def.Height))
                 h.r0 = math.max(0, number(a, "R0", height * boss.EggWidthRatio * 0.5 * 0.6))
                 h.speed, h.max = math.max(1, number(a, "Speed", def.Speed)), math.max(0, number(a, "MaxRadius", def.MaxRadius))
                 h.radius = math.max(0, number(a, "Thick", def.Thick)) * 0.5
@@ -2202,6 +2204,7 @@ do
         local pos = flat(position)
         if h.kind == "Lane" then return segmentDistance(pos, h.from, h.to) - h.radius - margin end
         if h.kind == "Quake" then
+            if h.safeY and position.Y >= h.safeY then return math.huge end
             if at < h.at then return math.huge end
             local radius = h.r0 + (at - h.at) * h.speed
             if radius > h.max then return math.huge end
@@ -2221,6 +2224,49 @@ do
         end
         return (pos - h.point).Magnitude - h.radius - margin
     end
+    local function quakeFlight(config, boss, root, hum, now, list)
+        local q = state.quakeFlight
+        if q and (q.root ~= root or now > q.finish) then q = nil end
+        local contactAt = math.huge
+        local margin = math.max(root.Size.X, root.Size.Z) * 0.5 + boss.HazardBody + 0.65
+        for _, h in ipairs(list) do
+            if h.kind == "Quake" then
+                -- Keep the feet, not just the root, above the exported wave
+                -- height. Retain this floor until the entire ring expires so
+                -- a lateral exit cannot descend across a second crossing.
+                h.safeY = h.ground + h.height + hum.HipHeight + root.Size.Y * 0.5 + 1.5
+                if not q then q = {root = root, minY = h.safeY, finish = h.finish + 0.2,
+                    y = root.Position.Y, progressAt = now} end
+                q.minY, q.finish = math.max(q.minY, h.safeY), math.max(q.finish, h.finish + 0.2)
+                local radius = (flat(root.Position) - h.point).Magnitude
+                local arrival = h.at + math.max(0, (radius - h.r0 - h.radius - margin) / h.speed)
+                local passed = h.at + (radius - h.r0 + h.radius + margin) / h.speed
+                if radius <= h.max + margin and radius >= h.r0 - h.radius - margin and now <= passed then
+                    contactAt = math.min(contactAt, arrival)
+                end
+            end
+        end
+        state.quakeFlight = q
+        if not q then return nil end
+        q.goalY = math.max(q.minY, q.goalY or root.Position.Y)
+        if root.Position.Y > q.y + 0.1 then q.y, q.progressAt = root.Position.Y, now end
+        local lift = q.minY - root.Position.Y
+        if lift > 0 and (contactAt - now <= lift / math.max(1, hum.WalkSpeed) + 0.18 or now - q.progressAt > 0.35) then
+            -- A late warning or frozen tween cannot wait for the ordinary
+            -- three-second stall timeout. One bounded vertical correction
+            -- reaches this wave's clearance; subsequent frames just hover.
+            app:release()
+            if app:updateFlight(root) then
+                local goal = Vector3.new(root.Position.X, q.minY, root.Position.Z)
+                root.CFrame = CFrame.lookAt(goal, goal + Vector3.new(0, 0, -1))
+                root.AssemblyLinearVelocity = Vector3.new()
+                q.y, q.progressAt = q.minY, now
+                state.evadeGoal, state.evadeApproach = nil, nil
+                state.stats.quakeLifts = (state.stats.quakeLifts or 0) + 1
+            end
+        end
+        return q
+    end
     local function evasion(config)
         local _, root, _, hum = character()
         if not root or root.Anchored or hum.PlatformStand then return false end
@@ -2234,28 +2280,11 @@ do
         local now = workspace:GetServerTimeNow()
         local list, height = hazards(config, boss, now)
         local margin = math.max(root.Size.X, root.Size.Z) * 0.5 + boss.HazardBody + 0.65
-        -- Let native physics perform the jump. A CFrame tween would pin the
-        -- root to the floor and undo the jump each frame.
-        local crossing
-        for _, h in ipairs(list) do
-            if h.kind == "Quake" then
-                local radius = (flat(root.Position) - h.point).Magnitude
-                local arrives = h.at + (radius - h.r0) / h.speed
-                if radius >= h.r0 and radius <= h.max and arrives - now <= 0.32 and now - arrives < (h.radius + margin) / h.speed then crossing = arrives end
-            end
-        end
-        if crossing and (state.jumpAt or -math.huge) + 0.55 < now then
-            app:release(false)
-            hum.Jump = true
-            state.jumpAt, state.jumpUntil = now, now + 0.65
-        end
-        if (state.jumpUntil or 0) > now or hum.FloorMaterial == Enum.Material.Air and state.jumpAt and now - state.jumpAt < 1.3 then
-            app.status.farm = "Dodging quake · native jump" return true
-        end
+        local quake = quakeFlight(config, boss, root, hum, now, list)
         local function danger(pos, at, warning)
             local worst = math.huge
             for _, h in ipairs(list) do
-                if h.kind ~= "Quake" then worst = math.min(worst, clearance(h, pos, at, margin, warning)) end
+                worst = math.min(worst, clearance(h, pos, at, margin, warning))
             end
             return worst
         end
@@ -2276,6 +2305,15 @@ do
                 if danger(pos, now + dt, true) < 0 then need = true break end
             end
         end
+        if not need and quake then
+            lease("Bucket", false) lease("Drill", false)
+            local goal = Vector3.new(root.Position.X, math.max(root.Position.Y, quake.goalY), root.Position.Z)
+            success("move:boss-quake")
+            move("evade", "boss-quake", state.lab, goal, 0.05, {goal = goal, air = true})
+            app:updateFlight(root)
+            app.status.farm = "Dodging shockwave · flying above ring"
+            return true
+        end
         if not need then
             if app.move and app.move.lane == "evade" then app:release() end
             state.evadeGoal, state.evadeApproach = nil, nil
@@ -2293,9 +2331,13 @@ do
         local function route(goal)
             -- Mining recovery may leave us well above ground. Find an actual
             -- floor and plan the descent rather than rejecting every exit.
-            local floor = workspace:Raycast(goal + Vector3.new(0, 5, 0), Vector3.new(0, -200, 0), params)
-            if not floor or floor.Normal.Y < 0.65 then return nil end
-            goal = floor.Position + Vector3.new(0, hum.HipHeight + root.Size.Y * 0.5, 0)
+            if quake then
+                goal = Vector3.new(goal.X, math.max(root.Position.Y, quake.goalY), goal.Z)
+            else
+                local floor = workspace:Raycast(goal + Vector3.new(0, 5, 0), Vector3.new(0, -200, 0), params)
+                if not floor or floor.Normal.Y < 0.65 then return nil end
+                goal = floor.Position + Vector3.new(0, hum.HipHeight + root.Size.Y * 0.5, 0)
+            end
             local delta = goal - root.Position
             local distance = delta.Magnitude
             local duration = distance / math.max(1, hum.WalkSpeed)
@@ -2321,7 +2363,7 @@ do
             -- Reject unsafe destinations even when every alternative scores
             -- poorly. Include the announced impact after arrival as well.
             for _, h in ipairs(list) do
-                if h.kind ~= "Quake" and clearance(h, goal, math.max(now + duration, h.at), margin, true) < 0 then return nil end
+                if clearance(h, goal, math.max(now + duration, h.at), margin, true) < 0 then return nil end
             end
             local wall = workspace:Raycast(root.Position, delta, params)
             if wall and wall.Normal.Y < 0.65 and (wall.Position - root.Position).Magnitude < distance - 0.5 then return nil end
@@ -2355,6 +2397,15 @@ do
         end
         lease("Bucket", false) lease("Drill", false)
         if not best then
+            if quake then
+                local goal = Vector3.new(root.Position.X, math.max(root.Position.Y, quake.goalY), root.Position.Z)
+                state.evadeGoal, state.evadeApproach = nil, nil
+                success("move:boss-quake")
+                move("evade", "boss-quake", state.lab, goal, 0.05, {goal = goal, air = true})
+                app:updateFlight(root)
+                app.status.farm = "Shockwave flight · no clear lateral exit"
+                return true
+            end
             app:release()
             hum.Jump = true
             app.status.farm = "Boss danger · no verified floor exit; jumping"
@@ -3314,10 +3365,13 @@ do
         end
         self:updateSpeed()
         local _, flightRoot = character()
-        if flightRoot and (state.knockUntil or 0) <= os.clock() and (state.jumpUntil or 0) <= workspace:GetServerTimeNow() then self:updateFlight(flightRoot) end
+        if flightRoot and (state.knockUntil or 0) <= os.clock() then self:updateFlight(flightRoot) end
         refreshCombat()
         if not blocked and capture(config, evolution) then return end
-        if not blocked and evasion(config) then attackDuringEvasion(config, evolution) return end
+        if (not blocked or chestModal) and evasion(config) then
+            if not blocked then attackDuringEvasion(config, evolution) end
+            return
+        end
         local pickerOpen = player:GetAttribute("ChestPickerOpen") == true
         local saleFirst = not pickerOpen and not state.pending.chest and salePolicy(config)
         local chestOwnsMovement = (not state.combat or pickerOpen) and not saleFirst and chests(config, evolution)
@@ -3339,11 +3393,25 @@ do
     end
     function app:physicsRound()
         if not self.running or self.teleporting or game.PlaceId ~= 104087083666671 or not state.lab or not refs.action then return end
-        local _, root = character()
-        if not root or (state.knockUntil or 0) > os.clock() or (state.jumpUntil or 0) > workspace:GetServerTimeNow() then return end
+        local _, root, _, hum = character()
+        if not root or (state.knockUntil or 0) > os.clock() then return end
         if player:GetAttribute("SlimeCutscene") == true or player:GetAttribute("BossCutscene") == true then return end
         if self.flight then self:updateFlight(root) end
-        if gate() or not self.settings.farm or state.pending.chest or player:GetAttribute("ChestPickerOpen") == true
+        -- Recheck imminent waves before physics, independent of the slower
+        -- farming tick. Capture and native cutscenes keep their own movement.
+        local grabbed, swallowed = player:GetAttribute("GrabbedLimb"), player:GetAttribute("SwallowedUntil")
+        local blocked = gate()
+        local chestModal = blocked == "Waiting for SessionModalOpen" and player:GetAttribute("ChestPickerOpen") == true
+        if not root.Anchored and not hum.PlatformStand and (not blocked or chestModal)
+            and not (type(grabbed) == "string" and grabbed ~= "")
+            and not (finite(swallowed) and swallowed > workspace:GetServerTimeNow()) then
+            local config, boss = module("BreakTheEgg", "Config"), module("BreakTheEgg", "BossConfig")
+            if config and boss then
+                local now = workspace:GetServerTimeNow()
+                quakeFlight(config, boss, root, hum, now, hazards(config, boss, now))
+            end
+        end
+        if blocked or not self.settings.farm or state.pending.chest or player:GetAttribute("ChestPickerOpen") == true
             or (player:GetAttribute("EggTutorialStep") or 0) < 8 or state.leases.Bucket then return end
         local config, evolution = module("BreakTheEgg", "Config"), module("BreakTheEgg", "ToolEvolutions")
         if config and evolution then attackDuringEvasion(config, evolution, true) end
@@ -3356,7 +3424,7 @@ do
                 .. "; acknowledged=" .. tostring(state.queueAccepted or "none"),
             "Pass attributes: InfiniteBucket=" .. tostring(player:GetAttribute("InfiniteBucket")) .. "; DoubleChest=" .. tostring(player:GetAttribute("DoubleChest"))
             .. "; ClaimAllUpgrades=" .. tostring(player:GetAttribute("ClaimAllUpgrades")),
-            "Boss evasion: replicated slams/lanes/globs/puddles/grabs/beams + timed quake jumps; active records=" .. tostring(state.hazardCount or 0)
+            "Boss evasion: replicated slams/lanes/globs/puddles/grabs/beams + upward shockwave flight; active records=" .. tostring(state.hazardCount or 0)
                 .. "; melee avoidance zones=" .. tostring(state.meleeCount or 0)
                 .. "; native boss strikes=" .. tostring(state.stats.bossStrikes or 0) .. "; confirmed win receipts=" .. tostring(state.stats.wins or 0),
             "AFK watchdog=" .. tostring(self.watch and math.floor(os.clock() - self.watch.at) or 0) .. " seconds without measurable progress; resume queued=" .. tostring(self.resumeQueued == true)}
@@ -3377,6 +3445,9 @@ do
             .. "; bag age=" .. tostring(state.bagSince and math.floor(os.clock() - state.bagSince) or 0) .. "s; batch threshold=8 / age=6s")
         local _, root, head, hum = character()
         if root then
+            table.insert(lines, "Shockwave clearance Y=" .. tostring(state.quakeFlight and state.quakeFlight.minY or "inactive")
+                .. "; hold until=" .. tostring(state.quakeFlight and state.quakeFlight.finish or "none")
+                .. "; late/stalled vertical corrections=" .. tostring(state.stats.quakeLifts or 0))
             table.insert(lines, "Noclip/vertical hold=" .. tostring(self.flight ~= nil)
                 .. "; alternate attack position=" .. tostring(state.approach and state.approach.goal or "none"))
             table.insert(lines, "Character root=" .. tostring(root.Position) .. "; head=" .. tostring(head.Position)
@@ -3468,9 +3539,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v16.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v17.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v16 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v17 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -3499,7 +3570,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v16", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v17", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
