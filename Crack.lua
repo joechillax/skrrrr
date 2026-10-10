@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v15.
+-- Crack the Egg: lobby + round progression, v16.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -224,7 +224,9 @@ end
 local function fail(key, fingerprint, reason)
     local item = app.failures[key]
     local count = item and item.fingerprint == fingerprint and item.count + 1 or 1
-    app.failures[key] = {fingerprint = fingerprint, count = count}
+    app.failures[key] = {fingerprint = fingerprint, count = count, reason = reason,
+        rejected = reason == "MiningResult rejected" or reason == "No MiningResult or target progress"
+            or item and item.fingerprint == fingerprint and item.rejected == true}
     app.cooldowns[key] = os.clock() + math.min(30, 2 ^ count)
     if count >= 3 then app.blocks[key] = {fingerprint = fingerprint, reason = reason} end
     app:note(key .. ": " .. tostring(reason))
@@ -623,7 +625,8 @@ do
         return game.PlaceId == 104087083666671 and "Tween" or "Walk"
     end
     local function movementFingerprint(target, lane)
-        return targetId(target) .. ":" .. travelPolicy()
+        local cached = state.targets[target]
+        return targetId(target) .. ":" .. travelPolicy() .. ":" .. tostring(type(cached) == "table" and cached.geometry or "")
     end
     local function event(folder, name)
         local parent = folderAt(folder)
@@ -1044,7 +1047,7 @@ do
         return "Easy"
     end
     local function index(obj)
-        if obj:IsA("Model") then
+        if obj:IsA("Model") or obj:IsA("Folder") then
             -- Models often arrive before attributes; indexing each model once lets
             -- later replication become eligible without installing thousands of listeners.
             if not state.targets[obj] then
@@ -1231,6 +1234,7 @@ do
                 state.evadeApproach, state.knockUntil = nil, nil
                 state.gun, state.explosive, state.gunRoute = nil, nil, nil
                 state.frontierAt, state.upperTarget, state.passiveVisit, state.passiveNextAt = nil, nil, nil, nil
+                state.inspection, state.inspections = nil, nil
                 state.approach, state.obstruction, state.saleRoute, state.saleRetryAt, state.salePreference = nil, nil, nil, nil, nil
                 -- These keys name objects/tokens in the departed world, never a
                 -- persistent purchase or inventory outcome.
@@ -1660,7 +1664,7 @@ do
     local function targetParts(model)
         local cached = state.targets[model]
         if type(cached) == "table" and cached.part and cached.part.Parent and cached.part.CanQuery ~= false then return cached.part end
-        local part = model.PrimaryPart
+        local part = model:IsA("Model") and model.PrimaryPart
         if not part or part.CanQuery == false then
             part = nil
             for _, obj in ipairs(model:GetDescendants()) do
@@ -1680,11 +1684,16 @@ do
         local primary = targetParts(model)
         if not primary then return nil end
         local cached = state.targets[model]
-        if not cached.faces then
+        if not cached.faces or os.clock() >= (cached.facesAt or 0) then
             cached.faces = {}
+            local signature = {}
             for _, obj in ipairs(model:GetDescendants()) do
-                if obj:IsA("BasePart") and obj.CanQuery ~= false then table.insert(cached.faces, obj) end
+                if obj:IsA("BasePart") and obj.CanQuery ~= false then
+                    table.insert(cached.faces, obj)
+                    table.insert(signature, targetId(obj) .. ":" .. tostring(obj.Position) .. ":" .. tostring(obj.Size))
+                end
             end
+            cached.facesAt, cached.geometry = os.clock() + 1, table.concat(signature, ";")
         end
         local best, position, distance
         for _, face in ipairs(cached.faces) do
@@ -1788,8 +1797,11 @@ do
         return best
     end
     local function hitFingerprint(target, family)
+        local cached = state.targets[target]
+        local geometry = target:GetAttribute("HP") ~= nil and type(cached) == "table" and cached.geometry or ""
         return tostring(target:GetAttribute("HP") or target:GetAttribute("Health")) .. ":"
             .. tostring(target:GetAttribute("Quantity")) .. ":" .. tostring(family) .. ":" .. tostring(player:GetAttribute("UnlockedLayer") or 1)
+            .. ":" .. tostring(geometry)
     end
     local function hit(target, result, family, cooldown, eventTarget)
         if not result or not result.Instance then return false end
@@ -2457,6 +2469,74 @@ do
         if selected and (due or equipped("Bucket") and distance <= range) then return true, selected, range end
         return false
     end
+    local function inspectRemainingTop(config, guardian, root, head)
+        local egg = state.lab:FindFirstChild("Egg")
+        if not egg or egg:GetAttribute("EventCarried") or egg:GetAttribute("Completed") then return false end
+        local candidate, surface, height
+        for model in pairs(state.targets) do
+            local hp, layer = model:GetAttribute("HP"), model:GetAttribute("Layer") or 1
+            local rejection = app.failures["hit:" .. targetId(model)]
+            local rejected = rejection and rejection.rejected == true and rejection.fingerprint == hitFingerprint(model, state.family)
+            if model.Parent and finite(hp) and hp > 0 and not model:GetAttribute("EggCore") and model:IsDescendantOf(egg)
+                and not rejected and layer <= (player:GetAttribute("UnlockedLayer") or 1) and not guardian.Covers(egg, layer, player) then
+                for _, face in ipairs(model:GetDescendants()) do
+                    if face:IsA("BasePart") and (not height or face.Position.Y > height) then
+                        candidate, surface, height = model, face.Position, face.Position.Y
+                    end
+                end
+            end
+        end
+        local guardianFailure = app.failures["hit:" .. targetId(egg)]
+        local guardianRejected = guardianFailure and guardianFailure.rejected == true and guardianFailure.fingerprint == hitFingerprint(egg, state.family)
+        if not candidate and not guardianRejected and (guardian.CanHit(egg, player) or guardian.CoreWaiting(egg, player)) then
+            -- Sample the actual native guardian profile from above. This only
+            -- chooses an inspection destination; attacks still need real LOS.
+            local center = config.EggCenter
+            local actual = guardian.Raycast(egg, player, center + Vector3.new(0, 64, 0), Vector3.new(0, -128, 0), nil)
+            if actual and actual.Guardian and actual.Instance == egg then candidate, surface = egg, actual.Position end
+        end
+        if not candidate then return false end
+        state.inspections = state.inspections or setmetatable({}, {__mode = "k"})
+        local native = guardian.State(egg, player)
+        local fp = tostring(candidate:GetAttribute("HP")) .. ":" .. tostring(surface) .. ":"
+            .. tostring(player:GetAttribute("UnlockedLayer")) .. ":" .. tostring(egg:GetAttribute("ShellGeneration"))
+            .. ":" .. tostring(native and native:GetAttribute("SlimeLayer"))
+        local record = state.inspections[candidate]
+        if not record or record.fingerprint ~= fp then record = {fingerprint = fp, tries = 0, nextAt = 0} state.inspections[candidate] = record end
+        local route = state.inspection
+        local continuing = route and route.target == candidate and route.fingerprint == fp
+        if not continuing and (record.tries >= 3 or os.clock() < record.nextAt) then return false end
+        if not route or route.target ~= candidate or route.fingerprint ~= fp then
+            record.tries += 1
+            local angle = (record.tries - 1) * math.pi * 2 / 3
+            local goal = surface + Vector3.new(math.cos(angle) * 2, 3, math.sin(angle) * 2) - (head.Position - root.Position)
+            route = {target = candidate, fingerprint = fp, at = os.clock(), goal = goal}
+            state.inspection = route
+            success("move:inspect-top")
+        end
+        local arrived, reason = move("mine", "inspect-top", candidate, surface, 5, {goal = route.goal, air = true})
+        app.status.farm = "Inspecting remaining top surface · " .. tostring(reason or "rechecking native attack ray")
+        if arrived then
+            route.arrivedAt = route.arrivedAt or os.clock()
+            local _, pos = aim(candidate, head.Position)
+            pos = candidate == egg and surface or pos
+            local actual = pos and contact(candidate, pos, head, reach(state.family or "Pickaxe", config), guardian)
+            if actual and (actual.Instance == candidate or actual.Instance:IsDescendantOf(candidate))
+                and (actual.Position - head.Position).Magnitude <= reach(state.family or "Pickaxe", config) then
+                -- Rearm only after a new airborne position proves a valid ray.
+                success("hit:" .. targetId(candidate)) success("move:target:" .. targetId(candidate))
+                state.target, state.selectAt, state.inspection = nil, 0, nil
+                record.nextAt = os.clock() + 15
+                return true
+            end
+        end
+        if os.clock() - route.at > 12 or route.arrivedAt and os.clock() - route.arrivedAt > 2 then
+            record.nextAt, state.inspection = os.clock() + 15, nil
+            if app.move and app.move.key == "inspect-top" then app:release() end
+            return false
+        end
+        return true
+    end
     local function farm(config, evolution)
         if not app.settings.farm or not state.lab or not refs.action then return end
         local _, root, head, hum = character()
@@ -2577,7 +2657,8 @@ do
                 local covered = {}
                 for _, model in ipairs(state.targetList) do
                     local hp, level = model:GetAttribute("HP"), model:GetAttribute("Layer") or 1
-                    local surface = model.PrimaryPart
+                    local surface = model:IsA("Model") and model.PrimaryPart
+                    if not surface and finite(hp) and hp > 0 then surface = targetParts(model) end
                     if model.Parent and finite(hp) and hp > 0 and not model:GetAttribute("EggCore")
                         and eggGeometry and model:IsDescendantOf(eggGeometry) and level <= unlocked and surface then
                         if covered[level] == nil then covered[level] = guardian.Covers(eggGeometry, level, player) end
@@ -2700,6 +2781,7 @@ do
             end
         end
         if not target or not target.Parent then
+            if not state.combat and tutorialStep ~= 2 and inspectRemainingTop(config, guardian, root, head) then return end
             -- Active round hover survives empty scans and streaming delays.
             app:release()
             state.approach, state.obstruction = nil, nil
@@ -3386,9 +3468,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v15.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v16.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v15 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v16 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -3417,7 +3499,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v16", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
