@@ -1,6 +1,6 @@
 task.wait(7)
 -- ChestFarmAutoLoop.lua: put this complete file in the executor's auto-execute folder.
--- Revision 10: fixes native loot Cost filtering and waits for chest-drop / inventory replication.
+-- Revision 11: native SaveGear church prompt and confirmation, with pre-timer church bookmarks.
 -- Hides the default Gameplay Paused popup after readiness; streaming pauses still apply.
 -- Includes Discord ending reports, cached discovery, and Blinker / identified boss ranged dodging.
 -- Continuous segmented depth travel; no healing, mining, selling, shops or team purchases.
@@ -10,8 +10,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 10
-    local BUILD = "r10-smart-loot-receipts"
+    local REVISION = 11
+    local BUILD = "r11-native-church-save"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -255,7 +255,10 @@ return function(source)
             {name = 'Cores earned', value = run.cores and tostring(math.floor(run.cores)) or 'Unavailable', inline = true},
             {name = 'Run time', value = string.format('%dm %02ds', math.floor(seconds / 60), seconds % 60), inline = true},
             {name = 'Items gained (observed)', value = itemsText(run.baseline and run.gained, 'Inventory not ready'), inline = false},
-            {name = 'Last carried gear', value = itemsText(run.carried, 'Inventory not ready'), inline = false}
+            {name = 'Last carried gear', value = itemsText(run.carried, 'Inventory not ready'), inline = false},
+            {name = 'Loot saved', value = outcome == 'RETURNED' and 'No verified save — ordinary lobby return does not save carried loot.'
+                or outcome == 'EXTRACTED' and 'Game saved-exit confirmed; saved item contents remain unverified.'
+                or 'No verified gear save.', inline = false}
         }
         return {id = run.id, status = 'queued', attempts = 0, created = clock(), body = {
             username = 'Earth Autofarm',
@@ -863,6 +866,7 @@ return function(api)
             end
         end)
     end
+    function M.prefetchAt(ctx, position) streamAhead(ctx, position) end
     function M.routeReady(ctx, x)
         local ground = M.scanPoint(ctx, x, true)
         streamAhead(ctx, ground)
@@ -935,7 +939,7 @@ end)()
         data = type(data) == 'table' and data or {}
         -- Old loot/mining/chest flags never opt the user into either new option.
         return { chest = true, smartLoot = data.smartLoot == true, extraction = data.extraction == true,
-            minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), schema = 10 }
+            minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), schema = 11 }
     end
     local loaded = s.config
     if not loaded then
@@ -1340,7 +1344,7 @@ end)()
             error('__EARTH_DEFENSE_RETRY', 0)
         end
         if ctx.featureOperation == 'gear' and not cfg.smartLoot
-            or (ctx.featureOperation == 'extract' or ctx.featureOperation == 'discovery') and not F.extractionReady() then
+            or (ctx.featureOperation == 'extract' or ctx.featureOperation == 'discovery' or ctx.featureOperation == 'church-search') and not F.extractionReady() then
             error('__EARTH_MODE_CHANGED', 0)
         end
     end
@@ -1383,16 +1387,51 @@ end)()
         if not safeToWork(ctx) then return false end
         return api.request('loot-action', service, method, api.pack(argument), callback)
     end
+    function F.isChurchSavePrompt(item)
+        -- UIController's native FramePrompt handler opens the frame whose name
+        -- equals the prompt Name. SaveGear is not a ReturnToLobby prompt.
+        return item and item.Parent and descendant(item, workspace) and item:IsA('ProximityPrompt')
+            and item.Name == 'SaveGear' and F.chestFallbackAllowed(item) and not F.skipLootArea(item)
+            and (tag(item, 'FramePrompt') or ancestry(item, 'church') or ancestry(item, 'altar'))
+    end
+    local function rememberChurch(ctx, item)
+        local point = position(item)
+        if not point then return end
+        local band = tonumber(workspace:GetAttribute('InfiniteDepthOffsetMeters')) or 0
+        local key = string.format('%.1f:%.1f:%.1f:%s', point.X, point.Y, point.Z, tostring(band))
+        s.churchMemories = s.churchMemories or {}
+        for _, record in ipairs(s.churchMemories) do
+            if record.key == key then record.seen = now(); return end
+        end
+        s.churchMemories[#s.churchMemories + 1] = {key = key, position = point, band = band, seen = now()}
+        if #s.churchMemories > 12 then table.remove(s.churchMemories, 1) end
+    end
+    function F.observeChurch(ctx)
+        if not cfg.extraction or now() < (ctx.churchObserveAt or 0) then return end
+        ctx.churchObserveAt = now() + 1
+        -- Read-only collection before the timer prevents streaming-out churches
+        -- from being forgotten. Movement and SaveGear still require the timer.
+        for _, item in ipairs(tagged('FramePrompt')) do
+            if F.isChurchSavePrompt(item) then rememberChurch(ctx, item) end
+        end
+        -- OnboardingFeedbackController uses this exact tag/name for a church.
+        for _, item in ipairs(tagged('OnboardingAttachment')) do
+            if item.Name == 'Church' and descendant(item, workspace) and not F.skipLootArea(item)
+                and F.chestFallbackAllowed(item) then rememberChurch(ctx, item) end
+        end
+    end
     local function index(ctx)
+        F.observeChurch(ctx)
         if ctx.featureIndex and now() < (ctx.indexAt or 0) and not next(ctx.indexPending or {}) then return ctx.featureIndex end
         local refresh = not ctx.featureIndex or now() >= (ctx.fullIndexAt or 0)
         local data, seen = { church = {} }, {}
         local function classify(item)
             if not item or not item.Parent or not item:IsA('ProximityPrompt') or seen[item] or F.skipLootArea(item) then return end
             local action = (tostring(item.ActionText or '') .. ' ' .. item.Name):lower()
-            if (ancestry(item, 'church') or ancestry(item, 'altar')) and F.chestFallbackAllowed(item)
+            if F.isChurchSavePrompt(item) or (ancestry(item, 'church') or ancestry(item, 'altar')) and F.chestFallbackAllowed(item)
                 and (action:find('lobby', 1, true) or action:find('extract', 1, true) or action:find('return', 1, true)) then
                 seen[item] = true; data.church[#data.church + 1] = item
+                if cfg.extraction then rememberChurch(ctx, item) end
             end
         end
         for _, item in ipairs(ctx.featureIndex and ctx.featureIndex.church or {}) do classify(item) end
@@ -1408,6 +1447,9 @@ end)()
             ctx.fullIndexAt = now() + 30
         end
         for item in pairs(ctx.indexPending or {}) do classify(item) end
+        -- Tags can arrive after DescendantAdded. Query the small native registry
+        -- independently of a full workspace refresh.
+        for _, item in ipairs(tagged('FramePrompt')) do classify(item) end
         ctx.indexPending = {}
         ctx.featureIndex, ctx.indexAt = data, now() + 2
         return data
@@ -2110,12 +2152,111 @@ end)()
         end
         return false
     end
+    local function savedChurchState()
+        if api.Players.LocalPlayer:GetAttribute('SavedExitTeleportLocked') ~= true then return false end
+        s.forceFresh = true
+        pcall(function() api.TeleportService:SetTeleportSetting('ChestFarmAutoLoop_FreshRun', true) end)
+        status('Game saved-exit state confirmed; awaiting lobby transfer')
+        return true
+    end
+    local function saveGearFrame()
+        local ui = controller('UIController')
+        if not ui or type(ui.GetFrame) ~= 'function' then return nil end
+        local ok, frame = pcall(ui.GetFrame, ui, 'SaveGear')
+        if not ok or not frame or not frame.Parent then return nil end
+        if type(ui.GetUI) == 'function' then
+            local read, root = pcall(ui.GetUI, ui)
+            if not read or not root or root.Enabled == false then return nil end
+        end
+        return frame, ui
+    end
+    local function confirmChurch(ctx, prompt)
+        if not F.extractionReady() or not F.isChurchSavePrompt(prompt) or prompt.Enabled == false then return false end
+        if not tag(prompt, 'FramePrompt') then status('Church SaveGear prompt is waiting for its native FramePrompt tag'); return false end
+        local point = position(prompt)
+        local radius = tonumber(prompt.MaxActivationDistance) or 10
+        if not point or radius <= 0 or api.Players.LocalPlayer.GameplayPaused == true
+            or (ctx.root.Position - point).Magnitude > radius then
+            status('Church confirmation waits for actual prompt range and loaded content'); return false
+        end
+        local frame, ui = saveGearFrame()
+        if frame and frame.Visible ~= true and type(ui.ToggleFrame) == 'function' then
+            -- Some executor helpers only deliver the server Triggered event.
+            -- Reproduce the verified native local FramePrompt UI action too.
+            pcall(ui.ToggleFrame, ui, 'SaveGear', true, false, true)
+            wait(ctx, 0.1)
+        end
+        frame = saveGearFrame()
+        if not frame or frame.Visible ~= true then
+            status('Church SaveGear prompt found; waiting for its native confirmation frame'); return false
+        end
+        -- Revalidate after the UI yield; an option change or correction cannot
+        -- turn a delayed local frame into permission for a save elsewhere.
+        ctx.check()
+        if not F.extractionReady() or not safeToWork(ctx) or not F.isChurchSavePrompt(prompt)
+            or prompt.Enabled == false or api.Players.LocalPlayer.GameplayPaused == true
+            or (ctx.root.Position - point).Magnitude > radius or s.churchSave then return false end
+        local record = {started = now(), prompt = prompt, point = point}
+        s.churchSave = record
+        local issued = api.request('church-save', 'PlayerService', 'SaveGear', api.pack(), function(result)
+            record.settled, record.accepted = true, result[1] and not not result[2]
+            record.retryAt = now() + 15
+            if record.accepted then
+                status('Church SaveGear accepted; awaiting the game saved-exit state')
+            else status('Church SaveGear rejected; retrying the native church flow after 15 seconds') end
+        end)
+        if not issued then s.churchSave = nil; status('Church save request not ready; retrying without a duplicate'); return false end
+        record.issued = true
+        status('Confirming church SaveGear; awaiting server reply')
+        -- The transition request is owned by the supervisor, survives a worker
+        -- replacement, and blocks overlapping lobby/start/save requests.
+        return true
+    end
+    local function revisitChurch(ctx)
+        if not F.extractionReady() or now() < (ctx.churchRevisitAt or 0) or s.churchSave then return false end
+        local band = tonumber(workspace:GetAttribute('InfiniteDepthOffsetMeters')) or 0
+        local best, distance
+        for _, record in ipairs(s.churchMemories or {}) do
+            if record.band == band and now() >= (record.retryAt or 0) then
+                local d = (record.position - ctx.root.Position).Magnitude
+                if not distance or d < distance then best, distance = record, d end
+            end
+        end
+        if not best or not acquire(ctx, 'church-search') then return false end
+        ctx.churchRevisitAt, best.retryAt = now() + 10, now() + 30
+        status('Revisiting a church seen earlier; waiting for its SaveGear prompt to stream in')
+        movement.prefetchAt(ctx, best.position)
+        movement.hover(ctx)
+        ctx.root.CFrame = CFrame.new(best.position + Vector3.new(0, 3, 3))
+        if ctx.root.AssemblyLinearVelocity then ctx.root.AssemblyLinearVelocity = Vector3.zero end
+        wait(ctx, 0.5)
+        ctx.indexAt, ctx.fullIndexAt = 0, 0
+        release(ctx); return true
+    end
     local function extract(ctx, data)
         if not F.extractionReady() then return false end
+        if savedChurchState() then return true end
+        local save = s.churchSave
+        if save then
+            if not save.settled then status('Church SaveGear reply pending; no duplicate save is sent'); return false end
+            if save.accepted then status('Church save accepted; waiting for server exit confirmation'); return false end
+            if now() < (save.retryAt or 0) then return false end
+            s.churchSave = nil
+        end
         local prompt = nearest(ctx, data.church, function(item)
             return item.Enabled ~= false and F.chestFallbackAllowed(item)
         end)
-        if not prompt then status('Minimum time met; searching for a loaded church return prompt'); return false end
+        if not prompt then
+            if revisitChurch(ctx) then return true end
+            status(s.runExhausted and 'No church SaveGear prompt loaded; available tunnel exhausted, waiting for server content'
+                or 'Minimum time met; looking for native church SaveGear prompts')
+            if now() >= (ctx.churchNoticeAt or 0) then
+                ctx.churchNoticeAt = now() + 30
+                print('[Earth Church] No eligible prompt loaded; remembered churches=' .. tostring(#(s.churchMemories or {}))
+                    .. ', route exhausted=' .. tostring(s.runExhausted == true) .. '. Ordinary return does not save loot.')
+            end
+            return false
+        end
         if now() < (ctx.extractAt or 0) or now() < (ctx.packRetryAt or 0) then return false end
         if s.lootRequest then status('Church return waits for the outstanding item reply; chest work continues'); return false end
         if not acquire(ctx, 'extract') then return false end
@@ -2130,13 +2271,14 @@ end)()
         s.extractionAttempt, s.extractionAttemptAt = true, now()
         local fired = firePrompt(ctx, prompt)
         if fired then
+            if F.isChurchSavePrompt(prompt) and not savedChurchState() then
+                confirmChurch(ctx, prompt)
+            end
             local deadline = now() + 1
             while safeToWork(ctx) and now() < deadline and api.Players.LocalPlayer:GetAttribute('SavedExitTeleportLocked') ~= true do wait(ctx, 0.05) end
-            if api.Players.LocalPlayer:GetAttribute('SavedExitTeleportLocked') == true then
-                s.forceFresh = true
-                pcall(function() api.TeleportService:SetTeleportSetting('ChestFarmAutoLoop_FreshRun', true) end)
-                status('Game saved-exit state confirmed; awaiting lobby transfer')
-            else status('Church prompt sent; save is unconfirmed, checking again after the retry interval') end
+            if not savedChurchState() and not s.churchSave and not F.isChurchSavePrompt(prompt) then
+                status('Church prompt sent; save is unconfirmed, checking again after the retry interval')
+            end
         else
             s.extractionAttempt, s.extractionAttemptAt = nil, nil
         end
@@ -2205,8 +2347,9 @@ end)()
         ctx.safePosition = ctx.root.Position
         if workspace.DescendantAdded then
             ctx.connect(workspace.DescendantAdded, function(item)
-                if item:IsA('ProximityPrompt') and cfg.extraction and F.extractionReady() then
+                if item:IsA('ProximityPrompt') and cfg.extraction then
                     ctx.indexPending = ctx.indexPending or {}; ctx.indexPending[item] = true
+                    if F.isChurchSavePrompt(item) then rememberChurch(ctx, item) end
                 end
             end)
         end
@@ -2234,6 +2377,7 @@ end)()
                     if ctx.dodgeUntil and now() < ctx.dodgeUntil then return end
                     if ctx.pendantAttempt and now() - ctx.pendantAttempt.started < 5 then release(ctx); return end
                     if not cfg.smartLoot and not cfg.extraction then release(ctx); return end
+                    F.observeChurch(ctx)
                     if (cfg.smartLoot or F.extractionReady()) and not s.itemDatabase then
                         status('Waiting for item definitions before smart loot / church packing'); return
                     end
@@ -2241,7 +2385,7 @@ end)()
                     if F.extractionReady() then
                         local data = index(ctx)
                         if extract(ctx, data) then return end
-                        if discover(ctx) then return end
+                        if not s.churchSave and discover(ctx) then return end
                     elseif cfg.extraction and s.runExhausted then
                         status(string.format('Chest route complete; church extraction unlocks in %.0fs', cfg.minutes * 60 - (now() - s.lootStarted)))
                     end
@@ -3264,6 +3408,7 @@ end
         if isLobby then
             s.deadSince, s.drillMissingSince, s.everReady = nil, nil, false
             s.lootStarted, s.extractionAttempt, s.extractionAttemptAt = nil, nil, nil
+            s.churchSave, s.churchMemories = nil, nil
             if not features.enabled() then stopFarm(); status("Both farm modes are off"); return end
             lobby(player, model, humanoid, root)
             claimRewards(player)
