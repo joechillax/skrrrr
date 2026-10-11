@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v21.
+-- Crack the Egg: lobby + round progression, v22.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -230,7 +230,7 @@ local function fail(key, fingerprint, reason)
     app.cooldowns[key] = os.clock() + math.min(30, 2 ^ count)
     if count >= 3 then
         app.blocks[key] = {fingerprint = fingerprint, reason = reason,
-            retryAt = app.eventKeys and app.eventKeys[key] and os.clock() + 30 or nil}
+            retryAt = (key == "equip-tool:Gun" or app.eventKeys and app.eventKeys[key]) and os.clock() + 30 or nil}
     end
     app:note(key .. ": " .. tostring(reason))
 end
@@ -1303,7 +1303,7 @@ do
             end
             if state.pending.equip then return false end
         end
-        if equipped(family) then return true end
+        if equipped(family) then success("equip-tool:" .. family) return true end
         if not owns(family, config) then return false end
         local drillReleased, bucketReleased = lease("Drill", false), lease("Bucket", false)
         if not drillReleased or not bucketReleased or state.leases.Drill or state.leases.Bucket then return false end
@@ -1368,6 +1368,14 @@ do
     local function allowedGun(gun)
         return gun and gun.Class ~= "Shotgun" and gun.Id ~= "RPG"
     end
+    local function combatGun()
+        local gun = ownedGun()
+        return allowedGun(gun) and gun or nil
+    end
+    local function selectableTool(family, config)
+        return owns(family, config) and not (family == "HandDrill"
+            and player:GetAttribute("Evolution_HandDrill") == 3 and combatGun())
+    end
     local function gunValue(gun)
         if not allowedGun(gun) then return 0 end
         local catalog = module("BreakTheEgg", "GunCatalog")
@@ -1375,7 +1383,7 @@ do
         return (gun.FoeDamage or 1) * gun.Pellets * rate * gun.Magazine / (gun.Magazine + rate * gun.Reload)
     end
     local function flameOwned(config)
-        return owns("HandDrill", config) and player:GetAttribute("Evolution_HandDrill") == 3
+        return selectableTool("HandDrill", config) and player:GetAttribute("Evolution_HandDrill") == 3
     end
     local function gunState(gun)
         local ammo = player:GetAttribute("GunAmmo")
@@ -1402,20 +1410,16 @@ do
         for id, at in pairs(g.shots) do if os.clock() - at > 5 then g.shots[id] = nil end end
         return g
     end
-    local function gunUsable()
-        local gun = ownedGun()
-        if not gun then return nil end
-        if not allowedGun(gun) then return nil end
-        if gun and not equipped("Gun") then
-            local fp = "Gun:" .. tostring(player.Character) .. ":" .. tostring(gun.Id)
-            if not eligible("equip-tool:Gun", fp) then return nil end
-        end
-        if not module("BreakTheEgg", "GunBallistics") then return nil end
-        local g = gun and gunState(gun)
-        if not g then return nil end
+    local function gunPause(gun)
+        if not equipped("Gun") then return "waiting for matching gun equip" end
+        if not module("BreakTheEgg", "GunBallistics") then return "waiting for native gun ballistics" end
+        local g = gunState(gun)
+        if not g then return "waiting for replicated ammo" end
         local reloadAt = player:GetAttribute("GunReloadAt") or 0
-        if finite(reloadAt) and reloadAt > workspace:GetServerTimeNow() or g.reload then return nil end
-        return gun -- An empty magazine is selected once to request native reload.
+        if finite(reloadAt) and reloadAt > workspace:GetServerTimeNow() or g.reload then return "reloading owned gun" end
+        if g.ammo <= 0 then return "requesting native reload" end
+        if os.clock() - (state.gunEquipAt or -math.huge) < 0.16 + (gun.SpinUp or 0) then return "gun spin-up" end
+        return nil
     end
     local function shopStock()
         local folder = folderAt("BreakTheEgg")
@@ -1834,13 +1838,13 @@ do
         if not head then return false end
         local family, best = "Pickaxe", nil
         for _, name in ipairs({"Pickaxe", "HandDrill", "Drill"}) do
-            if owns(name, config) and (name ~= "Drill" or (player:GetAttribute("DrillFuel") or 30) > 0
+            if selectableTool(name, config) and (name ~= "Drill" or (player:GetAttribute("DrillFuel") or 30) > 0
                 and (player:GetAttribute("DrillCoolingUntil") or 0) <= workspace:GetServerTimeNow()) then
                 local value = power(name, player:GetAttribute("Evolution_" .. name) or 1, config, evolution, "event")
                 if value and (not best or value > best) then family, best = name, value end
             end
         end
-        if gunUsable() then family = "Gun" elseif flameOwned(config) then family = "HandDrill" end
+        if combatGun() then family = "Gun" elseif flameOwned(config) then family = "HandDrill" end
         state.combatFamily = family
         for obj in pairs(state.enemies or {}) do
             local _, pos = aim(obj, head.Position)
@@ -2186,7 +2190,7 @@ do
         -- Dodge travel releases held inputs. Use tools which can deliver a
         -- discrete strike while moving instead of selecting an unheld drill.
         for _, name in ipairs({"Pickaxe", "HandDrill"}) do
-            if owns(name, config) then
+            if selectableTool(name, config) then
                 local value, interval = power(name, player:GetAttribute("Evolution_" .. name) or 1, config, evolution, "event")
                 if value and interval and (not score or value > score) then family, score, cooldown = name, value, interval end
             end
@@ -2197,7 +2201,7 @@ do
             cooldown = interval
         end
         if not family then return false end
-        local gun = gunUsable()
+        local gun = combatGun()
         if triggerOnly and not gun and not flameOwned(config) then return false end
         if gun then family, cooldown = "Gun", 0 end
         local best, result, distance
@@ -2235,7 +2239,11 @@ do
         if best then
             local hp = best:GetAttribute("HP") or best:GetAttribute("Health")
             local watch = state.triggerWatch
-            if not watch or watch.target ~= best or watch.family ~= family or watch.hp ~= hp then
+            local pause = gun and gunPause(gun)
+            if pause then
+                state.triggerWatch = nil -- Reload/equip waits are not damage-free firing.
+                app.status.gunCombat = gun.Name .. " · " .. pause
+            elseif not watch or watch.target ~= best or watch.family ~= family or watch.hp ~= hp then
                 state.triggerWatch = {target = best, family = family, hp = hp, at = os.clock()}
             elseif os.clock() - watch.at > 5 then
                 fail("hit:" .. targetId(best), hitFingerprint(best, family), "Trigger target made no damage progress; trying another enemy")
@@ -2243,7 +2251,10 @@ do
                 return false
             end
             if equip(family, config) then
-                if gun then shoot(best, result, gun) else hit(best, result, family, cooldown, best:GetAttribute("EggCore") ~= true) end
+                if gun then
+                    shoot(best, result, gun)
+                    app.status.gunCombat = gun.Name .. " · " .. (gunPause(gun) or "aiming/firing at live enemy")
+                else hit(best, result, family, cooldown, best:GetAttribute("EggCore") ~= true) end
             end
             -- Keep combat equipment through spin-up/reload/receipt gaps. This
             -- owns equipment only; shop/dodge travel continues independently.
@@ -2252,6 +2263,13 @@ do
         -- A deliberate backoff is not damage-free firing time. Otherwise a
         -- stale watch immediately rejects the first attempt after retry expiry.
         state.triggerWatch = nil
+        local phase = state.lab:GetAttribute("BossPhase")
+        if gun and (state.combat or phase == "Core") then
+            equip("Gun", config)
+            app.status.gunCombat = gun.Name .. " · " .. (gunPause(gun) or "seeking a clear enemy trace")
+            -- Boss evasion owns pursuit; ordinary thieves still need farm travel.
+            if phase == "Wave" or phase == "Intermission" or phase == "Core" then return true end
+        end
         return false
     end
     local function clearance(h, position, at, margin, warning)
@@ -2534,7 +2552,7 @@ do
                 return true
             end
             state.airPursuitAt = now + 0.25
-            local gun = gunUsable()
+            local gun = combatGun()
             local family = gun and "Gun" or flameOwned(config) and "HandDrill" or "Pickaxe"
             local range = reach(family, config)
             local _, _, actualHead = character()
@@ -3161,7 +3179,7 @@ do
         if mode ~= "collect" then
             local best
             for _, candidate in ipairs({"Pickaxe", "HandDrill", "Drill"}) do
-                if owns(candidate, config)
+                if selectableTool(candidate, config)
                     and (candidate ~= "Drill" or (player:GetAttribute("DrillFuel") or 30) > 0
                     and (player:GetAttribute("DrillCoolingUntil") or 0) <= workspace:GetServerTimeNow()) then
                     local value, cd = power(candidate, player:GetAttribute("Evolution_" .. candidate) or 1, config, evolution, mode)
@@ -3171,7 +3189,7 @@ do
             if not best then app.status.farm = "No ready owned mining tool in range" app:release() return end
             if tutorialStep == 1 then family, cooldown = "Pickaxe", player:GetAttribute("ToolCooldown_Pickaxe") or config.ToolById.Pickaxe.Cooldown end
         end
-        local gun = (mode == "event" or mode == "core") and gunUsable()
+        local gun = (mode == "event" or mode == "core") and combatGun()
         if gun then family, cooldown = "Gun", 0 end
         if not gun and (mode == "event" or mode == "core") and flameOwned(config) then
             family = "HandDrill"
@@ -3303,6 +3321,8 @@ do
         local watch = state.activity
         if not finite(measuredHP) and not finite(measuredQuantity) then
             state.activity = nil
+        elseif gun and gunPause(gun) then
+            state.activity = nil -- Native reload/replication is not an unsuccessful hit.
         elseif not watch or watch.target ~= target or watch.progress ~= progress then
             state.activity = {target = target, progress = progress, at = os.clock()}
         elseif os.clock() - watch.at > 5 then
@@ -3371,7 +3391,7 @@ do
         end
         local family, damage, cooldown
         for _, name in ipairs({"Pickaxe", "HandDrill", "Drill"}) do
-            if owns(name, config) and (name ~= "Drill" or (player:GetAttribute("DrillFuel") or 0) > 0) then
+            if selectableTool(name, config) and (name ~= "Drill" or (player:GetAttribute("DrillFuel") or 0) > 0) then
                 local value, interval = power(name, player:GetAttribute("Evolution_" .. name) or 1, config, evolution, "event")
                 if value and interval and (not damage or value > damage) then family, damage, cooldown = name, value, interval end
             end
@@ -3766,6 +3786,8 @@ do
             .. "; sale retry=" .. tostring(state.saleRoute and state.saleRoute.tries or 0))
         table.insert(lines, "Gun: " .. tostring(self.status.gun or "not checked") .. "; confirmed buys=" .. tostring(state.stats.gunBuys or 0)
             .. "; acknowledged shots=" .. tostring(state.stats.gunShots or 0) .. "; ammo=" .. tostring(state.gun and state.gun.ammo))
+        table.insert(lines, "Combat gun: " .. tostring(self.status.gunCombat or "not selected")
+            .. "; owned permitted gun takes priority through reload/equip waits; Flamethrower only without one")
         table.insert(lines, tostring(self.status.explosive or "Explosives: waiting for owned ready charges")
             .. "; acknowledged throws=" .. tostring(state.stats.explosives or 0))
         table.insert(lines, "Shell Magnet=" .. tostring(player:GetAttribute("VIPOwned_vip_magnet"))
@@ -3883,9 +3905,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v21.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v22.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v21 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v22 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -3914,7 +3936,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v21", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v22", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
