@@ -1,6 +1,6 @@
 task.wait(7)
 -- ChestFarmAutoLoop.lua: put this complete file in the executor's auto-execute folder.
--- Revision 11: native SaveGear church prompt and confirmation, with pre-timer church bookmarks.
+-- Revision 13: skips CommonChest; optional combined smart loot and native altar extraction.
 -- Hides the default Gameplay Paused popup after readiness; streaming pauses still apply.
 -- Includes Discord ending reports, cached discovery, and Blinker / identified boss ranged dodging.
 -- Continuous segmented depth travel; no healing, mining, selling, shops or team purchases.
@@ -11,7 +11,7 @@ return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
     local REVISION = 13
-    local BUILD = "r13-combined-loot-efficiency"
+    local BUILD = "r13-ignore-common-chest"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -1205,6 +1205,7 @@ end)()
     F.promptPosition = position
     function F.chestFallbackAllowed(item)
         while item and item ~= workspace do
+            if item.Name == 'CommonChest' or item:GetAttribute('RealName') == 'CommonChest' then return false end
             if tag(item, 'ShopItem') or (tonumber(item:GetAttribute('Cost')) or 0) > 0
                 or item:GetAttribute('Robux') == true or item:GetAttribute('ProductId') ~= nil
                 or item:GetAttribute('RobuxProductId') ~= nil then return false end
@@ -3038,7 +3039,7 @@ end
             end})
         function ctx.prepareChestPrompt(prompt)
             ctx.check()
-            if not prompt.Parent or prompt.Enabled == false then return false end
+            if not prompt.Parent or prompt.Enabled == false or not features.chestFallbackAllowed(prompt) then return false end
             local target = features.promptPosition(prompt) or (ctx.currentChest and ctx.currentChest.entry.Pos)
             if not target then
                 print('[ChestFarm] Waiting for a chest prompt position to load'); return false
