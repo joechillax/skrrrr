@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v25.
+-- Crack the Egg: lobby + round progression, v26.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -1256,7 +1256,7 @@ do
                 state.chests, state.offers, state.done = {}, {}, {}
                 state.workerAttempt, state.activity, state.hold, state.evadeGoal, state.bagSince, state.needScaffold = nil, nil, nil, nil, nil, nil
                 state.evadeApproach, state.knockUntil, state.quakeFlight, state.physicsEvadeAt = nil, nil, nil, nil
-                state.gun, state.explosive, state.gunRoute = nil, nil, nil
+                state.gun, state.explosive, state.gunRoute, state.matchReset = nil, nil, nil, nil
                 state.frontierAt, state.upperTarget, state.passiveVisit, state.passiveNextAt = nil, nil, nil, nil
                 state.inspection, state.inspections, state.eventRecoveries = nil, nil, nil
                 state.approach, state.obstruction, state.saleRoute, state.saleRetryAt, state.salePreference = nil, nil, nil, nil, nil
@@ -3856,11 +3856,41 @@ do
             state.padStarted = state.padStarted or os.clock()
         end
     end
+    function app:resetAtMatchLimit()
+        if not self.running or self.teleporting or game.PlaceId ~= 104087083666671 then return false end
+        local joined, now = player:GetAttribute("SessionJoinedAt"), workspace:GetServerTimeNow()
+        -- Use the same authoritative elapsed clock as SessionClient's HUD.
+        -- Missing/future timestamps never substitute script uptime or UTC.
+        if not finite(joined) or joined < 0 or not finite(now) or now - joined < 3600 then return false end
+        if state.won or finite(player:GetAttribute("PersonalEndingAt")) or player:GetAttribute("WinCutscene") == true then return false end
+        local c, _, _, hum = character()
+        if not c then return false end
+        local reset = state.matchReset
+        if not reset or reset.joined ~= joined then
+            reset = {joined = joined, attempts = 0}
+            state.matchReset = reset
+        end
+        if reset.done then return false end
+        self.status.farm = "60-minute match limit · resetting character"
+        self:release(false)
+        self:restoreSpeed()
+        if reset.at and os.clock() - reset.at < 10 or reset.attempts >= 3 then return true end
+        reset.at, reset.attempts = os.clock(), reset.attempts + 1
+        local healthOK = pcall(function() hum.Health = 0 end)
+        local jointsOK = pcall(c.BreakJoints, c)
+        if jointsOK or healthOK and hum.Health <= 0 then
+            reset.done = true
+            state.stats.matchResets = (state.stats.matchResets or 0) + 1
+            self:note("60-minute match limit reached; character reset requested")
+        else self:note("Character reset failed; bounded retry pending") end
+        return true
+    end
     function app:stepRound()
         if game.PlaceId ~= 137477934962022 then self.preparationAt, self.preparationBypass = nil, nil end
         if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then self:release() self:restoreSpeed() return end
         if self.teleporting then self:release() self:restoreSpeed() return end
         refresh()
+        if self:resetAtMatchLimit() then return end
         repeatRound()
         if game.PlaceId ~= 104087083666671 then self:restoreFlight() if not gate() then self:updateSpeed() else self:restoreSpeed() end return end
         if not refs.action or not state.lab then self:release() self:restoreSpeed() self.status.farm = "Waiting for BreakTheEgg world + Action" return end
@@ -3971,7 +4001,10 @@ do
             "Boss evasion: replicated slams/globs/puddles/grabs + upward quake/lane/beam flight; active records=" .. tostring(state.hazardCount or 0)
                 .. "; melee avoidance zones=" .. tostring(state.meleeCount or 0)
                 .. "; native boss strikes=" .. tostring(state.stats.bossStrikes or 0) .. "; confirmed win receipts=" .. tostring(state.stats.wins or 0),
-            "AFK watchdog=" .. tostring(self.watch and math.floor(os.clock() - self.watch.at) or 0) .. " seconds without measurable progress; resume queued=" .. tostring(self.resumeQueued == true)}
+            "AFK watchdog=" .. tostring(self.watch and math.floor(os.clock() - self.watch.at) or 0) .. " seconds without measurable progress; resume queued=" .. tostring(self.resumeQueued == true),
+            "Match reset limit=3600s; SessionJoinedAt=" .. tostring(player:GetAttribute("SessionJoinedAt"))
+                .. "; reset requests=" .. tostring(state.stats.matchResets or 0)
+                .. "; current match reset=" .. tostring(state.matchReset and state.matchReset.done == true)}
         local eventCount, eventBlocks = 0, 0
         for _ in pairs(state.enemies or {}) do eventCount += 1 end
         for key in pairs(self.eventKeys or {}) do
@@ -4111,9 +4144,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v25.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v26.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v25 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v26 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -4142,7 +4175,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v25", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v26", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
