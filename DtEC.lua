@@ -11,7 +11,7 @@ return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
     local REVISION = 13
-    local BUILD = "r13-remembered-item-reloading"
+    local BUILD = "r13-remembered-reload-v131"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -736,8 +736,10 @@ return function(api)
         end)
     end
     function B.cleanup(ctx)
+        if B.worldChanged then B.worldChanged(ctx) end
         if cancelReload then cancelReload(ctx) end
         ctx.itemObservePending, ctx.itemObserveCount = nil, nil
+        ctx.itemWorldSnapshot, ctx.itemWorldAt, ctx.itemWorldDirty = nil, nil, nil
         local job = s.bringDelivery
         if job and job.ctx == ctx then cancel(job) end
     end
@@ -748,8 +750,8 @@ return function(api)
         -- not extraction. Its late reply can only release; it cannot pick up loot.
         return job ~= nil and not job.cancelled
     end
-    local function loose(ctx, item)
-        if not api.free(item) or not api.part(item) or api.skip(item) then return false end
+    local function looseMetadata(item)
+        if not api.free(item) or api.skip(item) then return false end
         if item:GetAttribute('Welded') or api.tag(item, 'Welded') or api.tag(item, 'BuyPart')
             or api.tag(item, 'Ore') or item:GetAttribute('Placed') == true
             or item:GetAttribute('CraftedPlaceable') == true then return false end
@@ -761,6 +763,7 @@ return function(api)
         local owner = tonumber(item:GetAttribute('OwnerUserId'))
         return not owner or owner == 0 or owner == api.Players.LocalPlayer.UserId
     end
+    local function loose(ctx, item) return api.part(item) ~= nil and looseMetadata(item) end
     -- Remembered Item Reloading adapted from manual DTeC's Memory/LoadTick.
     -- Only real seen loose drops are remembered. No saved Instance is sent to
     -- the server after unloading; normal bringing revalidates the loaded item.
@@ -773,15 +776,44 @@ return function(api)
             m = {records = {}, byTarget = {}, serial = 0, band = band, job = job}
             s.lootItemMemory = m
             ctx.bringScan = nil
+            ctx.itemWorldSnapshot, ctx.itemWorldAt, ctx.itemWorldDirty = nil, nil, nil
         end
         return m
+    end
+    function B.worldChanged(ctx)
+        local m = s.lootItemMemory
+        if workspace:GetAttribute('InfiniteRebasing') then
+            if m then
+                if m.reload then api.cancelReload(m.reload.ctx, m.reload.token); m.reload = nil end
+                for _, record in ipairs(m.records) do record.invalid = true end
+                m.records, m.byTarget, m.rebasing = {}, {}, true
+            end
+            ctx.itemObservePending, ctx.itemObserveCount, ctx.bringScan = nil, nil, nil
+            ctx.itemWorldSnapshot, ctx.itemWorldAt, ctx.itemWorldDirty = nil, nil, nil
+            if api.enabled() then s.smartLootStatus = 'World coordinates are shifting; remembered loot reload paused' end
+            return true
+        elseif m and m.rebasing then
+            m.rebasing = nil; ctx.bringScan, ctx.bringScanAt = nil, 0
+            if api.enabled() then s.smartLootStatus = 'World ready; remembered loot scan resumed' end
+        end
+        return false
+    end
+    local function loadedItems(ctx, force)
+        -- Share the read-only view between reloading and ordinary delivery.
+        -- Events invalidate it, but cannot trigger repeated whole-list reads.
+        local age = now() - (ctx.itemWorldAt or -math.huge)
+        if force or not ctx.itemWorldSnapshot or age >= 1 or ctx.itemWorldDirty and age >= 0.25 then
+            ctx.itemWorldSnapshot, ctx.itemWorldAt, ctx.itemWorldDirty = api.items(), now(), nil
+        end
+        return ctx.itemWorldSnapshot
     end
     local function live(ctx, record)
         local item = record.target
         if record.invalid or not item then return nil end
         if item.Parent and item.Parent ~= workspace:FindFirstChild('Items') then record.invalid = true; return nil end
+        if item.Parent and not looseMetadata(item) then record.invalid = true; return nil end
         if item.Parent and api.part(item) then
-            if loose(ctx, item) and api.id(item) == record.id then return item end
+            if api.id(item) == record.id then return item end
             record.invalid = true -- Loaded stock/ownership/tag changes are not streaming loss.
         end
     end
@@ -801,14 +833,19 @@ return function(api)
         end
     end
     local function capture(ctx, item, useful)
-        if not api.enabled() or not useful then return end
+        if not api.enabled() or not useful or workspace:GetAttribute('InfiniteRebasing') then return end
         local m = memory(ctx)
         local record = m.byTarget[item]
         if s.bringDelivery and s.bringDelivery.item == item then return record end
         -- Losing the parent/parts is the condition this feature recovers from;
         -- it must not be mistaken for a newly ineligible loaded drop.
-        if not item.Parent or not api.part(item) then return record end
-        if not loose(ctx, item) or not useful(item) then
+        if not item.Parent then return record end
+        if not looseMetadata(item) then
+            if record then record.invalid = true end
+            return
+        end
+        if not api.part(item) then return record end
+        if not useful(item) then
             if record then record.invalid = true end
             return
         end
@@ -834,7 +871,7 @@ return function(api)
         return record
     end
     function B.observe(ctx, item)
-        if not api.enabled() or not ctx.active or not api.rememberSnapshot then return end
+        if not api.enabled() or not ctx.active or not api.rememberSnapshot or B.worldChanged(ctx) then return end
         local items = workspace:FindFirstChild('Items')
         if not items then return end
         local target = item
@@ -843,6 +880,7 @@ return function(api)
             target = target.Parent
         end
         if not target or target.Parent ~= items or not (target:IsA('Model') or target:IsA('BasePart')) then return end
+        ctx.itemWorldDirty = true
         ctx.itemObservePending = ctx.itemObservePending or {}
         if not ctx.itemObservePending[target] and (ctx.itemObserveCount or 0) < 256 then
             ctx.itemObservePending[target] = true; ctx.itemObserveCount = (ctx.itemObserveCount or 0) + 1
@@ -862,6 +900,8 @@ return function(api)
     end
     memoryStep = function(ctx)
         if not api.rememberSnapshot then return end
+        if api.reloadTick then api.reloadTick(ctx) end
+        if B.worldChanged(ctx) then cancelReload(ctx); return end
         if not ctx.active or not api.enabled() or not api.owned() or not api.safe(ctx) or manual() then
             cancelReload(ctx); return
         end
@@ -878,10 +918,20 @@ return function(api)
         local reload = m.reload
         if reload and (reload.ctx ~= ctx or api.reloadEnabled and not api.reloadEnabled()) then cancelReload(); reload = nil end
         if reload then
+            local record, token = reload.record, reload.token
+            if token.done and not reload.pollUntil then
+                reload.pollUntil = token.ok and math.max(token.started + 3, now() + 0.15) or now() + 0.25
+            end
+            local finishing = token.expired or token.timedOut or token.blocked or now() - reload.started >= 10
+                or reload.pollUntil and now() >= reload.pollUntil
             -- Bounded rescan handles fresh Instances, partial model loading and
             -- delayed replication even when DescendantAdded is unavailable.
-            if not reload.scan and now() >= (reload.scanAt or 0) then
-                reload.scan = {items = api.items(), cursor = 1}; reload.scanAt = now() + 1
+            -- Like Memory.Poll in the manual script, force a final real view at
+            -- the observation boundary instead of trusting a stale earlier scan.
+            if finishing and not reload.finalStarted then
+                reload.scan = {items = loadedItems(ctx, true), cursor = 1}; reload.finalStarted = true
+            elseif not reload.scan and now() >= (reload.scanAt or 0) and not reload.finalStarted then
+                reload.scan = {items = loadedItems(ctx), cursor = 1}; reload.scanAt = now() + 1
             end
             if reload.scan then
                 local scan, useful = reload.scan, api.rememberSnapshot(ctx)
@@ -889,9 +939,11 @@ return function(api)
                     local item = scan.items[scan.cursor]; if not item then break end
                     scan.cursor = scan.cursor + 1; capture(ctx, item, useful)
                 end
-                if scan.cursor > #scan.items then reload.scan = nil end
+                if scan.cursor > #scan.items then
+                    reload.scan = nil
+                    if reload.finalStarted then reload.finalDone = true end
+                end
             end
-            local record, token = reload.record, reload.token
             local item = live(ctx, record)
             if item then
                 cancelReload(ctx); ctx.bringScan, ctx.bringScanAt = nil, 0
@@ -901,11 +953,18 @@ return function(api)
             if record.invalid or now() - record.seenAt > 1800 or not api.eligible(ctx, record.target) then cancelReload(ctx); return end
             api.pollReload(ctx, token)
             if token.started and not reload.counted then record.attempts = (record.attempts or 0) + 1; reload.counted = true end
-            if token.done and not reload.doneAt then reload.doneAt = now() end
-            if now() - reload.started >= 10 or reload.doneAt and now() - reload.doneAt >= (token.ok and 1.25 or 0.25) then
+            if token.done and not reload.pollUntil then
+                -- Match the manual script: a short native read still gets a
+                -- full three-second arrival window measured from actual dispatch.
+                reload.pollUntil = token.ok and math.max(token.started + 3, now() + 0.15) or now() + 0.25
+            end
+            if (token.expired or token.timedOut or token.blocked or now() - reload.started >= 10
+                or reload.pollUntil and now() >= reload.pollUntil) and (reload.finalDone or now() - reload.started >= 12) then
                 record.reloadAt = now() + 30 * 2 ^ math.max(0, (record.attempts or 1) - 1)
                 cancelReload(ctx)
-                s.smartLootStatus = 'Remembered loot still unloaded; chest route continues'
+                s.smartLootStatus = (token.blocked or token.cancelFailed)
+                    and 'Area request stalled; loaded loot and chest work continue'
+                    or 'Remembered loot still unloaded; chest route continues'
             end
             return
         end
@@ -1028,7 +1087,7 @@ return function(api)
         -- Bounded work per pulse: one local inventory view per chunk, 128 items
         -- maximum, and one world snapshot per second. Never walks Workspace here.
         if not ctx.bringScan then
-            ctx.bringScan = {items = api.items(), cursor = 1}
+            ctx.bringScan = {items = loadedItems(ctx), cursor = 1}
         end
         local scan = ctx.bringScan
         local eligible, useful = api.snapshot(ctx)
@@ -1248,12 +1307,45 @@ return function(api)
         end
         return reached
     end
+    local function deadStream(token)
+        return token.done or type(token.thread) == 'thread' and coroutine.status(token.thread) == 'dead'
+    end
+    local function clearStream(ctx, token)
+        if ctx.streamRequest == token then ctx.streamRequest = nil end
+        if token.ctx and token.ctx.streamRequest == token then token.ctx.streamRequest = nil end
+        if api.state.itemReloadFlight == token then api.state.itemReloadFlight = nil end
+    end
+    local function cancelStream(ctx, token)
+        if not deadStream(token) then
+            if now() < (token.cancelRetryAt or 0) then return false end
+            token.cancelRetryAt = now() + 0.5
+            if type(token.thread) == 'thread' and type(task.cancel) == 'function' then pcall(task.cancel, token.thread) end
+            if not deadStream(token) then token.cancelFailed = true; return false end
+        end
+        token.expired, token.done, token.ok, token.cancelFailed = true, true, false, nil
+        clearStream(ctx, token)
+        return true
+    end
+    function M.stepItemReload(ctx)
+        -- Retain an uncancellable read across worker replacement/reexecution.
+        -- Its real return (or confirmed closed coroutine) alone frees the slot.
+        local token = api.state.itemReloadFlight
+        if not token then return end
+        if deadStream(token) then clearStream(ctx, token); return end
+        if now() >= token.started + 3.5 then token.timedOut = true end
+        if token.cancelled or token.timedOut then cancelStream(ctx, token) end
+    end
     local function streamAhead(ctx, position)
+        M.stepItemReload(ctx)
+        local flight = api.state.itemReloadFlight
+        if flight and flight ~= ctx.streamRequest then return end
         if ctx.streamRequest then
             local token = ctx.streamRequest
-            if now() - token.started > 8 and token.thread and coroutine.status(token.thread) ~= 'dead' then
-                pcall(task.cancel, token.thread)
-                if coroutine.status(token.thread) ~= 'dead' then return end
+            if token.purpose == 'remembered-item' then
+                if not deadStream(token) then return end
+            elseif now() - token.started > 8 and token.thread and coroutine.status(token.thread) ~= 'dead' then
+                if type(task.cancel) == 'function' then pcall(task.cancel, token.thread) end
+                if coroutine.status(token.thread) ~= 'dead' then token.cancelFailed = true; return end
             end
             if not token.done and (not token.thread or coroutine.status(token.thread) ~= 'dead') then return end
             ctx.streamRequest = nil
@@ -1267,17 +1359,23 @@ return function(api)
         local queued = ctx.itemReloadRequest
         if queued and queued.cancelled then ctx.itemReloadRequest = nil; queued = nil end
         local token
-        if queued and now() >= (ctx.itemReloadAt or 0) then
+        if queued and now() >= math.max(ctx.itemReloadAt or 0, api.state.itemReloadAt or 0) then
             token, position = queued, queued.position
             ctx.itemReloadRequest, ctx.itemReloadAt = nil, now() + 8
+            api.state.itemReloadAt = ctx.itemReloadAt
         else token = {position = position} end
         token.started = now(); ctx.streamRequest = token
+        if token.purpose == 'remembered-item' then
+            token.ctx = ctx; api.state.itemReloadFlight = token
+        end
         token.thread = task.spawn(function()
             if not ctx.active or token.cancelled or api.owned and not api.owned() then
                 token.done, token.ok = true, false; return
             end
-            local ok, why = pcall(method, api.Players.LocalPlayer, position, 3)
+            local ok, why = pcall(method, api.Players.LocalPlayer, position,
+                token.purpose == 'remembered-item' and 0.75 or 3)
             token.done, token.ok = true, ok
+            if api.state.itemReloadFlight == token then api.state.itemReloadFlight = nil end
             if ctx.active and ctx.streamRequest == token and not ok then
                 ctx.streamError = tostring(why)
             end
@@ -1286,9 +1384,10 @@ return function(api)
     function M.prefetchAt(ctx, position) streamAhead(ctx, position) end
     function M.requestItemReload(ctx, position)
         if not ctx.active or not validVector(position) or ctx.streamUnsupported
+            or workspace:GetAttribute('InfiniteRebasing')
             or ctx.itemReloadRequest or ctx.streamRequest and ctx.streamRequest.purpose == 'remembered-item'
                 and not ctx.streamRequest.done and (not ctx.streamRequest.thread or coroutine.status(ctx.streamRequest.thread) ~= 'dead')
-            or now() < (ctx.itemReloadAt or 0) then return nil end
+            or now() < math.max(ctx.itemReloadAt or 0, api.state.itemReloadAt or 0) then return nil end
         local available, enabled = pcall(function() return workspace.StreamingEnabled end)
         local read, method = pcall(function() return api.Players.LocalPlayer.RequestStreamAroundAsync end)
         if available and enabled == false or not read or type(method) ~= 'function' then return nil end
@@ -1297,15 +1396,19 @@ return function(api)
         return token
     end
     function M.pollItemReload(ctx, token)
+        M.stepItemReload(ctx)
         if token.cancelled or token.done then return end
+        local flight = api.state.itemReloadFlight or ctx.streamRequest
+        if not token.started and flight and flight.cancelFailed then token.blocked = true; return end
         -- Also progresses when the normal chest sweep is parked/exhausted.
         streamAhead(ctx, M.scanPoint(ctx, api.state.routeScanX or point(ctx).X, true))
     end
     function M.cancelItemReload(ctx, token)
         token.cancelled = true
         if ctx.itemReloadRequest == token then ctx.itemReloadRequest = nil end
-        -- An already-running read keeps the shared slot until completion or the
-        -- normal route timeout. A late reply never authorizes loot collection.
+        if token.started then cancelStream(ctx, token) end
+        -- Failed cancellation retains the actual read; late replies cannot
+        -- resume the retired loot job or start a parallel area request.
     end
     function M.routeReady(ctx, x)
         local ground = M.scanPoint(ctx, x, true)
@@ -1352,7 +1455,8 @@ return function(api)
         if ctx.hoverForce then pcall(function() ctx.hoverForce:Destroy() end); ctx.hoverForce = nil end
         if ctx.hoverAttachment then pcall(function() ctx.hoverAttachment:Destroy() end); ctx.hoverAttachment = nil end
         local token = ctx.streamRequest
-        if token and token.thread and coroutine.status(token.thread) ~= 'dead' then pcall(task.cancel, token.thread) end
+        if token and token.purpose == 'remembered-item' then M.cancelItemReload(ctx, token)
+        elseif token and token.thread and coroutine.status(token.thread) ~= 'dead' then pcall(task.cancel, token.thread) end
         ctx.streamRequest = nil
         if ctx.itemReloadRequest then ctx.itemReloadRequest.cancelled = true; ctx.itemReloadRequest = nil end
     end
@@ -2181,6 +2285,7 @@ end)()
         eligible = function(ctx, item) return usefulSnapshot(ctx, true)(item) end,
         rememberSnapshot = function(ctx) local _, useful = usefulSnapshot(ctx, true); return useful end,
         requestReload = movement.requestItemReload, pollReload = movement.pollItemReload,
+        reloadTick = movement.stepItemReload,
         cancelReload = movement.cancelItemReload,
         reloadEnabled = function() return not F.extractionReady() end,
         score = lootScore, makeRoom = makeRoom, settleRoom = settleRareDrop,
@@ -3025,6 +3130,11 @@ end)()
         ctx.itemRetry, ctx.damageChecks, ctx.pickaxeTargets = {}, {}, {}
         ctx.sackDrop = s.pendingSackDrop
         ctx.safePosition = ctx.root.Position
+        if type(workspace.GetAttributeChangedSignal) == 'function' then
+            ctx.connect(workspace:GetAttributeChangedSignal('InfiniteRebasing'), function()
+                if cfg.lootExtract or s.lootItemMemory then bring.worldChanged(ctx) end
+            end)
+        end
         if workspace.DescendantAdded then
             ctx.connect(workspace.DescendantAdded, function(item)
                 if cfg.lootExtract then bring.observe(ctx, item) end
