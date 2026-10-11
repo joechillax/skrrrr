@@ -11,7 +11,7 @@ return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
     local REVISION = 13
-    local BUILD = "r13-moving-after-chests"
+    local BUILD = "r13-mythic-guns-rare-shard-room"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -801,6 +801,7 @@ return function(api)
         job.stage, job.readyAt = 'hold', now() + 0.45
     end
     function B.step(ctx, allowNew)
+        if api.settleRoom then api.settleRoom(ctx) end
         local job = s.bringDelivery
         if job then
             if job.ctx ~= ctx or not ctx.active or not api.enabled() or not api.owned()
@@ -826,6 +827,9 @@ return function(api)
                 if not api.eligible(ctx, job.item) then cancel(job); return true end
                 local p = api.part(job.item)
                 if not p or (p.Position - ctx.root.Position).Magnitude > 8 then cancel(job); return true end
+                -- Capacity replacement happens only after a successful ownership
+                -- grant and stable delivery. It never holds the character route.
+                if api.makeRoom and not api.makeRoom(ctx, job.item) then return true end
                 local receipt = api.receipt(ctx, job.item); receipt.brought = true
                 job.receipt, ctx.gearPickup = receipt, receipt
                 job.stage, job.receiptUntil = 'receipt', now() + 5
@@ -846,7 +850,8 @@ return function(api)
             return true
         end
         if not allowNew or not api.enabled() or not api.safe(ctx) or manual() or s.lootRequest
-            or s.equipmentRequest or ctx.gearPickup or now() < (ctx.bringScanAt or 0) then return false end
+            or s.equipmentRequest or ctx.gearPickup or api.roomPending and api.roomPending()
+            or now() < (ctx.bringScanAt or 0) then return false end
         -- Bounded work per pulse: one local inventory view per chunk, 128 items
         -- maximum, and one world snapshot per second. Never walks Workspace here.
         if not ctx.bringScan then
@@ -1530,15 +1535,18 @@ end)()
         return #inventory < 6 or RELICS[id(item)] == true and inventoryCount(ctx, id(item), inventory) > 0
     end
     F.isRelic, F.stackCount, F.hasRoom = isRelic, stackCount, hasRoom
+    local rarity = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6, Secret = 7 }
+    local GUNS = {Revolver = true, Rifle = true, Shotgun = true, BlackholeGun = true}
+    local function rarityRank(item) return rarity[attr(item, 'Rarity')] or 0 end
     local function weaponValue(item)
         local damage = tonumber(attr(item, 'Damage')) or 0
-        local speed = tonumber(attr(item, 'AttackSpeed')) or 1
+        local speed = tonumber(attr(item, GUNS[attr(item, 'Class')] and 'FireRate' or 'AttackSpeed')) or 1
         if damage ~= damage or damage == math.huge or damage < 0 then return 0 end
         if speed ~= speed or speed == math.huge or speed <= 0 then speed = 1 end
         return damage * speed
     end
-    local function findTool(ctx, class, inventory)
-        local best, score
+    local function findTool(ctx, class, inventory, rarityFirst)
+        local best, score, rank
         for _, tool in ipairs(inventory or tools(ctx)) do
             local name = id(tool)
             local candidate = attr(tool, 'Class')
@@ -1547,7 +1555,11 @@ end)()
             if candidate == class or class == 'ItemBag' and (name == 'Large_Sack' or name == 'ItemBag') then
                 local value = class == 'ItemBag' and (tonumber(attr(tool, 'MaxSize')) or (name == 'Large_Sack' and 20 or 10))
                     or weaponValue(tool)
-                if not best or value > score then best, score = tool, value end
+                local tier = rarityRank(tool)
+                local different = best and rarityFirst and tier > 0 and rank > 0 and tier ~= rank
+                if not best or different and tier > rank or not different and value > score then
+                    best, score, rank = tool, value, tier
+                end
             end
         end
         return best
@@ -1766,7 +1778,6 @@ end)()
         return ok
     end
     function F.prompt(ctx, prompt) return firePrompt(ctx, prompt) end
-    local rarity = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6, Secret = 7 }
     local function armorSlot(item)
         local slot = attr(item, 'ArmorType')
         if slot == 'Helmet' then slot = 'Head' elseif slot == 'Chestplate' then slot = 'Chest' elseif slot == 'Pants' then slot = 'Legs' end
@@ -1775,7 +1786,7 @@ end)()
     local function armorState(ctx)
         local state = {}
         for _, slot in ipairs({'Head', 'Chest', 'Legs', 'Boots'}) do
-            state[slot] = {armor = tonumber(ctx.character:GetAttribute(slot)) or 0, speed = 0, names = {}}
+            state[slot] = {armor = tonumber(ctx.character:GetAttribute(slot)) or 0, speed = 0, rarity = 0, names = {}}
         end
         for _, equipped in ipairs(children(ctx.character)) do
             local name = equipped:GetAttribute('ArmorName')
@@ -1787,6 +1798,8 @@ end)()
                 end)
                 current.armor = math.max(current.armor, tonumber(equipped:GetAttribute('Armor')) or 0, ok and tonumber(baseArmor) or 0)
                 current.speed = math.max(current.speed, tonumber(equipped:GetAttribute('SpeedBoost')) or 0, ok and tonumber(baseSpeed) or 0)
+                local ranked, value = pcall(function() return s.itemDatabase.GetAttribute(name, 'Rarity') end)
+                current.rarity = math.max(current.rarity, rarityRank(equipped), ranked and (rarity[value] or 0) or 0)
             end
         end
         return state
@@ -1795,19 +1808,26 @@ end)()
         local slot = armorSlot(item); if not slot then return false end
         local current = (state or armorState(ctx))[slot]
         if current.names[id(item)] then return false end
+        local rank = rarityRank(item)
+        if rank > 0 and current.rarity > 0 and rank ~= current.rarity then return rank > current.rarity end
         local armor = tonumber(attr(item, 'Armor')) or 0
         local speed = tonumber(attr(item, 'SpeedBoost')) or 0
         return armor > current.armor or armor == current.armor and slot == 'Boots' and speed > current.speed
     end
     local function weaponBetter(ctx, item, owned)
         local class = attr(item, 'Class')
-        if class ~= 'Sword' and class ~= 'Pickaxe' and class ~= 'ItemBag' then return false end
+        if GUNS[class] then
+            if rarityRank(item) < rarity.Mythic then return false end
+        elseif class ~= 'Sword' and class ~= 'Pickaxe' and class ~= 'ItemBag' then return false end
         local current
-        if owned then current = owned[class] else current = findTool(ctx, class) end
+        if owned then current = owned[class] else current = findTool(ctx, class, nil, true) end
         if not current then return true end
+        if id(current) == id(item) then return false end
+        local rank, existingRank = rarityRank(item), rarityRank(current)
+        if rank > 0 and existingRank > 0 and rank ~= existingRank then return rank > existingRank end
         local value = class == 'ItemBag' and (tonumber(attr(item, 'MaxSize')) or 0) or weaponValue(item)
         local existing = class == 'ItemBag' and (tonumber(attr(current, 'MaxSize')) or 0) or weaponValue(current)
-        return value > existing or value == existing and (rarity[attr(item, 'Rarity')] or 0) > (rarity[attr(current, 'Rarity')] or 0)
+        return value > existing or value == existing and rank > existingRank
     end
     local function interact(ctx, item, callback)
         if not F.freeWorldItemAllowed(item) then return false end
@@ -1850,13 +1870,82 @@ end)()
         status('No gear receipt for ' .. pending.id .. '; skipping that item for 5 minutes')
         return true
     end
-    local function usefulSnapshot(ctx)
+    local function ownedSnapshot(ctx, inventory)
+        local owned = {}
+        for _, class in ipairs({'Sword', 'Pickaxe', 'ItemBag', 'Revolver', 'Rifle', 'Shotgun', 'BlackholeGun'}) do
+            owned[class] = findTool(ctx, class, inventory, true)
+        end
+        return owned
+    end
+    local function lootScore(item)
+        -- Protect all other relics. Only RareShard yields its slot to Mythic+
+        -- gear (including Phoenix) or a higher-priority relic.
+        local tier = isRelic(item) and id(item) ~= 'RareShard' and 4
+            or rarityRank(item) >= rarity.Mythic and 3 or id(item) == 'RareShard' and 2 or 1
+        local value = armorSlot(item) and (tonumber(attr(item, 'Armor')) or 0)
+            or attr(item, 'Class') == 'ItemBag' and (tonumber(attr(item, 'MaxSize')) or 0) or weaponValue(item)
+        return tier * 1000000000 + rarityRank(item) * 1000000 + math.min(value, 999999)
+    end
+    local function rareShardTool(ctx, inventory)
+        for _, tool in ipairs(inventory or tools(ctx)) do
+            if id(tool) == 'RareShard' and tool:IsA('Tool') and tool.Parent
+                and (descendant(tool, ctx.character) or descendant(tool, api.Players.LocalPlayer:FindFirstChild('Backpack')))
+                and not (s.rareDropBlocked and s.rareDropBlocked[tool]) then return tool end
+        end
+    end
+    local function canReplaceRare(ctx, item, inventory)
+        return not armorSlot(item) and (isRelic(item) and id(item) ~= 'RareShard' or rarityRank(item) >= rarity.Mythic)
+            and api.remote and api.remote('ToolService', 'DropSpecificItem') ~= nil
+            and rareShardTool(ctx, inventory) ~= nil
+    end
+    local function settleRareDrop(ctx)
+        local record = s.rareShardDrop
+        if not record then return true end
+        -- The exact tool instance and reply survive cancellation/re-execution.
+        -- An unreturned RPC never authorizes a second drop or an altar save.
+        if not record.settled then return false end
+        local tool = record.tool
+        local remains = tool.Parent and (descendant(tool, record.character) or descendant(tool, record.backpack))
+        if not remains or stackCount(tool) < record.count then
+            s.rareShardDrop = nil
+            s.smartLootStatus = 'Rare Shard drop confirmed; rechecking toolbar space'
+            return true
+        end
+        if now() - record.started < 5 or now() - record.settledAt < 1.5 then return false end
+        s.rareDropBlocked = s.rareDropBlocked or setmetatable({}, {__mode = 'k'})
+        s.rareDropBlocked[tool] = true
+        s.rareShardDrop = nil
+        s.smartLootStatus = 'Rare Shard drop unconfirmed; no duplicate drop'
+        return true
+    end
+    local function makeRoom(ctx, item)
+        if not settleRareDrop(ctx) then return false end
+        local inventory = tools(ctx)
+        if armorSlot(item) or hasRoom(ctx, item, inventory) then return true end
+        if not cfg.lootExtract or not safeToWork(ctx) or s.lootRequest or s.equipmentRequest
+            or not canReplaceRare(ctx, item, inventory) then return false end
+        local tool = rareShardTool(ctx, inventory)
+        local record = {tool = tool, count = stackCount(tool), started = now(), character = ctx.character,
+            backpack = api.Players.LocalPlayer:FindFirstChild('Backpack')}
+        local rf = api.remote('ToolService', 'DropSpecificItem')
+        s.rareShardDrop = record
+        s.smartLootStatus = 'Making room for ' .. id(item) .. ': dropping Rare Shards'
+        task.spawn(function()
+            -- Native hotbar action: exactly one Tool argument. No guessed stack
+            -- count or DropAll argument; repeat only after a real count decrease.
+            record.result = api.pack(pcall(function() return rf:InvokeServer(tool) end))
+            record.settled, record.settledAt = true, now()
+        end)
+        return false
+    end
+    local function usefulSnapshot(ctx, allowReplacement)
         local armor, inventory = armorState(ctx), tools(ctx)
-        local owned = {Sword = findTool(ctx, 'Sword', inventory), Pickaxe = findTool(ctx, 'Pickaxe', inventory), ItemBag = findTool(ctx, 'ItemBag', inventory)}
+        local owned = ownedSnapshot(ctx, inventory)
         return function(item)
-            return isRelic(item) and hasRoom(ctx, item, inventory)
+            local room = hasRoom(ctx, item, inventory) or allowReplacement and canReplaceRare(ctx, item, inventory)
+            return isRelic(item) and room
                 or armorSlot(item) and armorBetter(ctx, item, armor)
-                or weaponBetter(ctx, item, owned) and hasRoom(ctx, item, inventory)
+                or weaponBetter(ctx, item, owned) and room
         end
     end
     local function pickupRecord(ctx, target)
@@ -1870,12 +1959,10 @@ end)()
         owned = api.owned, enabled = function() return cfg.lootExtract end, safe = safeToWork,
         free = F.freeWorldItemAllowed, skip = F.skipLootArea, part = part, tag = tag,
         items = function() return children(workspace:FindFirstChild('Items')) end, id = id,
-        snapshot = usefulSnapshot, eligible = function(ctx, item) return usefulSnapshot(ctx)(item) end,
-        score = function(item)
-            local value = armorSlot(item) and (tonumber(attr(item, 'Armor')) or 0)
-                or attr(item, 'Class') == 'ItemBag' and (tonumber(attr(item, 'MaxSize')) or 0) or weaponValue(item)
-            return (isRelic(item) and 1000000000 or 0) + (rarity[attr(item, 'Rarity')] or 0) * 1000000 + math.min(value, 999999)
-        end,
+        snapshot = function(ctx) return usefulSnapshot(ctx, true) end,
+        eligible = function(ctx, item) return usefulSnapshot(ctx, true)(item) end,
+        score = lootScore, makeRoom = makeRoom, settleRoom = settleRareDrop,
+        roomPending = function() return s.rareShardDrop ~= nil end,
         receipt = pickupRecord, received = gearReceipt, confirm = finishGearReceipt, accepted = api.accepted,
         interact = function(ctx, item, callback) return operation(ctx, 'InteractionService', 'Interact', item, callback) end})
     function F.bringStep(ctx, allowNew) return bring.step(ctx, allowNew) end
@@ -1889,17 +1976,19 @@ end)()
         -- and packing still read live state after every asynchronous action.
         local armor = armorState(ctx)
         local inventory = tools(ctx)
-        local owned = {Sword = findTool(ctx, 'Sword', inventory), Pickaxe = findTool(ctx, 'Pickaxe', inventory), ItemBag = findTool(ctx, 'ItemBag', inventory)}
+        local owned = ownedSnapshot(ctx, inventory)
         local items = worldItems()
-        local target = nearest(ctx, items, function(item)
-            return isRelic(item) and F.freeWorldItemAllowed(item)
-                and now() >= (ctx.itemRetry[item] or 0) and hasRoom(ctx, item, inventory)
-        end, 180)
-        target = target or nearest(ctx, items, function(item)
-            return F.freeWorldItemAllowed(item) and (armorBetter(ctx, item, armor) or weaponBetter(ctx, item, owned))
+        local target, score
+        for _, item in ipairs(items) do
+            local p = position(item)
+            if p and (p - ctx.root.Position).Magnitude <= 180 and F.freeWorldItemAllowed(item)
                 and now() >= (ctx.itemRetry[item] or 0)
-                and (#inventory < 6 or armorSlot(item))
-        end, 180)
+                and (isRelic(item) and hasRoom(ctx, item, inventory) or armorBetter(ctx, item, armor)
+                    or weaponBetter(ctx, item, owned) and hasRoom(ctx, item, inventory)) then
+                local value = lootScore(item)
+                if not target or value > score then target, score = item, value end
+            end
+        end
         if not target then
             if not ctx.smartLootWindow then
                 local nearby = nearest(ctx, items, nil, 180)
@@ -2624,6 +2713,7 @@ end)()
         end
         if now() < (ctx.extractAt or 0) or now() < (ctx.packRetryAt or 0) then return false end
         if s.lootRequest then status('Church return waits for the outstanding item reply; chest work continues'); return false end
+        if not settleRareDrop(ctx) then status('Church return waits for the Rare Shard drop receipt; chest work continues'); return false end
         if not settleGear(ctx) then status('Church return waits briefly for the last smart pickup inventory receipt'); return false end
         if not acquire(ctx, 'extract') then return false end
         if not packForReturn(ctx, data) then
