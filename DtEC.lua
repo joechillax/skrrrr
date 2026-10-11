@@ -11,7 +11,7 @@ return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
     local REVISION = 13
-    local BUILD = "r13-remembered-reload-v131"
+    local BUILD = "r13-remembered-reload-v133"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -677,6 +677,27 @@ return function(api)
     local s, now = api.state, api.now
     local B = {}
     local memoryStep, cancelReload
+    local RELOAD_LIMIT, PASS_WAIT, RELOAD_WINDOW, PASS_COOLDOWN = 2, 30, 4.5, 30
+    local function countReload(reload)
+        if reload.token.started and not reload.counted then
+            reload.record.attempts = (reload.record.attempts or 0) + 1
+            reload.counted = true
+        end
+    end
+    local function chargeReload(reload)
+        countReload(reload)
+        if not reload.charged and reload.token.started and reload.budget then
+            reload.budget.spent = reload.budget.spent + math.max(0, now() - reload.token.started)
+            reload.charged = true
+        end
+    end
+    local function reloadDue(reload)
+        local token = reload.token
+        return token.expired or token.timedOut or token.blocked
+            or token.started and now() >= token.started + RELOAD_WINDOW
+            or not token.started and now() - reload.started >= 10
+            or reload.pollUntil and now() >= reload.pollUntil
+    end
     local unpackValues = table.unpack or unpack
     local function manual()
         local c = api.controller('DragController')
@@ -772,7 +793,7 @@ return function(api)
         local job = tostring(game.PlaceId) .. ':' .. tostring(game.JobId)
         local m = s.lootItemMemory
         if not m or m.band ~= band or m.job ~= job then
-            if m and m.reload and api.cancelReload then api.cancelReload(m.reload.ctx, m.reload.token) end
+            if m and m.reload and api.cancelReload then chargeReload(m.reload); api.cancelReload(m.reload.ctx, m.reload.token) end
             m = {records = {}, byTarget = {}, serial = 0, band = band, job = job}
             s.lootItemMemory = m
             ctx.bringScan = nil
@@ -784,7 +805,7 @@ return function(api)
         local m = s.lootItemMemory
         if workspace:GetAttribute('InfiniteRebasing') then
             if m then
-                if m.reload then api.cancelReload(m.reload.ctx, m.reload.token); m.reload = nil end
+                if m.reload then chargeReload(m.reload); api.cancelReload(m.reload.ctx, m.reload.token); m.reload = nil end
                 for _, record in ipairs(m.records) do record.invalid = true end
                 m.records, m.byTarget, m.rebasing = {}, {}, true
             end
@@ -895,6 +916,7 @@ return function(api)
         local m = s.lootItemMemory
         local reload = m and m.reload
         if reload and (not ctx or reload.ctx == ctx) then
+            chargeReload(reload)
             api.cancelReload(reload.ctx, reload.token); m.reload = nil
         end
     end
@@ -919,11 +941,13 @@ return function(api)
         if reload and (reload.ctx ~= ctx or api.reloadEnabled and not api.reloadEnabled()) then cancelReload(); reload = nil end
         if reload then
             local record, token = reload.record, reload.token
+            -- Charge successful early arrivals too. Restreaming or a recreated
+            -- target cannot erase the original remembered entry's attempt count.
+            countReload(reload)
             if token.done and not reload.pollUntil then
                 reload.pollUntil = token.ok and math.max(token.started + 3, now() + 0.15) or now() + 0.25
             end
-            local finishing = token.expired or token.timedOut or token.blocked or now() - reload.started >= 10
-                or reload.pollUntil and now() >= reload.pollUntil
+            local finishing = reloadDue(reload)
             -- Bounded rescan handles fresh Instances, partial model loading and
             -- delayed replication even when DescendantAdded is unavailable.
             -- Like Memory.Poll in the manual script, force a final real view at
@@ -952,14 +976,15 @@ return function(api)
             end
             if record.invalid or now() - record.seenAt > 1800 or not api.eligible(ctx, record.target) then cancelReload(ctx); return end
             api.pollReload(ctx, token)
-            if token.started and not reload.counted then record.attempts = (record.attempts or 0) + 1; reload.counted = true end
+            countReload(reload)
             if token.done and not reload.pollUntil then
                 -- Match the manual script: a short native read still gets a
                 -- full three-second arrival window measured from actual dispatch.
                 reload.pollUntil = token.ok and math.max(token.started + 3, now() + 0.15) or now() + 0.25
             end
-            if (token.expired or token.timedOut or token.blocked or now() - reload.started >= 10
-                or reload.pollUntil and now() >= reload.pollUntil) and (reload.finalDone or now() - reload.started >= 12) then
+            local hardStop = token.started and now() >= token.started + RELOAD_WINDOW
+                or not token.started and now() - reload.started >= 12
+            if reloadDue(reload) and (reload.finalDone or hardStop) then
                 record.reloadAt = now() + 30 * 2 ^ math.max(0, (record.attempts or 1) - 1)
                 cancelReload(ctx)
                 s.smartLootStatus = (token.blocked or token.cancelFailed)
@@ -971,21 +996,39 @@ return function(api)
         if not api.requestReload or not B.available() or api.reloadEnabled and not api.reloadEnabled()
             or now() < (m.reloadAt or 0) then return end
         if #m.records == 0 then return end
+        local budget = m.pass
+        if budget and budget.resumeAt then
+            if now() < budget.resumeAt then return end
+            m.pass = nil; budget = nil
+        end
         m.reloadAt = now() + 1 -- bounded selection; request cadence is independently eight seconds.
         local eligible = api.snapshot(ctx)
         local best, score
         for _, record in ipairs(m.records) do
-            if not record.invalid and (record.attempts or 0) < 3 and now() >= (record.reloadAt or 0)
+            if not record.invalid and (record.attempts or 0) < RELOAD_LIMIT and now() >= (record.reloadAt or 0)
                 and now() >= (record.retryAt or 0) and not live(ctx, record) and not record.invalid and eligible(record.target) then
                 local value = api.score(record.target)
                 if not best or value > score then best, score = record, value end
             end
         end
         if best then
+            if not budget then
+                m.passNumber = (m.passNumber or 0) + 1
+                budget = {spent = 0, number = m.passNumber}; m.pass = budget
+            end
+            -- Reserve a complete unchanged area window. Budget-skipped entries
+            -- remain remembered; loaded deliveries never use this read budget.
+            if budget.spent + RELOAD_WINDOW > PASS_WAIT then
+                budget.resumeAt = now() + PASS_COOLDOWN
+                m.reloadAt = budget.resumeAt
+                s.smartLootStatus = 'Reload wait budget reached; loaded loot continues, automatic retry in 30s'
+                return
+            end
             local token = api.requestReload(ctx, best.position)
             if token then
-                m.reload = {ctx = ctx, record = best, token = token, started = now()}; m.reloadAt = now() + 8
-                s.smartLootStatus = 'Reloading remembered loot: ' .. best.id
+                m.reload = {ctx = ctx, record = best, token = token, started = now(), budget = budget}; m.reloadAt = now() + 8
+                s.smartLootStatus = string.format('Reloading remembered loot: %s [item #%d, attempt %d/2; %.1fs budget left]',
+                    best.id, best.serial, (best.attempts or 0) + 1, math.max(0, PASS_WAIT - budget.spent))
             end
         end
     end
