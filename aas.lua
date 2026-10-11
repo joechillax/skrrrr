@@ -1,4 +1,4 @@
--- JoesAAS 5.15 | standalone source | October 2026
+-- JoesAAS 5.16 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -8,7 +8,7 @@ if game.GameId ~= 10502841145 then
     warn("JoesAAS: this build targets the exported game's universe, not this experience.")
     return
 end
-local A = {version="5.15"}
+local A = {version="5.16"}
 environment.JoesAAS = A
 environment.AnimeSuite = A -- Compatibility with older running versions.
 A.Core = (function()
@@ -450,6 +450,7 @@ return function(A)
     end
     function A.stop()
         if not A.alive then return end
+        if A.restoreNativeRetry then A.cleanupStep('native retry',A.restoreNativeRetry) end
         A.stopping=true
         -- Stop new work before cleanup; one broken dependency must not retain the old instance.
         A.running=false; A.epoch=A.epoch+1
@@ -819,6 +820,19 @@ return function(A)
         if key and declared and declared~=key then return false end
         return true
     end
+    function A.runEndMatches(prefix,packet,raw,key)
+        if not A.runEventMatches(prefix,packet,raw,key) then return false end
+        if prefix=='Raid' and type(packet)=='table' then
+            local cfg=A.config('RaidConfig'); local entries=cfg and cfg:GetAllRaids() or {}
+            local entry=entries[key or A.runKey(raw or A.player:GetAttribute('VisibilityContext'))]
+            if entry and entry.GateOnly==true and (packet.AutoGateTransfer==true
+                or packet.TimeTrialTransfer==true or packet.AutoRetry==true) then
+                -- Regular Raid retry/transfer notifications are not a portal's completion.
+                return false
+            end
+        end
+        return true
+    end
     for prefix,field in pairs(fields) do
         local name,keyField=prefix,field
         A.on(name..'State',function(packet)
@@ -847,7 +861,7 @@ return function(A)
             end
         end)
         A.on(name..'Ended',function(first,second)
-            if A.runEventMatches(name,A.endPacket(first,second)) then stateContext=nil; hasFull=false end
+            if A.runEndMatches(name,A.endPacket(first,second)) then stateContext=nil; hasFull=false end
         end)
     end
     A.job('Mode state recovery',1,function()
@@ -2249,7 +2263,7 @@ return function(A)
     local events,openings={},{}
     local dirty=true
     local fields={mode=true,key=true,reason=true,accepted=true,selected=true,duration=true,rank=true,
-        source=true,action=true,sent=true,retry=true,autoRetry=true,timeTrialTransfer=true}
+        source=true,action=true,sent=true,retry=true,autoRetry=true,timeTrialTransfer=true,won=true,result=true,instanceKey=true}
     local function clean(input)
         local result={}
         for key,value in pairs(type(input)=='table' and input or {}) do
@@ -2265,7 +2279,7 @@ return function(A)
         for _,event in ipairs(type(saved.events)=='table' and saved.events or {}) do
             if #events>=400 then break end
             if type(event)=='table' and type(event.kind)=='string' then
-                events[#events+1]={time=tonumber(event.time),kind=event.kind:sub(1,60),details=clean(event.details),
+                events[#events+1]={time=tonumber(event.time),sessionSeconds=tonumber(event.sessionSeconds),kind=event.kind:sub(1,60),details=clean(event.details),
                     context=type(event.context)=='string' and event.context:sub(1,120) or nil,loading=event.loading==true}
             end
         end
@@ -2279,7 +2293,7 @@ return function(A)
         end
         local ctrl=A.client('TeleportController')
         local ok,loading=pcall(function() return ctrl and ctrl:IsLoading() end)
-        local event={time=os.time(),kind=kind,details=clean(details),
+        local event={time=os.time(),sessionSeconds=os.clock(),kind=kind,details=clean(details),
             context=A.player:GetAttribute('VisibilityContext'),loading=ok and loading==true,running=A.running}
         events[#events+1]=event; if #events>400 then table.remove(events,1) end
         if kind=='opening' then
@@ -2296,11 +2310,17 @@ return function(A)
         local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
         local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
         local activityJob=A.tasks.Activities
+        local nativeAutoSettings={}; local settingsUtil=A.util('SettingsStateUtil')
+        if settingsUtil and type(settingsUtil.Get)=='function' then
+            for _,name in ipairs({'RaidAutoSettings','DefenseAutoSettings','BossRushAutoSettings'}) do
+                nativeAutoSettings[name]=settingsUtil:Get(name)
+            end
+        end
         local snapshot={schema=1,version=A.version,userId=A.player.UserId,gameId=game.GameId,
             savedAt=os.time(),context=A.player:GetAttribute('VisibilityContext'),running=A.running,
             activities=A.status.Activities,error=A.status['Activity error'],events=events,openings=openings,
             stuck=A.stuckSnapshot and A.stuckSnapshot() or {},nativeAutoGates=A.nativeAutoGates and A.nativeAutoGates() or {},
-            coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
+            nativeAutoSettings=nativeAutoSettings,coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
             gameState=stateOK and gameState or {error=tostring(gameState):sub(1,240)},
             eventError=A.status.Event,activityJobFailures=activityJob and activityJob.failures,settings={}}
         for _,key in ipairs({'towerAutoJoin','towerSelection','trialAutoJoin','trialJoinSelection','dungeonAutoJoin',
@@ -2351,6 +2371,8 @@ return function(A)
     local stuckBackoff={}
     local stuckRetry
     local leaveAt,leaveAttempts=0,0
+    local worldReturnAt
+    local requiresExit={}
     local choiceCache={}
     for _,mode in ipairs(order) do available[mode]={} end
     local prioritySignature,normalizedPriority=nil,nil
@@ -2586,6 +2608,7 @@ return function(A)
             or current~=mode or raw~=contextRaw or pending or leaving or returning or stuckExit
             or (stuckRetry and stuckRetry.mode==mode and stuckRetry.context==raw and stuckRetry.untilTime>os.clock()) then return false end
         stuckExit={mode=mode,context=raw,attempts=0,lastSent=-math.huge}
+        if A.pauseNativeRetry and not A.pauseNativeRetry('stuck exit') then stuckExit=nil; return false end
         pending=nil; locked=nil
         suspendFarm()
         if A.stopTrialMovement then A.stopTrialMovement() end
@@ -2655,9 +2678,17 @@ return function(A)
             end
         end
         if protected[current] and returning~=current then locked=current end
+        if locked and A.pauseNativeRetry then A.pauseNativeRetry('protected '..locked) end
         if type(raw)=='string' and raw:match('^World:') and not A.inMode() and not loading then
+            if locked and not returning then
+                worldReturnAt=worldReturnAt or os.clock()
+                if os.clock()-worldReturnAt<3 then
+                    status('Confirming world return; retaining '..locked..' lock'); return
+                end
+                A.joinTrace('confirmed world exit',{mode=locked,reason='Stable world state for 3s without an end event'})
+            end
             locked=nil; returning=nil; leaving=nil
-        end
+        else worldReturnAt=nil end
         -- An accepted request is not a run lock. Once its interruptible mode is
         -- entered, missing variant metadata must not block a higher-tier opening.
         if pending and (not pending.accepted or (current==pending.mode and raw~=pending.fromContext))
@@ -2685,6 +2716,7 @@ return function(A)
                     local opening=available[pending.mode][pending.key]
                     if opening then opening.consumed=true; opening.deadline=math.max(opening.deadline,os.clock()+60) end
                 end
+                requiresExit[pending.mode..':'..pending.key]=nil
                 pending=nil; returning=nil
             elseif protected[current] and returning~=current then pending=nil
             elseif not loading and (not current or definitions[current]) then
@@ -2717,7 +2749,7 @@ return function(A)
                 or A.settings[definitions[mode].ranks][entry.rank]~=true then coordinateAgain=true; return end
         end
         if not mode then status(current and ('In '..current) or (waitingReason or 'Waiting for a selected activity')); return end
-        local direct=mode=='MaxTac' or mode=='Tower' or mode=='TimeTrial' or mode=='Dungeon'
+        local direct=(mode=='MaxTac' or mode=='Tower' or mode=='TimeTrial' or mode=='Dungeon') and not requiresExit[mode..':'..key]
         if leaving and not direct then
             if os.clock()-leaveAt>=5 then
                 if leaveAttempts<3 then
@@ -2737,6 +2769,9 @@ return function(A)
             if returning~=current and priority(mode)<=priority(current) then status('Current '..current..' has equal/higher priority than '..mode); return end
             if not direct then
                 if returning==current then status('Waiting for '..current..' return teleport'); return end
+                if A.pauseNativeRetry and not A.pauseNativeRetry('transfer to '..mode) then
+                    status('Waiting to suspend native retry before leaving '..current); return
+                end
                 leaving=current; leaveAt=os.clock(); leaveAttempts=1; suspendFarm(); status('Leaving '..current..' for '..mode)
                 if not A.fire(leaveBridge(current)) then leaving=nil; status('Leave bridge unavailable: '..current) end
                 return
@@ -2784,8 +2819,13 @@ return function(A)
         A.on(mode..'Ended',function(first,second)
             local packet=A.endPacket(first,second)
             local _,raw=context()
-            if not A.runEventMatches(mode,packet,raw,A.runKey(raw)) then return end
-            A.joinTrace('run ended',{mode=mode,autoRetry=type(packet)=='table' and packet.AutoRetry==true,timeTrialTransfer=type(packet)=='table' and packet.TimeTrialTransfer==true})
+            if not A.runEndMatches(mode,packet,raw,A.runKey(raw)) then
+                A.joinTrace('ignored run end',{mode=mode,reason='Foreign run or previous Raid retry/transfer'}); return
+            end
+            local won; if type(first)=='boolean' then won=first end
+            A.joinTrace('run ended',{mode=mode,won=won,
+                result=type(packet)=='table' and packet.Result,instanceKey=type(packet)=='table' and packet.InstanceKey,
+                autoRetry=type(packet)=='table' and packet.AutoRetry==true,timeTrialTransfer=type(packet)=='table' and packet.TimeTrialTransfer==true})
             local current=context()
             -- The native portal transfer can deliver the previous Raid's end
             -- after MaxTac entry; that packet must not end the new locked run.
@@ -2824,6 +2864,13 @@ return function(A)
                 if accepted==true then pending.accepted=true end
                 if accepted==false then
                     local key=pending.key
+                    if reason=='already_in_raid' or reason=='already_in_defense' or reason=='already_in_gamemode' then
+                        requiresExit[requested..':'..key]=true; backoff[requested..':'..key]=nil
+                        pending=nil
+                        A.joinTrace('transfer fallback',{mode=requested,key=key,reason=reason})
+                        status('Direct transfer rejected; using confirmed exit before '..requested)
+                        return
+                    end
                     if mode=='Defense' and reason=='defense_already_active' then
                         backoff[requested..':'..key]=os.clock()+30
                     else
@@ -2859,6 +2906,11 @@ return function(A)
         if accepted==true then pending.accepted=true; return end
         if accepted~=false then return end
         local mode,key=pending.mode,pending.key
+        if reason=='already_in_raid' or reason=='already_in_defense' or reason=='already_in_gamemode' then
+            requiresExit[mode..':'..key]=true; backoff[mode..':'..key]=nil; pending=nil
+            A.joinTrace('transfer fallback',{mode=mode,key=key,reason=reason})
+            status('Direct transfer rejected; using confirmed exit before '..mode); return
+        end
         if reason=='gate_closed' then
             local opening=available[mode][key]
             if opening then opening.consumed=true; opening.deadline=math.max(opening.deadline,os.clock()+60) end
@@ -2963,7 +3015,7 @@ return function(A)
                     remaining=entry.deadline==math.huge and 'until schedule closes' or math.max(0,entry.deadline-os.clock()),rank=entry.rank}
             end
         end
-        return {pending=pending and {mode=pending.mode,key=pending.key,accepted=pending.accepted==true,
+        return {worldReturnAge=worldReturnAt and math.max(0,os.clock()-worldReturnAt),pending=pending and {mode=pending.mode,key=pending.key,accepted=pending.accepted==true,
             attempts=pending.attempts,rank=pending.entry.rank,age=os.clock()-pending.at},locked=locked,leaving=leaving,returning=returning,available=openings,
             stuckExit=stuckExit and {mode=stuckExit.mode,context=stuckExit.context,attempts=stuckExit.attempts},
             stuckRecovery=A.stuckSnapshot and A.stuckSnapshot() or nil}
@@ -3023,7 +3075,10 @@ return function(A)
         local mode,raw=A.activityContext()
         if not specs[mode] or type(raw)~='string' then watch=nil; return end
         if not watch or watch.context~=raw or watch.mode~=mode then
-            watch={mode=mode,context=raw,lastProgress=os.clock(),state={},deaths={},phase=nil,graceUntil=0}
+            local ctrl=A.client('TeleportController')
+            local coordinator=A.joinSnapshot()
+            watch={mode=mode,context=raw,lastProgress=os.clock(),state={},deaths={},phase=nil,graceUntil=0,
+                awaitingEntry=(ctrl and ctrl:IsLoading()==true) or (coordinator.pending and coordinator.pending.mode==mode) or false}
         end
         return watch
     end
@@ -3109,7 +3164,7 @@ return function(A)
         A.on(name..'Ended',function(first,second)
             local packet=A.endPacket(first,second)
             local w=current()
-            if not w or specs[w.mode].bridge~=name or not A.runEventMatches(name,packet,w.context,w.key) then return end
+            if not w or specs[w.mode].bridge~=name or not A.runEndMatches(name,packet,w.context,w.key) then return end
             if name=='Raid' and w.mode=='MaxTac' and type(packet)=='table' and packet.AutoGateTransfer==true then return end
             if type(packet)=='table' and packet.InstanceKey and packet.InstanceKey~=w.context:match('^[^:]+:(.+)$') then return end
             w.ended=true; w.deaths={}
@@ -3144,7 +3199,8 @@ return function(A)
     function A.stuckSnapshot()
         local w=watch
         return w and {mode=w.mode,context=w.context,key=w.key,timeout=A.stuckTimeout(w.mode),
-            idle=math.max(0,os.clock()-math.max(w.lastProgress,w.graceUntil)),reason=w.reason,ended=w.ended==true} or {}
+            idle=w.awaitingEntry and 0 or math.max(0,os.clock()-math.max(w.lastProgress,w.graceUntil)),
+            awaitingEntry=w.awaitingEntry==true,reason=w.reason,ended=w.ended==true} or {}
     end
     A.job('Stuck recovery',0.5,function()
         local w=current()
@@ -3161,6 +3217,14 @@ return function(A)
             if coordinator.pending or coordinator.leaving then
                 A.status['Stuck recovery']='Waiting for bounded activity transfer confirmation'; return
             end
+        end
+        if w.awaitingEntry then
+            local ctrl=A.client('TeleportController')
+            if ctrl and ctrl:IsLoading() then
+                A.status['Stuck recovery']='Waiting for '..w.mode..' entry loading; combat timer has not started'; return
+            end
+            w.awaitingEntry=false; progress(w,'Entry ready')
+            A.joinTrace('combat timer started',{mode=w.mode,reason='Entry confirmed and loading finished'})
         end
         local arena=arenaFor(w.mode,w.context)
         if arena and not w.key then w.key=arena:GetAttribute(specs[w.mode].key) end
@@ -3575,6 +3639,93 @@ end)()(A);
 -- ===== native_preferences =====
 (function()
 return function(A)
+    local maps={'RaidAutoSettings','DefenseAutoSettings','BossRushAutoSettings'}
+    local path=A.folder..'/native-retry-restore.json'
+    local saved=A.safeLoad(path)
+    local restore={}
+    if type(saved)=='table' and saved.schema==1 and type(saved.entries)=='table' then
+        for _,name in ipairs(maps) do
+            if type(saved.entries[name])=='table' then restore[name]=A.Core.trueKeys(saved.entries[name]) end
+        end
+    end
+    local function persist()
+        if type(writefile)~='function' then return false end
+        local ok=pcall(function()
+            if type(makefolder)=='function' then pcall(makefolder,'JoesAAS'); pcall(makefolder,A.folder) end
+            local bytes=A.S.HTTP:JSONEncode({schema=1,entries=restore})
+            writefile(path,bytes)
+            if type(readfile)=='function' then assert(readfile(path)==bytes) end
+        end)
+        return ok
+    end
+    local function publish(util,name,value)
+        if not A.ready('Native retry:'..name,1) then return false end
+        if not A.fire('SettingsUpdate',name,value) then return false end
+        util:Set(name,value); return true
+    end
+    function A.pauseNativeRetry(reason)
+        local util=A.util('SettingsStateUtil')
+        if not util or type(util.Get)~='function' then return true end
+        for _,name in ipairs(maps) do
+            local live=util:Get(name)
+            if type(live)=='table' then
+                local nextMap=A.Core.copy(live); local changed=false
+                for key,row in pairs(nextMap) do
+                    if type(key)=='string' and type(row)=='table' and row.AutoStart==true then
+                        if type(util.Set)~='function' then return false end
+                        restore[name]=restore[name] or {}; restore[name][key]=true
+                        row.AutoStart=false; changed=true
+                    end
+                end
+                if changed then
+                    -- Persist restoration intent before changing a server-saved preference.
+                    if not persist() or not publish(util,name,nextMap) then
+                        A.status['Native retry']='Cannot safely pause native retry; restoration record retained'; return false
+                    end
+                    A.joinTrace('native retry paused',{reason=reason,source=name})
+                end
+            end
+        end
+        return true
+    end
+    function A.restoreNativeRetry()
+        if next(restore)==nil then return true end
+        if not A.alive or not A.running then return false end
+        local util=A.util('SettingsStateUtil')
+        if not util or type(util.Get)~='function' or type(util.Set)~='function' then return false end
+        -- A new native Auto choice takes precedence over the old paused one.
+        local hasAuto=false
+        for _,name in ipairs(maps) do
+            for _,row in pairs(util:Get(name) or {}) do
+                if type(row)=='table' and row.AutoStart==true then hasAuto=true end
+            end
+        end
+        for _,name in ipairs(maps) do
+            if restore[name] then
+                local live=util:Get(name); if type(live)~='table' then return false end
+                local nextMap=A.Core.copy(live); local changed=false
+                for key,on in pairs(restore[name]) do
+                    if on==true and type(nextMap[key])=='table' and not hasAuto then
+                        nextMap[key].AutoStart=true; changed=true
+                    end
+                end
+                if changed and not publish(util,name,nextMap) then return false end
+                restore[name]=nil
+                if not persist() then return false end
+            end
+        end
+        A.joinTrace('native retry restored',{reason='Protected activity/exit finished or script unloaded'})
+        return true
+    end
+    A.job('Native retry guard',1,function()
+        local state=A.joinSnapshot()
+        local mode=A.activityContext()
+        if (mode=='MaxTac' or mode=='Tower' or mode=='TimeTrial' or mode=='Dungeon') and state.returning~=mode then
+            A.pauseNativeRetry('protected '..mode); return
+        end
+        if state.locked or state.pending or state.leaving or state.stuckExit then return end
+        A.restoreNativeRetry()
+    end)
     -- The native server now claims personal missions. Transfer an old ON choice
     -- once, confirm replication, then leave future control to the game's button.
     local nextAttempt=0
