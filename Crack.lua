@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v22.
+-- Crack the Egg: lobby + round progression, v23.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -38,7 +38,7 @@ end
 local app = {alive = true, running = false, connections = {}, objects = {}, notes = {},
     status = {}, blocks = {}, failures = {}, cooldowns = {}, goals = shared.goals, retries = {},
     settings = {upgrades = true, reserve = 0, upgradeFocus = "Balanced",
-        hatch = false, eggPolicy = "Finish nearest", craft = "Off", resume = false,
+        hatch = true, hatchRevision = 1, eggPolicy = "Finish nearest", craft = "Off", resume = false,
         farm = true, runUpgrades = true, chests = true, allowSingleChoice = false, sell = true, repeatRuns = true,
         difficulty = "Easy", partySize = 1, mineTravel = "Walk", collectTravel = "Walk",
         sellTravel = "Walk", chestTravel = "Walk", queueTravel = "Walk", shopTravel = "Walk"},
@@ -128,6 +128,9 @@ if type(readfile) == "function" then
             for _, k in ipairs({"upgrades", "hatch", "resume", "farm", "runUpgrades", "chests", "allowSingleChoice", "sell", "repeatRuns"}) do
                 if type(s[k]) == "boolean" then app.settings[k] = s[k] end
             end
+            -- Enable the newly requested round hatching once for older settings.
+            -- Subsequent saved OFF selections remain OFF.
+            if s.hatchRevision ~= 1 then app.settings.hatch = true app.saveAt = os.clock() + 0.5 end
             app.settings.reserve = finite(s.reserve) and math.clamp(math.floor(s.reserve), 0, 1e9) or 0
             app.settings.eggPolicy = choice(s.eggPolicy, policies, "Finish nearest")
             app.settings.upgradeFocus = choice(s.upgradeFocus, focuses, "Balanced")
@@ -272,7 +275,11 @@ local function inventory()
         elseif type(k) == "string" and v == true then owned[k] = true end
     end
     for _, egg in ipairs(eggs.Eggs) do
-        if type(egg) == "table" and type(egg.Id) == "string" and egg.Id ~= "" then byId[egg.Id] = egg end
+        if type(egg) == "table" and type(egg.Id) == "string" and egg.Id ~= "" then
+            -- False marks an ambiguous id as still present, so neither choosing
+            -- nor consumption reconciliation can mistake duplicates for removal.
+            if byId[egg.Id] ~= nil then byId[egg.Id] = false else byId[egg.Id] = egg end
+        end
     end
     return {eggs = eggs.Eggs, byId = byId,
         equipped = type(eggs.Equipped) == "string" and eggs.Equipped or player:GetAttribute("EquippedEggId"),
@@ -447,10 +454,11 @@ local function stepPerks(catalog)
     status("perks", "Buying " .. target.id .. " for " .. target.price .. " gems")
 end
 
-local function stepEggs(rules, crafted, inv)
+local function stepEggs(rules, crafted, inv, roundOnly)
     if shared.calls.eggs then return end
     if not inv then status("eggs", "Egg inventory loading/unavailable") return end
     if reconcile("eggs", inv) then return end
+    if roundOnly and not app.settings.hatch then return end
     local object = remote("EggHatchery", "Request")
     if not object then status("eggs", "EggHatchery.Request missing") return end
     local now = workspace:GetServerTimeNow()
@@ -469,7 +477,8 @@ local function stepEggs(rules, crafted, inv)
             return
         end
     end
-    local id = app.settings.craft
+    -- Round hatching can equip the next growth egg; crafting stays in the lobby.
+    local id = roundOnly and "Off" or app.settings.craft
     local def = crafted and type(crafted.ById) == "table" and crafted.ById[id]
     if id ~= "Off" and not crafted then status("eggs", "Craft catalog loading/unavailable") return end
     if id ~= "Off" and not def then status("eggs", "Unknown selected recipe; choose a current perk") return end
@@ -1785,6 +1794,50 @@ do
         end
         return first
     end
+    local function gunContact(target, position, head, range)
+        if target:GetAttribute("EggCore") == true then return contact(target, position, head, range) end
+        local ballistics = module("BreakTheEgg", "GunBallistics")
+        if not ballistics then return nil end
+        -- Match native gun world exclusions/passable surfaces, then query the
+        -- actual foe separately. Shop displays, workers and camera cosmetics
+        -- must not veto a shot that the gun's own world trace accepts.
+        local egg, guardian = state.lab:FindFirstChild("Egg"), module("BreakTheEgg", "LayerGuardian")
+        local function probe(position)
+        local delta = position - head.Position
+        if delta.Magnitude < 0.01 or delta.Magnitude > range then return nil end
+        local trace = ballistics.Trace(head.Position, delta.Unit, {Range = math.min(range, delta.Magnitude + 0.2),
+            Bounces = 0, Params = ballistics.Params(state.lab),
+            Guardian = egg and guardian and function(origin, direction, actual)
+                return guardian.Raycast(egg, player, origin, direction, actual)
+            end or nil,
+            OnHit = function(actual)
+                return ballistics.Passable(actual.Instance) and "pass" or "stop"
+            end})
+        local last = trace.Points and trace.Points[#trace.Points]
+        local segment = last and last - head.Position
+        if not segment or segment.Magnitude < 0.05 then return nil end
+        local params = RaycastParams.new()
+        params.FilterType, params.FilterDescendantsInstances = Enum.RaycastFilterType.Include, {target}
+        local actual = workspace:Spherecast(head.Position, 0.5, segment, params)
+        if actual and (actual.Instance == target or actual.Instance:IsDescendantOf(target))
+            and (actual.Position - head.Position).Magnitude <= range then return actual end
+        end
+        local actual = probe(position)
+        if actual then return actual end
+        local cached, tried = state.targets[target], 0
+        for _, face in ipairs(type(cached) == "table" and cached.faces or {}) do
+            if face.Parent and face.CanQuery ~= false then
+                actual = probe(face.Position)
+                if actual then return actual end
+                tried += 1
+                if tried >= 4 then break end
+            end
+        end
+    end
+    local function combatContact(target, position, head, range, gun)
+        if gun then return gunContact(target, position, head, range) end
+        return contact(target, position, head, range)
+    end
     local function approachPosition(target, position, head, root, hum, range, guardian, airOnly)
         -- A short, bounded search for a verified attack ray. Distance alone
         -- cannot prove arrival: a wedge, guardian or wall may still block it.
@@ -1849,7 +1902,7 @@ do
         for obj in pairs(state.enemies or {}) do
             local _, pos = aim(obj, head.Position)
             if pos and eligible("hit:" .. targetId(obj), hitFingerprint(obj, family)) then
-                local actual = contact(obj, pos, head, reach(family, config))
+                local actual = combatContact(obj, pos, head, reach(family, config), family == "Gun")
                 local reachable = actual and (actual.Instance == obj or actual.Instance:IsDescendantOf(obj))
                     and (actual.Position - head.Position).Magnitude <= reach(family, config)
                 if reachable or eligible("move:target:" .. targetId(obj), movementFingerprint(obj, "event")) then return true end
@@ -2184,7 +2237,7 @@ do
         return (pos - (from + d * alpha)).Magnitude
     end
     local function attackDuringEvasion(config, evolution, triggerOnly)
-        local _, _, head = character()
+        local _, root, head = character()
         if not head then return end
         local family, score, cooldown
         -- Dodge travel releases held inputs. Use tools which can deliver a
@@ -2206,13 +2259,22 @@ do
         if gun then family, cooldown = "Gun", 0 end
         local best, result, distance
         for obj in pairs(state.enemies or {}) do
+            local key, fp = "hit:" .. targetId(obj), hitFingerprint(obj, family)
+            local ready = eligible(key, fp)
+            local failedPose = state.gunFailedPoses and state.gunFailedPoses[obj]
+            local changedPose = gun and failedPose and root and (root.Position - failedPose).Magnitude > 4
             if obj.Parent and (obj:GetAttribute("Health") or 0) > 0
-                and eligible("hit:" .. targetId(obj), hitFingerprint(obj, family)) then
+                and (ready or changedPose) then
                 local _, pos = aim(obj, head.Position)
                 if pos and (pos - head.Position).Magnitude <= reach(family, config) then
-                    local contactResult = contact(obj, pos, head, reach(family, config))
+                    local contactResult = combatContact(obj, pos, head, reach(family, config), gun)
                     if contactResult and contactResult.Instance:IsDescendantOf(obj)
                         and (contactResult.Position - head.Position).Magnitude <= reach(family, config) then
+                        if not ready then
+                            success(key) -- New physical stance with a fresh native firing trace.
+                            state.gunFailedPoses[obj] = nil
+                            state.triggerWatch = nil
+                        end
                         local d = (contactResult.Position - head.Position).Magnitude
                         local priority = obj:GetAttribute("Variant") == "Medic" and 100 or 0
                         local value = priority - d
@@ -2227,7 +2289,7 @@ do
                     and eligible("hit:" .. targetId(obj), hitFingerprint(obj, family)) then
                     local _, pos = aim(obj, head.Position)
                     local range = reach(family, config)
-                    local actual = pos and contact(obj, pos, head, range)
+                    local actual = pos and combatContact(obj, pos, head, range, gun)
                     if actual and actual.Instance:IsDescendantOf(obj) and (actual.Position - head.Position).Magnitude <= range then
                         best, result = obj, actual break
                     end
@@ -2247,6 +2309,10 @@ do
                 state.triggerWatch = {target = best, family = family, hp = hp, at = os.clock()}
             elseif os.clock() - watch.at > 5 then
                 fail("hit:" .. targetId(best), hitFingerprint(best, family), "Trigger target made no damage progress; trying another enemy")
+                if gun then
+                    state.gunFailedPoses = state.gunFailedPoses or {}
+                    state.gunFailedPoses[best] = root.Position
+                end
                 state.triggerWatch = nil
                 return false
             end
@@ -2374,6 +2440,24 @@ do
         -- This is a positioning constraint, not immunity from goo/grab/slam.
         if not quake and allowedGun(ownedGun()) and (bodyActive or phase == "Core") then
             local y = config.EggGroundY + hum.HipHeight + root.Size.Y * 0.5 + 18
+            local head = player.Character and player.Character:FindFirstChild("Head")
+            if head and root.Position.Y < y then
+                local ceilingParams = RaycastParams.new()
+                ceilingParams.FilterType, ceilingParams.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
+                local excludes = {player.Character}
+                local egg = state.lab:FindFirstChild("Egg")
+                if egg then table.insert(excludes, egg) end
+                for _, name in ipairs({"WorldEvent", "FloorShells", "Workers"}) do
+                    local obj = state.lab:FindFirstChild(name)
+                    if obj then table.insert(excludes, obj) end
+                end
+                ceilingParams.FilterDescendantsInstances = excludes
+                local top = head.Position.Y - root.Position.Y + head.Size.Y * 0.5 + 0.3
+                local ceiling = workspace:Raycast(head.Position, Vector3.new(0, y + top - head.Position.Y, 0), ceilingParams)
+                if ceiling and ceiling.Normal.Y < -0.5 then
+                    y = math.max(config.EggGroundY + hum.HipHeight + root.Size.Y * 0.5 + 2, ceiling.Position.Y - top - 0.25)
+                end
+            end
             quake = {root = root, minY = y, goalY = math.max(y, root.Position.Y), combat = true}
         end
         local need = danger(root.Position, now, true) < 0 or bodyActive and startRadius < bodyRadius
@@ -2427,8 +2511,13 @@ do
             -- Mining recovery may leave us well above ground. Find an actual
             -- floor and plan the descent rather than rejecting every exit.
             if quake then
-                goal = Vector3.new(goal.X, math.max(root.Position.Y, quake.goalY), goal.Z)
-                if reentry then goal = Vector3.new(goal.X, math.max(goal.Y, quake.minY), goal.Z) end
+                if reentry then
+                    -- Ordinary gun hover is a preference. Native wave clearance
+                    -- is a hard floor, but neither requires retaining an old
+                    -- altitude above a roof after a lower shot becomes possible.
+                    local minY = quake.combat and config.EggGroundY + hum.HipHeight + root.Size.Y * 0.5 + 2 or quake.minY
+                    goal = Vector3.new(goal.X, math.max(goal.Y, minY), goal.Z)
+                else goal = Vector3.new(goal.X, math.max(root.Position.Y, quake.goalY), goal.Z) end
                 local floor = support(goal)
                 -- Vertical protection works even before floor geometry streams.
                 -- Lateral exits must not leave observed arena support for void.
@@ -2439,6 +2528,18 @@ do
                 local floor = workspace:Raycast(goal + Vector3.new(0, 5, 0), Vector3.new(0, -200, 0), params)
                 if not floor or floor.Normal.Y < 0.65 then return nil end
                 goal = floor.Position + Vector3.new(0, hum.HipHeight + root.Size.Y * 0.5, 0)
+            end
+            if reentry then
+                local head = player.Character and player.Character:FindFirstChild("Head")
+                local top = head and head.Position.Y - root.Position.Y + head.Size.Y * 0.5 + 0.3 or 3.3
+                local feet = hum.HipHeight + root.Size.Y * 0.5 - 0.2
+                for _, offset in ipairs({Vector3.new(), Vector3.new(root.Size.X * 0.45, 0, 0),
+                    Vector3.new(-root.Size.X * 0.45, 0, 0), Vector3.new(0, 0, root.Size.Z * 0.45),
+                    Vector3.new(0, 0, -root.Size.Z * 0.45)}) do
+                    local occupied = workspace:Raycast(goal + offset - Vector3.new(0, feet, 0),
+                        Vector3.new(0, feet + top, 0), supportParams)
+                    if occupied then return nil end -- Never finish embedded in a roof/platform.
+                end
             end
             local delta = goal - root.Position
             local distance = delta.Magnitude
@@ -2577,33 +2678,71 @@ do
             table.sort(targets, function(a, b) return a.distance < b.distance end)
             local best, score
             local count = #targets
+            local currentCost, currentWorst, currentSafe = route(root.Position, true)
+            local currentFits = currentCost and currentWorst >= 0 and (currentSafe - root.Position).Magnitude < 0.25
             local cursor = state.airTargetCursor or 0
             state.airTargetCursor = count > 0 and (cursor + math.min(12, count)) % count or 0
             for i = 1, math.min(12, count) do
                 local item = targets[(cursor + i - 1) % count + 1]
-                local current = contact(item.target, item.position, actualHead, range)
-                if rootSupport and current and (current.Instance == item.target or current.Instance:IsDescendantOf(item.target))
+                local current = combatContact(item.target, item.position, actualHead, range, gun)
+                if rootSupport and currentFits and current and (current.Instance == item.target or current.Instance:IsDescendantOf(item.target))
                     and (current.Position - actualHead.Position).Magnitude <= range then
                     if app.move and app.move.key == "boss-air-combat" then app:release() end
+                    if quake.combat and root.Position.Y < quake.minY then
+                        local preferred = {Position = Vector3.new(root.Position.X, quake.minY, root.Position.Z) + offset}
+                        if not combatContact(item.target, item.position, preferred, range, gun) then
+                            quake.goalY = root.Position.Y -- Keep a clear under-roof shot instead of rising back into cover.
+                        end
+                    end
                     targets = {} break -- Already in actual range; retain hover and attack.
                 end
-                for _, fraction in ipairs({0.45, 0.7, 0.9}) do
+                for _, distance in ipairs(gun and {math.min(10, range * 0.45), math.min(24, range * 0.6),
+                    math.min(48, range * 0.7), range * 0.9} or {math.min(10, range * 0.45), range * 0.7, range * 0.9}) do
                 for side = 0, 15 do
                     local angle = side * math.pi / 8
-                    local distance = fraction == 0.45 and math.min(10, range * fraction) or range * fraction
                     local goal = item.position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * distance
                     goal = Vector3.new(goal.X, quake.minY, goal.Z)
                     local virtualHead = {Position = goal + offset}
-                    local hit = contact(item.target, item.position, virtualHead, range)
+                    local hit = combatContact(item.target, item.position, virtualHead, range, gun)
                     if hit and (hit.Instance == item.target or hit.Instance:IsDescendantOf(item.target))
                         and (hit.Position - virtualHead.Position).Magnitude <= range then
                         local cost, worst, safe = route(goal, true)
                         if cost and worst >= 0 then
-                            local value = cost + (hit.Position - virtualHead.Position).Magnitude * (gun and 2 or 0.2)
-                            if not score or value < score then best, score = safe, value end
+                            local verified = combatContact(item.target, item.position, {Position = safe + offset}, range, gun)
+                            if verified then
+                                local value = cost + (verified.Position - safe - offset).Magnitude * (gun and 2 or 0.2)
+                                if not score or value < score then best, score = safe, value end
+                            end
                         end
                     end
                 end
+                end
+            end
+            if #targets > 0 and not best and gun then
+                -- High traces failed: search bounded lower airborne stances
+                -- around a rotating enemy window. Native clearance/hazard/body checks still
+                -- apply, and the gun stays selected throughout the descent.
+                local lowCursor = state.lowTargetCursor or 0
+                state.lowTargetCursor = (lowCursor + math.min(6, count)) % count
+                for i = 1, math.min(6, count) do
+                    local item = targets[(lowCursor + i - 1) % count + 1]
+                    for _, lift in ipairs({12, 6, 2}) do
+                        for _, distance in ipairs({24, 48}) do
+                            for side = 0, 7 do
+                                local angle = side * math.pi / 4
+                                local goal = item.position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * math.min(distance, range * 0.7)
+                                goal = Vector3.new(goal.X, item.position.Y - offset.Y + lift, goal.Z)
+                                local cost, worst, safe = route(goal, true)
+                                if cost and worst >= 0 then
+                                    local actual = gunContact(item.target, item.position, {Position = safe + offset}, range)
+                                    if actual then
+                                        local value = cost + (actual.Position - safe - offset).Magnitude * 2
+                                        if not score or value < score then best, score = safe, value end
+                                    end
+                                end
+                            end
+                        end
+                    end
                 end
             end
             lease("Bucket", false) lease("Drill", false)
@@ -2621,7 +2760,8 @@ do
                     success("move:boss-air-combat")
                     move("evade", "boss-air-combat", state.lab, best, 0.5, {goal = best, air = true})
                 end
-                app.status.farm = "Airborne boss pursuit · returning to verified attack range"
+                app.status.farm = best.Y < quake.minY and "Boss pursuit · moving below cover to clear gun trace"
+                    or "Airborne boss pursuit · returning to verified attack range"
                 return true
             end
             if #targets > 0 and recoverAirPosition() then return true end
@@ -3212,7 +3352,7 @@ do
         local range = reach(family, config)
         local lane = mode == "collect" and "collect" or mode == "event" and "event" or "mine"
         local rayGuardian = mode ~= "collect" and guardian or nil
-        local result = contact(target, position, head, range, rayGuardian)
+        local result = gun and gunContact(target, position, head, range) or not gun and contact(target, position, head, range, rayGuardian)
         if mode ~= "collect" and mode ~= "event" and result and result.Instance ~= target and not result.Instance:IsDescendantOf(target) then
             local blocker = result.Instance
             while blocker and blocker ~= state.lab do
@@ -3683,6 +3823,9 @@ do
             local list = {}
             for model in pairs(state.targets) do if model.Parent then table.insert(list, model) else state.targets[model] = nil end end
             state.targetList, state.targetCursor, state.compactAt = list, #list > 0 and (state.targetCursor or 0) % #list or 0, os.clock() + 5
+            for obj in pairs(state.gunFailedPoses or {}) do
+                if not obj.Parent or (obj:GetAttribute("Health") or 0) <= 0 then state.gunFailedPoses[obj] = nil end
+            end
             local liveFaults = {}
             for obj, id in pairs(state.targetIds) do
                 if obj.Parent then liveFaults["hit:" .. id], liveFaults["move:target:" .. id] = true, true end
@@ -3695,6 +3838,7 @@ do
         local _, flightRoot = character()
         if flightRoot and (state.knockUntil or 0) <= os.clock() then self:updateFlight(flightRoot) end
         refreshCombat()
+        self.roundCombatActive = state.combat or state.lab:GetAttribute("BossPhase") == "Core"
         state.combatReady = combatReady(config, evolution)
         if not blocked and capture(config, evolution) then return end
         -- Cash stat upgrades do not own travel and must continue during a
@@ -3905,9 +4049,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v22.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v23.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v22 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v23 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -3936,7 +4080,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v22", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v23", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
@@ -4010,6 +4154,10 @@ local function render()
     elseif game.PlaceId == 104087083666671 then
         ui.info.Text = (app.status.farm or gate() or "Checking round") .. "\n" .. (app.status.chests or "Checking chests")
         if app.afkError then ui.info.Text = (app.status.farm or "Checking round") .. "\n" .. app.afkError end
+        if app.status.gunCombat and app.roundCombatActive then
+            ui.info.Text = (app.status.farm or "Checking round") .. "\n" .. app.status.gunCombat
+                .. (app.afkError and "\n" .. app.afkError or "")
+        end
     else
         ui.info.Text = gate() or ((app.status.perks or "Checking upgrades") .. "\n"
             .. (app.status.eggs or "Checking eggs") .. "\n" .. (app.status.queue or ""))
@@ -4138,11 +4286,24 @@ connect(RunService.Heartbeat, function()
             if (app.retries.errorNote or 0) <= now then app:note(eggsErr) app.retries.errorNote = now + 10 end
         end
     end
+    if app.running and game.PlaceId == 104087083666671 and not gate() then
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum and finite(hum.Health) and hum.Health > 0 then
+            local rules, rulesErr = module("EggHatchery", "Rules")
+            app.moduleErrors.Rules = rulesErr
+            local eggsOK, eggsErr = pcall(stepEggs, rules, nil, inventory(), true)
+            if not eggsOK and (app.retries.errorNote or 0) <= now then
+                status("eggs", "Inventory/contract error; see diagnostics")
+                app:note(eggsErr) app.retries.errorNote = now + 10
+            end
+        end
+    end
     if now - lastRender >= 0.25 then lastRender = now render() end
 end)
 if app.settings.resume then app:Start() end
 render()
-app:note("Ready. AFK repeat runs, boss warning evasion, scientist priority and Claim All. Lobby walk / round tween. Hatching remains opt-in.")
+app:note("Ready. AFK repeat runs, boss warning evasion, scientist priority and Claim All. Lobby walk / round tween. Auto hatch at 100% in lobby and rounds.")
 return app
 
 
