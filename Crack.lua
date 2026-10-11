@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v27.
+-- Crack the Egg: lobby + round progression, v28.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -1375,7 +1375,7 @@ do
         return player:GetAttribute("Owns_Gun") == true and catalog and catalog.Get(player:GetAttribute("GunId")) or nil
     end
     local function allowedGun(gun)
-        return gun and gun.Class ~= "Sniper" and gun.Class ~= "Shotgun" and gun.Id ~= "RPG"
+        return gun and gun.Mode == "Auto" and gun.Class ~= "Sniper" and gun.Class ~= "Shotgun" and gun.Id ~= "RPG"
     end
     local function combatGun()
         local gun = ownedGun()
@@ -1557,7 +1557,7 @@ do
             end
         end
         if not best then leaveShop() app.status.gun = allowedGun(gun) and "Keeping " .. gun.Name .. " · waiting for stronger automatic stock"
-            or "Waiting for affordable automatic gun · owned flamethrower fallback; snipers excluded" return false end
+            or "Waiting for affordable automatic gun · owned flamethrower fallback; semi/burst guns excluded" return false end
         local fp = tostring(serial) .. ":" .. best.slot .. ":" .. best.id .. ":" .. best.price
         if not eligible("gun-buy", fp) then leaveShop() return false end
         local route = state.gunRoute
@@ -4066,7 +4066,7 @@ do
         end
         if pathJob then table.insert(lines, "Path age=" .. string.format("%.1f", os.clock() - pathJob.started) .. "; done=" .. tostring(pathJob.done)) end
         local gunFolder = folderAt("BreakTheEgg")
-        table.insert(lines, "Gun policy: buy automatic guns only; all sniper-class guns/shotguns/RPG excluded; Flame fallback with excluded ownership"
+        table.insert(lines, "Gun policy: buy/equip/fire automatic guns only; semi/burst guns, snipers, shotguns and RPG excluded; Flame fallback with excluded ownership"
             .. "; native Rate=" .. tostring(gunFolder and gunFolder:GetAttribute("GunRate"))
             .. "; ReloadMul=" .. tostring(gunFolder and gunFolder:GetAttribute("GunReloadMul"))
             .. "; MagMul=" .. tostring(gunFolder and gunFolder:GetAttribute("GunMagMul"))
@@ -4144,9 +4144,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v27.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v28.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v27 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v28 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -4175,7 +4175,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v27", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v28", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
