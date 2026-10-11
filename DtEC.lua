@@ -10,8 +10,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 12
-    local BUILD = "r12-sack-ready-church"
+    local REVISION = 13
+    local BUILD = "r13-combined-loot-efficiency"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -260,6 +260,8 @@ return function(source)
                 or outcome == 'EXTRACTED' and 'Game saved-exit confirmed; saved item contents remain unverified.'
                 or 'No verified gear save.', inline = false}
         }
+        fields[#fields + 1] = {name = 'Run Cores/min', value = run.cores and seconds > 0
+            and string.format('%.1f', run.cores * 60 / math.max(1, now() - run.started)) or 'Unavailable', inline = true}
         return {id = run.id, status = 'queued', attempts = 0, created = clock(), body = {
             username = 'Earth Autofarm',
             embeds = {{title = 'Earth run - ' .. outcome, color = outcome == 'LOSS' and 15158332
@@ -923,7 +925,7 @@ end)()
     F.travelDepth, F.cancelTravel = movement.travel, movement.cancel
     F.syncRoute, F.initializeRoute, F.travelRoute = movement.syncRoute, movement.initializeRoute, movement.travelRoute
     F.hover = movement.hover
-    local DEFAULTS = { smartLoot = false, extraction = false, minutes = 10 }
+    local DEFAULTS = { lootExtract = false, minutes = 10 }
     local SETTINGS = 'EarthAutofarm_Settings_v7'
     local FILE = 'EarthAutofarmSettings.json'
     local function clamp(value, low, high, fallback)
@@ -937,9 +939,12 @@ end)()
     end
     local function validate(data)
         data = type(data) == 'table' and data or {}
-        -- Old loot/mining/chest flags never opt the user into either new option.
-        return { chest = true, smartLoot = data.smartLoot == true, extraction = data.extraction == true,
-            minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), schema = 12 }
+        -- Preserve either former optional choice as the one combined feature.
+        -- An explicit new OFF takes precedence over old saved flags.
+        local enabled = data.lootExtract == true
+        if data.lootExtract == nil then enabled = data.smartLoot == true or data.extraction == true end
+        return { chest = true, lootExtract = enabled,
+            minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), schema = 13 }
     end
     local loaded = s.config
     if not loaded then
@@ -969,20 +974,21 @@ end)()
         end
     end
     function F.change(key, value)
+        if key == 'smartLoot' or key == 'extraction' then key = 'lootExtract' end
         if DEFAULTS[key] == nil then return end
         if key == 'minutes' then cfg.minutes = clamp(value, 0, 180, cfg.minutes)
         elseif type(value) == 'boolean' then cfg[key] = value else return end
         persist()
-        if key == 'smartLoot' and not value and s.farm then s.farm.smartLootWindow = nil end
+        if key == 'lootExtract' and not value and s.farm then s.farm.smartLootWindow = nil end
         -- An option change never resets chest progress or replaces a live farm.
         status('Chest farm running; optional settings updated')
         if s.gui then pcall(s.gui.update) end
     end
-    function F.extractionEnabled() return cfg.extraction end
+    function F.extractionEnabled() return cfg.lootExtract end
     function F.extractionReady()
-        return cfg.extraction and s.lootStarted ~= nil and now() - s.lootStarted >= cfg.minutes * 60
+        return cfg.lootExtract and s.lootStarted ~= nil and now() - s.lootStarted >= cfg.minutes * 60
     end
-    function F.smartLootEnabled() return cfg.smartLoot end
+    function F.smartLootEnabled() return cfg.lootExtract end
     local buildGui = (function()
 return function(api)
     local s, cfg = api.state, api.state.config
@@ -1020,7 +1026,7 @@ return function(api)
     ui.screen = make('ScreenGui', parent, { Name = 'EarthAutofarmPanel', ResetOnSpawn = false,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 1500, IgnoreGuiInset = false })
     local panel = make('Frame', ui.screen, { Name = 'Panel', AnchorPoint = Vector2.new(1, 0),
-        Position = UDim2.new(1, -20, 0, 30), Size = UDim2.new(0, 410, 0, 396),
+        Position = UDim2.new(1, -20, 0, 30), Size = UDim2.new(0, 410, 0, 348),
         BackgroundColor3 = color.bg, BorderSizePixel = 0, Active = true })
     rounded(panel, 16)
     make('UIStroke', panel, { Color = color.edge, Thickness = 1 })
@@ -1034,7 +1040,7 @@ return function(api)
         TextColor3 = color.muted, BackgroundTransparency = 1, Position = UDim2.new(1, -46, 0, 13),
         Size = UDim2.new(0, 32, 0, 34), AutoButtonColor = false })
     local body = make('Frame', panel, { Position = UDim2.new(0, 0, 0, 64),
-        Size = UDim2.new(1, 0, 0, 332), BackgroundTransparency = 1 })
+        Size = UDim2.new(1, 0, 0, 284), BackgroundTransparency = 1 })
     local function bind(signal, fn)
         local c = signal:Connect(fn); ui.connections[#ui.connections + 1] = c
         return c
@@ -1048,9 +1054,8 @@ return function(api)
         local detail = label(box, subtitle, 46, 35, 232, 26, 10, color.muted)
         return box, detail
     end
-    local smart = row(1, 'Smart loot items', 'Useful gear upgrades, Shards and Void Crystals', 0)
-    local church = row(2, 'Church extraction', 'Search and return after the minimum time', 80)
-    local minimum = row(3, 'Minimum run time', 'Only applies when Church extraction is ON', 160)
+    local smart = row(1, 'Smart loot + altar extraction', 'Collect useful gear and relics; save at an altar', 0)
+    local minimum = row(2, 'Minimum run time', 'Only applies when loot + extraction is ON', 80)
     local function input(parentBox, value, x, y, width, changed)
         local box = make('TextBox', parentBox, { Text = tostring(value), Font = bold, TextSize = 14,
             TextColor3 = color.accent, BackgroundColor3 = color.bg, BorderSizePixel = 0,
@@ -1072,15 +1077,15 @@ return function(api)
         bind(button.Activated, function() api.change(key, not cfg[key]) end)
         return button
     end
-    local switches = { smartLoot = toggle(smart, 'smartLoot'), extraction = toggle(church, 'extraction') }
-    local status = make('Frame', body, { Position = UDim2.new(0, 16, 0, 240), Size = UDim2.new(1, -32, 0, 85),
+    local switches = { lootExtract = toggle(smart, 'lootExtract') }
+    local status = make('Frame', body, { Position = UDim2.new(0, 16, 0, 160), Size = UDim2.new(1, -32, 0, 105),
         BackgroundTransparency = 1 })
     ui.stage = label(status, 'Waiting for readiness…', 0, 0, 378, 31, 12, color.accent, true)
-    ui.stats = label(status, '', 0, 34, 378, 37, 11, color.muted)
+    ui.stats = label(status, '', 0, 34, 378, 61, 11, color.muted)
     local collapsed = false
     bind(minimize.Activated, function()
         collapsed = not collapsed; body.Visible = not collapsed
-        panel.Size = UDim2.new(0, 410, 0, collapsed and 64 or 396); minimize.Text = collapsed and '+' or '−'
+        panel.Size = UDim2.new(0, 410, 0, collapsed and 64 or 348); minimize.Text = collapsed and '+' or '−'
     end)
     local UIS = api.getService('UserInputService')
     if UIS then
@@ -1106,12 +1111,12 @@ return function(api)
             button.BackgroundColor3 = cfg[key] and color.accent or color.edge
             button.TextColor3 = cfg[key] and color.bg or color.muted
         end
-        minutes.TextEditable = cfg.extraction
-        minutes.TextTransparency = cfg.extraction and 0 or 0.55
+        minutes.TextEditable = cfg.lootExtract
+        minutes.TextTransparency = cfg.lootExtract and 0 or 0.55
         local elapsed = math.max(0, api.now() - (s.lootStarted or api.now()))
         local ctx = s.farm
-        local optionalActive = cfg.extraction and (s.runExhausted or elapsed >= cfg.minutes * 60)
-            or cfg.smartLoot and (s.lootRequest or ctx and (ctx.featureHold or ctx.gearPickup))
+        local optionalActive = cfg.lootExtract and (s.runExhausted or elapsed >= cfg.minutes * 60)
+            or cfg.lootExtract and (s.lootRequest or ctx and (ctx.featureHold or ctx.gearPickup))
             or s.featureStatusAt and api.now() - s.featureStatusAt < 3
         ui.stage.Text = optionalActive and s.featureStatus or s.status or 'Waiting for readiness…'
         local h = api.player.Character and api.player.Character:FindFirstChildOfClass('Humanoid')
@@ -1119,11 +1124,16 @@ return function(api)
         local bag = s.sackSize and string.format('%s/%s', s.sackSize, s.sackCapacity or '?') or '—'
         ui.stats.Text = string.format('%02d:%02d elapsed   ·   HP %d%%   ·   Sack %s\n%d chest removals   ·   %d Cores observed',
             math.floor(elapsed / 60), math.floor(elapsed % 60), health, bag, s.stats.lootObserved or 0, s.stats.coreEarned or 0)
-        if cfg.smartLoot then
+        local cores = tonumber(api.player:GetAttribute('CoresEarned'))
+        local rateElapsed = s.reportRun and api.now() - s.reportRun.started or elapsed
+        if cores and cores == cores and cores >= 0 and cores < math.huge and rateElapsed > 0 then
+            ui.stats.Text = ui.stats.Text .. string.format(' · %.1f run Cores/min', cores * 60 / rateElapsed)
+        end
+        if cfg.lootExtract then
             ui.stats.Text = ui.stats.Text .. string.format('\n%d loot pickups · %s', s.stats.smartPickups or 0, s.smartLootStatus or 'Checking loose items')
         end
         local camera = workspace.CurrentCamera
-        if camera then scale.Scale = math.min(1, math.max(0.55, math.min((camera.ViewportSize.Y - 60) / 396, (camera.ViewportSize.X - 40) / 410))) end
+        if camera then scale.Scale = math.min(1, math.max(0.55, math.min((camera.ViewportSize.Y - 60) / 348, (camera.ViewportSize.X - 40) / 410))) end
     end
     function ui.dispose()
         for _, c in ipairs(ui.connections) do pcall(function() c:Disconnect() end) end
@@ -1248,14 +1258,14 @@ end)()
         return true
     end
     function F.chestLootWindow(ctx, point)
-        if cfg.smartLoot then
-            ctx.smartLootWindow = { position = point, untilAt = now() + 1.5, expires = now() + 7 }
+        if cfg.lootExtract then
+            ctx.smartLootWindow = { position = point, arrivalUntil = now() + 1.5, untilAt = now() + 1.5, expires = now() + 7 }
             s.smartLootStatus = 'Waiting for chest drops'
         end
     end
     function F.smartLootPending(ctx)
         local window = ctx.smartLootWindow
-        if not cfg.smartLoot or window and now() >= window.untilAt then ctx.smartLootWindow = nil; return false end
+        if not cfg.lootExtract or window and now() >= window.untilAt then ctx.smartLootWindow = nil; return false end
         return window ~= nil
     end
     local function tools(ctx)
@@ -1281,13 +1291,14 @@ end)()
         local count = item:GetAttribute('MedicalStackCount')
         return type(count) == 'number' and count == count and count > 0 and count < math.huge and math.max(1, math.floor(count)) or 1
     end
-    local function inventoryCount(ctx, name)
+    local function inventoryCount(ctx, name, inventory)
         local total = 0
-        for _, tool in ipairs(tools(ctx)) do if id(tool) == name then total = total + stackCount(tool) end end
+        for _, tool in ipairs(inventory or tools(ctx)) do if id(tool) == name then total = total + stackCount(tool) end end
         return total
     end
-    local function hasRoom(ctx, item)
-        return #tools(ctx) < 6 or RELICS[id(item)] == true and inventoryCount(ctx, id(item)) > 0
+    local function hasRoom(ctx, item, inventory)
+        inventory = inventory or tools(ctx)
+        return #inventory < 6 or RELICS[id(item)] == true and inventoryCount(ctx, id(item), inventory) > 0
     end
     F.isRelic, F.stackCount, F.hasRoom = isRelic, stackCount, hasRoom
     local function weaponValue(item)
@@ -1297,9 +1308,9 @@ end)()
         if speed ~= speed or speed == math.huge or speed <= 0 then speed = 1 end
         return damage * speed
     end
-    local function findTool(ctx, class)
+    local function findTool(ctx, class, inventory)
         local best, score
-        for _, tool in ipairs(tools(ctx)) do
+        for _, tool in ipairs(inventory or tools(ctx)) do
             local name = id(tool)
             local candidate = attr(tool, 'Class')
             if name == 'Champions_Hammer' then candidate = 'Pickaxe' end
@@ -1356,7 +1367,7 @@ end)()
             and ctx.featureOperation ~= 'dodge' then
             error('__EARTH_DEFENSE_RETRY', 0)
         end
-        if ctx.featureOperation == 'gear' and not cfg.smartLoot
+        if ctx.featureOperation == 'gear' and not cfg.lootExtract
             or (ctx.featureOperation == 'extract' or ctx.featureOperation == 'discovery' or ctx.featureOperation == 'church-search') and not F.extractionReady() then
             error('__EARTH_MODE_CHANGED', 0)
         end
@@ -1420,7 +1431,7 @@ end)()
         if #s.churchMemories > 12 then table.remove(s.churchMemories, 1) end
     end
     function F.observeChurch(ctx)
-        if not cfg.extraction or now() < (ctx.churchObserveAt or 0) then return end
+        if not cfg.lootExtract or now() < (ctx.churchObserveAt or 0) then return end
         ctx.churchObserveAt = now() + 1
         -- Read-only collection before the timer prevents streaming-out churches
         -- from being forgotten. Movement and SaveGear still require the timer.
@@ -1444,7 +1455,7 @@ end)()
             if F.isChurchSavePrompt(item) or (ancestry(item, 'church') or ancestry(item, 'altar')) and F.chestFallbackAllowed(item)
                 and (action:find('lobby', 1, true) or action:find('extract', 1, true) or action:find('return', 1, true)) then
                 seen[item] = true; data.church[#data.church + 1] = item
-                if cfg.extraction then rememberChurch(ctx, item) end
+                if cfg.lootExtract then rememberChurch(ctx, item) end
             end
         end
         for _, item in ipairs(ctx.featureIndex and ctx.featureIndex.church or {}) do classify(item) end
@@ -1531,21 +1542,38 @@ end)()
         if slot == 'Helmet' then slot = 'Head' elseif slot == 'Chestplate' then slot = 'Chest' elseif slot == 'Pants' then slot = 'Legs' end
         if slot == 'Head' or slot == 'Chest' or slot == 'Legs' or slot == 'Boots' then return slot end
     end
-    local function armorBetter(ctx, item)
-        local slot = armorSlot(item); if not slot then return false end
-        local armor = tonumber(attr(item, 'Armor')) or 0
-        local current = tonumber(ctx.character:GetAttribute(slot)) or 0
-        local speed = tonumber(attr(item, 'SpeedBoost')) or 0
-        local existingSpeed = 0
-        for _, equipped in ipairs(children(ctx.character)) do
-            if equipped:GetAttribute('ArmorName') and armorSlot(equipped) == slot then existingSpeed = tonumber(equipped:GetAttribute('SpeedBoost')) or 0 end
+    local function armorState(ctx)
+        local state = {}
+        for _, slot in ipairs({'Head', 'Chest', 'Legs', 'Boots'}) do
+            state[slot] = {armor = tonumber(ctx.character:GetAttribute(slot)) or 0, speed = 0, names = {}}
         end
-        return armor > current or armor == current and slot == 'Boots' and speed > existingSpeed
+        for _, equipped in ipairs(children(ctx.character)) do
+            local name = equipped:GetAttribute('ArmorName')
+            local current = state[armorSlot(equipped)]
+            if current and name and equipped:GetAttribute('AdminArmorLabPreview') ~= true then
+                current.names[name] = true
+                local ok, baseArmor, baseSpeed = pcall(function()
+                    return s.itemDatabase.GetAttribute(name, 'Armor'), s.itemDatabase.GetAttribute(name, 'SpeedBoost')
+                end)
+                current.armor = math.max(current.armor, tonumber(equipped:GetAttribute('Armor')) or 0, ok and tonumber(baseArmor) or 0)
+                current.speed = math.max(current.speed, tonumber(equipped:GetAttribute('SpeedBoost')) or 0, ok and tonumber(baseSpeed) or 0)
+            end
+        end
+        return state
     end
-    local function weaponBetter(ctx, item)
+    local function armorBetter(ctx, item, state)
+        local slot = armorSlot(item); if not slot then return false end
+        local current = (state or armorState(ctx))[slot]
+        if current.names[id(item)] then return false end
+        local armor = tonumber(attr(item, 'Armor')) or 0
+        local speed = tonumber(attr(item, 'SpeedBoost')) or 0
+        return armor > current.armor or armor == current.armor and slot == 'Boots' and speed > current.speed
+    end
+    local function weaponBetter(ctx, item, owned)
         local class = attr(item, 'Class')
         if class ~= 'Sword' and class ~= 'Pickaxe' and class ~= 'ItemBag' then return false end
-        local current = findTool(ctx, class)
+        local current
+        if owned then current = owned[class] else current = findTool(ctx, class) end
         if not current then return true end
         local value = class == 'ItemBag' and (tonumber(attr(item, 'MaxSize')) or 0) or weaponValue(item)
         local existing = class == 'ItemBag' and (tonumber(attr(current, 'MaxSize')) or 0) or weaponValue(current)
@@ -1568,43 +1596,56 @@ end)()
         end
         return false
     end
-    local function upgradeGear(ctx)
-        if not cfg.smartLoot then return false end
-        F.smartLootPending(ctx)
+    local function finishGearReceipt(ctx, pending)
+        if ctx.gearPickup ~= pending or not gearReceipt(ctx, pending) then return false end
+        ctx.gearPickup = nil; ctx.itemRetry[pending.item] = math.huge
+        s.stats.smartPickups = (s.stats.smartPickups or 0) + 1
+        s.smartLootStatus = 'Confirmed ' .. pending.id
+        status('Gear pickup confirmed: ' .. pending.id)
+        local window = ctx.smartLootWindow
+        if window then window.untilAt = math.min(window.expires, math.max(window.arrivalUntil or window.untilAt, now() + 0.35)) end
+        return true
+    end
+    local function settleGear(ctx)
         local pending = ctx.gearPickup
-        if pending then
-            if gearReceipt(ctx, pending) then
-                ctx.gearPickup = nil; ctx.itemRetry[pending.item] = math.huge
-                s.stats.smartPickups = (s.stats.smartPickups or 0) + 1
-                s.smartLootStatus = 'Confirmed ' .. pending.id
-                status('Gear pickup confirmed: ' .. pending.id)
-            elseif now() - pending.started < 5 or not pending.settled then
-                s.smartLootStatus = 'Awaiting inventory receipt: ' .. pending.id
-                -- A bounded settle window has ended; never repeat an uncertain interaction.
-                return false
-            else
-                ctx.itemRetry[pending.item] = now() + 300; ctx.gearPickup = nil
-                s.smartLootStatus = 'No pickup receipt: ' .. pending.id
-                status('No gear receipt for ' .. pending.id .. '; skipping that item for 5 minutes')
-            end
+        if not pending then return true end
+        if finishGearReceipt(ctx, pending) then return true end
+        if not pending.settled or now() - pending.started < 5
+            or now() - (pending.settledAt or pending.started) < 1.5 then
+            s.smartLootStatus = 'Awaiting inventory receipt: ' .. pending.id
+            return false
         end
+        ctx.itemRetry[pending.item] = now() + 300; ctx.gearPickup = nil
+        s.smartLootStatus = 'No pickup receipt: ' .. pending.id
+        status('No gear receipt for ' .. pending.id .. '; skipping that item for 5 minutes')
+        return true
+    end
+    local function upgradeGear(ctx)
+        if not cfg.lootExtract then return false end
+        F.smartLootPending(ctx)
+        if not settleGear(ctx) then return false end
         if s.lootRequest then return false end
+        -- Snapshot only for this non-yielding candidate pass. Inventory receipts
+        -- and packing still read live state after every asynchronous action.
+        local armor = armorState(ctx)
+        local inventory = tools(ctx)
+        local owned = {Sword = findTool(ctx, 'Sword', inventory), Pickaxe = findTool(ctx, 'Pickaxe', inventory), ItemBag = findTool(ctx, 'ItemBag', inventory)}
         local items = worldItems()
         local target = nearest(ctx, items, function(item)
             return isRelic(item) and F.freeWorldItemAllowed(item)
-                and now() >= (ctx.itemRetry[item] or 0) and hasRoom(ctx, item)
+                and now() >= (ctx.itemRetry[item] or 0) and hasRoom(ctx, item, inventory)
         end, 180)
         target = target or nearest(ctx, items, function(item)
-            return F.freeWorldItemAllowed(item) and (armorBetter(ctx, item) or weaponBetter(ctx, item))
+            return F.freeWorldItemAllowed(item) and (armorBetter(ctx, item, armor) or weaponBetter(ctx, item, owned))
                 and now() >= (ctx.itemRetry[item] or 0)
-                and (#tools(ctx) < 6 or armorSlot(item))
+                and (#inventory < 6 or armorSlot(item))
         end, 180)
         if not target then
             if not ctx.smartLootWindow then
                 local nearby = nearest(ctx, items, nil, 180)
                 local blocked = nearest(ctx, items, function(item)
-                    return F.freeWorldItemAllowed(item) and (isRelic(item) or weaponBetter(ctx, item))
-                        and not hasRoom(ctx, item)
+                    return F.freeWorldItemAllowed(item) and (isRelic(item) or weaponBetter(ctx, item, owned))
+                        and not hasRoom(ctx, item, inventory)
                 end, 180)
                 s.smartLootStatus = blocked and 'Toolbar full; useful loot skipped'
                     or nearby and 'No eligible upgrades nearby' or 'No loose gear nearby'
@@ -1612,6 +1653,12 @@ end)()
             return false
         end
         if not acquire(ctx, 'gear') then s.smartLootStatus = 'Waiting for chest movement to yield'; return false end
+        -- Acquisition can yield. Recheck live equipment/capacity before dispatch;
+        -- the candidate-pass snapshot must never authorize an outdated downgrade.
+        if not F.freeWorldItemAllowed(target) or not (isRelic(target) and hasRoom(ctx, target)
+            or armorSlot(target) and armorBetter(ctx, target) or weaponBetter(ctx, target) and hasRoom(ctx, target)) then
+            release(ctx); return false
+        end
         status((isRelic(target) and 'Collecting a relic: ' or 'Equipping a useful upgrade: ') .. id(target))
         s.smartLootStatus = 'Picking up ' .. id(target)
         if not move(ctx, target) then release(ctx); return false end
@@ -1620,11 +1667,10 @@ end)()
         for _, item in ipairs(tools(ctx)) do record.inventory[item] = true end
         for _, item in ipairs(children(ctx.character)) do record.inventory[item] = true end
         ctx.gearPickup = record; ctx.itemRetry[target] = now() + 300
-        if ctx.smartLootWindow then
-            ctx.smartLootWindow.untilAt = math.min(ctx.smartLootWindow.expires, now() + 2)
-        end
+        -- Keep the initial replication grace and an in-flight receipt hold.
+        -- A successful pickup needs only a short quiet tail, not another fixed two seconds.
         local issued = operation(ctx, 'InteractionService', 'Interact', target, function(result)
-            record.settled = true
+            record.settled, record.settledAt = true, now()
             if not api.accepted(result) then
                 ctx.itemRetry[target] = now() + 300
                 if ctx.gearPickup == record then ctx.gearPickup = nil end
@@ -1638,6 +1684,7 @@ end)()
         -- the chest route indefinitely, and only a real receipt counts as loot.
         local deadline = now() + 1.5
         while issued and ctx.gearPickup == record and now() < deadline and not gearReceipt(ctx, record) do wait(ctx, 0.05) end
+        if issued then finishGearReceipt(ctx, record) end
         release(ctx); return issued
     end
     local function sendBag(ctx, active, payload)
@@ -2316,6 +2363,7 @@ end)()
         end
         if now() < (ctx.extractAt or 0) or now() < (ctx.packRetryAt or 0) then return false end
         if s.lootRequest then status('Church return waits for the outstanding item reply; chest work continues'); return false end
+        if not settleGear(ctx) then status('Church return waits briefly for the last smart pickup inventory receipt'); return false end
         if not acquire(ctx, 'extract') then return false end
         if not packForReturn(ctx, data) then
             ctx.packRetryAt = math.max(ctx.packRetryAt or 0, now() + 1)
@@ -2404,7 +2452,7 @@ end)()
         ctx.safePosition = ctx.root.Position
         if workspace.DescendantAdded then
             ctx.connect(workspace.DescendantAdded, function(item)
-                if item:IsA('ProximityPrompt') and cfg.extraction then
+                if item:IsA('ProximityPrompt') and cfg.lootExtract then
                     ctx.indexPending = ctx.indexPending or {}; ctx.indexPending[item] = true
                     if F.isChurchSavePrompt(item) then rememberChurch(ctx, item) end
                 end
@@ -2433,9 +2481,9 @@ end)()
                     if not ctx.defenseThread and F.dodge(ctx) then return end
                     if ctx.dodgeUntil and now() < ctx.dodgeUntil then return end
                     if ctx.pendantAttempt and now() - ctx.pendantAttempt.started < 5 then release(ctx); return end
-                    if not cfg.smartLoot and not cfg.extraction then release(ctx); return end
+                    if not cfg.lootExtract then release(ctx); return end
                     F.observeChurch(ctx)
-                    if (cfg.smartLoot or F.extractionReady()) and not s.itemDatabase then
+                    if not s.itemDatabase then
                         status('Waiting for item definitions before smart loot / church packing'); return
                     end
                     -- Church return takes priority as soon as the minimum time is met.
@@ -2443,10 +2491,10 @@ end)()
                         local data = index(ctx)
                         if extract(ctx, data) then return end
                         if not s.churchSave and discover(ctx) then return end
-                    elseif cfg.extraction and s.runExhausted then
+                    elseif cfg.lootExtract and s.runExhausted then
                         status(string.format('Chest route complete; church extraction unlocks in %.0fs', cfg.minutes * 60 - (now() - s.lootStarted)))
                     end
-                    if cfg.smartLoot then
+                    if cfg.lootExtract then
                         upgradeGear(ctx)
                     end
                 end)
