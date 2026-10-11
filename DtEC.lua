@@ -1,6 +1,6 @@
 task.wait(7)
 -- ChestFarmAutoLoop.lua: put this complete file in the executor's auto-execute folder.
--- Revision 13: skips CommonChest; optional combined smart loot and native altar extraction.
+-- Revision 13: skips CommonChest; background useful-item bringing in optional smart loot mode.
 -- Hides the default Gameplay Paused popup after readiness; streaming pauses still apply.
 -- Includes Discord ending reports, cached discovery, and Blinker / identified boss ranged dodging.
 -- Continuous segmented depth travel; no healing, mining, selling, shops or team purchases.
@@ -11,7 +11,7 @@ return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
     local REVISION = 13
-    local BUILD = "r13-ignore-common-chest"
+    local BUILD = "r13-background-bring-items"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -668,6 +668,226 @@ end
     local FEATURE_SOURCE = [=====[return function(api)
     local s, now, controller = api.state, api.now, api.controller
     local F = {}
+    local bring
+    local buildBring = (function()
+-- Native Request(item) ownership and alignment holding adapted from EarthManualAssist.
+-- Interact accepts LockedTarget in the game's DragController: collect while held,
+-- then Cancel(true). This avoids a moving character outrunning a dropped item.
+return function(api)
+    local s, now = api.state, api.now
+    local B = {}
+    local unpackValues = table.unpack or unpack
+    local function manual()
+        local c = api.controller('DragController')
+        return c and c.LockedTarget ~= nil
+            or api.Players.LocalPlayer:GetAttribute('PlacingCraftedPlaceable') == true
+    end
+    function B.available()
+        return api.remote and api.remote('DragService', 'Request') and api.remote('DragService', 'Cancel')
+            and api.remote('InteractionService', 'Interact') ~= nil
+    end
+    local function clearHold(job)
+        for _, object in ipairs(job.constraints or {}) do pcall(function() object:Destroy() end) end
+        job.constraints = {}; job.goal = nil
+        job.ctx.bringEquipmentLock = nil
+    end
+    local function retire(job)
+        clearHold(job)
+        if s.bringDelivery == job then s.bringDelivery = nil end
+    end
+    local cancel
+    local function call(job, method, rf, args, callback)
+        if job.pending or not rf then return false end
+        local token = {started = now(), method = method}
+        job.pending = token
+        task.spawn(function()
+            -- Native calls may yield indefinitely. Keep the slot quarantined until
+            -- the actual reply; timeout must never authorize another ownership request.
+            local ok, value = pcall(function() return rf:InvokeServer(unpackValues(args, 1, #args)) end)
+            if job.pending ~= token then return end
+            job.pending = nil
+            local handled = pcall(callback, ok, value)
+            if not handled then
+                if method == 'Cancel' then job.releaseFailed = true; clearHold(job)
+                else job.owns = true; cancel(job) end
+            end
+        end)
+        return true
+    end
+    cancel = function(job)
+        job.cancelled = true
+        clearHold(job)
+        if job.pending then return end
+        if job.releaseFailed then return end
+        if not job.owns then retire(job); return end
+        if manual() then
+            job.manualConflict = true
+            s.smartLootStatus = 'Bring cleanup waits for your manual drag'
+            return -- Cancel has no item argument; never cancel another manual drag.
+        end
+        job.stage = 'release'
+        call(job, 'Cancel', job.cancelRemote, {true}, function(ok, value)
+            if ok and value ~= false then job.owns = false; retire(job)
+            else
+                job.releaseFailed = true
+                s.smartLootStatus = 'Bring ownership release unconfirmed; further bringing paused'
+            end
+        end)
+    end
+    function B.cleanup(ctx)
+        local job = s.bringDelivery
+        if job and job.ctx == ctx then cancel(job) end
+    end
+    function B.pending() return s.bringDelivery ~= nil end
+    function B.blocksSave()
+        local job = s.bringDelivery
+        -- A timed-out/cancelled ownership call quarantines further bringing,
+        -- not extraction. Its late reply can only release; it cannot pick up loot.
+        return job ~= nil and not job.cancelled
+    end
+    local function loose(ctx, item)
+        if not api.free(item) or not api.part(item) or api.skip(item) then return false end
+        if item:GetAttribute('Welded') or api.tag(item, 'Welded') or api.tag(item, 'BuyPart')
+            or api.tag(item, 'Ore') or item:GetAttribute('Placed') == true
+            or item:GetAttribute('CraftedPlaceable') == true then return false end
+        local ancestor = item.Parent
+        while ancestor and ancestor ~= workspace do
+            if api.tag(ancestor, 'BuyPart') then return false end
+            ancestor = ancestor.Parent
+        end
+        local owner = tonumber(item:GetAttribute('OwnerUserId'))
+        return not owner or owner == 0 or owner == api.Players.LocalPlayer.UserId
+    end
+    local function moveItem(job)
+        local item, root = job.item, job.ctx.root
+        local p = api.part(item)
+        if not p or not root.Parent then return false end
+        local cf = root.CFrame * CFrame.new(3, 1, -4)
+        local previous = job.rootPosition
+        local moving = previous and (root.Position - previous).Magnitude > 6
+        local error = (item:GetPivot().Position - cf.Position).Magnitude
+        if not previous or moving or error > 2 then
+            if previous and not moving and error > 8 then
+                job.corrections = (job.corrections or 0) + 1
+                if job.corrections > 3 then return false end
+            end
+            item:PivotTo(cf)
+            p.AssemblyLinearVelocity, p.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+        end
+        job.rootPosition = root.Position
+        return true
+    end
+    local function hold(job)
+        local p, root = api.part(job.item), job.ctx.root
+        job.constraints = {}
+        local function create(class, parent)
+            local object = Instance.new(class); job.constraints[#job.constraints + 1] = object
+            object.Name, object.Parent = 'EarthAutofarmBring', parent
+            return object
+        end
+        local attach = create('Attachment', p)
+        attach.CFrame = p.CFrame:ToObjectSpace(job.item:GetPivot())
+        local goal = create('Attachment', root); goal.CFrame = CFrame.new(3, 1, -4)
+        local align = create('AlignPosition', p)
+        align.Attachment0, align.Attachment1 = attach, goal
+        align.Responsiveness, align.MaxForce = 45, 45000
+        align.RigidityEnabled, align.ReactionForceEnabled = false, false
+        local orientation = create('AlignOrientation', p)
+        orientation.Attachment0, orientation.Attachment1 = attach, goal
+        orientation.Responsiveness, orientation.MaxTorque = 45, 500000
+        orientation.RigidityEnabled, orientation.ReactionTorqueEnabled = false, false
+        job.goal = goal; job.ctx.bringEquipmentLock = true
+        if not moveItem(job) then error('Bring placement unavailable') end
+        job.stage, job.readyAt = 'hold', now() + 0.45
+    end
+    function B.step(ctx, allowNew)
+        local job = s.bringDelivery
+        if job then
+            if job.ctx ~= ctx or not ctx.active or not api.enabled() or not api.owned()
+                or not api.safe(ctx) or manual() then cancel(job); return true end
+            if job.cancelled then
+                if not job.pending and not job.releaseFailed then cancel(job) end
+                return true
+            end
+            if job.pending and now() - job.pending.started >= 8 then
+                s.smartLootStatus = 'Bring reply delayed; chest route continues without duplicate requests'
+                cancel(job); return true
+            end
+            if job.receipt and api.received(ctx, job.receipt) then
+                api.confirm(ctx, job.receipt); cancel(job); return true
+            end
+            if not loose(ctx, job.item) or not api.eligible(ctx, job.item) then cancel(job); return true end
+            if job.owns then
+                local ok, moved = pcall(moveItem, job)
+                if not ok or not moved then cancel(job); return true end
+            end
+            if job.stage == 'hold' and now() >= job.readyAt and not s.lootRequest then
+                -- Recheck after the ownership wait, while beside the current root.
+                if not api.eligible(ctx, job.item) then cancel(job); return true end
+                local p = api.part(job.item)
+                if not p or (p.Position - ctx.root.Position).Magnitude > 8 then cancel(job); return true end
+                local receipt = api.receipt(ctx, job.item); receipt.brought = true
+                job.receipt, ctx.gearPickup = receipt, receipt
+                job.stage, job.receiptUntil = 'receipt', now() + 5
+                if not api.interact(ctx, job.item, function(result)
+                    receipt.settled, receipt.settledAt = true, now()
+                    if not api.accepted(result) then
+                        if ctx.gearPickup == receipt then ctx.gearPickup = nil end
+                        s.smartLootStatus = 'Brought item pickup rejected; continuing chest route'
+                        cancel(job)
+                    end
+                end) then
+                    ctx.gearPickup = nil; cancel(job)
+                end
+            elseif job.stage == 'receipt' and now() >= job.receiptUntil then
+                s.smartLootStatus = 'Brought item has no inventory receipt; chest route continues'
+                cancel(job)
+            end
+            return true
+        end
+        if not allowNew or not api.enabled() or not api.safe(ctx) or manual() or s.lootRequest
+            or s.equipmentRequest or ctx.gearPickup or now() < (ctx.bringScanAt or 0) then return false end
+        -- Bounded work per pulse: one local inventory view per chunk, 128 items
+        -- maximum, and one world snapshot per second. Never walks Workspace here.
+        if not ctx.bringScan then
+            ctx.bringScan = {items = api.items(), cursor = 1}
+        end
+        local scan, eligible = ctx.bringScan, api.snapshot(ctx)
+        for _ = 1, 128 do
+            local item = scan.items[scan.cursor]
+            if not item then break end
+            scan.cursor = scan.cursor + 1
+            if loose(ctx, item) and now() >= (ctx.itemRetry[item] or 0) and eligible(item) then
+                local score = api.score(item)
+                if not scan.best or score > scan.score then scan.best, scan.score = item, score end
+            end
+        end
+        if scan.cursor <= #scan.items then return false end
+        ctx.bringScan, ctx.bringScanAt = nil, now() + 1
+        local item = scan.best
+        if not item or not loose(ctx, item) or not api.eligible(ctx, item) then return false end
+        job = {ctx = ctx, item = item, stage = 'request', cancelRemote = api.remote('DragService', 'Cancel')}
+        s.bringDelivery = job; ctx.itemRetry[item] = now() + 300
+        ctx.bringEquipmentLock = true
+        s.smartLootStatus = 'Bringing useful loot: ' .. api.id(item)
+        local issued = call(job, 'Request', api.remote('DragService', 'Request'), {item}, function(ok, granted)
+            if ok and granted == false then retire(job); return end
+            -- Unknown replies can still have granted ownership: release once,
+            -- with no guessed success or duplicate Request.
+            job.owns = true
+            if not ok or granted ~= true or job.cancelled or not ctx.active or not api.owned()
+                or not api.enabled() or not api.safe(ctx) or manual() or not loose(ctx, item)
+                or not api.eligible(ctx, item) then cancel(job); return end
+            local held = pcall(hold, job)
+            if not held then cancel(job) end
+        end)
+        if not issued then retire(job) end
+        return true
+    end
+    return B
+end
+
+end)()
     local buildMovement = (function()
 return function(api)
     local M, now = {}, api.now
@@ -979,7 +1199,10 @@ end)()
         if key == 'minutes' then cfg.minutes = clamp(value, 0, 180, cfg.minutes)
         elseif type(value) == 'boolean' then cfg[key] = value else return end
         persist()
-        if key == 'lootExtract' and not value and s.farm then s.farm.smartLootWindow = nil end
+        if key == 'lootExtract' and not value and s.farm then
+            s.farm.smartLootWindow = nil
+            if bring then bring.cleanup(s.farm) end
+        end
         -- An option change never resets chest progress or replaces a live farm.
         status('Chest farm running; optional settings updated')
         if s.gui then pcall(s.gui.update) end
@@ -1334,6 +1557,7 @@ end)()
         end
     end
     local function equip(ctx, tool)
+        if ctx.bringEquipmentLock then return nil end
         if not tool or not tool.Parent then return nil end
         local active = activeFor(ctx, tool)
         if active then s.equipRecords[tool] = nil; return active end
@@ -1604,7 +1828,7 @@ end)()
         s.smartLootStatus = 'Confirmed ' .. pending.id
         status('Gear pickup confirmed: ' .. pending.id)
         local window = ctx.smartLootWindow
-        if window then window.untilAt = math.min(window.expires, math.max(window.arrivalUntil or window.untilAt, now() + 0.35)) end
+        if window and not pending.brought then window.untilAt = math.min(window.expires, math.max(window.arrivalUntil or window.untilAt, now() + 0.35)) end
         return true
     end
     local function settleGear(ctx)
@@ -1621,11 +1845,41 @@ end)()
         status('No gear receipt for ' .. pending.id .. '; skipping that item for 5 minutes')
         return true
     end
+    local function usefulSnapshot(ctx)
+        local armor, inventory = armorState(ctx), tools(ctx)
+        local owned = {Sword = findTool(ctx, 'Sword', inventory), Pickaxe = findTool(ctx, 'Pickaxe', inventory), ItemBag = findTool(ctx, 'ItemBag', inventory)}
+        return function(item)
+            return isRelic(item) and hasRoom(ctx, item, inventory)
+                or armorSlot(item) and armorBetter(ctx, item, armor)
+                or weaponBetter(ctx, item, owned) and hasRoom(ctx, item, inventory)
+        end
+    end
+    local function pickupRecord(ctx, target)
+        local record = {item = target, id = id(target), slot = armorSlot(target), inventory = {}, started = now(),
+            relic = isRelic(target), beforeCount = inventoryCount(ctx, id(target))}
+        for _, item in ipairs(tools(ctx)) do record.inventory[item] = true end
+        for _, item in ipairs(children(ctx.character)) do record.inventory[item] = true end
+        return record
+    end
+    bring = buildBring({state = s, now = now, controller = controller, remote = api.remote, Players = api.Players,
+        owned = api.owned, enabled = function() return cfg.lootExtract end, safe = safeToWork,
+        free = F.freeWorldItemAllowed, skip = F.skipLootArea, part = part, tag = tag,
+        items = function() return children(workspace:FindFirstChild('Items')) end, id = id,
+        snapshot = usefulSnapshot, eligible = function(ctx, item) return usefulSnapshot(ctx)(item) end,
+        score = function(item)
+            local value = armorSlot(item) and (tonumber(attr(item, 'Armor')) or 0)
+                or attr(item, 'Class') == 'ItemBag' and (tonumber(attr(item, 'MaxSize')) or 0) or weaponValue(item)
+            return (isRelic(item) and 1000000000 or 0) + (rarity[attr(item, 'Rarity')] or 0) * 1000000 + math.min(value, 999999)
+        end,
+        receipt = pickupRecord, received = gearReceipt, confirm = finishGearReceipt, accepted = api.accepted,
+        interact = function(ctx, item, callback) return operation(ctx, 'InteractionService', 'Interact', item, callback) end})
+    function F.bringStep(ctx, allowNew) return bring.step(ctx, allowNew) end
     local function upgradeGear(ctx)
         if not cfg.lootExtract then return false end
         F.smartLootPending(ctx)
         if not settleGear(ctx) then return false end
         if s.lootRequest then return false end
+        if bring.available() then return bring.step(ctx, not F.extractionReady()) end
         -- Snapshot only for this non-yielding candidate pass. Inventory receipts
         -- and packing still read live state after every asynchronous action.
         local armor = armorState(ctx)
@@ -1847,7 +2101,7 @@ end)()
     end
     function F.usePendant(ctx)
         -- Only an already-owned pendant; use its native lifecycle/cooldown handler.
-        if ctx.featureHold or ctx.currentChest or not safeToWork(ctx) then return false end
+        if ctx.featureHold or ctx.currentChest or ctx.bringEquipmentLock or not safeToWork(ctx) then return false end
         local serverNow = workspace:GetServerTimeNow()
         local ending = tonumber(api.Players.LocalPlayer:GetAttribute('VampirePendantCooldownEndsAt')) or 0
         if ending > serverNow then ctx.pendantAttempt = nil; return false end
@@ -2341,6 +2595,7 @@ end)()
     local function extract(ctx, data)
         if not F.extractionReady() then return false end
         if savedChurchState() then return true end
+        if bring.blocksSave() then status('Church waits for background item ownership cleanup; chest work continues'); return false end
         local save = s.churchSave
         if save then
             if not save.settled then status('Church SaveGear reply pending; no duplicate save is sent'); return false end
@@ -2403,6 +2658,7 @@ end)()
         release(ctx); return true
     end
     function F.cleanup(ctx)
+        bring.cleanup(ctx)
         movement.cleanup(ctx)
         if not ctx.active and ctx.defenseThread and ctx.defenseThread ~= coroutine.running() then pcall(task.cancel, ctx.defenseThread) end
         release(ctx); ctx.combatTarget = nil
@@ -2477,6 +2733,9 @@ end)()
                 ctx.featurePulse = now()
                 local ok, why = pcall(function()
                     ctx.check()
+                    -- Progress delivery and stale ownership cleanup even while the
+                    -- optional switch is OFF or a transition prevents new actions.
+                    bring.step(ctx, false)
                     F.watcher(ctx)
                     if not safeToWork(ctx) then release(ctx); return end
                     if not ctx.defenseThread and F.dodge(ctx) then return end
@@ -2623,7 +2882,7 @@ end
             end
             if ctx.dodgeUntil and now() < ctx.dodgeUntil then return end
             if features and features.dodge(ctx) then return end
-            if features and features.usePendant(ctx) then return end
+            if features and not ctx.bringEquipmentLock and features.usePendant(ctx) then return end
             if now() >= (combat.inventoryAt or 0) or not combat.selected
                 or not combat.selected.tool.Parent or (combat.selected.tool.Parent ~= model and combat.selected.tool.Parent ~= child(player, "Backpack")) then
                 combat.selected, combat.inventoryAt = bestWeapon(), now() + 1
@@ -2646,6 +2905,7 @@ end
                 ready = active.Tool.Name == selected.id or active.Tool.Name == selected.id .. tostring(player.UserId)
             end
             if not ready then
+                if ctx.bringEquipmentLock then return end -- Native tool changes cancel drag ownership.
                 local record = combat.equipRecords[selected.tool]
                 if selected.tool.Parent == model then notice("Waiting for the equipped weapon's native attack handler"); return end
                 if record and record.accepted then
