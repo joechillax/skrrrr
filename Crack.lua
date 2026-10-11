@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v24.
+-- Crack the Egg: lobby + round progression, v25.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -1391,6 +1391,15 @@ do
         local rate = catalog.CycleRate(gun.Id)
         return (gun.FoeDamage or 1) * gun.Pellets * rate * gun.Magazine / (gun.Magazine + rate * gun.Reload)
     end
+    local function preferGun(candidate, current)
+        if not allowedGun(candidate) then return false end
+        if not allowedGun(current) then return true end
+        -- Native automatic fire takes priority; damage ranks guns within the
+        -- same firing category. A sniper stays available as a stock fallback.
+        local auto, currentAuto = candidate.Mode == "Auto", current.Mode == "Auto"
+        if auto ~= currentAuto then return auto end
+        return gunValue(candidate) > gunValue(current)
+    end
     local function flameOwned(config)
         return selectableTool("HandDrill", config) and player:GetAttribute("Evolution_HandDrill") == 3
     end
@@ -1489,12 +1498,12 @@ do
         return folder, ids, prices, cash, serial
     end
     local function gunReserve()
-        local current = gunValue(ownedGun())
+        local current = ownedGun()
         local _, ids, prices = shopStock()
         local catalog, reserve = module("BreakTheEgg", "GunCatalog"), nil
         for i, id in ipairs(ids or {}) do
             local price = prices[i]
-            if catalog and gunValue(catalog.Get(id)) > current and finite(price) and price >= 0 then reserve = math.min(reserve or price, price) end
+            if catalog and preferGun(catalog.Get(id), current) and finite(price) and price >= 0 then reserve = math.min(reserve or price, price) end
         end
         return reserve or 0
     end
@@ -1532,7 +1541,7 @@ do
         if type(fireproximityprompt) ~= "function" then leaveShop() app.status.gun = "Auto-buy gun needs fireproximityprompt" return false end
         local _, root, head = character()
         if not root then return false end
-        local best, score
+        local best
         for i, id in ipairs(ids) do
             local def, price = catalog.Get(id), prices[i]
             local slot = prompts:FindFirstChild("Slot" .. i)
@@ -1540,13 +1549,14 @@ do
             local anchor = prompt and prompt.Parent
             local point = anchor and anchor:IsA("Attachment") and anchor.WorldPosition or anchor and anchor:IsA("BasePart") and anchor.Position
             if anchor and anchor:IsA("Attachment") then anchor = anchor.Parent end
-            if allowedGun(def) and gunValue(def) > gunValue(gun) and finite(price) and price >= 0 and price <= cash and prompt and prompt:IsA("ProximityPrompt")
+            if preferGun(def, gun) and finite(price) and price >= 0 and price <= cash and prompt and prompt:IsA("ProximityPrompt")
                 and prompt.Enabled and prompt:GetAttribute("GunShopSlot") == i and anchor and anchor:IsA("BasePart") then
-                local value = gunValue(def)
-                if not best or value > score then best, score = {id = id, slot = i, price = price, prompt = prompt, anchor = anchor, point = point}, value end
+                if not best or preferGun(def, best.def) then
+                    best = {id = id, def = def, slot = i, price = price, prompt = prompt, anchor = anchor, point = point}
+                end
             end
         end
-        if not best then leaveShop() app.status.gun = gun and "Keeping " .. gun.Name .. " · waiting for stronger allowed stock"
+        if not best then leaveShop() app.status.gun = gun and "Keeping " .. gun.Name .. " · waiting for preferred automatic/stronger stock"
             or "Waiting for affordable gun (no shotguns/RPG) · owned flamethrower fallback" return false end
         local fp = tostring(serial) .. ":" .. best.slot .. ":" .. best.id .. ":" .. best.price
         if not eligible("gun-buy", fp) then leaveShop() return false end
@@ -4023,7 +4033,7 @@ do
         end
         if pathJob then table.insert(lines, "Path age=" .. string.format("%.1f", os.clock() - pathJob.started) .. "; done=" .. tostring(pathJob.done)) end
         local gunFolder = folderAt("BreakTheEgg")
-        table.insert(lines, "Gun policy: all stocked guns except shotgun class/RPG; stronger replacements only"
+        table.insert(lines, "Gun policy: automatic guns first; stronger within firing category; no shotgun class/RPG"
             .. "; native Rate=" .. tostring(gunFolder and gunFolder:GetAttribute("GunRate"))
             .. "; ReloadMul=" .. tostring(gunFolder and gunFolder:GetAttribute("GunReloadMul"))
             .. "; MagMul=" .. tostring(gunFolder and gunFolder:GetAttribute("GunMagMul"))
@@ -4101,9 +4111,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v24.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v25.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v24 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v25 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -4132,7 +4142,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v24", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v25", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
