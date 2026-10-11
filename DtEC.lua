@@ -11,7 +11,7 @@ return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
     local REVISION = 13
-    local BUILD = "r13-background-bring-items"
+    local BUILD = "r13-moving-after-chests"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -1482,6 +1482,11 @@ end)()
         return true
     end
     function F.chestLootWindow(ctx, point)
+        if cfg.lootExtract and bring and bring.available() then
+            -- Background delivery scans late drops without parking at the chest.
+            ctx.smartLootWindow = nil
+            return
+        end
         if cfg.lootExtract then
             ctx.smartLootWindow = { position = point, arrivalUntil = now() + 1.5, untilAt = now() + 1.5, expires = now() + 7 }
             s.smartLootStatus = 'Waiting for chest drops'
@@ -2963,11 +2968,11 @@ end
             if not selected.melee and features then features.afterAttack(ctx, target, selected.class, healthBefore) end
             local endsAt = math.max(tonumber(active.LastSwing) or 0, tonumber(active.AttackLockedUntil) or 0, tonumber(active.Debounce) or 0)
             combat.nextAttack = math.max(now() + 0.1, endsAt)
-            if target and endsAt > now() then
-                if combat.target ~= target then combat.target, combat.burstUntil = target, now() + 6 end
-                -- A threat gets a bounded defensive burst before movement can resume.
-                combat.holdUntil = math.min(endsAt, combat.burstUntil or now())
-            end
+            -- Native cooldowns delay the next attack, never the chest route.
+            -- Standing beside a living enemy through several swings only exposes
+            -- the player to more hits. The separate ranged-defense worker can
+            -- still take movement ownership for an actual projectile/telegraph.
+            combat.target, combat.holdUntil, combat.burstUntil = target, nil, nil
         end
         ctx.combatThread = task.spawn(function()
             while ctx.active and owned() and s.farm == ctx do
@@ -3179,8 +3184,7 @@ end
             end
         end
         function ctx.awaitCombat()
-            while ctx.active and ((ctx.combat and now() < (ctx.combat.holdUntil or 0) and coroutine.running() ~= ctx.featureThread)
-                or (ctx.featureHold and coroutine.running() ~= ctx.featureThread)
+            while ctx.active and ((ctx.featureHold and coroutine.running() ~= ctx.featureThread)
                 or (features.smartLootPending(ctx) and coroutine.running() ~= ctx.featureThread)
                 or ctx.defenseMoving
                 or (ctx.dodgeUntil and now() < ctx.dodgeUntil)) do
@@ -3332,7 +3336,10 @@ end
                 prompt:InputHoldBegin()
                 s.stats.promptFires = s.stats.promptFires + 1
                 if ctx.currentChest then ctx.currentChest.attempted, ctx.currentChest.usedNative = true, true end
-                taskApi.wait(math.max(0.03, duration + 0.05))
+                local deadline = now() + math.max(0.03, duration + 0.05)
+                while prompt.Parent and prompt.Enabled ~= false and now() < deadline do
+                    taskApi.wait(math.min(0.05, deadline - now()))
+                end
                 return true
             end))
             if ctx.heldPrompts[prompt] then pcall(function() prompt:InputHoldEnd() end) end
