@@ -1,4 +1,4 @@
--- JoesAAS 5.14 | standalone source | October 2026
+-- JoesAAS 5.15 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -8,7 +8,7 @@ if game.GameId ~= 10502841145 then
     warn("JoesAAS: this build targets the exported game's universe, not this experience.")
     return
 end
-local A = {version="5.14"}
+local A = {version="5.15"}
 environment.JoesAAS = A
 environment.AnimeSuite = A -- Compatibility with older running versions.
 A.Core = (function()
@@ -3301,7 +3301,7 @@ return function(A)
                     if not power or type(power.BuildRanking)~='function' then
                         A.status['Fixer gigs']='Native pet ranking unavailable'; return
                     end
-                    -- Keep gig pets in the ranking: busy rank 4 must not make rank 7 eligible.
+                    -- Keep gig pets in the ranking: busy rank 18 must not make rank 21 eligible.
                     if rankingDirty or not ranked or os.clock()-rankingAt>=30 then
                         ranked={}
                         for _,row in ipairs(power.BuildRanking(d,{IncludeGigPets=true})) do
@@ -3309,14 +3309,14 @@ return function(A)
                         end
                         rankingDirty=false; rankingAt=os.clock()
                     end
-                    for position=4,6 do
+                    for position=18,20 do
                         local uid=ranked[position]
                         if type(uid)=='string' and type(d.Pets[uid])=='table' and not autoPets[uid]
                             and not util.IsPetOnGig(d,uid) and (petBackoff[uid] or 0)<=os.clock() then
                             pet=uid; rank=position; action='Send'; break
                         end
                     end
-                    if not action then A.status['Fixer gigs']='Waiting for an available non-scaling pet ranked 4–6'; return end
+                    if not action then A.status['Fixer gigs']='Waiting for an available non-scaling pet ranked 18–20'; return end
                 end
             end
         end
@@ -3516,6 +3516,17 @@ end)()(A);
 return function(A)
     local revision,applied,observedStat=1,0,nil
     local pending,nextAttempt=nil,0
+    local petsNext=os.clock()+10
+    A.job('Equip best pets',1,function()
+        if not A.alive or not A.running or os.clock()<petsNext then return end
+        local d=A.petData(); if not d or type(d.Pets)~='table' then return end
+        local ctrl=A.client('TeleportController')
+        if ctrl and ctrl:IsLoading() then return end
+        if pending or A.requestInFlight('FixerGigAction') then return end
+        -- Same zero-argument action as the pet inventory's Equip Best button.
+        petsNext=os.clock()+10
+        if A.fire('EquipBest') then A.status['Equip best pets']='Requested native Equip Best; repeats every 10s' end
+    end)
     function A.wakeLoadout() revision=revision+1; if A.tasks.Loadout then A.tasks.Loadout.next=0 end end
     A.onPetInventory(A.wakeLoadout)
     A.on('EquipBestLoadoutResult',function(accepted,reason,stat)
@@ -4539,7 +4550,7 @@ return function(A)
     toggle('Cyber','Auto deploy pets to Fixer Gigs','fixerAutoDeploy',wakeFixer)
     choose('Cyber','Fixer deployment order','fixerPreference',choices({'Board order','Big Jobs first'}))
     status('Cyber','Fixer gigs')
-    note('Cyber','Fixer deployment','Uses your 4th, 5th and 6th strongest non-scaling pets, filling available gigs in your chosen order. Pets already on gigs stay in the ranking and are skipped. Enable auto claim too to collect rewards and keep deploying. Sending a pet makes it unavailable for combat until claimed.')
+    note('Cyber','Fixer deployment','Uses your 18th, 19th and 20th strongest non-scaling pets, filling available gigs in your chosen order. Pets already on gigs stay in the ranking and are skipped. Enable auto claim too to collect rewards and keep deploying. Sending a pet makes it unavailable for combat until claimed.')
     note('Settings','Native automation in Update 18','Guild → Personal now has Auto Claim. Fixer Auto repeats its assigned pet; ranked Fixer deployment here leaves native Auto slots alone. Native Grimoire Passives already advances both slots. Auto Rejoin is handled by the game; your executor must still run JoesAAS after reconnecting.')
     status('Settings','Native migration')
     choose('Settings','Automatic loadout objective','loadoutStat',choices({'Power','Damage','Yen','XP','Drop','Luck','Kill','CritChance','CritDamage','ShinyChance'}))
