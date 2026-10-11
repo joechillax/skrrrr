@@ -11,7 +11,7 @@ return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
     local REVISION = 13
-    local BUILD = "r13-remembered-reload-v133"
+    local BUILD = "r13-smart-loot-rir"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -677,23 +677,27 @@ return function(api)
     local s, now = api.state, api.now
     local B = {}
     local memoryStep, cancelReload
-    local RELOAD_LIMIT, PASS_WAIT, RELOAD_WINDOW, PASS_COOLDOWN = 2, 30, 4.5, 30
+    local RELOAD_WINDOW = 4.5
+    local function policy(record)
+        if api.reloadPolicy then return api.reloadPolicy(record.target) end
+        return 2, 30
+    end
     local function countReload(reload)
-        if reload.token.started and not reload.counted then
+        if reload.token.called and not reload.counted then
             reload.record.attempts = (reload.record.attempts or 0) + 1
             reload.counted = true
         end
     end
     local function chargeReload(reload)
         countReload(reload)
-        if not reload.charged and reload.token.started and reload.budget then
-            reload.budget.spent = reload.budget.spent + math.max(0, now() - reload.token.started)
+        if not reload.charged and reload.token.called then
+            s.lootReloadObservationSeconds = (s.lootReloadObservationSeconds or 0) + math.max(0, now() - reload.token.started)
             reload.charged = true
         end
     end
     local function reloadDue(reload)
         local token = reload.token
-        return token.expired or token.timedOut or token.blocked
+        return token.expired or token.timedOut or token.blocked or token.skipped
             or token.started and now() >= token.started + RELOAD_WINDOW
             or not token.started and now() - reload.started >= 10
             or reload.pollUntil and now() >= reload.pollUntil
@@ -799,7 +803,30 @@ return function(api)
             ctx.bringScan = nil
             ctx.itemWorldSnapshot, ctx.itemWorldAt, ctx.itemWorldDirty = nil, nil, nil
         end
+        if m.schedulerVersion ~= 1 then
+            m.schedulerVersion, m.areas, m.pass, m.passNumber = 1, {}, nil, nil
+        end
         return m
+    end
+    local function areaFor(m, position, create)
+        for _, area in ipairs(m.areas) do
+            if (area.position - position).Magnitude <= 32 then return area end
+        end
+        if not create then return end
+        if #m.areas >= 32 then
+            local oldest = 1
+            for i = 2, #m.areas do if m.areas[i].seenAt < m.areas[oldest].seenAt then oldest = i end end
+            table.remove(m.areas, oldest)
+        end
+        local area = {position = position, seenAt = now(), retryAt = 0, misses = 0}
+        m.areas[#m.areas + 1] = area
+        return area
+    end
+    local function areaReady(m, record)
+        local area = areaFor(m, record.position)
+        local limit = policy(record)
+        return not area or now() >= area.retryAt
+            or limit >= 4 and limit > (area.limit or 0) or api.score(record.target) > (area.score or 0)
     end
     function B.worldChanged(ctx)
         local m = s.lootItemMemory
@@ -807,7 +834,7 @@ return function(api)
             if m then
                 if m.reload then chargeReload(m.reload); api.cancelReload(m.reload.ctx, m.reload.token); m.reload = nil end
                 for _, record in ipairs(m.records) do record.invalid = true end
-                m.records, m.byTarget, m.rebasing = {}, {}, true
+                m.records, m.byTarget, m.areas, m.rebasing = {}, {}, {}, true
             end
             ctx.itemObservePending, ctx.itemObserveCount, ctx.bringScan = nil, nil, nil
             ctx.itemWorldSnapshot, ctx.itemWorldAt, ctx.itemWorldDirty = nil, nil, nil
@@ -938,7 +965,7 @@ return function(api)
         end
         if now() >= (m.pruneAt or 0) then prune(m); m.pruneAt = now() + 2 end
         local reload = m.reload
-        if reload and (reload.ctx ~= ctx or api.reloadEnabled and not api.reloadEnabled()) then cancelReload(); reload = nil end
+        if reload and (reload.ctx ~= ctx or api.reloadEnabled and not api.reloadEnabled(ctx)) then cancelReload(); reload = nil end
         if reload then
             local record, token = reload.record, reload.token
             -- Charge successful early arrivals too. Restreaming or a recreated
@@ -970,6 +997,8 @@ return function(api)
             end
             local item = live(ctx, record)
             if item then
+                local area = areaFor(m, record.position)
+                if area then area.retryAt, area.misses, area.seenAt = 0, 0, now() end
                 cancelReload(ctx); ctx.bringScan, ctx.bringScanAt = nil, 0
                 s.smartLootStatus = 'Remembered loot loaded: ' .. record.id
                 return
@@ -985,7 +1014,14 @@ return function(api)
             local hardStop = token.started and now() >= token.started + RELOAD_WINDOW
                 or not token.started and now() - reload.started >= 12
             if reloadDue(reload) and (reload.finalDone or hardStop) then
-                record.reloadAt = now() + 30 * 2 ^ math.max(0, (record.attempts or 1) - 1)
+                if token.called and not token.skipped then
+                    local _, base = policy(record)
+                    record.reloadAt = now() + math.min(120, base * 2 ^ math.max(0, (record.attempts or 1) - 1))
+                    local area = areaFor(m, record.position, true)
+                    area.misses, area.seenAt = area.misses + 1, now()
+                    area.limit, area.score = math.max(area.limit or 0, (policy(record))), math.max(area.score or 0, api.score(record.target))
+                    area.retryAt = now() + math.min(120, 30 * 2 ^ (area.misses - 1))
+                end
                 cancelReload(ctx)
                 s.smartLootStatus = (token.blocked or token.cancelFailed)
                     and 'Area request stalled; loaded loot and chest work continue'
@@ -993,42 +1029,38 @@ return function(api)
             end
             return
         end
-        if not api.requestReload or not B.available() or api.reloadEnabled and not api.reloadEnabled()
+        if not api.requestReload or not B.available() or api.reloadEnabled and not api.reloadEnabled(ctx)
             or now() < (m.reloadAt or 0) then return end
         if #m.records == 0 then return end
-        local budget = m.pass
-        if budget and budget.resumeAt then
-            if now() < budget.resumeAt then return end
-            m.pass = nil; budget = nil
-        end
         m.reloadAt = now() + 1 -- bounded selection; request cadence is independently eight seconds.
         local eligible = api.snapshot(ctx)
-        local best, score
+        local best, score, loadedReady
         for _, record in ipairs(m.records) do
-            if not record.invalid and (record.attempts or 0) < RELOAD_LIMIT and now() >= (record.reloadAt or 0)
-                and now() >= (record.retryAt or 0) and not live(ctx, record) and not record.invalid and eligible(record.target) then
+            local item = not record.invalid and live(ctx, record)
+            local limit = policy(record)
+            if item and now() >= (ctx.itemRetry[item] or 0) and eligible(item) then
+                loadedReady = math.max(loadedReady or 0, api.score(item))
+            end
+            if not record.invalid and not item and (record.attempts or 0) < limit and now() >= (record.reloadAt or 0)
+                and now() >= (record.retryAt or 0) and areaReady(m, record) and eligible(record.target) then
                 local value = api.score(record.target)
-                if not best or value > score then best, score = record, value end
+                if not best or value > score or value == score and record.seenAt > best.seenAt then best, score = record, value end
             end
         end
+        if loadedReady and (not best or loadedReady >= score) then return end
         if best then
-            if not budget then
-                m.passNumber = (m.passNumber or 0) + 1
-                budget = {spent = 0, number = m.passNumber}; m.pass = budget
-            end
-            -- Reserve a complete unchanged area window. Budget-skipped entries
-            -- remain remembered; loaded deliveries never use this read budget.
-            if budget.spent + RELOAD_WINDOW > PASS_WAIT then
-                budget.resumeAt = now() + PASS_COOLDOWN
-                m.reloadAt = budget.resumeAt
-                s.smartLootStatus = 'Reload wait budget reached; loaded loot continues, automatic retry in 30s'
-                return
-            end
-            local token = api.requestReload(ctx, best.position)
+            local limit = policy(best)
+            local token = api.requestReload(ctx, best.position, function()
+                return ctx.active and api.enabled() and api.owned() and api.safe(ctx) and not manual()
+                    and not workspace:GetAttribute('InfiniteRebasing') and s.lootItemMemory == m and m.reload and m.reload.record == best
+                    and (not api.reloadEnabled or api.reloadEnabled(ctx)) and not best.invalid
+                    and (best.attempts or 0) < policy(best) and not live(ctx, best) and not best.invalid
+                    and areaReady(m, best) and api.eligible(ctx, best.target)
+            end)
             if token then
-                m.reload = {ctx = ctx, record = best, token = token, started = now(), budget = budget}; m.reloadAt = now() + 8
-                s.smartLootStatus = string.format('Reloading remembered loot: %s [item #%d, attempt %d/2; %.1fs budget left]',
-                    best.id, best.serial, (best.attempts or 0) + 1, math.max(0, PASS_WAIT - budget.spent))
+                m.reload = {ctx = ctx, record = best, token = token, started = now()}; m.reloadAt = now() + 1
+                s.smartLootStatus = string.format('Reloading useful loot: %s [item #%d, attempt %d/%d]',
+                    best.id, best.serial, (best.attempts or 0) + 1, limit)
             end
         end
     end
@@ -1404,8 +1436,7 @@ return function(api)
         local token
         if queued and now() >= math.max(ctx.itemReloadAt or 0, api.state.itemReloadAt or 0) then
             token, position = queued, queued.position
-            ctx.itemReloadRequest, ctx.itemReloadAt = nil, now() + 8
-            api.state.itemReloadAt = ctx.itemReloadAt
+            ctx.itemReloadRequest = nil
         else token = {position = position} end
         token.started = now(); ctx.streamRequest = token
         if token.purpose == 'remembered-item' then
@@ -1414,6 +1445,15 @@ return function(api)
         token.thread = task.spawn(function()
             if not ctx.active or token.cancelled or api.owned and not api.owned() then
                 token.done, token.ok = true, false; return
+            end
+            if token.purpose == 'remembered-item' then
+                if token.guard and not token.guard() then
+                    token.done, token.ok, token.skipped = true, false, true
+                    if api.state.itemReloadFlight == token then api.state.itemReloadFlight = nil end
+                    return
+                end
+                ctx.itemReloadAt, api.state.itemReloadAt = now() + 8, now() + 8
+                token.called = true
             end
             local ok, why = pcall(method, api.Players.LocalPlayer, position,
                 token.purpose == 'remembered-item' and 0.75 or 3)
@@ -1425,7 +1465,9 @@ return function(api)
         end)
     end
     function M.prefetchAt(ctx, position) streamAhead(ctx, position) end
-    function M.requestItemReload(ctx, position)
+    function M.requestItemReload(ctx, position, guard)
+        local flight = api.state.itemReloadFlight or ctx.streamRequest
+        if flight and flight.cancelFailed and not deadStream(flight) then return nil end
         if not ctx.active or not validVector(position) or ctx.streamUnsupported
             or workspace:GetAttribute('InfiniteRebasing')
             or ctx.itemReloadRequest or ctx.streamRequest and ctx.streamRequest.purpose == 'remembered-item'
@@ -1434,7 +1476,7 @@ return function(api)
         local available, enabled = pcall(function() return workspace.StreamingEnabled end)
         local read, method = pcall(function() return api.Players.LocalPlayer.RequestStreamAroundAsync end)
         if available and enabled == false or not read or type(method) ~= 'function' then return nil end
-        local token = {position = position, purpose = 'remembered-item', queuedAt = now()}
+        local token = {position = position, purpose = 'remembered-item', queuedAt = now(), guard = guard}
         ctx.itemReloadRequest = token
         return token
     end
@@ -2248,6 +2290,12 @@ end)()
             or attr(item, 'Class') == 'ItemBag' and (tonumber(attr(item, 'MaxSize')) or 0) or weaponValue(item)
         return tier * 1000000000 + rarityRank(item) * 1000000 + math.min(value, 999999)
     end
+    local function reloadPolicy(item)
+        if id(item) == 'VoidCrystal' or rarityRank(item) == rarity.Secret then return 5, 15 end
+        if isRelic(item) and id(item) ~= 'RareShard' or rarityRank(item) >= rarity.Mythic then return 4, 15 end
+        if id(item) == 'RareShard' then return 1, 30 end
+        return 2, 30
+    end
     local function rareShardTool(ctx, inventory)
         for _, tool in ipairs(inventory or tools(ctx)) do
             if id(tool) == 'RareShard' and tool:IsA('Tool') and tool.Parent
@@ -2330,7 +2378,10 @@ end)()
         requestReload = movement.requestItemReload, pollReload = movement.pollItemReload,
         reloadTick = movement.stepItemReload,
         cancelReload = movement.cancelItemReload,
-        reloadEnabled = function() return not F.extractionReady() end,
+        reloadEnabled = function(ctx)
+            return not F.extractionReady() and not ctx.streamWaiting and api.Players.LocalPlayer.GameplayPaused ~= true
+        end,
+        reloadPolicy = reloadPolicy,
         score = lootScore, makeRoom = makeRoom, settleRoom = settleRareDrop,
         roomPending = function() return s.rareShardDrop ~= nil end,
         receipt = pickupRecord, received = gearReceipt, confirm = finishGearReceipt, accepted = api.accepted,
