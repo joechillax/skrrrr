@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v26.
+-- Crack the Egg: lobby + round progression, v27.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -1375,7 +1375,7 @@ do
         return player:GetAttribute("Owns_Gun") == true and catalog and catalog.Get(player:GetAttribute("GunId")) or nil
     end
     local function allowedGun(gun)
-        return gun and gun.Class ~= "Shotgun" and gun.Id ~= "RPG"
+        return gun and gun.Class ~= "Sniper" and gun.Class ~= "Shotgun" and gun.Id ~= "RPG"
     end
     local function combatGun()
         local gun = ownedGun()
@@ -1392,10 +1392,10 @@ do
         return (gun.FoeDamage or 1) * gun.Pellets * rate * gun.Magazine / (gun.Magazine + rate * gun.Reload)
     end
     local function preferGun(candidate, current)
-        if not allowedGun(candidate) then return false end
+        if not allowedGun(candidate) or candidate.Mode ~= "Auto" then return false end
         if not allowedGun(current) then return true end
-        -- Native automatic fire takes priority; damage ranks guns within the
-        -- same firing category. A sniper stays available as a stock fallback.
+        -- Buy automatic guns only. Blacklisted ownership never blocks the
+        -- Flamethrower fallback or reserves its weapon upgrades.
         local auto, currentAuto = candidate.Mode == "Auto", current.Mode == "Auto"
         if auto ~= currentAuto then return auto end
         return gunValue(candidate) > gunValue(current)
@@ -1556,8 +1556,8 @@ do
                 end
             end
         end
-        if not best then leaveShop() app.status.gun = gun and "Keeping " .. gun.Name .. " · waiting for preferred automatic/stronger stock"
-            or "Waiting for affordable gun (no shotguns/RPG) · owned flamethrower fallback" return false end
+        if not best then leaveShop() app.status.gun = allowedGun(gun) and "Keeping " .. gun.Name .. " · waiting for stronger automatic stock"
+            or "Waiting for affordable automatic gun · owned flamethrower fallback; snipers excluded" return false end
         local fp = tostring(serial) .. ":" .. best.slot .. ":" .. best.id .. ":" .. best.price
         if not eligible("gun-buy", fp) then leaveShop() return false end
         local route = state.gunRoute
@@ -1640,7 +1640,7 @@ do
         local gain = 0
         if def.Tree == "weapons" then
             local guns = module("BreakTheEgg", "GunCatalog")
-            if not ownedGun() or not guns then return 0 end
+            if not combatGun() or not guns then return 0 end
             local from, to = guns.Upgrades(ranks), guns.Upgrades(copy)
             for field, weight in pairs({Damage = 3, Rate = 2, Mag = 0.6, Shell = 1, Pierce = 0.7, Ricochet = 0.3, Explosive = 3}) do
                 gain += math.max(0, to[field] - from[field]) / math.max(1, math.abs(from[field])) * weight
@@ -1698,7 +1698,7 @@ do
         local budget = math.max(0, cash - gunReserve())
         local best, score, cost, fingerprint
         for _, def in ipairs(catalog.Nodes) do
-            local gateOpen = not def.Gate or def.Gate == catalog.WeaponGate and ownedGun()
+            local gateOpen = not def.Gate or def.Gate == catalog.WeaponGate and combatGun()
                 and folderAt("BreakTheEgg"):GetAttribute("GunShopOpen") == true
             if not def.Product and not def.ProductId and not def.premium and gateOpen
                 and (def.Currency == nil or def.Currency == "cash") and (state.ranks[def.Id] or 0) <= 0
@@ -4066,7 +4066,7 @@ do
         end
         if pathJob then table.insert(lines, "Path age=" .. string.format("%.1f", os.clock() - pathJob.started) .. "; done=" .. tostring(pathJob.done)) end
         local gunFolder = folderAt("BreakTheEgg")
-        table.insert(lines, "Gun policy: automatic guns first; stronger within firing category; no shotgun class/RPG"
+        table.insert(lines, "Gun policy: buy automatic guns only; all sniper-class guns/shotguns/RPG excluded; Flame fallback with excluded ownership"
             .. "; native Rate=" .. tostring(gunFolder and gunFolder:GetAttribute("GunRate"))
             .. "; ReloadMul=" .. tostring(gunFolder and gunFolder:GetAttribute("GunReloadMul"))
             .. "; MagMul=" .. tostring(gunFolder and gunFolder:GetAttribute("GunMagMul"))
@@ -4144,9 +4144,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v26.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v27.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v26 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v27 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -4175,7 +4175,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v26", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v27", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
