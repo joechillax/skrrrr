@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v19.
+-- Crack the Egg: lobby + round progression, v20.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -228,7 +228,10 @@ local function fail(key, fingerprint, reason)
         rejected = reason == "MiningResult rejected" or reason == "No MiningResult or target progress"
             or item and item.fingerprint == fingerprint and item.rejected == true}
     app.cooldowns[key] = os.clock() + math.min(30, 2 ^ count)
-    if count >= 3 then app.blocks[key] = {fingerprint = fingerprint, reason = reason} end
+    if count >= 3 then
+        app.blocks[key] = {fingerprint = fingerprint, reason = reason,
+            retryAt = app.eventKeys and app.eventKeys[key] and os.clock() + 30 or nil}
+    end
     app:note(key .. ": " .. tostring(reason))
 end
 
@@ -237,6 +240,10 @@ local function eligible(key, fingerprint)
     if block and block.fingerprint ~= fingerprint then
         app.blocks[key], app.failures[key], app.cooldowns[key] = nil, nil, nil
         block = nil
+    end
+    if block and block.retryAt and os.clock() >= block.retryAt then
+        app.blocks[key], app.cooldowns[key] = nil, nil
+        block = nil -- Event geometry/state can become attackable without HP changing.
     end
     if block then return false, block.reason end
     if (app.cooldowns[key] or 0) > os.clock() then return false, "retry backoff" end
@@ -600,6 +607,9 @@ function app:Start()
     if self.settings.repeatRuns and self.queueResume then self:queueResume() end
     self.perks = nil
     self.refreshAt = 0
+    if shared.round then
+        shared.round.triggerWatch, shared.round.activity = nil, nil
+    end
     -- Retain unresolved outcomes and target failure blocks across Stop/Start.
     self:note("Started progression")
 end
@@ -610,6 +620,9 @@ do
     local state = shared.round or {pending = {}, ranks = nil, serial = 1000000,
         chests = {}, offers = {}, done = {}, targets = {}, parts = {}, leases = {}, stats = {hits = 0, collected = 0, chests = 0}}
     shared.round = state
+    -- Unresolved requests survive replacement; elapsed attack/watch time does
+    -- not belong to a new running owner or include time spent stopped.
+    state.triggerWatch, state.activity, state.combatAt, state.selectAt = nil, nil, 0, 0
     state.targetList = state.targetList or {}
     state.targetIds = state.targetIds or setmetatable({}, {__mode = "k"})
     state.targetSerial = state.targetSerial or 0
@@ -1712,6 +1725,7 @@ do
     local function refreshCombat()
         if (state.combatAt or 0) > os.clock() then return end
         state.combatAt, state.combat, state.enemies = os.clock() + 0.2, false, {}
+        app.eventKeys = {}
         local world = state.lab and state.lab:FindFirstChild("WorldEvent")
         if world then
             -- Scientists must never depend on the rotating shell discovery
@@ -1722,6 +1736,8 @@ do
                     or model:GetAttribute("CreatureLimb") == true and model:GetAttribute("State") ~= "Retract") then
                     state.combat, state.enemies[model] = true, true
                     if not state.targets[model] then index(model) end
+                    local id = targetId(model)
+                    app.eventKeys["hit:" .. id], app.eventKeys["move:target:" .. id] = true, true
                 end
             end
         end
@@ -1808,6 +1824,30 @@ do
         return tostring(target:GetAttribute("HP") or target:GetAttribute("Health")) .. ":"
             .. tostring(target:GetAttribute("Quantity")) .. ":" .. tostring(family) .. ":" .. tostring(player:GetAttribute("UnlockedLayer") or 1)
             .. ":" .. tostring(geometry)
+    end
+    local function combatReady(config, evolution)
+        local _, _, head = character()
+        if not head then return false end
+        local family, best = "Pickaxe", nil
+        for _, name in ipairs({"Pickaxe", "HandDrill", "Drill"}) do
+            if owns(name, config) and (name ~= "Drill" or (player:GetAttribute("DrillFuel") or 30) > 0
+                and (player:GetAttribute("DrillCoolingUntil") or 0) <= workspace:GetServerTimeNow()) then
+                local value = power(name, player:GetAttribute("Evolution_" .. name) or 1, config, evolution, "event")
+                if value and (not best or value > best) then family, best = name, value end
+            end
+        end
+        if gunUsable() then family = "Gun" elseif flameOwned(config) then family = "HandDrill" end
+        state.combatFamily = family
+        for obj in pairs(state.enemies or {}) do
+            local _, pos = aim(obj, head.Position)
+            if pos and eligible("hit:" .. targetId(obj), hitFingerprint(obj, family)) then
+                local actual = contact(obj, pos, head, reach(family, config))
+                local reachable = actual and (actual.Instance == obj or actual.Instance:IsDescendantOf(obj))
+                    and (actual.Position - head.Position).Magnitude <= reach(family, config)
+                if reachable or eligible("move:target:" .. targetId(obj), movementFingerprint(obj, "event")) then return true end
+            end
+        end
+        return false
     end
     local function hit(target, result, family, cooldown, eventTarget)
         if not result or not result.Instance then return false end
@@ -2205,6 +2245,9 @@ do
             -- owns equipment only; shop/dodge travel continues independently.
             return true
         end
+        -- A deliberate backoff is not damage-free firing time. Otherwise a
+        -- stale watch immediately rejects the first attempt after retry expiry.
+        state.triggerWatch = nil
         return false
     end
     local function clearance(h, position, at, margin, warning)
@@ -2919,8 +2962,8 @@ do
                         if tutorialStep == 1 and (kind == "collect" or kind == "passive") then kind = nil end
                         if tutorialStep == 2 and (kind == "collect" or kind == "passive") then utility = 50 end
                         if tutorialStep == 2 and kind ~= "collect" and kind ~= "passive" and kind ~= "event" then kind = nil end
-                        if state.combat and kind ~= "event" then kind = nil end
-                        if kind and eligible("hit:" .. targetId(model), hitFingerprint(model, state.family)) then
+                        local selectionFamily = kind == "event" and state.combatFamily or state.family
+                        if kind and eligible("hit:" .. targetId(model), hitFingerprint(model, selectionFamily)) then
                             local rank = kind == "event" and (model:GetAttribute("EventScientist") == true and 3 or 2) or 1
                             if kind == "mine" then
                                 if (model:GetAttribute("Layer") or 1) == state.frontierLayer then rank = 1.1 end
@@ -2939,7 +2982,8 @@ do
                             if reachable then value += 200000
                             elseif model == state.target and kind == state.mode and kind ~= "event" then value += 100000 end
                             if kind == "mine" and model == state.upperTarget and (state.target ~= model or state.mode ~= "mine") then value += 200000 end
-                            local movementReady = reachable or eligible("move:target:" .. targetId(model), movementFingerprint(model, (kind == "collect" or kind == "passive") and "collect" or "mine"))
+                            local movementReady = reachable or eligible("move:target:" .. targetId(model), movementFingerprint(model,
+                                (kind == "collect" or kind == "passive") and "collect" or kind == "event" and "event" or "mine"))
                             if movementReady and (not target or rank > bestRank or rank == bestRank and value > score) then
                                 target, part, position, score, mode, bestRank = model, p, pos, value, kind, rank
                             end
@@ -2959,7 +3003,7 @@ do
         local egg = state.lab:FindFirstChild("Egg")
         local guardianReady = egg and (guardian.CanHit(egg, player) or guardian.CoreWaiting(egg, player))
         if mode == "guardian" and not guardianReady then target, state.target = nil, nil end
-        if not state.combat and tutorialStep ~= 2 and guardianReady then
+        if not state.combatReady and tutorialStep ~= 2 and guardianReady then
             local surface = ray(config.EggCenter, head, guardian, 200)
             if not target and (not surface or surface.Instance ~= egg or not surface.Guardian) then
                 local direction = config.EggCenter - head.Position
@@ -2978,7 +3022,7 @@ do
             end
         end
         if not target or not target.Parent then
-            if not state.combat and tutorialStep ~= 2 and inspectRemainingTop(config, guardian, root, head) then return end
+            if not state.combatReady and tutorialStep ~= 2 and inspectRemainingTop(config, guardian, root, head) then return end
             -- Active round hover survives empty scans and streaming delays.
             app:release()
             state.approach, state.obstruction = nil, nil
@@ -2986,7 +3030,7 @@ do
             state.needSale = count > 0
             local phase = state.lab:GetAttribute("BossPhase") or "Idle"
             if tutorialStep == 2 and not state.combat then equip("Bucket", config) end
-            app.status.farm = tutorialStep == 2 and "Tutorial: waiting for ready shells to collect" or state.combat and "Event target obstructed or cooling down; keeping mining tool" or full and "Bucket full; waiting for sale" or phase ~= "Idle" and ("Boss " .. phase .. ": waiting for damage target; evasion active") or "Waiting for eligible geometry/drops or layer unlock"
+            app.status.farm = tutorialStep == 2 and "Tutorial: waiting for ready shells to collect" or state.combat and "No actionable event target · checking shells/rewards; bounded retry" or full and "Bucket full; waiting for sale" or phase ~= "Idle" and ("Boss " .. phase .. ": waiting for damage target; evasion active") or "Waiting for eligible geometry/drops or layer unlock"
             return
         end
         state.hoverWaitAt = nil
@@ -3550,6 +3594,7 @@ do
         local _, flightRoot = character()
         if flightRoot and (state.knockUntil or 0) <= os.clock() then self:updateFlight(flightRoot) end
         refreshCombat()
+        state.combatReady = combatReady(config, evolution)
         if not blocked and capture(config, evolution) then return end
         if (not blocked or chestModal) and evasion(config) then
             if not blocked then attackDuringEvasion(config, evolution) end
@@ -3557,8 +3602,11 @@ do
         end
         local pickerOpen = player:GetAttribute("ChestPickerOpen") == true
         local saleFirst = not pickerOpen and not state.pending.chest and salePolicy(config)
-        local chestOwnsMovement = (not state.combat or pickerOpen) and not saleFirst and chests(config, evolution)
-        if chestOwnsMovement or player:GetAttribute("ChestPickerOpen") == true then lease("Bucket", false) lease("Drill", false) end
+        local chestOwnsMovement = (not state.combatReady or pickerOpen) and not saleFirst and chests(config, evolution)
+        if chestOwnsMovement or player:GetAttribute("ChestPickerOpen") == true then
+            lease("Bucket", false) lease("Drill", false)
+            self.status.farm = "Chest rewards · " .. tostring(self.status.chests or "claiming owned rewards")
+        end
         if not blocked then
             local tutorialOwnsMovement = not state.combat and not chestOwnsMovement and app.settings.farm and tutorial(config)
             local gunOwnsMovement = not saleFirst and not tutorialOwnsMovement and not chestOwnsMovement and buyGun(config)
@@ -3617,6 +3665,14 @@ do
                 .. "; melee avoidance zones=" .. tostring(state.meleeCount or 0)
                 .. "; native boss strikes=" .. tostring(state.stats.bossStrikes or 0) .. "; confirmed win receipts=" .. tostring(state.stats.wins or 0),
             "AFK watchdog=" .. tostring(self.watch and math.floor(os.clock() - self.watch.at) or 0) .. " seconds without measurable progress; resume queued=" .. tostring(self.resumeQueued == true)}
+        local eventCount, eventBlocks = 0, 0
+        for _ in pairs(state.enemies or {}) do eventCount += 1 end
+        for key in pairs(self.eventKeys or {}) do
+            if self.blocks[key] then eventBlocks += 1 end
+        end
+        table.insert(lines, "Live event targets=" .. eventCount .. "; actionable=" .. tostring(state.combatReady == true)
+            .. "; combat tool=" .. tostring(state.combatFamily) .. "; event failure blocks=" .. eventBlocks
+            .. "; unchanged event retry=30s")
         local nativeCart = workspace:FindFirstChild("Minecart")
         table.insert(lines, "Confirmed cashouts=" .. tostring(state.stats.sales or 0)
             .. "; sale method=" .. tostring(state.saleRoute and state.saleRoute.method or "none")
@@ -3733,9 +3789,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v19.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v20.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v19 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v20 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -3764,7 +3820,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v19", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v20", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
@@ -3972,6 +4028,7 @@ if app.settings.resume then app:Start() end
 render()
 app:note("Ready. AFK repeat runs, boss warning evasion, scientist priority and Claim All. Lobby walk / round tween. Hatching remains opt-in.")
 return app
+
 
 
 
