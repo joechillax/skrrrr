@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v20.
+-- Crack the Egg: lobby + round progression, v21.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -1365,8 +1365,14 @@ do
         local catalog = module("BreakTheEgg", "GunCatalog")
         return player:GetAttribute("Owns_Gun") == true and catalog and catalog.Get(player:GetAttribute("GunId")) or nil
     end
-    local function preferredGun(gun)
-        return gun and (gun.Id == "Minigun" or gun.Id == "Vulcan")
+    local function allowedGun(gun)
+        return gun and gun.Class ~= "Shotgun" and gun.Id ~= "RPG"
+    end
+    local function gunValue(gun)
+        if not allowedGun(gun) then return 0 end
+        local catalog = module("BreakTheEgg", "GunCatalog")
+        local rate = catalog.CycleRate(gun.Id)
+        return (gun.FoeDamage or 1) * gun.Pellets * rate * gun.Magazine / (gun.Magazine + rate * gun.Reload)
     end
     local function flameOwned(config)
         return owns("HandDrill", config) and player:GetAttribute("Evolution_HandDrill") == 3
@@ -1399,8 +1405,7 @@ do
     local function gunUsable()
         local gun = ownedGun()
         if not gun then return nil end
-        local config = module("BreakTheEgg", "Config")
-        if not preferredGun(gun) and config and flameOwned(config) then return nil end
+        if not allowedGun(gun) then return nil end
         if gun and not equipped("Gun") then
             local fp = "Gun:" .. tostring(player.Character) .. ":" .. tostring(gun.Id)
             if not eligible("equip-tool:Gun", fp) then return nil end
@@ -1425,12 +1430,12 @@ do
         return folder, ids, prices, cash, serial
     end
     local function gunReserve()
-        if preferredGun(ownedGun()) then return 0 end
+        local current = gunValue(ownedGun())
         local _, ids, prices = shopStock()
         local catalog, reserve = module("BreakTheEgg", "GunCatalog"), nil
         for i, id in ipairs(ids or {}) do
             local price = prices[i]
-            if catalog and preferredGun(catalog.Get(id)) and finite(price) and price >= 0 then reserve = math.min(reserve or price, price) end
+            if catalog and gunValue(catalog.Get(id)) > current and finite(price) and price >= 0 then reserve = math.min(reserve or price, price) end
         end
         return reserve or 0
     end
@@ -1458,10 +1463,9 @@ do
                 end
             end
         end
-        if preferredGun(gun) then leaveShop() app.status.gun = "Owned gun: " .. gun.Name return false end
         if not app.settings.farm or state.pending.upgrade then leaveShop() return false end
         local phase = state.lab:GetAttribute("BossPhase") or "Idle"
-        if (state.combat or phase == "Wave" or phase == "Intermission" or phase == "Core") and not flameOwned(config) then leaveShop() return false end
+        if (state.combat or phase == "Wave" or phase == "Intermission" or phase == "Core") and not flameOwned(config) and not allowedGun(gun) then leaveShop() return false end
         if (player:GetAttribute("EggTutorialStep") or 0) < 8 then leaveShop() return false end
         local folder, ids, prices, cash, serial = shopStock()
         local catalog, prompts = module("BreakTheEgg", "GunCatalog"), workspace:FindFirstChild("GunShopPrompts")
@@ -1477,14 +1481,14 @@ do
             local anchor = prompt and prompt.Parent
             local point = anchor and anchor:IsA("Attachment") and anchor.WorldPosition or anchor and anchor:IsA("BasePart") and anchor.Position
             if anchor and anchor:IsA("Attachment") then anchor = anchor.Parent end
-            if preferredGun(def) and finite(price) and price >= 0 and price <= cash and prompt and prompt:IsA("ProximityPrompt")
+            if allowedGun(def) and gunValue(def) > gunValue(gun) and finite(price) and price >= 0 and price <= cash and prompt and prompt:IsA("ProximityPrompt")
                 and prompt.Enabled and prompt:GetAttribute("GunShopSlot") == i and anchor and anchor:IsA("BasePart") then
-                local rate = catalog.CycleRate(id)
-                local value = (def.FoeDamage or 1) * def.Pellets * rate * def.Magazine / (def.Magazine + rate * def.Reload)
+                local value = gunValue(def)
                 if not best or value > score then best, score = {id = id, slot = i, price = price, prompt = prompt, anchor = anchor, point = point}, value end
             end
         end
-        if not best then leaveShop() app.status.gun = "Waiting for affordable Minigun/Vulcan restock · owned flamethrower fallback" return false end
+        if not best then leaveShop() app.status.gun = gun and "Keeping " .. gun.Name .. " · waiting for stronger allowed stock"
+            or "Waiting for affordable gun (no shotguns/RPG) · owned flamethrower fallback" return false end
         local fp = tostring(serial) .. ":" .. best.slot .. ":" .. best.id .. ":" .. best.price
         if not eligible("gun-buy", fp) then leaveShop() return false end
         local route = state.gunRoute
@@ -2348,6 +2352,12 @@ do
         local startRadius = (flat(root.Position) - center).Magnitude
         local phase = state.lab:GetAttribute("BossPhase")
         local bodyActive = phase == "Wave" or phase == "Intermission"
+        -- A ranged weapon can fight from above even between native warnings.
+        -- This is a positioning constraint, not immunity from goo/grab/slam.
+        if not quake and allowedGun(ownedGun()) and (bodyActive or phase == "Core") then
+            local y = config.EggGroundY + hum.HipHeight + root.Size.Y * 0.5 + 18
+            quake = {root = root, minY = y, goalY = math.max(y, root.Position.Y), combat = true}
+        end
         local need = danger(root.Position, now, true) < 0 or bodyActive and startRadius < bodyRadius
         local m = app.move
         if #list > 0 and m and m.lane == "evade" and state.evadeGoal and (root.Position - state.evadeGoal).Magnitude > 0.5 then need = true end
@@ -2388,19 +2398,19 @@ do
                 Vector3.new(0, -40, 0), supportParams)
         end
         local rootSupport = support(root.Position)
-        local bodyNear = startRadius < bodyRadius + 35
+        local bodyNear = bodyActive and startRadius < bodyRadius + 35
         local escapeDeadline = math.huge
         for _, h in ipairs(list) do
             if h.kind ~= "Quake" and clearance(h, root.Position, math.max(now, h.at), margin, true) < 0 then
                 escapeDeadline = math.min(escapeDeadline, math.max(now, h.at))
             end
         end
-        local function route(goal, reentry)
+        local function route(goal, reentry, correction)
             -- Mining recovery may leave us well above ground. Find an actual
             -- floor and plan the descent rather than rejecting every exit.
             if quake then
                 goal = Vector3.new(goal.X, math.max(root.Position.Y, quake.goalY), goal.Z)
-                if reentry then goal = Vector3.new(goal.X, quake.minY, goal.Z) end
+                if reentry then goal = Vector3.new(goal.X, math.max(goal.Y, quake.minY), goal.Z) end
                 local floor = support(goal)
                 -- Vertical protection works even before floor geometry streams.
                 -- Lateral exits must not leave observed arena support for void.
@@ -2414,12 +2424,13 @@ do
             end
             local delta = goal - root.Position
             local distance = delta.Magnitude
-            local duration = distance / math.max(1, hum.WalkSpeed)
+            local duration = correction and 0 or distance / math.max(1, hum.WalkSpeed)
             local score, worst = distance, math.huge
             local urgent = escapeDeadline - now < duration + 0.18
             local previousRadius = startRadius
-            for i = 1, 16 do
-                local fraction = i / 16
+            local samples = math.clamp(math.ceil(math.max(distance / 2, duration / 0.05)), 16, 256)
+            for i = 1, correction and 0 or samples do
+                local fraction = i / samples
                 local pos = root.Position + delta * fraction
                 local radius = (flat(pos) - center).Magnitude
                 if bodyNear and radius < bodyRadius then
@@ -2435,9 +2446,16 @@ do
                 -- An urgent correction doesn't traverse these samples in
                 -- physics. Prefer the nearest verified safe endpoint instead
                 -- of fleeing farther to reduce a hypothetical tween exposure.
-                if c < 0 and not urgent then score += (500 + (-c) * 100) * duration / 16 end
+                if c < 0 and not urgent then score += (500 + (-c) * 100) * duration / samples end
             end
-            if bodyNear and (flat(goal) - center).Magnitude < bodyRadius then return nil end
+            if not correction then
+                for _, h in ipairs(list) do
+                    if (h.kind == "Puddle" or h.kind == "Melee") and now >= h.at and now <= h.finish then
+                        worst = math.min(worst, segmentDistance(h.point, flat(root.Position), flat(goal)) - h.radius - margin)
+                    end
+                end
+            end
+            if bodyActive and (flat(goal) - center).Magnitude < bodyRadius then return nil end
             -- Reject unsafe destinations even when every alternative scores
             -- poorly. Include the announced impact after arrival as well.
             for _, h in ipairs(list) do
@@ -2457,6 +2475,54 @@ do
                 if boundary and boundary.Normal.Y < 0.65 and (boundary.Position - floorOrigin).Magnitude < horizontal.Magnitude - 0.5 then return nil end
             end
             return score, worst, goal
+        end
+        local function recoverAirPosition()
+            if not quake or now < (state.airRecoveryScanAt or 0) then return false end
+            state.airRecoveryScanAt = now + 0.5
+            local best, bestScore, direct
+            local trapped = danger(root.Position, now, true) < 0 or not rootSupport
+                or bodyActive and startRadius < bodyRadius
+            local function consider(goal)
+                goal = Vector3.new(goal.X, quake.minY, goal.Z)
+                local floor = support(goal)
+                if not floor or floor.Normal.Y < 0.65 then return end
+                local cost, worst, safe = route(goal, true)
+                local correction = false
+                if (not cost or worst < 0) and trapped and now >= (state.airRecoveryCorrectionAt or 0) then
+                    cost, worst, safe = route(goal, true, true)
+                    correction = true
+                end
+                if cost and worst >= 0 then
+                    -- Relocation need not already have a firing angle. Prefer
+                    -- observed safe ground near the native fight, not outside
+                    -- the wall just because that is closest to our old root.
+                    local score = (flat(safe) - center).Magnitude + cost * 0.15
+                    if not bestScore or score < bestScore then best, bestScore, direct = safe, score, correction end
+                end
+            end
+            for _, extra in ipairs({8, 24, 48}) do
+                local radius = bodyActive and bodyRadius + extra or extra
+                for side = 0, 23 do
+                    local angle = side * math.pi / 12
+                    consider(center + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius)
+                end
+            end
+            if not best then return false end
+            local m = app.move
+            if direct or not rootSupport or m and m.key == "boss-air-recovery" and os.clock() - m.progressAt > 0.65 then
+                app:release()
+                if not app:updateFlight(root) then return false end
+                root.CFrame = CFrame.new(best)
+                root.AssemblyLinearVelocity = Vector3.new()
+                state.airRecoveryCorrectionAt = now + 1
+                state.stats.airRecoveries = (state.stats.airRecoveries or 0) + 1
+            else
+                success("move:boss-air-recovery")
+                move("evade", "boss-air-recovery", state.lab, best, 0.5, {goal = best, air = true})
+            end
+            state.airRecoveryGoal = best
+            app.status.farm = "Airborne boss recovery · moving to observed safe arena position"
+            return true
         end
         if not need and quake then
             -- A height hold is a constraint, not an indefinite combat pause.
@@ -2492,25 +2558,34 @@ do
             end
             table.sort(targets, function(a, b) return a.distance < b.distance end)
             local best, score
-            for i = 1, math.min(12, #targets) do
-                local item = targets[i]
+            local count = #targets
+            local cursor = state.airTargetCursor or 0
+            state.airTargetCursor = count > 0 and (cursor + math.min(12, count)) % count or 0
+            for i = 1, math.min(12, count) do
+                local item = targets[(cursor + i - 1) % count + 1]
                 local current = contact(item.target, item.position, actualHead, range)
                 if rootSupport and current and (current.Instance == item.target or current.Instance:IsDescendantOf(item.target))
                     and (current.Position - actualHead.Position).Magnitude <= range then
                     if app.move and app.move.key == "boss-air-combat" then app:release() end
                     targets = {} break -- Already in actual range; retain hover and attack.
                 end
-                for side = 0, 7 do
-                    local angle = side * math.pi / 4
-                    local goal = item.position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * math.min(10, range * 0.45)
+                for _, fraction in ipairs({0.45, 0.7, 0.9}) do
+                for side = 0, 15 do
+                    local angle = side * math.pi / 8
+                    local distance = fraction == 0.45 and math.min(10, range * fraction) or range * fraction
+                    local goal = item.position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * distance
                     goal = Vector3.new(goal.X, quake.minY, goal.Z)
                     local virtualHead = {Position = goal + offset}
                     local hit = contact(item.target, item.position, virtualHead, range)
                     if hit and (hit.Instance == item.target or hit.Instance:IsDescendantOf(item.target))
                         and (hit.Position - virtualHead.Position).Magnitude <= range then
                         local cost, worst, safe = route(goal, true)
-                        if cost and worst >= 0 and (not score or cost < score) then best, score = safe, cost end
+                        if cost and worst >= 0 then
+                            local value = cost + (hit.Position - virtualHead.Position).Magnitude * (gun and 2 or 0.2)
+                            if not score or value < score then best, score = safe, value end
+                        end
                     end
+                end
                 end
             end
             lease("Bucket", false) lease("Drill", false)
@@ -2531,11 +2606,16 @@ do
                 app.status.farm = "Airborne boss pursuit · returning to verified attack range"
                 return true
             end
+            if #targets > 0 and recoverAirPosition() then return true end
+            if #targets > 0 and app.move and app.move.key == "boss-air-recovery" then
+                app.status.farm = "Airborne boss recovery · moving to observed safe arena position"
+                return true
+            end
             local goal = Vector3.new(root.Position.X, math.max(root.Position.Y, quake.goalY), root.Position.Z)
             success("move:boss-quake")
             move("evade", "boss-quake", state.lab, goal, 0.05, {goal = goal, air = true})
             app:updateFlight(root)
-            app.status.farm = #targets > 0 and "Airborne boss · no safe supported attack position" or "Dodging boss · airborne hazard clearance"
+            app.status.farm = #targets > 0 and "Airborne boss · retrying attack angles and arena recovery" or "Dodging boss · airborne hazard clearance"
             return true
         end
         local best, bestScore
@@ -2586,6 +2666,7 @@ do
         end
         lease("Bucket", false) lease("Drill", false)
         if not best then
+            if recoverAirPosition() then return true end
             if quake then
                 local goal = Vector3.new(root.Position.X, math.max(root.Position.Y, quake.goalY), root.Position.Z)
                 state.evadeGoal, state.evadeApproach = nil, nil
@@ -3596,6 +3677,12 @@ do
         refreshCombat()
         state.combatReady = combatReady(config, evolution)
         if not blocked and capture(config, evolution) then return end
+        -- Cash stat upgrades do not own travel and must continue during a
+        -- prolonged airborne fight, rather than waiting for evasion to end.
+        local fightPhase = state.lab:GetAttribute("BossPhase")
+        if not blocked and allowedGun(ownedGun()) and (fightPhase == "Wave" or fightPhase == "Intermission" or fightPhase == "Core") then
+            upgrades(config)
+        end
         if (not blocked or chestModal) and evasion(config) then
             if not blocked then attackDuringEvasion(config, evolution) end
             return
@@ -3695,6 +3782,7 @@ do
                 .. "; late/stalled vertical corrections=" .. tostring(state.stats.quakeLifts or 0))
             table.insert(lines, "Urgent verified exits=" .. tostring(state.stats.hazardEscapes or 0)
                 .. "; airborne re-entry corrections=" .. tostring(state.stats.airReentries or 0)
+                .. "; safe arena recoveries=" .. tostring(state.stats.airRecoveries or 0)
                 .. "; scientist pursuit rescues=" .. tostring(state.stats.eventRescues or 0)
                 .. "; menu flag (round continues)=" .. tostring(game:GetService("GuiService").MenuIsOpen)
                 .. "; Auto collect rank=" .. tostring(state.ranks and state.ranks.autoCollect or 0))
@@ -3716,6 +3804,12 @@ do
                 .. "; destination=" .. tostring(app.move.destination)) end
         end
         if pathJob then table.insert(lines, "Path age=" .. string.format("%.1f", os.clock() - pathJob.started) .. "; done=" .. tostring(pathJob.done)) end
+        local gunFolder = folderAt("BreakTheEgg")
+        table.insert(lines, "Gun policy: all stocked guns except shotgun class/RPG; stronger replacements only"
+            .. "; native Rate=" .. tostring(gunFolder and gunFolder:GetAttribute("GunRate"))
+            .. "; ReloadMul=" .. tostring(gunFolder and gunFolder:GetAttribute("GunReloadMul"))
+            .. "; MagMul=" .. tostring(gunFolder and gunFolder:GetAttribute("GunMagMul"))
+            .. "; server anti-cheat/damage handler absent from supplied client dump")
         for lane, p in pairs(state.pending) do table.insert(lines, lane .. " pending age=" .. math.floor(os.clock() - p.at)) end
         return table.concat(lines, "\n")
     end
@@ -3789,9 +3883,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v20.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v21.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v20 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v21 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -3820,7 +3914,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v20", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v21", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
@@ -4028,6 +4122,7 @@ if app.settings.resume then app:Start() end
 render()
 app:note("Ready. AFK repeat runs, boss warning evasion, scientist priority and Claim All. Lobby walk / round tween. Hatching remains opt-in.")
 return app
+
 
 
 
