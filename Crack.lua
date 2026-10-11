@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v23.
+-- Crack the Egg: lobby + round progression, v24.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -1394,28 +1394,71 @@ do
     local function flameOwned(config)
         return selectableTool("HandDrill", config) and player:GetAttribute("Evolution_HandDrill") == 3
     end
+    function app:observeGunAttribute(name)
+        local g = state.gun
+        if not g then return end
+        if g.id ~= player:GetAttribute("GunId") then state.gun = nil return end
+        if name == "GunAmmo" then
+            local ammo = player:GetAttribute("GunAmmo")
+            if finite(ammo) and ammo ~= g.nativeAmmo then
+                -- Capture a refill even when both its start and finish happen
+                -- between Heartbeat scans. An unchanged stale value is no proof.
+                if finite(g.nativeAmmo) and ammo > g.nativeAmmo then g.refill = {ammo = ammo, at = os.clock()} end
+                g.nativeAmmo = ammo
+            end
+        elseif name == "GunReloadAt" then
+            local deadline = player:GetAttribute("GunReloadAt")
+            if finite(deadline) and deadline ~= g.nativeReloadAt then
+                if deadline > workspace:GetServerTimeNow() then g.nativeReloadUntil = deadline end
+                g.nativeReloadAt = deadline
+            end
+        end
+    end
     local function gunState(gun)
         local ammo = player:GetAttribute("GunAmmo")
         if not finite(ammo) then return nil end
         local g = state.gun
         if not g or g.id ~= gun.Id then
-            g = {id = gun.Id, ammo = math.max(0, ammo), seenAmmo = ammo, shots = {}, nextAt = 0, burst = 0}
+            g = {id = gun.Id, ammo = math.max(0, ammo), seenAmmo = ammo, nativeAmmo = ammo,
+                nativeReloadAt = player:GetAttribute("GunReloadAt") or 0, shots = {}, nextAt = 0, burst = 0}
             state.gun = g
         end
         local now, reloadAt = workspace:GetServerTimeNow(), player:GetAttribute("GunReloadAt") or 0
-        if g.reload and finite(reloadAt) and reloadAt > 0 then g.reload.observed = reloadAt end
-        if g.reload and not g.reload.observed and os.clock() >= (g.reloadRetryAt or math.huge) and (g.reloadTries or 0) < 3 then
-            g.reload = nil -- Bounded retries of the native idempotent reload, never a shot refill guess.
+        local activeReload = finite(reloadAt) and reloadAt > now
+        if g.nativeAmmo == nil then
+            -- v23 retained an expired local reload after its final retry. When
+            -- replacing that owner, reconcile a full native magazine only once,
+            -- after acknowledged traffic has settled and no shot is in flight.
+            local mag = player:GetAttribute("GunMag") or gun.Magazine
+            if g.reload and os.clock() - g.reload.at >= 30 and not activeReload
+                and ammo > 0 and finite(mag) and ammo == mag and (state.stats.gunShots or 0) > 0
+                and next(g.shots) == nil then
+                g.ammo, g.seenAmmo, g.reload, g.reloadTries, g.reloadRetryAt = ammo, ammo, nil, 0, nil
+                state.stats.gunReloadRecoveries = (state.stats.gunReloadRecoveries or 0) + 1
+            end
+            g.nativeAmmo, g.nativeReloadAt = ammo, reloadAt
         end
+        if g.reload and activeReload then g.reload.observed = reloadAt end
+        if g.reload and g.nativeReloadUntil and g.nativeReloadUntil >= (g.reload.serverAt
+            or now - (os.clock() - g.reload.at)) then g.reload.observed = g.nativeReloadUntil end
+        local refill = g.refill and ammo > 0 and ammo <= g.refill.ammo and not activeReload
         if g.reload and g.reload.observed and now >= g.reload.observed
-            and ammo > 0 and (ammo > g.seenAmmo or ammo == (player:GetAttribute("GunMag") or gun.Magazine)) then
+            and not activeReload and ammo > 0 or refill then
             g.ammo, g.reload, g.shots, g.burst, g.reloadTries = ammo, nil, {}, 0, 0
+            g.refill, g.nativeReloadUntil, g.reloadRetryAt = nil, nil, nil
         elseif ammo ~= g.seenAmmo then
             -- A replicated refill can follow an unobserved short reload.
             g.ammo = ammo > g.seenAmmo and ammo or math.min(g.ammo, math.max(0, ammo))
             if ammo > g.seenAmmo then g.reload, g.shots, g.burst, g.reloadTries = nil, {}, 0, 0 end
         end
-        g.seenAmmo = ammo
+        if g.reload and not activeReload and os.clock() >= (g.reloadRetryAt or math.huge) then
+            -- A missing acknowledgement never owns an infinite reload latch.
+            -- Positive ammo still needs actual refill/deadline evidence above.
+            g.reload = nil
+            if (g.reloadTries or 0) >= 3 then g.reloadRetryAt = os.clock() + 30 end
+        end
+        if g.refill and os.clock() - g.refill.at > 10 then g.refill = nil end
+        g.seenAmmo, g.nativeAmmo = ammo, ammo
         for id, at in pairs(g.shots) do if os.clock() - at > 5 then g.shots[id] = nil end end
         return g
     end
@@ -1426,7 +1469,10 @@ do
         if not g then return "waiting for replicated ammo" end
         local reloadAt = player:GetAttribute("GunReloadAt") or 0
         if finite(reloadAt) and reloadAt > workspace:GetServerTimeNow() or g.reload then return "reloading owned gun" end
-        if g.ammo <= 0 then return "requesting native reload" end
+        if g.ammo <= 0 then
+            if (g.reloadTries or 0) >= 3 then return "awaiting authoritative ammo; reload retry backed off" end
+            return "requesting native reload"
+        end
         if os.clock() - (state.gunEquipAt or -math.huge) < 0.16 + (gun.SpinUp or 0) then return "gun spin-up" end
         return nil
     end
@@ -1870,7 +1916,7 @@ do
                     local result = contact(target, position, {Position = goal + offset}, range, guardian)
                     if result and (result.Instance == target or result.Instance:IsDescendantOf(target))
                         and (result.Position - goal - offset).Magnitude <= range
-                        and (not result.Guardian or (result.Distance or 1) > 0.5) then
+                        and (type(result) ~= "table" or not result.Guardian or (result.Distance or 1) > 0.5) then
                         local value = (goal - root.Position).Magnitude + (air and 10 or 0)
                         if not score or value < score then best, score = {target = target, goal = goal, air = air, at = os.clock(), position = position}, value end
                     end
@@ -2000,7 +2046,7 @@ do
         if g.ammo <= 0 then
             if os.clock() >= (g.reloadRetryAt or 0) then
                 if send(refs.action, "GunReload") then
-                    g.reload = {at = os.clock()}
+                    g.reload = {at = os.clock(), serverAt = now}
                     g.reloadTries = (g.reloadTries or 0) + 1
                     g.reloadRetryAt = os.clock() + math.max(3, gun.Reload + 1)
                 end
@@ -2972,7 +3018,7 @@ do
             -- chooses an inspection destination; attacks still need real LOS.
             local center = config.EggCenter
             local actual = guardian.Raycast(egg, player, center + Vector3.new(0, 64, 0), Vector3.new(0, -128, 0), nil)
-            if actual and actual.Guardian and actual.Instance == egg then candidate, surface = egg, actual.Position end
+            if type(actual) == "table" and actual.Guardian and actual.Instance == egg then candidate, surface = egg, actual.Position end
         end
         if not candidate then return false end
         state.inspections = state.inspections or setmetatable({}, {__mode = "k"})
@@ -3244,7 +3290,7 @@ do
         if mode == "guardian" and not guardianReady then target, state.target = nil, nil end
         if not state.combatReady and tutorialStep ~= 2 and guardianReady then
             local surface = ray(config.EggCenter, head, guardian, 200)
-            if not target and (not surface or surface.Instance ~= egg or not surface.Guardian) then
+            if not target and (not surface or surface.Instance ~= egg or type(surface) ~= "table" or not surface.Guardian) then
                 local direction = config.EggCenter - head.Position
                 -- Analytic native geometry supplies a route target behind an
                 -- obstruction. Dispatch still needs a clear physical/native ray.
@@ -3254,7 +3300,7 @@ do
             end
             -- The native guardian surface is the unlock target. Distant leftover
             -- chunks must not keep it behind an ordinary-target fallback.
-            if surface and surface.Instance == egg and surface.Guardian
+            if type(surface) == "table" and surface.Instance == egg and surface.Guardian
                 and eligible("hit:" .. targetId(egg), hitFingerprint(egg, state.family)) then
                 target, position, mode = egg, surface.Position, "guardian"
                 state.target, state.position, state.mode = target, position, mode
@@ -3932,6 +3978,12 @@ do
             .. "; acknowledged shots=" .. tostring(state.stats.gunShots or 0) .. "; ammo=" .. tostring(state.gun and state.gun.ammo))
         table.insert(lines, "Combat gun: " .. tostring(self.status.gunCombat or "not selected")
             .. "; owned permitted gun takes priority through reload/equip waits; Flamethrower only without one")
+        table.insert(lines, "Native gun ammo=" .. tostring(player:GetAttribute("GunAmmo"))
+            .. "; magazine=" .. tostring(player:GetAttribute("GunMag"))
+            .. "; reload deadline=" .. tostring(player:GetAttribute("GunReloadAt"))
+            .. "; server time=" .. tostring(workspace:GetServerTimeNow())
+            .. "; predicted reload attempts=" .. tostring(state.gun and state.gun.reloadTries or 0)
+            .. "; observed deadline=" .. tostring(state.gun and state.gun.reload and state.gun.reload.observed))
         table.insert(lines, tostring(self.status.explosive or "Explosives: waiting for owned ready charges")
             .. "; acknowledged throws=" .. tostring(state.stats.explosives or 0))
         table.insert(lines, "Shell Magnet=" .. tostring(player:GetAttribute("VIPOwned_vip_magnet"))
@@ -4049,9 +4101,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v23.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v24.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v23 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v24 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -4080,7 +4132,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v23", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v24", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
@@ -4175,6 +4227,9 @@ if not uiOK then
 end
 
 connect(player.AttributeChanged, function(name)
+    if app.observeGunAttribute and (name == "GunId" or name == "GunAmmo" or name == "GunReloadAt") then
+        app:observeGunAttribute(name)
+    end
     if name == "Gems" or string.sub(name, 1, 5) == "Perk_" then
         -- Replication is a wake-up signal, never a substitute for State before spending.
         app.refreshAt = 0
@@ -4305,6 +4360,7 @@ if app.settings.resume then app:Start() end
 render()
 app:note("Ready. AFK repeat runs, boss warning evasion, scientist priority and Claim All. Lobby walk / round tween. Auto hatch at 100% in lobby and rounds.")
 return app
+
 
 
 
