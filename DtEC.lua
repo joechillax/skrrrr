@@ -1,6 +1,6 @@
 task.wait(7)
 -- ChestFarmAutoLoop.lua: put this complete file in the executor's auto-execute folder.
--- Revision 14: skips CommonChest; background useful-item bringing in optional smart loot mode.
+-- Revision 15: skips CommonChest; background useful-item bringing in optional smart loot mode.
 -- Hides the default Gameplay Paused popup after readiness; streaming pauses still apply.
 -- Includes Discord ending reports, cached discovery, and Blinker / identified boss ranged dodging.
 -- Optional class quests: native combat, spare-gold sales, coin supplies and drill driving.
@@ -11,8 +11,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 14
-    local BUILD = "r14-equipped-class-quests"
+    local REVISION = 15
+    local BUILD = "r15-quest-idle-recovery"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -448,7 +448,12 @@ end
     end
     local function observeClassData(data)
         if type(data) ~= "table" then return end
-        s.classData = data
+        -- Native ClassesController retains fields omitted by an update.
+        -- Preserve ownership through a progress-only event; never invent it.
+        local merged = {}
+        for key, value in pairs(s.classData or {}) do merged[key] = value end
+        for key, value in pairs(data) do merged[key] = value end
+        s.classData = merged
         s.classObservedAt = now()
         -- Count server-reported objective changes separately from prompt attempts.
         for name, progress in pairs(data.ClassProgress or {}) do
@@ -1238,21 +1243,28 @@ return function(api)
     function Q.ownedClass(data, name)
         if type(data)~='table' then return false end
         if type(data.OwnedClasses)=='table' then
-            if data.OwnedClasses[name]~=nil then return data.OwnedClasses[name]==true end
             for _, v in ipairs(data.OwnedClasses) do if v==name then return true end end
-            return false
         end
-        local progress = type(data.ClassProgress)=='table' and data.ClassProgress[name]
-        return type(progress)=='table' and finite(progress.Level) and progress.Level>=1
+        -- ClassesController tests the OwnedClasses array with table.find.
+        -- Progress entries alone are not proof of ownership.
+        return false
+    end
+    function Q.supported(key, drive)
+        return weapons[key]~=nil or melee[key]~=nil or guns[key]~=nil
+            or key=='SellGoldItems' or key=='OpenChest' or key=='TotalDepth' and drive==true
     end
     function Q.plan(data, catalog, drive)
         local name = type(data)=='table' and data.SelectedClass
         local progress = name and type(data.ClassProgress)=='table' and data.ClassProgress[name]
         local entry = name and type(catalog)=='table' and catalog[name]
+        -- The lobby displays level 1 for an owned class before its first
+        -- ClassProgress entry exists; it does not infer ownership from progress.
+        if progress==nil and Q.ownedClass(data,name) then progress={Level=1,Objectives={}} end
         if type(progress)~='table' or not finite(progress.Level) or progress.Level<1 or progress.Level%1~=0
             or not entry or not entry.Requirements then return {kind='waiting'} end
         local requirements = entry.Requirements[progress.Level+1]
-        local plan = {name=name, level=progress.Level, unmet={}, counts=progress.Objectives or {}}
+        local plan = {name=name, level=progress.Level, unmet={}, unsupported={},
+            counts=type(progress.Objectives)=='table' and progress.Objectives or {}}
         if not requirements then plan.kind='complete'; return plan end
         local pending = {}
         for key, goal in pairs(requirements) do
@@ -1260,9 +1272,12 @@ return function(api)
             if not finite(count) or count<0 then count=0 end
             if finite(goal) and count<goal then
                 plan.unmet[#plan.unmet+1]={key=key, count=count, goal=goal}; pending[key]=true
+                if not Q.supported(key,drive) then plan.unsupported[#plan.unsupported+1]=key end
             end
         end
         table.sort(plan.unmet,function(a,b)return a.key<b.key end)
+        table.sort(plan.unsupported)
+        plan.partial=#plan.unsupported>0 and #plan.unsupported<#plan.unmet
         -- Exact weapon objectives take precedence over general combat.
         for _, key in ipairs({'FlintlockKills','CutlassKills'}) do
             if pending[key] then plan.kind,plan.weapon,plan.objective='combat',weapons[key],key; return plan end
@@ -1271,7 +1286,7 @@ return function(api)
         for _, item in ipairs(plan.unmet) do
             if melee[item.key] or guns[item.key] then
                 plan.kind,plan.objective='combat',item.key
-                plan.weaponClass=guns[item.key] and (type(guns[item.key])=='string' and guns[item.key] or 'Revolver') or 'Sword'
+                plan.weaponClass=guns[item.key] and (type(guns[item.key])=='string' and guns[item.key] or 'Gun') or 'Sword'
                 return plan
             end
         end
@@ -1286,9 +1301,9 @@ return function(api)
         for offset=1,#queue do
             local name=queue[(origin+offset-1)%#queue+1]
             if name~=current and Q.ownedClass(data,name) and not (blocked and blocked[name]) then
-                local probe={SelectedClass=name,ClassProgress=data.ClassProgress}
+                local probe={SelectedClass=name,ClassProgress=data.ClassProgress,OwnedClasses=data.OwnedClasses}
                 local plan=Q.plan(probe,catalog,drive~=false)
-                if plan.kind=='combat' or plan.kind=='gold' or plan.kind=='chests' or plan.kind=='depth' then return name end
+                if #(plan.unsupported or {})==0 and (plan.kind=='combat' or plan.kind=='gold' or plan.kind=='chests' or plan.kind=='depth') then return name end
             end
         end
     end
@@ -1341,6 +1356,10 @@ return function(api)
         for seat,value in pairs(ctx.questSeats or {}) do pcall(function() if seat.Parent then seat.ThrottleFloat=value end end) end
         ctx.questSeats=nil
     end
+    local function clearHold(job)
+        for _,object in ipairs(job.constraints or {}) do pcall(function()object:Destroy()end) end
+        job.constraints=nil
+    end
     function Q.stopDrive(ctx)
         clearThrottle(ctx)
         if ctx.questDriving or ctx.questSeating then
@@ -1353,6 +1372,7 @@ return function(api)
     end
     local function release(job)
         job.cancelled=true
+        clearHold(job)
         job.ctx.bringEquipmentLock=nil
         job.ctx.questOwns=nil -- A quarantined native call must not park the chest route.
         if job.pending or calls.drag or calls.shop or calls.wallet then return end
@@ -1368,19 +1388,29 @@ return function(api)
     function Q.cleanup(ctx)
         Q.stopDrive(ctx)
         if s.questDelivery and s.questDelivery.ctx==ctx then release(s.questDelivery) end
+        if s.questCashJob and s.questCashJob.ctx==ctx then
+            s.questCashJob.cancelled=true
+            if not calls.cash then s.questCashJob=nil end
+        end
         ctx.questOwns,ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass,ctx.questAimHead=nil,nil,nil,nil,nil
     end
-    local function free(item)
+    local function free(item,allowFuelOre)
         if not api.free(item) or not api.part(item) or item:GetAttribute('Welded') or api.tag(item,'Welded')
-            or item:GetAttribute('Placed') or item:GetAttribute('CraftedPlaceable') or api.tag(item,'Ore') then return false end
+            or item:GetAttribute('Placed') or item:GetAttribute('CraftedPlaceable')
+            or api.tag(item,'Ore') and not (allowFuelOre and api.id(item)=='Ore_Coal' and (tonumber(api.attr(item,'Fuel')) or 0)>0) then return false end
         local owner=tonumber(item:GetAttribute('OwnerUserId'))
         return not owner or owner==0 or owner==api.Players.LocalPlayer.UserId
     end
     function Q.gold(item,ctx,snapshot)
         if not free(item) then return false end
         local id=api.id(item)
-        if api.attr(item,'Relic') or api.attr(item,'ClassRelic') or id=='Flintlock' or id=='Sword_Pirate' then return false end
+        if api.attr(item,'Relic') or api.attr(item,'ClassRelic') or api.tag(item,'MoneySack')
+            or id=='Money_Sack' or id=='Flintlock' or id=='Sword_Pirate' then return false end
         local isGold=s.itemCategories and s.itemCategories.GoldenItems and s.itemCategories.GoldenItems[id]==true
+        -- User-confirmed live rule supplements the export's finite category list.
+        for _,name in ipairs({id or '',item.Name or '',api.attr(item,'DisplayName') or '',item:GetAttribute('RealName') or ''}) do
+            if type(name)=='string' and name:lower():find('gold',1,true) then isGold=true;break end
+        end
         if s.questProtectedCatalog~=s.questCatalog or not s.questProtectedIds then
             s.questProtectedCatalog=s.questCatalog; s.questProtectedIds={}
             local function collect(t)
@@ -1444,26 +1474,47 @@ return function(api)
         if job.item:IsA('BasePart') then cf,size=job.item.CFrame,job.item.Size else cf,size=job.item:GetBoundingBox() end
         local offset=CFrame.new(0,target.Size.Y*.5+size.Y*.5-.08,0)*cf:ToObjectSpace(job.item:GetPivot())
         if job.kind=='fuel' then offset=CFrame.new() end
-        if job.kind=='supply' then offset=CFrame.new(3,1,-4) end
-        job.item:PivotTo(target.CFrame*offset)
+        if job.kind=='supply' and not job.shop then offset=CFrame.new(3,1,-4) end
+        local goal=job.fuelAttachment and job.fuelAttachment.Parent and job.fuelAttachment.WorldCFrame or target.CFrame*offset
+        job.item:PivotTo(goal)
         p.AssemblyLinearVelocity,p.AssemblyAngularVelocity=Vector3.zero,Vector3.zero
+        if not job.constraints then
+            job.constraints={}
+            local function create(class,parent)
+                local object=Instance.new(class);job.constraints[#job.constraints+1]=object
+                object.Name,object.Parent='EarthQuestDelivery',parent;return object
+            end
+            local attachment=create('Attachment',p);attachment.CFrame=p.CFrame:ToObjectSpace(job.item:GetPivot())
+            local destination=create('Attachment',target);destination.CFrame=target.CFrame:ToObjectSpace(goal)
+            local align=create('AlignPosition',p);align.Attachment0,align.Attachment1=attachment,destination
+            align.Responsiveness,align.MaxForce,align.RigidityEnabled,align.ReactionForceEnabled=45,45000,false,false
+            local orientation=create('AlignOrientation',p);orientation.Attachment0,orientation.Attachment1=attachment,destination
+            orientation.Responsiveness,orientation.MaxTorque,orientation.RigidityEnabled,orientation.ReactionTorqueEnabled=45,500000,false,false
+        end
         return true
     end
     local function startDelivery(ctx,item,target,kind,plan)
         if s.questDelivery or calls.drag or s.bringDelivery or s.lootRequest or s.equipmentRequest or manual() then return false end
         local job={ctx=ctx,item=item,target=target,kind=kind,started=now(),stage='request',
             before=kind=='fuel' and tonumber(ctx.drill:GetAttribute('Fuel')) or objective(plan,'SellGoldItems'),class=plan.name}
+        if kind=='fuel' then
+            for _,attachment in ipairs(api.tagged('OnboardingAttachment')) do
+                if attachment.Name=='DrillFurnace' and attachment:IsA('Attachment') and attachment:IsDescendantOf(ctx.drill) then
+                    job.fuelAttachment=attachment;break
+                end
+            end
+        end
         s.questDelivery=job; ctx.bringEquipmentLock=true
         job.pending=true
         if not call('drag','DragService','Request',{item},function(ok,value)
             job.pending=nil; job.owns=ok and value==true
             if not job.owns then retries[item]=now()+15 end
             if not job.owns or job.cancelled or not enabled(ctx) then release(job); return end
-            if not free(item) or kind=='gold' and not Q.gold(item,ctx) then release(job); return end
+            if not free(item,kind=='fuel') or kind=='gold' and not Q.gold(item,ctx) then release(job); return end
             local moved,result=pcall(place,job)
             if not moved or not result then release(job); return end
             job.stage,job.readyAt='placed',now()+.55
-        end,function()return enabled(ctx) and free(item) and not manual()end) then
+        end,function()return enabled(ctx) and free(item,kind=='fuel') and not manual()end) then
             job.pending=nil; s.questDelivery=nil; ctx.bringEquipmentLock=nil; return false
         end
         return true
@@ -1489,8 +1540,10 @@ return function(api)
         end
         if job.stage=='placed' and now()>=job.readyAt then
             job.stage='receipt'; job.receiptUntil=now()+5
+            pcall(place,job);clearHold(job)
             call('drag','DragService','Cancel',{true},function(ok,value)
-                if ok and value~=false then job.owns=false; ctx.bringEquipmentLock=nil
+                if ok and value~=false then
+                    job.owns=false;ctx.bringEquipmentLock=nil;ctx.questOwns=nil;job.background=true
                 else job.releaseFailed=true; release(job) end
             end)
         elseif job.stage=='receipt' then
@@ -1499,30 +1552,54 @@ return function(api)
                 or plan.name==job.class and objective(plan,'SellGoldItems')
             if finite(count) and finite(job.before) and count>job.before then
                 setStatus(job.kind=='fuel' and 'Drill fuel increase confirmed' or 'Gold-sales quest progress confirmed')
-                retries[job.item]=math.huge; s.questDelivery=nil
+                retries[job.item]=math.huge;clearHold(job);s.questDelivery=nil
             elseif now()>=job.receiptUntil then
-                retries[job.item]=now()+120; s.questDelivery=nil
+                retries[job.item]=now()+120;clearHold(job);s.questDelivery=nil
                 setStatus('Delivery did not confirm server progress; retry held for 120s')
             end
         end
         return true
     end
     local function looseItems() local folder=workspace:FindFirstChild('Items'); return folder and folder:GetChildren() or {} end
+    local function fuelItem(ctx)
+        local furnace=ctx.drill:FindFirstChild('Furnace')
+        if not furnace or not api.part(furnace) then return end
+        local item=nearest(looseItems(),ctx.root.Position,function(item)
+            local value=tonumber(api.attr(item,'Fuel'))
+            return free(item,true) and value and value>0 and not api.attr(item,'Relic') and not api.attr(item,'ClassRelic')
+                and now()>=(retries[item] or 0)
+        end)
+        return item,furnace
+    end
+    local function driveReady(ctx)
+        local tank,capacity=tonumber(ctx.drill:GetAttribute('Fuel')),tonumber(ctx.drill:GetAttribute('MaxFuel'))
+        if not finite(tank) or not finite(capacity) or capacity<=0 then return false,'Drill fuel state loading' end
+        if tank<=0 and fuelItem(ctx) then return true end
+        if tank<=0 then return false,'No loaded free fuel for the drill' end
+        local physical=ctx.drill:FindFirstChild('DrillPhysicsSeat') or ctx.drill:FindFirstChild('VehicleSeat')
+        local presentation=ctx.drill:FindFirstChild('LocalDriverSeat')
+        if not presentation and physical and physical:IsA('VehicleSeat') then presentation=physical end
+        if not physical or not physical:IsA('BasePart') or not presentation or not presentation:IsA('VehicleSeat') then
+            return false,'Native drill seats still loading'
+        end
+        local driver=ctx.drill:GetAttribute('DriverUserId')
+        if driver~=nil and driver~=api.Players.LocalPlayer.UserId then return false,'Another player is driving' end
+        return true
+    end
     local function fuel(ctx,plan)
         local tank=tonumber(ctx.drill:GetAttribute('Fuel'))
         local capacity=tonumber(ctx.drill:GetAttribute('MaxFuel'))
-        if not finite(tank) or not finite(capacity) or capacity<=0 or tank>capacity*.25 then return false end
-        Q.stopDrive(ctx)
-        local furnace=ctx.drill:FindFirstChild('Furnace')
-        local item=nearest(looseItems(),ctx.root.Position,function(item)
-            local value=tonumber(api.attr(item,'Fuel'))
-            return free(item) and value and value>0 and not api.attr(item,'Relic') and not api.attr(item,'ClassRelic')
-                and now()>=(retries[item] or 0)
-        end)
-        if furnace and api.part(furnace) and item then
-            startDelivery(ctx,item,furnace,'fuel',plan); setStatus('Refuelling through Drill.Furnace; awaiting tank increase')
-        else setStatus('Depth quest waits for loaded free fuel and Drill.Furnace') end
-        return true
+        if not finite(tank) or not finite(capacity) or capacity<=0 or tank>0 then return false end
+        local item,furnace=fuelItem(ctx)
+        if item then
+            Q.stopDrive(ctx)
+            if startDelivery(ctx,item,furnace,'fuel',plan) then
+                setStatus('Refuelling through Drill.Furnace; awaiting tank increase'); return true
+            end
+        end
+        -- Low positive fuel remains usable; an empty tank without a deliverable
+        -- fuel item is handled by preflight without taking the chest route.
+        return false
     end
     local function holdRoute(ctx)
         if ctx.currentChest or ctx.featureHold or ctx.defenseMoving or now()<(ctx.dodgeUntil or 0)
@@ -1546,7 +1623,11 @@ return function(api)
         return false
     end
     local function drive(ctx,plan)
-        if fuel(ctx,plan) then return end
+        if fuel(ctx,plan) then return true end
+        local ready,reason=driveReady(ctx)
+        if not ready then
+            Q.stopDrive(ctx);ctx.questOwns=nil;setStatus(reason..'; chest farming continues');return false
+        end
         local seat=ctx.drill:FindFirstChild('DrillPhysicsSeat') or ctx.drill:FindFirstChild('VehicleSeat')
         local presentation=ctx.drill:FindFirstChild('LocalDriverSeat')
         if not presentation and seat and seat:IsA('VehicleSeat') then presentation=seat end
@@ -1566,13 +1647,14 @@ return function(api)
                 if call('drive','DrillService','StartDriving',{},function(ok,value)
                     ctx.questStartRetry=now()+5
                     if ok and value==true then
-                        if enabled(ctx) then ctx.humanoid.Sit=true; presentation:Sit(ctx.humanoid)
+                        if enabled(ctx) and ctx.questOwns and ctx.questSeating
+                            and (ctx.root.Position-seat.Position).Magnitude<=3 then ctx.humanoid.Sit=true; presentation:Sit(ctx.humanoid)
                         else ctx.questDriving=true; Q.stopDrive(ctx) end
                     end
-                end,function()return enabled(ctx) and ctx.drill:GetAttribute('DriverUserId')==nil
+                end,function()return enabled(ctx) and ctx.questOwns and ctx.drill:GetAttribute('DriverUserId')==nil
                     and (ctx.root.Position-seat.Position).Magnitude<=3 end) then ctx.questStartRetry=now()+5 end
             end
-            setStatus('Waiting for server DriverUserId confirmation'); return
+            setStatus('Waiting for server DriverUserId confirmation'); return true
         end
         ctx.questDriving=true; ctx.questSeating=ctx.questSeating or now()
         ctx.questSeats=ctx.questSeats or {}
@@ -1588,6 +1670,101 @@ return function(api)
                 then ctx.questThrottleAt=now()+.25 end
         end
         setStatus('Driving drill; waiting for credited TotalDepth progress')
+        return true
+    end
+    function Q.darknessActive()
+        -- DarknessUtil.IsActive: Lighting.Event==Night OR the player's
+        -- InDarknessZone flag; clock time and a dark-looking screenshot differ.
+        local lighting=game:GetService('Lighting')
+        return lighting and lighting:GetAttribute('Event')=='Night'
+            or api.Players.LocalPlayer:GetAttribute('InDarknessZone')==true
+    end
+    local function combatTarget(ctx,plan,gun)
+        if plan.objective=='DarknessEnemyKills' and not Q.darknessActive() then return nil end
+        local best,score
+        local killGoal=plan.objective and (plan.objective:find('Kills',1,true) or plan.objective=='HeadShot')
+        for _,npc in ipairs(api.enemies()) do
+            local h=npc:FindFirstChildOfClass('Humanoid')
+            local p=api.part(npc)
+            local allowed=npc:GetAttribute('NpcFaction')~='FriendlyCompanion' and h and h.Health>0 and p
+                and not (not gun and ctx.pickaxeTargets and ctx.pickaxeTargets[npc])
+            if allowed and plan.objective=='VampireKills' then allowed=tostring(npc:GetAttribute('RealName') or npc.Name):find('Vampire',1,true)~=nil end
+            if allowed and (plan.objective=='CrazyMinerKills' or plan.objective=='BanditMinerKills') then
+                allowed=normalize(npc:GetAttribute('RealName') or npc.Name)==normalize(plan.objective:gsub('Kills',''))
+            end
+            if allowed then
+                local distance=(p.Position-ctx.root.Position).Magnitude
+                -- Finishing low-health targets earns kill objectives sooner than
+                -- camping a nearby boss. Damage objectives still prefer proximity.
+                local value=killGoal and h.Health+math.min(distance/8,100) or distance
+                if not score or value<score then best,score=npc,value end
+            end
+        end
+        return best
+    end
+    local function combatWork(ctx,plan)
+        if plan.kind~='combat' then return false end
+        ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass=true,plan.weapon,plan.weaponClass
+        ctx.questAimHead=plan.objective=='HeadShot'
+        local tool=Q.preferred(ctx);if not tool then return false end
+        local class=api.attr(tool,'Class');local gun=class=='Revolver' or class=='Rifle' or class=='Shotgun'
+        if gun and (tonumber(api.attr(tool,'Ammo')) or 0)<=0
+            and (tonumber(api.Players.LocalPlayer:GetAttribute(class=='Revolver' and 'Pistol_Ammo' or class..'_Ammo')) or 0)<=0 then return false end
+        local npc=combatTarget(ctx,plan,gun);if not npc then return false end
+        if not holdRoute(ctx) then return true end
+        Q.stopDrive(ctx);ctx.combatTarget=npc
+        local point=api.part(npc).Position;local delta=ctx.root.Position-point
+        local radius=gun and 30 or math.min(8,math.max(3,(tonumber(api.attr(tool,'Range')) or 12)*.6))
+        if delta.Magnitude>radius+2 then
+            api.hover(ctx)
+            local side=delta.Magnitude>0 and delta.Unit or Vector3.new(0,0,1)
+            ctx.root.CFrame=CFrame.new(point+side*radius+Vector3.new(0,1,0))
+        end
+        setStatus('Class quest: '..plan.objective..' using '..api.id(tool));return true
+    end
+    local function goldReady(ctx,plan)
+        if now()>=(ctx.questProbeAt or 0) then
+            ctx.questProbeAt=now()+1
+            local useful=api.snapshot and api.snapshot(ctx)
+            local item=nearest(looseItems(),ctx.root.Position,function(item)return Q.gold(item,ctx,useful) and now()>=(retries[item] or 0)end)
+            ctx.questGoldPad=item and nearest(sellers(ctx),api.part(item).Position,Q.sellPad) or nil
+            ctx.questGoldReady=ctx.questGoldPad and item or nil
+        end
+        local item=ctx.questGoldReady
+        return item and free(item) and Q.sellPad(ctx.questGoldPad) and now()>=(retries[item] or 0)
+    end
+    local function runnable(ctx,plan)
+        if plan.objective=='DarknessEnemyKills' and not Q.darknessActive() then
+            return false,'Darkness quest waits for Night or InDarknessZone'
+        end
+        if plan.kind=='combat' then
+            ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass=true,plan.weapon,plan.weaponClass
+            ctx.questAimHead=plan.objective=='HeadShot'
+        end
+        if Q.moneyTarget(ctx) then return true end
+        for _,goal in ipairs(plan.unmet) do if goal.key=='SellGoldItems' and goldReady(ctx,plan) then return true end end
+        if plan.kind=='combat' then
+            local tool=Q.preferred(ctx)
+            if tool then
+                local class=api.attr(tool,'Class');local gun=class=='Revolver' or class=='Rifle' or class=='Shotgun'
+                local ammo=class=='Revolver' and 'Pistol_Ammo' or tostring(class)..'_Ammo'
+                local armed=not gun or (tonumber(api.attr(tool,'Ammo')) or 0)>0 or (tonumber(api.Players.LocalPlayer:GetAttribute(ammo)) or 0)>0
+                if armed and combatTarget(ctx,plan,gun) then return true end
+                if not armed and Q.supplyReady(ctx,ammo) then return true end
+            elseif plan.weapon and Q.supplyReady(ctx,plan.weapon) then return true end
+        elseif plan.kind=='depth' then
+            local seat=ctx.drill:FindFirstChild('DrillPhysicsSeat') or ctx.drill:FindFirstChild('VehicleSeat')
+            if seat and now()-(ctx.questProgressAt or now())>=20 and api.findTool(ctx,'Sword') then
+                for _,npc in ipairs(api.enemies()) do
+                    local hp=npc:FindFirstChildOfClass('Humanoid');local p=api.part(npc)
+                    if hp and hp.Health>0 and p and npc:GetAttribute('NpcFaction')~='FriendlyCompanion'
+                        and (p.Position-seat.Position).Magnitude<=120 then return true end
+                end
+            end
+        end
+        local ready,reason=false,nil
+        if cfg.driveDepth then ready,reason=driveReady(ctx) end
+        return ready,reason or 'No loaded quest target or supply'
     end
     local function queued(plan,reason)
         local name=Q.nextClass(s.classData,s.questCatalog,cfg.questQueue,plan.name,s.questBlocked,cfg.driveDepth)
@@ -1625,11 +1802,13 @@ return function(api)
             if now()-selection.started>=12 then setStatus('Class selection unconfirmed; starting with server-selected class'); return false end
             return true
         end
-        -- The dump exposes this RF but omits its lobby caller. A single class-name
-        -- argument is provisional; SelectedClass acknowledgement is mandatory.
+        -- Lobby ClassesController uses SelectClass(CurrentClass) for an owned
+        -- class and consumes a table containing SelectedClass/OwnedClasses/progress.
         selection={name=name,started=now()}; s.questSelection=selection
         call('selection','ClassService','SelectClass',{name},function(ok,value)
-            selection.rejected=not ok or value==false
+            selection.rejected=not ok or type(value)~='table'
+            if not selection.rejected and type(value.SelectedClass)=='string' and type(value.ClassProgress)=='table'
+                and (s.classObservedAt or -1)<=selection.started then api.observeClass(value) end
             s.questPollAt=0
             if selection.rejected then selection.started=now()-12 end
         end,function()return cfg.classQuest and api.owned() and Q.ownedClass(s.classData,name)
@@ -1643,18 +1822,40 @@ return function(api)
                 if tool.Parent==container and ctx.questWeapon and api.id(tool)==ctx.questWeapon then return tool,true end
             end end
         end
+        if ctx.questWeaponClass=='Gun' then
+            local best,score
+            for _,class in ipairs({'Revolver','Rifle','Shotgun'}) do
+                local tool=api.findTool(ctx,class)
+                if tool then
+                    local ammo=class=='Revolver' and 'Pistol_Ammo' or class..'_Ammo'
+                    local armed=(tonumber(api.attr(tool,'Ammo')) or 0)>0 or (tonumber(api.Players.LocalPlayer:GetAttribute(ammo)) or 0)>0
+                    local value=(armed and 1e9 or 0)+(tonumber(api.attr(tool,'Damage')) or 0)*(tonumber(api.attr(tool,'FireRate')) or 1)
+                    if not score or value>score then best,score=tool,value end
+                end
+            end
+            return best,true
+        end
         return ctx.questWeaponClass and api.findTool(ctx,ctx.questWeaponClass) or nil,true
     end
     function Q.step(ctx)
         if not cfg.classQuest then
-            if ctx.questOwns or ctx.questDriving or s.questDelivery then Q.cleanup(ctx) end
+            if ctx.questOwns or ctx.questDriving or s.questDelivery or s.questCashJob then Q.cleanup(ctx) end
             return false
         end
         Q.poll()
         local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if not enabled(ctx) then ctx.questProgressAt=now(); Q.cleanup(ctx); return false end
         if api.extractionReady() then Q.cleanup(ctx); return false end
-        if deliveryStep(ctx,plan) then return true end
+        if Q.cashStep(ctx) then return true end
+        local outstanding=s.questDelivery
+        if deliveryStep(ctx,plan) then
+            if outstanding and outstanding.background and not outstanding.owns and not outstanding.pending and not calls.drag then
+                s.questPlan=plan
+                if combatWork(ctx,plan) then return true end
+                ctx.questOwns=nil;return false
+            end
+            return true
+        end
         if now()<(ctx.questTickAt or 0) then return ctx.questOwns end
         ctx.questTickAt=now()+.2
         s.questPlan=plan
@@ -1677,7 +1878,20 @@ return function(api)
             queued(plan,'No quest counter progress for 120s'); return false
         end
         if plan.kind=='chests' then Q.cleanup(ctx); setStatus('Opening chests for '..plan.name..' quest'); return false end
+        local canWork,reason=runnable(ctx,plan)
+        if not canWork then
+            Q.stopDrive(ctx);ctx.questOwns=nil;ctx.combatTarget=nil;s.questIdle=true
+            setStatus(reason..'; chest farming continues');return false
+        end
+        s.questIdle=nil
         if not holdRoute(ctx) then return true end
+        local money=Q.moneyTarget(ctx)
+        if money then
+            Q.stopDrive(ctx);api.hover(ctx)
+            ctx.root.CFrame=CFrame.new(api.part(money).Position+Vector3.new(0,1,2))
+            s.questCashJob={ctx=ctx,item=money,started=now(),readyAt=now()+.2,stage='approach',before=s.stats.coinEarned or 0}
+            setStatus('Collecting a free money bag for quest supplies');return true
+        end
         if plan.kind=='depth' then
             ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass=nil,nil,nil
             local seat=ctx.drill:FindFirstChild('DrillPhysicsSeat') or ctx.drill:FindFirstChild('VehicleSeat')
@@ -1694,13 +1908,13 @@ return function(api)
                     if (ctx.root.Position-p.Position).Magnitude>9 then ctx.root.CFrame=CFrame.new(p.Position+Vector3.new(0,2,6)) end
                     setStatus('Drill depth stalled; fighting a nearby obstruction')
                 else setStatus('Drill obstruction needs an owned sword') end
-            else drive(ctx,plan) end
+            else return drive(ctx,plan) end
             return true
         end
         if plan.kind=='gold' then
             ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass=nil,nil,nil
             if tryGold(ctx,plan) then return true end
-            if cfg.driveDepth then drive(ctx,plan); return true end
+            if cfg.driveDepth then return drive(ctx,plan) end
             Q.stopDrive(ctx)
             ctx.questOwns=nil; setStatus('Looking for disposable gold and a loaded TradingPost sell pad'); return false
         end
@@ -1714,7 +1928,7 @@ return function(api)
             setStatus('Quest weapon unavailable: '..tostring(plan.weapon or plan.weaponClass))
             if plan.weapon then
                 if Q.supply(ctx,plan,plan.weapon) then return true end
-                if cfg.driveDepth then ctx.questOwns=true; drive(ctx,plan); return true end
+                if cfg.driveDepth then ctx.questOwns=true; return drive(ctx,plan) end
             end
             ctx.questOwns=nil; return false
         end
@@ -1723,39 +1937,58 @@ return function(api)
             and (tonumber(api.Players.LocalPlayer:GetAttribute(class=='Revolver' and 'Pistol_Ammo' or class..'_Ammo')) or 0)<=0 then
             setStatus('Quest gun needs ammunition')
             if Q.supply(ctx,plan,class=='Revolver' and 'Pistol_Ammo' or class..'_Ammo') then return true end
-            if cfg.driveDepth then ctx.questOwns=true; drive(ctx,plan); return true end
+            if cfg.driveDepth then ctx.questOwns=true; return drive(ctx,plan) end
             return false
         end
-        local npc=nearest(api.enemies(),ctx.root.Position,function(npc)
-            local h=npc:FindFirstChildOfClass('Humanoid')
-            if npc:GetAttribute('NpcFaction')=='FriendlyCompanion' or not h or h.Health<=0 then return false end
-            if not gun and ctx.pickaxeTargets and ctx.pickaxeTargets[npc] then return false end
-            if plan.objective=='VampireKills' then return tostring(npc:GetAttribute('RealName') or npc.Name):find('Vampire',1,true)~=nil end
-            if plan.objective=='CrazyMinerKills' or plan.objective=='BanditMinerKills' then
-                return normalize(npc:GetAttribute('RealName') or npc.Name)==normalize(plan.objective:gsub('Kills',''))
-            end
-            return true
-        end)
+        local npc=combatTarget(ctx,plan,gun)
         if not npc then
-            if cfg.driveDepth then drive(ctx,plan); return true end
+            if cfg.driveDepth then return drive(ctx,plan) end
             Q.stopDrive(ctx); ctx.questOwns=nil; setStatus('Finding a living quest target'); return false
         end
-        Q.stopDrive(ctx)
-        ctx.combatTarget=npc
-        local point=api.part(npc).Position
-        local delta=ctx.root.Position-point
-        local radius=gun and 30 or math.min(8,math.max(3,(tonumber(api.attr(tool,'Range')) or 12)*.6))
-        if delta.Magnitude>radius+2 then
-            api.hover(ctx)
-            local side=delta.Magnitude>0 and delta.Unit or Vector3.new(0,0,1)
-            ctx.root.CFrame=CFrame.new(point+side*radius+Vector3.new(0,1,0))
-        end
-        setStatus('Class quest: '..plan.objective..' using '..api.id(tool))
-        return true
+        return combatWork(ctx,plan)
     end
     Q.call=call
     Q.free,Q.place,Q.release,Q.startDelivery,Q.enabled,Q.manual,Q.looseItems=free,place,release,startDelivery,enabled,manual,looseItems
     local supplyIds={Flintlock=true,Sword_Pirate=true,Pistol_Ammo=true,Rifle_Ammo=true,Shotgun_Ammo=true}
+    function Q.moneyTarget(ctx)
+        if calls.cash or s.questCashJob or s.questDelivery or s.bringDelivery or s.lootRequest or manual() then return nil end
+        return nearest(api.tagged('MoneySack'),ctx.root.Position,function(item)
+            local creator=item:GetAttribute('BagCreator')
+            return free(item) and api.id(item)=='Money_Sack' and api.tag(item,'Interactive')
+                and (not creator or creator=='' or creator==api.Players.LocalPlayer.Name) and now()>=(retries[item] or 0)
+        end)
+    end
+    function Q.cashStep(ctx)
+        local job=s.questCashJob;if not job then return false end
+        if job.ctx~=ctx or job.cancelled or not enabled(ctx) or manual() then
+            job.cancelled=true;ctx.questOwns=nil
+            if not calls.cash then s.questCashJob=nil end
+            return false
+        end
+        if job.stage=='approach' and now()>=job.readyAt then
+            job.stage='receipt';job.receiptUntil=now()+5
+            -- DragController collects Money_Sack through Interact(item), not ItemBag.
+            if not call('cash','InteractionService','Interact',{job.item},function(ok,value)
+                if job.cancelled then s.questCashJob=nil;return end
+                job.rejected=not ok or value==false
+                job.sent=true;ctx.questOwns=nil
+            end,function()return enabled(ctx) and not job.cancelled and free(job.item) and api.tag(job.item,'Interactive')
+                and (api.part(job.item).Position-ctx.root.Position).Magnitude<=10 and not manual()end) then
+                retries[job.item]=now()+15;s.questCashJob=nil;ctx.questOwns=nil
+            end
+        elseif job.stage=='receipt' then
+            if (s.stats.coinEarned or 0)>job.before and (not job.item.Parent or not api.tag(job.item,'Interactive')) then
+                retries[job.item]=math.huge;s.questCashJob=nil;ctx.questOwns=nil
+                setStatus('Money bag coin increase confirmed')
+            elseif job.rejected or now()>=job.receiptUntil then
+                retries[job.item]=job.sent and math.huge or now()+30
+                job.cancelled=true;ctx.questOwns=nil
+                if not calls.cash then s.questCashJob=nil end
+                setStatus('Money bag pickup unconfirmed; farming continues without a duplicate request')
+            end
+        end
+        return ctx.questOwns==true
+    end
     local function supplyCount(ctx,id)
         if id:sub(-5)=='_Ammo' then return tonumber(api.Players.LocalPlayer:GetAttribute(id)) or 0 end
         local count=0
@@ -1772,6 +2005,14 @@ return function(api)
             and not item:GetAttribute('Robux') and not item:GetAttribute('ProductId') and not item:GetAttribute('RobuxProductId')
     end
     local function checkout(item) return item and item.Parent and item:IsA('BasePart') and api.tag(item,'BuyPart') and item:IsDescendantOf(workspace) end
+    function Q.supplyReady(ctx,id)
+        if not supplyIds[id] then return false end
+        local item=nearest(looseItems(),ctx.root.Position,function(item)
+            return api.id(item)==id and now()>=(retries[item] or 0) and (free(item) or stock(item))
+                and (id:sub(-5)=='_Ammo' or api.hasRoom(ctx,item))
+        end)
+        return item and (free(item) or nearest(api.tagged('BuyPart'),api.part(item).Position,checkout))~=nil
+    end
     local function obstructed(job)
         if not checkout(job.target) then return true end
         for _,item in ipairs(looseItems()) do
@@ -1825,14 +2066,12 @@ return function(api)
                 job.pending=nil; job.owns=ok and value==true
                 if not guarded() or not job.owns or not stock(job.item) then release(job); return end
                 local moved,result=pcall(place,job)
-                -- Supply checkout placement uses the pad's top, not the player's pickup offset.
                 if moved and result then
-                    local p=api.part(job.item); local height=p.Size.Y*.5+job.target.Size.Y*.5-.08
-                    job.item:PivotTo(job.target.CFrame*CFrame.new(0,height,0))
                     job.stage,job.readyAt='shop-drop',now()+.6
                 else fail('Stock placement failed; no purchase') end
             end,guarded) then job.pending=nil end
         elseif job.stage=='shop-drop' and now()>=job.readyAt then
+            pcall(place,job);clearHold(job)
             call('drag','DragService','Cancel',{true},function(ok,value)
                 if ok and value~=false then job.owns=false; job.stage='quote' else fail('Checkout release unconfirmed; no purchase') end
             end,guarded)
@@ -2252,7 +2491,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 14 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 15 }
     end
     local loaded = s.config
     if not loaded then
@@ -2297,9 +2536,9 @@ end)()
         status('Chest farm running; optional settings updated')
         if s.gui then pcall(s.gui.update) end
     end
-    function F.extractionEnabled() return cfg.lootExtract end
+    function F.extractionEnabled() return cfg.lootExtract and not cfg.classQuest end
     function F.extractionReady()
-        return cfg.lootExtract and s.lootStarted ~= nil and now() - s.lootStarted >= cfg.minutes * 60
+        return F.extractionEnabled() and s.lootStarted ~= nil and now() - s.lootStarted >= cfg.minutes * 60
     end
     function F.smartLootEnabled() return cfg.lootExtract end
     local buildGui = (function()
@@ -2367,8 +2606,8 @@ return function(api)
         local detail = label(box, subtitle, 46, 35, 232, 26, 10, color.muted)
         return box, detail
     end
-    local smart = row(1, 'Smart loot + altar extraction', 'Collect useful gear and relics; save at an altar', 0)
-    local minimum = row(2, 'Minimum run time', 'Only applies when loot + extraction is ON', 80)
+    local smart,smartHint = row(1, 'Smart loot + altar extraction', 'Collect useful gear and relics; save at an altar', 0)
+    local minimum,minimumHint = row(2, 'Minimum run time', 'Only applies when loot + extraction is ON', 80)
     local classQuest = row(3, 'Auto equipped-class quest', 'Quest combat, spare gold sales and coin supplies', 160)
     local depthQuest = row(4, 'Drive for depth quests', 'Also drive to find enemies and supplies for quests', 240)
     local queueBox, queueHint = row(5, 'Class queue', 'Owned classes, comma separated. Blank: current class.', 320, 92)
@@ -2435,8 +2674,11 @@ return function(api)
             button.BackgroundColor3 = cfg[key] and color.accent or color.edge
             button.TextColor3 = cfg[key] and color.bg or color.muted
         end
-        minutes.TextEditable = cfg.lootExtract
-        minutes.TextTransparency = cfg.lootExtract and 0 or 0.55
+        minutes.TextEditable = cfg.lootExtract and not cfg.classQuest
+        minutes.TextTransparency = minutes.TextEditable and 0 or 0.55
+        smartHint.Text = cfg.classQuest and (cfg.lootExtract and 'Smart loot stays ON; altar extraction is paused for quests'
+            or 'Smart loot is OFF; altar extraction is paused for quests') or 'Collect useful gear and relics; save at an altar'
+        minimumHint.Text = cfg.classQuest and 'Disabled during class quests; no timed altar exit' or 'Only applies when loot + extraction is ON'
         queueInput.TextEditable = cfg.classQuest
         queueInput.TextTransparency = cfg.classQuest and 0 or 0.55
         local elapsed = math.max(0, api.now() - (s.lootStarted or api.now()))
@@ -2468,6 +2710,9 @@ return function(api)
                     progress[#progress+1] = string.format('%s %d/%d', item.key, item.count, item.goal)
                 end
                 ui.stats.Text = ui.stats.Text .. string.format('\n%s Lv %d · %s', plan.name, plan.level, table.concat(progress, ' · '))
+                if plan.unsupported and #plan.unsupported>0 then
+                    ui.stats.Text = ui.stats.Text .. '\nNot automated: '..table.concat(plan.unsupported, ', ')
+                end
                 if s.questStatus then ui.stats.Text = ui.stats.Text .. '\n' .. s.questStatus end
             else ui.stats.Text = ui.stats.Text .. '\n' .. (s.questStatus or 'Waiting for class quests') end
         end
@@ -2687,6 +2932,9 @@ end)()
     local function equip(ctx, tool)
         if ctx.bringEquipmentLock then return nil end
         if not tool or not tool.Parent then return nil end
+        local class=attr(tool,'Class')
+        if cfg.classQuest and ctx.questCombat and ctx.questWeapon and id(tool)~=ctx.questWeapon
+            and (class=='Sword' or class=='Pickaxe' or class=='Champions_Hammer' or GUNS[class]) then return nil end
         local active = activeFor(ctx, tool)
         if active then s.equipRecords[tool] = nil; return active end
         if tool.Parent == ctx.character then return nil end
@@ -3097,8 +3345,10 @@ end)()
     local questApi = {state=s, now=now, controller=controller, remote=api.remote, RS=api.RS,
         Players=api.Players, owned=api.owned, observeClass=api.observeClass or function(data)s.classData=data;s.classObservedAt=now()end,
         free=F.freeWorldItemAllowed, part=part, tag=tag, tagged=tagged, id=id, attr=attr,
-        useful=function(ctx,item)return usefulSnapshot(ctx,true)(item) end,
-        snapshot=function(ctx)return usefulSnapshot(ctx,true)end,
+        -- A full toolbar can block picking up an upgrade without making that
+        -- upgrade disposable gold. Sale protection tests value, not free slots.
+        useful=function(ctx,item)local _,useful=usefulSnapshot(ctx,true);return useful(item) end,
+        snapshot=function(ctx)local _,useful=usefulSnapshot(ctx,true);return useful end,
         findTool=findTool, hasRoom=hasRoom, enemies=F.enemies, persist=persist, hover=movement.hover,
         cancelTravel=movement.cancel, extractionReady=F.extractionReady,
         releaseHover=function(ctx)
@@ -3110,8 +3360,9 @@ end)()
     F.quest=quest
     function F.questPreferred(ctx) return quest.preferred(ctx) end
     function F.questLobby() return quest.lobby() end
-    function F.questKeepsRun() return cfg.classQuest and not s.questSwitchRun and not s.questStalled and s.questPlan
+    function F.questKeepsRun() return cfg.classQuest and not s.questSwitchRun and not s.questStalled and not s.questIdle and s.questPlan
         and (s.questPlan.kind == 'depth' or s.questPlan.kind == 'combat' or s.questPlan.kind == 'gold') end
+    function F.questPreventsExit() return cfg.classQuest and not s.questSwitchRun end
     function F.bringStep(ctx, allowNew) return bring.step(ctx, allowNew) end
     function F.rememberItem(ctx, item) bring.observe(ctx, item) end
     local function upgradeGear(ctx)
@@ -3986,7 +4237,13 @@ end)()
                     -- Progress delivery and stale ownership cleanup even while the
                     -- optional switch is OFF or a transition prevents new actions.
                     bring.step(ctx, false)
-                    if quest.step(ctx) then return end
+                    if quest.step(ctx) then
+                        -- Native bringing is independent of quest movement. Useful
+                        -- loot can arrive beside a fighting character without a trip.
+                        if cfg.lootExtract and s.itemDatabase and ctx.questCombat and not ctx.questDriving and not s.questDelivery
+                            and not s.questCashJob and safeToWork(ctx) then upgradeGear(ctx) end
+                        return
+                    end
                     F.watcher(ctx)
                     if not safeToWork(ctx) then release(ctx); return end
                     if not ctx.defenseThread and F.dodge(ctx) then return end
@@ -4002,7 +4259,7 @@ end)()
                         local data = index(ctx)
                         if extract(ctx, data) then return end
                         if not s.churchSave and discover(ctx) then return end
-                    elseif cfg.lootExtract and s.runExhausted then
+                    elseif F.extractionEnabled() and s.runExhausted then
                         status(string.format('Chest route complete; church extraction unlocks in %.0fs', cfg.minutes * 60 - (now() - s.lootStarted)))
                     end
                     if cfg.lootExtract then
@@ -5100,7 +5357,7 @@ end
             status("Seat did not release after 30 seconds; recovering through a fresh solo run")
         end
         if s.questSwitchRun then s.runExhausted = true end
-        if s.runExhausted and (not features.questKeepsRun() and not features.extractionEnabled()
+        if s.runExhausted and not features.questPreventsExit() and (not features.questKeepsRun() and not features.extractionEnabled()
             or s.seatBlockedSince and now() - s.seatBlockedSince >= 30) then
             s.returnReason = s.questSwitchRun and 'Class quest queue requested the next owned class'
                 or s.seatBlockedSince and 'Seat recovery started a fresh chest run' or 'Chest route exhausted; starting a fresh run'
