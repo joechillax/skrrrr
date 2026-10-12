@@ -1,4 +1,4 @@
--- JoesAAS 5.16 | standalone source | October 2026
+-- JoesAAS 5.17 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -8,7 +8,7 @@ if game.GameId ~= 10502841145 then
     warn("JoesAAS: this build targets the exported game's universe, not this experience.")
     return
 end
-local A = {version="5.16"}
+local A = {version="5.17"}
 environment.JoesAAS = A
 environment.AnimeSuite = A -- Compatibility with older running versions.
 A.Core = (function()
@@ -2309,7 +2309,7 @@ return function(A)
         local ctrl=A.client('TeleportController')
         local stateOK,gameState=pcall(function() return {loading=ctrl and ctrl:IsLoading()==true,inMode=A.inMode()} end)
         local coordinatorOK,coordinator=pcall(function() return A.joinSnapshot and A.joinSnapshot() or {} end)
-        local activityJob=A.tasks.Activities
+        local activityJob=A.tasks.Activities; local stuckJob=A.tasks['Stuck recovery']
         local nativeAutoSettings={}; local settingsUtil=A.util('SettingsStateUtil')
         if settingsUtil and type(settingsUtil.Get)=='function' then
             for _,name in ipairs({'RaidAutoSettings','DefenseAutoSettings','BossRushAutoSettings'}) do
@@ -2322,7 +2322,9 @@ return function(A)
             stuck=A.stuckSnapshot and A.stuckSnapshot() or {},nativeAutoGates=A.nativeAutoGates and A.nativeAutoGates() or {},
             nativeAutoSettings=nativeAutoSettings,coordinator=coordinatorOK and coordinator or {error=tostring(coordinator):sub(1,240)},
             gameState=stateOK and gameState or {error=tostring(gameState):sub(1,240)},
-            eventError=A.status.Event,activityJobFailures=activityJob and activityJob.failures,settings={}}
+            eventError=A.status.Event,activityJobFailures=activityJob and activityJob.failures,
+            stuckJobFailures=stuckJob and stuckJob.failures,stuckRecoveryStatus=A.status['Stuck recovery'],
+            nativeRetryStatus=A.status['Native retry'],settings={}}
         for _,key in ipairs({'towerAutoJoin','towerSelection','trialAutoJoin','trialJoinSelection','dungeonAutoJoin',
             'dungeonSelection','gateAutoJoin','gateSelection','gateRanks','maxTacAutoJoin','maxTacSelection','maxTacRanks','priority','raidAutoJoin','raidSelection',
             'defenseAutoJoin','defenseSelection','rushAutoJoin','rushSelection','bossRushAutoJoin','bossRushSelection',
@@ -2348,6 +2350,7 @@ end)()(A);
 -- ===== activities =====
 (function()
 return function(A)
+    A.activityEntryTimeout=60
     local definitions={
         MaxTac={config='RaidConfig',method='GetAllRaids',toggle='maxTacAutoJoin',selection='maxTacSelection',ranks='maxTacRanks'},
         Tower={config='TowerConfig',method='GetAllTowers',toggle='towerAutoJoin',selection='towerSelection'},
@@ -2602,18 +2605,25 @@ return function(A)
         local mode=context()
         return mode~=nil or pending~=nil or leaving~=nil or locked~=nil or returning~=nil or stuckExit~=nil
     end
-    function A.requestStuckExit(mode,raw)
+    function A.requestStuckExit(mode,raw,reason)
         local current,contextRaw=context()
         if not A.alive or not A.running or not A.settings.autoLeaveStuck or not definitions[mode]
-            or current~=mode or raw~=contextRaw or pending or leaving or returning or stuckExit
+            or current~=mode or raw~=contextRaw or pending or leaving or (returning and reason~='Run return timed out') or stuckExit
             or (stuckRetry and stuckRetry.mode==mode and stuckRetry.context==raw and stuckRetry.untilTime>os.clock()) then return false end
         stuckExit={mode=mode,context=raw,attempts=0,lastSent=-math.huge}
-        if A.pauseNativeRetry and not A.pauseNativeRetry('stuck exit') then stuckExit=nil; return false end
+        if A.pauseNativeRetry then
+            local ok,paused=pcall(A.pauseNativeRetry,'stuck exit')
+            if not ok or not paused then
+                A.status['Native retry']='Retry pause failed; sending requested stuck Leave anyway. Native retry may re-enter.'
+                A.joinTrace('retry pause failed',{mode=mode,reason=ok and 'Pause unavailable; leaving anyway' or tostring(paused)})
+            end
+        end
+        returning=nil; returningContext=nil
         pending=nil; locked=nil
         suspendFarm()
         if A.stopTrialMovement then A.stopTrialMovement() end
         if A.stopDungeonMovement then A.stopDungeonMovement() end
-        A.joinTrace('stuck timeout',{mode=mode,reason='No run or combat progress within configured timeout'})
+        A.joinTrace('stuck timeout',{mode=mode,reason=reason or 'No run or combat progress within configured timeout'})
         A.coordinateActivities()
         return true
     end
@@ -2700,7 +2710,7 @@ return function(A)
             if nextMode and priority(nextMode)>priority(pending.mode) then pending=nil end
         end
         if pending then
-            if os.clock()-pending.at>=60 then
+            if os.clock()-pending.at>=A.activityEntryTimeout then
                 backoff[pending.mode..':'..pending.key]=os.clock()+30
                 A.status['Activity error']='Entry timed out: '..pending.mode..'; waiting for native state before retrying'
                 pending=nil
@@ -3073,17 +3083,27 @@ return function(A)
     local function current()
         if not A.alive or not A.running or not A.settings.autoLeaveStuck then watch=nil; return end
         local mode,raw=A.activityContext()
-        if not specs[mode] or type(raw)~='string' then watch=nil; return end
+        if not specs[mode] or type(raw)~='string' then
+            local coordinator=watch and A.joinSnapshot()
+            if coordinator and coordinator.locked==watch.mode and not coordinator.returning then return end
+            watch=nil; return
+        end
         if not watch or watch.context~=raw or watch.mode~=mode then
             local ctrl=A.client('TeleportController')
             local coordinator=A.joinSnapshot()
-            watch={mode=mode,context=raw,lastProgress=os.clock(),state={},deaths={},phase=nil,graceUntil=0,
+            watch={mode=mode,context=raw,enteredAt=os.clock(),lastProgress=os.clock(),counters={},state={},deaths={},phase=nil,graceUntil=0,
                 awaitingEntry=(ctrl and ctrl:IsLoading()==true) or (coordinator.pending and coordinator.pending.mode==mode) or false}
         end
         return watch
     end
     local function progress(w,reason)
         w.lastProgress=os.clock(); w.reason=reason
+    end
+    local function advanceCounter(w,field,value,reason)
+        local n=tonumber(value); local previous=w.counters[field]
+        if valid(n) and (not previous or n>previous) then
+            w.counters[field]=n; progress(w,reason or (field..' advanced'))
+        end
     end
     local function isDead(enemy)
         if enemy:GetAttribute('EnemyDead')==true then return true end
@@ -3146,8 +3166,7 @@ return function(A)
         for _,field in ipairs(observed) do if packet[field]~=nil then nextState[field]=A.Core.copy(packet[field]) end end
         for _,field in ipairs(type(packet.Cleared)=='table' and packet.Cleared or {}) do nextState[field]=nil end
         for _,field in ipairs({'Wave','Room','Floor'}) do
-            local before,after=tonumber(old[field]),tonumber(nextState[field])
-            if after and (not before or after>before) then progress(w,field..' advanced') end
+            advanceCounter(w,field,nextState[field])
         end
         for _,field in ipairs({'EnemyCount','Alive'}) do
             local before,after=tonumber(old[field]),tonumber(nextState[field])
@@ -3157,6 +3176,12 @@ return function(A)
         local afterPhase=type(nextState.ShieldBoss)=='table' and nextState.ShieldBoss.Phase
         if beforePhase and afterPhase and beforePhase~=afterPhase then progress(w,'Boss phase advanced') end
         w.state=nextState; phaseGrace(w); gateGrace(w)
+        if prefix=='Raid' and packet.Full==true and (packet.InstanceKey==instance or (key and key==w.key))
+            and (tonumber(nextState.Wave) or 0)>0 then
+            -- The native Raid controller marks entry live on this state. A stale
+            -- loading overlay cannot indefinitely mask an established combat run.
+            w.combatConfirmed=true
+        end
     end
     for _,prefix in ipairs({'Raid','Defense','Tower','TimeTrial','Dungeon','BossRush'}) do
         local name=prefix
@@ -3167,7 +3192,7 @@ return function(A)
             if not w or specs[w.mode].bridge~=name or not A.runEndMatches(name,packet,w.context,w.key) then return end
             if name=='Raid' and w.mode=='MaxTac' and type(packet)=='table' and packet.AutoGateTransfer==true then return end
             if type(packet)=='table' and packet.InstanceKey and packet.InstanceKey~=w.context:match('^[^:]+:(.+)$') then return end
-            w.ended=true; w.deaths={}
+            w.ended=true; w.endedAt=os.clock(); w.deaths={}
         end)
         if name~='Tower' then A.on(name..'MapReady',function(instance,detail,generation)
             local w=current()
@@ -3177,22 +3202,24 @@ return function(A)
                 watch=nil; w=current()
             end
             w.associated=true
-            if room and generation~=nil and generation~=w.generation then
+            local newRoom=room and (not w.counters.Room or room>w.counters.Room)
+            if room and generation~=nil and generation~=w.generation and (newRoom or w.generation==nil) then
                 w.generation=generation; w.graceUntil=math.max(w.graceUntil,os.clock()+30)
             end
             if room and (not tonumber(w.state.Room) or room>tonumber(w.state.Room)) then
-                w.state.Room=room; progress(w,'Room loaded')
+                w.state.Room=room; advanceCounter(w,'Room',room,'Room loaded')
             end
         end) end
     end
     A.on('DungeonRoomReady',function(key,room,_,__,cycle,generation)
         local w=current()
         if not w or w.mode~='Dungeon' or key~=w.context:match('^[^:]+:(.+)$') then return end
-        if cycle==true and generation~=nil and generation~=w.generation then
+        local newRoom=tonumber(room) and (not w.counters.Room or tonumber(room)>w.counters.Room)
+        if cycle==true and generation~=nil and generation~=w.generation and (newRoom or w.generation==nil) then
             w.generation=generation; w.graceUntil=math.max(w.graceUntil,os.clock()+30)
         end
         if tonumber(room) and tonumber(room)>(tonumber(w.state.Room) or 0) then
-            w.state.Room=tonumber(room); progress(w,'Dungeon room advanced')
+            w.state.Room=tonumber(room); advanceCounter(w,'Room',room,'Dungeon room advanced')
         end
     end)
     A.connect(A.player:GetAttributeChangedSignal('VisibilityContext'),current)
@@ -3200,7 +3227,8 @@ return function(A)
         local w=watch
         return w and {mode=w.mode,context=w.context,key=w.key,timeout=A.stuckTimeout(w.mode),
             idle=w.awaitingEntry and 0 or math.max(0,os.clock()-math.max(w.lastProgress,w.graceUntil)),
-            awaitingEntry=w.awaitingEntry==true,reason=w.reason,ended=w.ended==true} or {}
+            awaitingEntry=w.awaitingEntry==true,entryAge=math.max(0,os.clock()-w.enteredAt),combatConfirmed=w.combatConfirmed==true,
+            returnAge=w.returningAt and math.max(0,os.clock()-w.returningAt),reason=w.reason,ended=w.ended==true} or {}
     end
     A.job('Stuck recovery',0.5,function()
         local w=current()
@@ -3208,7 +3236,13 @@ return function(A)
         if not w then A.status['Stuck recovery']='Watching game modes · normal world farming is unaffected'; return end
         if A.activityExitPending() then return end
         local coordinator=A.joinSnapshot()
-        if w.ended or coordinator.returning then A.status['Stuck recovery']='Run ended; waiting for normal return'; return end
+        if w.ended or coordinator.returning then
+            w.returningAt=w.returningAt or w.endedAt or os.clock()
+            local elapsed=os.clock()-w.returningAt
+            A.status['Stuck recovery']='Run ended; waiting for return '..string.format('%.1f',elapsed)..'/'..A.activityEntryTimeout..'s'
+            if elapsed>=A.activityEntryTimeout then A.requestStuckExit(w.mode,w.context,'Run return timed out') end
+            return
+        end
         if coordinator.pending or coordinator.leaving then
             -- Entry requests have their own bounded 60-second deadline. Never turn a
             -- pending request into repeated proof of combat progress.
@@ -3220,11 +3254,14 @@ return function(A)
         end
         if w.awaitingEntry then
             local ctrl=A.client('TeleportController')
-            if ctrl and ctrl:IsLoading() then
-                A.status['Stuck recovery']='Waiting for '..w.mode..' entry loading; combat timer has not started'; return
+            if ctrl and ctrl:IsLoading() and not w.combatConfirmed then
+                local age=os.clock()-w.enteredAt
+                A.status['Stuck recovery']='Waiting for '..w.mode..' entry '..string.format('%.1f',age)..'/'..A.activityEntryTimeout..'s'
+                if age>=A.activityEntryTimeout then A.requestStuckExit(w.mode,w.context,'Entry loading timed out') end
+                return
             end
             w.awaitingEntry=false; progress(w,'Entry ready')
-            A.joinTrace('combat timer started',{mode=w.mode,reason='Entry confirmed and loading finished'})
+            A.joinTrace('combat timer started',{mode=w.mode,reason=w.combatConfirmed and 'Native combat state confirmed' or 'Entry loading finished'})
         end
         local arena=arenaFor(w.mode,w.context)
         if arena and not w.key then w.key=arena:GetAttribute(specs[w.mode].key) end
@@ -3663,7 +3700,7 @@ return function(A)
         if not A.fire('SettingsUpdate',name,value) then return false end
         util:Set(name,value); return true
     end
-    function A.pauseNativeRetry(reason)
+    local function pauseRetry(reason)
         local util=A.util('SettingsStateUtil')
         if not util or type(util.Get)~='function' then return true end
         for _,name in ipairs(maps) do
@@ -3687,6 +3724,11 @@ return function(A)
             end
         end
         return true
+    end
+    function A.pauseNativeRetry(reason)
+        local ok,paused=pcall(pauseRetry,reason)
+        if not ok then A.status['Native retry']='Retry pause failed: '..tostring(paused); return false end
+        return paused==true
     end
     function A.restoreNativeRetry()
         if next(restore)==nil then return true end
@@ -4631,7 +4673,7 @@ return function(A)
     toggle('Modes','Auto leave stuck runs','autoLeaveStuck',function() A.coordinateActivities() end)
     input('Modes','Stuck timeout · other modes (seconds)','stuckSeconds',true,1,3600)
     input('Modes','Stuck timeout · Trial + Dungeon (seconds)','trialDungeonStuckSeconds',true,1,3600)
-    note('Modes','Stuck detection','Defaults: 10 seconds for MaxTac, Tower, Gate, Raid, Defense, Rush and Boss Rush; 20 seconds shared by Time Trials and Dungeon. Kills, fewer remaining enemies, new waves/rooms/floors and run/boss phase changes reset the timer. Damage never resets it. Normal Tower join/choice timers, Gate ARISE delays and up to 30 seconds for a new Trial/Dungeon room handshake are allowed first. Walking and countdown updates do not reset it. Normal world mob farming is unaffected. Failed modes wait 30 seconds before this script rejoins.')
+    note('Modes','Stuck detection','Defaults: 10 seconds for MaxTac, Tower, Gate, Raid, Defense, Rush and Boss Rush; 20 seconds shared by Time Trials and Dungeon. Kills, fewer remaining enemies, new waves/rooms/floors and run/boss phase changes reset the timer. Damage never resets it. Native Raid/MaxTac combat state starts the timer even if the loading flag is stuck. Unconfirmed loading and failed return teleports have a separate 60-second recovery limit. Normal Tower join/choice timers, Gate ARISE delays and up to 30 seconds for a new Trial/Dungeon room handshake are allowed first; duplicate room handshakes do not extend it. Walking and countdown updates do not reset it. Normal world mob farming is unaffected. Failed modes wait 30 seconds before this script rejoins.')
     status('Modes','Stuck recovery')
     note('Modes','Transfers','MaxTac, Tower, Trials and Dungeons use direct native entry. Other destinations wait for normal exit. MaxTac, Gate and Tower stay at their join position.')
     note('Modes','Movement','Time Trials and Dungeons follow mobs with continuous anti-stuck steps. Tower opens your own tower. Turn off competing auto-join / movement in your other script to let this coordinator control switching.')
