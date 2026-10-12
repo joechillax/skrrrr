@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 25: release broken ore/corpses and stalled targets; open Common Chests, skip Mimics.
+-- Revision 26: read-only map scans no longer deadlock quest/chest movement handoffs.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 35 minutes or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 25
-    local BUILD = "r25-finished-targets-mimic-only"
+    local REVISION = 26
+    local BUILD = "r26-readonly-scan-handoff"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -3227,6 +3227,7 @@ end)()
         if now()<ctx.questChestDue then return false end
         if not Q.holdRoute(ctx)then return true end
         ctx.questChestTaking=true;ctx.questChestLease=coroutine.running()
+        setStatus('Checking loaded chests alongside class quests')
         local ok,entry=pcall(api.chestCandidate,ctx,250)
         if not ok then ctx.questChestTaking=nil;ctx.questChestLease=nil;error(entry,0)end
         if not entry then ctx.questChestTaking=nil;ctx.questChestLease=nil;ctx.questChestDue=now()+3;return false end
@@ -4040,7 +4041,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 25 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 26 }
     end
     local loaded=saveStore:get('settings')
     -- Only the currently running legacy client can migrate its untagged config.
@@ -4166,7 +4167,7 @@ return function(api)
     local mark = label(header, 'E', 18, 16, 32, 32, 22, color.accent, true)
     mark.TextXAlignment = Enum.TextXAlignment.Center
     label(header, 'DTEC JoeJoe Automation', 62, 13, 260, 23, 17, color.text, true)
-    label(header, 'Account settings · Chest farm starts automatically.', 62, 36, 270, 16, 11, color.muted)
+    label(header, 'Revision '..tostring(s.revision or '?')..' · Account settings', 62, 36, 270, 16, 11, color.muted)
     local minimize = make('TextButton', header, { Text = '−', Font = bold, TextSize = 24,
         TextColor3 = color.muted, BackgroundTransparency = 1, Position = UDim2.new(1, -46, 0, 13),
         Size = UDim2.new(0, 32, 0, 34), AutoButtonColor = false })
@@ -4267,6 +4268,7 @@ return function(api)
             or s.featureStatusAt and api.now() - s.featureStatusAt < 3
         ui.stage.Text = optionalActive and s.featureStatus or s.status or 'Waiting for readiness…'
         if cfg.classQuest and ctx and ctx.questOwns then ui.stage.Text = s.questStatus or ui.stage.Text end
+        if ctx and ctx.questChestLease and ctx.worldReading then ui.stage.Text='Reading loaded map for a quest chest' end
         local h = api.player.Character and api.player.Character:FindFirstChildOfClass('Humanoid')
         local health = h and h.MaxHealth > 0 and math.floor(100 * h.Health / h.MaxHealth) or 0
         local bag = s.sackSize and string.format('%s/%s', s.sackSize, s.sackCapacity or '?') or '—'
@@ -4295,6 +4297,11 @@ return function(api)
                 if s.questStatus then ui.stats.Text = ui.stats.Text .. '\n' .. s.questStatus end
                 if s.questUpgradeStatus then ui.stats.Text=ui.stats.Text..'\n'..s.questUpgradeStatus end
             else ui.stats.Text = ui.stats.Text .. '\n' .. (s.questStatus or 'Waiting for class quests') end
+            if ctx then
+                local control=ctx.questChestLease and 'Quest chest' or ctx.featureHold and 'Loot/extraction'
+                    or ctx.questOwns and 'Quest' or ctx.travel and 'Chest travel' or ctx.routeParked and 'Route waiting' or 'Chest route'
+                ui.stats.Text=ui.stats.Text..'\nMovement: '..control..(ctx.worldReading and ' · reading map' or '')
+            end
         end
         local camera = workspace.CurrentCamera
         if camera then scale.Scale = math.min(1, math.max(0.55, math.min((camera.ViewportSize.Y - 60) / 670, (camera.ViewportSize.X - 40) / 410))) end
@@ -5992,7 +5999,8 @@ end)()
         if not ctx.active or not ctx.initialized or not ctx.featureThread then return end
         local worker = ctx.featureThread
         local dead = coroutine.status(worker) == 'dead'
-        if not dead and (not ctx.featureHold or now() - (ctx.featurePulse or now()) < 20) then return end
+        local ownsMovement=ctx.featureHold or ctx.questOwns or ctx.questChestLease or ctx.worldReader==worker
+        if not dead and (not ownsMovement or now() - (ctx.featurePulse or now()) < 20) then return end
         if not dead then
             pcall(task.cancel, worker)
             if coroutine.status(worker) ~= 'dead' then
@@ -6003,6 +6011,8 @@ end)()
             if ctx.currentChest then ctx.currentChest.retryAt = now() + 30 end
             ctx.currentChest, ctx.lootThread, ctx.defenseAbort = nil, nil, nil
         end
+        if ctx.worldReader==worker then ctx.worldReading,ctx.worldReader=nil,nil end
+        ctx.questChestLease=nil;ctx.questChestTaking=nil
         F.cleanup(ctx)
         ctx.featureThread = nil
         ctx.featureRecoveries = (ctx.featureRecoveries or 0) + 1
@@ -6342,9 +6352,19 @@ end
         ctx.helpers = {}
         local taskApi = {}
         local function readWorld()
-            while ctx.worldReading do ctx.check(); ctx.awaitCombat(); task.wait(0.03) end
+            -- This lock protects a READ-ONLY snapshot, not character movement.
+            -- Parking its producer for quest movement makes a quest consumer
+            -- wait forever for the very producer it has parked.
+            while ctx.worldReading do
+                if ctx.worldReader and coroutine.status(ctx.worldReader)=='dead' then
+                    ctx.worldReading,ctx.worldReader=nil,nil
+                    break
+                end
+                ctx.check();task.wait(0.03)
+            end
             if not ctx.worldObjects or now() >= (ctx.worldRefreshAt or 0) then
                 ctx.worldReading = true
+                local reader=coroutine.running();ctx.worldReader=reader;ctx.worldReadPulse=now()
                 local ok, objects = pcall(function()
                     local list, queue, cursor, seen = {}, {workspace}, 1, {[workspace] = true}
                     while cursor <= #queue do
@@ -6352,13 +6372,13 @@ end
                         for _, child in ipairs(parent:GetChildren()) do
                             if not seen[child] then
                                 seen[child] = true; list[#list + 1] = child; queue[#queue + 1] = child
-                                if #list % 100 == 0 then ctx.check(); ctx.awaitCombat(); task.wait(0.03) end
+                                if #list % 100 == 0 then ctx.worldReadPulse=now();ctx.check();task.wait(0.03) end
                             end
                         end
                     end
                     return list
                 end)
-                ctx.worldReading = nil
+                if ctx.worldReader==reader then ctx.worldReading,ctx.worldReader=nil,nil end
                 if not ok then error(objects, 0) end
                 ctx.worldObjects, ctx.worldRefreshAt = objects, now() + (workspace.DescendantAdded and 30 or 2)
             end
