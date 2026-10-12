@@ -1,8 +1,8 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 27: native mine exits, routine quest sales, class discounts and fullbright.
+-- Revision 28: mine gate transitions, native door holds, Watcher discovery and 20/35-minute quest exits.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
--- Quest limits: church save at 35 minutes or 1.5 minutes idle; remembers streamed-out churches.
+-- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
 -- Hides the default Gameplay Paused popup after readiness; streaming pauses still apply.
 -- Includes Discord ending reports, cached discovery, and Blinker / identified boss ranged dodging.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 27
-    local BUILD = "r27-native-mine-exits-quest-economy"
+    local REVISION = 28
+    local BUILD = "r28-mine-gate-transitions-quest-limits"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -1615,8 +1615,15 @@ return function(api,Q)
         end
         local c=api.controller('BackpackController')
         if c and (c.EquipPending or 0)>0 then return true end
-        for _,id in ipairs(L.desired(s.classData,s.questCatalog,job.owned))do
-            if not contains(job.equipped,id) and not job.attempted[id]then
+        local actions={}
+        if plan.weapon and plan.weapon~='Sword_Void' and (plan.weaponClass~='Sword' or not job.owned[plan.weapon])
+            or plan.weaponClass=='Gun' or plan.weaponClass=='Rifle' or plan.weaponClass=='Shotgun'then
+            actions[#actions+1]={id='Sword_Void',wanted=false}
+        end
+        for _,id in ipairs(L.desired(s.classData,s.questCatalog,job.owned))do actions[#actions+1]={id=id,wanted=true}end
+        for _,action in ipairs(actions)do
+            local id,wanted=action.id,action.wanted
+            if contains(job.equipped,id)~=wanted and not job.attempted[id]then
                 if s.questCalls.loadoutSwap then return true end
                 local issued=Q.call('loadoutSwap','LobbyBackpackService','SetEquipped',{id},function(ok,accepted,equipped)
                     if ok and accepted and type(equipped)=='table' then
@@ -1625,7 +1632,7 @@ return function(api,Q)
                         s.questStatus=contains(equipped,id) and 'Quest startup gear confirmed: '..id or 'Startup gear not selected: '..id
                     else s.questStatus='Startup gear unconfirmed: '..id..'; no repeat toggle' end
                 end,function()return cfg.classQuest and api.owned() and lobby() and s.questLoadout==job
-                    and not contains(job.equipped,id) and (not c or (c.EquipPending or 0)==0) end)
+                    and contains(job.equipped,id)~=wanted and (not c or (c.EquipPending or 0)==0) end)
                 if issued then job.attempted[id]=true end
                 return true
             end
@@ -2118,17 +2125,102 @@ return function(api,Q)
         return not kind:find('coal',1,true) and (kind:find('diamond',1,true) or kind:find('emerald',1,true)
             or kind:find('ruby',1,true) or kind:find('gold',1,true) or kind:find('iron',1,true))~=nil
     end
-    function D.activeMine()
+    function D.inDungeon(ctx)
+        ctx=ctx or s.farm
+        local transition=ctx and ctx.questMineTransition
+        local c=api.controller('DungeonUIController')
+        if transition and (transition.mode=='Exit' or transition.mode=='Outside') and (not c or not c._BoundDungeon or c._BoundDungeon==transition.mine)then return false end
+        return api.Players.LocalPlayer:GetAttribute('InDungeon')==true
+    end
+    function D.contains(mine,point,padding)
+        local bounds=mine and mine:FindFirstChild('MineshaftBounds',true)
+        if not bounds or not bounds:IsA('BasePart')then return nil end
+        local ok,inside=pcall(function()
+            local localPoint=bounds.CFrame:PointToObjectSpace(point);local half=bounds.Size*.5
+            local extra=padding or 0
+            return math.abs(localPoint.X)<=half.X+extra and math.abs(localPoint.Y)<=half.Y+extra and math.abs(localPoint.Z)<=half.Z+extra
+        end)
+        if ok then return inside end
+    end
+    function D.activeMine(ctx)
+        ctx=ctx or s.farm
         local c=api.controller('DungeonUIController')
         local root=c and c._BoundDungeon
         return root and root.Parent and root:IsDescendantOf(workspace)
-            and api.Players.LocalPlayer:GetAttribute('InDungeon')==true and D.mineshaft(root) or nil
+            and D.inDungeon(ctx) and D.mineshaft(root) or nil
+    end
+    function D.observeDoors(ctx)
+        local c=api.controller('DungeonUIController')
+        local bound=c and c._BoundDungeon
+        local function exited(mine)
+            ctx.questMineTransition={mode='Exit',mine=mine}
+            D.stopGate(ctx)
+            D.stopMine(ctx);ctx.questMineEntry=nil;ctx.questMineReadyAt=nil;ctx.questFundingMine=nil
+            ctx.questOwns=nil;ctx.questThreat=nil;ctx.questCombat=nil;ctx.questExitCombat=nil;ctx.combatTarget=nil
+            ctx.questBindMineAt=nil
+            status('Native mineshaft exit confirmed; resuming outdoor work')
+        end
+        -- UpdateState(false) also clears the bound root after a manual exit.
+        -- Never set InDungeon ourselves or treat a teleport as an exit receipt.
+        if ctx.questLastBoundMine and not bound and api.Players.LocalPlayer:GetAttribute('ActiveDungeonQueueId')==nil then
+            exited(ctx.questLastBoundMine)
+        end
+        ctx.questLastBoundMine=bound and D.mineshaft(bound) or nil
+        local player=api.Players.LocalPlayer
+        local inside=bound and D.contains(bound,ctx.root.Position,16)
+        if ctx.questMineTransition and ctx.questMineTransition.mode=='Outside' and inside==true then ctx.questMineTransition=nil end
+        if inside==false and not ctx.questMineEntry and player:GetAttribute('ActiveDungeonQueueId')==nil
+            and player:GetAttribute('DungeonRunLocked')~=true and not player.GameplayPaused
+            and not workspace:GetAttribute('InfiniteRebasing') and not workspace:GetAttribute('InCutScene')then
+            ctx.questOutsideMineAt=ctx.questOutsideMineAt or now()
+            if now()-ctx.questOutsideMineAt>=2 and not(ctx.questMineTransition and ctx.questMineTransition.mode=='Exit')then
+                exited(bound);ctx.questMineTransition.mode='Outside'
+                status('Outside loaded mineshaft bounds; releasing stale local mine route')
+            end
+        else ctx.questOutsideMineAt=nil end
+        if now()<(ctx.questDoorScanAt or 0)then return end
+        ctx.questDoorScanAt=now()+1
+        if not ctx.connect then return end
+        ctx.questDoorRemotes=ctx.questDoorRemotes or setmetatable({}, {__mode='k'})
+        local roots,seen={},{}
+        local function add(item)
+            local mine=D.mineshaft(item)
+            if mine and not seen[mine]then seen[mine]=true;roots[#roots+1]=mine end
+        end
+        add(bound)
+        for _,door in ipairs(api.tagged('DungeonDoor'))do add(door)end
+        for _,mine in ipairs(api.tagged('Mineshaft'))do add(mine)end
+        for _,item in ipairs(workspace:GetChildren())do add(item)end
+        for _,mine in ipairs(roots)do
+            for _,item in ipairs(mine:GetDescendants())do
+                if item.Name=='DungeonDoorTransition' and item:IsA('RemoteEvent') and item.OnClientEvent and not ctx.questDoorRemotes[item]then
+                    ctx.questDoorRemotes[item]=true
+                    ctx.connect(item.OnClientEvent,function(mode)
+                        if not ctx.active then return end
+                        if mode=='Enter'then
+                            if not item:IsDescendantOf(workspace)then return end
+                            ctx.questMineTransition={mode='Enter',mine=mine};ctx.questMineReadyAt=now()+3
+                        elseif mode=='Exit'then
+                            local active=D.activeMine(ctx)
+                            local pending=ctx.questMineEntry
+                            if active==mine or ctx.questLastBoundMine==mine or pending and pending.mine==mine then exited(mine)end
+                        end
+                    end)
+                end
+            end
+        end
     end
     function D.mineEnemy(npc,mine)
         if D.mineshaft(npc)==mine then return true end
         local session=mine and mine:GetAttribute('SessionDungeonId')
-        return session~=nil and npc:GetAttribute('SessionDungeonId')==session
-            and npc:GetAttribute('DungeonWaveNpc')==true
+        local npcSession=npc:GetAttribute('SessionDungeonId')
+        if session~=nil and npcSession~=nil then return npcSession==session and npc:GetAttribute('DungeonWaveNpc')==true end
+        local p=api.part(npc)
+        local inside=p and D.contains(mine,p.Position)
+        if inside~=nil then return inside end
+        -- Legacy Watchers can live in workspace.Npc, without wave/session fields.
+        local ctx=s.farm
+        return p and ctx and api.tag(npc,'Watcher') and (p.Position-ctx.root.Position).Magnitude<=80 or false
     end
     function D.exitPrompt(mine)
         local prompt=mine and (mine:FindFirstChild('DungeonExitPrompt',true) or mine:FindFirstChild('ExitPrompt',true))
@@ -2142,8 +2234,45 @@ return function(api,Q)
     end
     function D.accessible(node)
         local mine=D.mineshaft(node)
-        if api.Players.LocalPlayer:GetAttribute('InDungeon')==true then return mine~=nil and mine==D.activeMine() end
+        if D.inDungeon()then return mine~=nil and mine==D.activeMine() end
         return mine==nil
+    end
+    function D.exitGate(mine)
+        if not mine or mine:FindFirstChild('QueueSpot')then return end
+        local wave=mine:FindFirstChild('Wave')
+        if wave and wave:GetAttribute('QueueControlled')==true then return end
+        for _,gate in ipairs(mine:GetChildren())do
+            if gate.Name=='Gate_Cave' and gate:IsA('BasePart') and gate.CanTouch==true
+                and gate:FindFirstChild('DungeonDoorTransition') and gate:FindFirstChild('SpawnNode')
+                and gate:GetAttribute('DungeonDoorReady')~=false and gate:GetAttribute('DungeonDoorAvailable')~=false then return gate end
+        end
+    end
+    function D.crossGate(ctx,gate)
+        -- Legacy exit doors are touch parts, not DungeonExitPrompt objects.
+        -- Cross their local thin axis using the real character. The notification
+        -- RemoteEvent is observed only; no guessed FireServer call is sent.
+        if not gate or not gate.Parent or gate.CanTouch~=true or ctx.root.CanTouch==false
+            or api.Players.LocalPlayer.GameplayPaused or workspace:GetAttribute('InCutScene')then return false end
+        local x=gate.Size.X<gate.Size.Z
+        local normal=x and Vector3.new(1,0,0) or Vector3.new(0,0,1)
+        local offset=(x and gate.Size.X or gate.Size.Z)*.5+3
+        local side=gate.CFrame:PointToObjectSpace(ctx.root.Position)
+        if (x and side.X or side.Z)<0 then normal=normal*-1 end
+        local begin=gate.CFrame:PointToWorldSpace(normal*offset)
+        local finish=gate.CFrame:PointToWorldSpace(normal*-offset)
+        local mine=D.activeMine(ctx)
+        ctx.questMineEntry={started=now(),exit=true,mine=mine,gate=gate,finish=finish,phase=0}
+        api.hover(ctx);ctx.root.CFrame=CFrame.new(begin)
+        ctx.root.AssemblyLinearVelocity=(finish-begin).Unit*12
+        if type(ctx.humanoid.MoveTo)=='function'then ctx.humanoid:MoveTo(finish)end
+        status('Crossing native Gate_Cave; waiting for the game exit transition')
+        return true
+    end
+    function D.stopGate(ctx)
+        if ctx.questMineEntry and ctx.questMineEntry.gate then
+            ctx.root.AssemblyLinearVelocity=Vector3.zero
+            if type(ctx.humanoid.MoveTo)=='function'then ctx.humanoid:MoveTo(ctx.root.Position)end
+        end
     end
     local function readyPrompt(prompt)
         local player=api.Players.LocalPlayer
@@ -2154,14 +2283,22 @@ return function(api,Q)
             and api.miningDoorAllowed(prompt)
     end
     function D.entry(ctx)
+        D.observeDoors(ctx)
         local active=D.activeMine()
         local job=ctx.questMineEntry
         if job then
-            if (not job.exit and active) or (job.exit and api.Players.LocalPlayer:GetAttribute('InDungeon')~=true) then
+            if (not job.exit and active) or (job.exit and not D.inDungeon(ctx)) then
                 if not job.exit then ctx.questMineReadyAt=now()+3 else ctx.questFundingMine=nil end
+                D.stopGate(ctx)
                 ctx.questMineEntry=nil;ctx.questOwns=nil;return false
             end
-            if now()-job.started>=18 then ctx.questMineEntry=nil;ctx.questOwns=nil;return false end
+            if now()-job.started>=18 then D.stopGate(ctx);ctx.questMineEntry=nil;ctx.questOwns=nil;return false end
+            if job.gate then
+                if not job.gate.Parent or job.gate.CanTouch~=true then D.stopGate(ctx);ctx.questMineEntry=nil;ctx.questOwns=nil;return false end
+                if job.phase==0 and now()-job.started>=1.25 then
+                    D.stopGate(ctx);job.phase=1
+                end
+            end
             if Q.holdRoute(ctx)then status(job.exit and 'Awaiting native mineshaft exit' or 'Awaiting native mineshaft entry / queue')end
             return true
         end
@@ -2171,6 +2308,15 @@ return function(api,Q)
         if active then
             local exit=D.exitPrompt(active)
             if readyPrompt(exit)then candidates[1]=exit end
+            if not exit then
+                local gate=D.exitGate(active)
+                if gate and now()>=(retries[gate] or 0) and Q.holdRoute(ctx)then
+                    Q.stopDrive(ctx);api.watch(ctx)
+                    if not api.watcherReady(ctx)then return false end
+                    retries[gate]=now()+20
+                    return D.crossGate(ctx,gate)
+                end
+            end
         else
             for _,door in ipairs(api.tagged('DungeonDoor'))do
                 local mine=D.mineshaft(door)
@@ -2198,10 +2344,12 @@ return function(api,Q)
         Q.stopDrive(ctx);api.watch(ctx)
         if not api.watcherReady(ctx)then ctx.questOwns=nil;return false end
         retries[prompt]=now()+60
+        ctx.questMineEntry={started=now(),exit=active~=nil,mine=active or D.mineshaft(prompt)}
         if api.fireMiningPrompt(ctx,prompt)then
-            ctx.questMineEntry={started=now(),exit=active~=nil};status(active and 'Leaving a depleted mineshaft' or 'Entering a ready Mineshaft for mining objectives')
+            if ctx.questMineEntry then status(active and 'Leaving a depleted mineshaft' or 'Entering a ready Mineshaft for mining objectives')end
             return true
         end
+        ctx.questMineEntry=nil
         ctx.questOwns=nil;return false
     end
     function D.saleEligible(item,ctx,snapshot,objective)
@@ -2235,10 +2383,13 @@ return function(api,Q)
     function D.saleReceipt(job)
         if job.item.Parent then return false end
         if (s.stats.coinEarned or 0)>(job.coinBefore or 0)then return true end
+        local target=api.part(job.target)
+        local point=target and target.Position or job.saleBand==(tonumber(workspace:GetAttribute('InfiniteDepthOffsetMeters')) or 0) and job.salePosition
+        if not point then return false end
         for _,bag in ipairs(api.tagged('MoneySack'))do
             if not (job.moneyBefore or {})[bag] and api.id(bag)=='Money_Sack' and api.free(bag) then
                 local p=api.part(bag);local creator=bag:GetAttribute('BagCreator')
-                if p and creator==api.Players.LocalPlayer.Name and (p.Position-api.part(job.target).Position).Magnitude<=30 then return true end
+                if p and creator==api.Players.LocalPlayer.Name and (p.Position-point).Magnitude<=30 then return true end
             end
         end
         return false
@@ -2281,6 +2432,7 @@ return function(api,Q)
         return false
     end
     function D.cleanup(ctx)
+        D.stopGate(ctx)
         D.stopMine(ctx)
         ctx.questMineEntry=nil
         ctx.questMineReadyAt=nil
@@ -2369,7 +2521,11 @@ return function(api,Q)
         -- Stay in the native dungeon instead of releasing the chest route and
         -- leaving InDungeon/queue state behind during a client teleport.
         local candidates={}
-        for _,npc in ipairs(api.enemies())do
+        local seen={};local loaded={}
+        for _,group in ipairs({api.enemies(),api.tagged('Watcher')})do
+            for _,npc in ipairs(group)do if not seen[npc]then seen[npc]=true;loaded[#loaded+1]=npc end end
+        end
+        for _,npc in ipairs(loaded)do
             local h=npc:FindFirstChildOfClass('Humanoid')
             if D.mineEnemy(npc,mine) and h and h.Health>0 and api.part(npc)
                 and (not api.enemyAlive or api.enemyAlive(npc))
@@ -2712,7 +2868,11 @@ end)()
         plan.partial=#plan.unsupported>0 and #plan.unsupported<#plan.unmet
         -- Exact weapon objectives take precedence over general combat.
         for _, key in ipairs({'FlintlockKills','CutlassKills'}) do
-            if pending[key] then plan.kind,plan.weapon,plan.objective='combat',weapons[key],key; return plan end
+            if pending[key] then
+                plan.kind,plan.weapon,plan.objective='combat',weapons[key],key
+                plan.weaponClass=key=='CutlassKills' and 'Sword' or 'Revolver'
+                return plan
+            end
         end
         if pending.SellGoldItems then plan.kind,plan.objective='gold','SellGoldItems'; return plan end
         for _, item in ipairs(plan.unmet) do
@@ -3032,6 +3192,9 @@ end)()
         local job={ctx=ctx,item=item,target=target,kind=kind,started=now(),stage='request',objective=plan.objective,
             before=kind=='fuel' and tonumber(ctx.drill:GetAttribute('Fuel')) or objective(plan,plan.objective or 'SellGoldItems'),class=plan.name,
             questBefore=objective(plan,plan.objective or 'SellGoldItems'),coinBefore=s.stats.coinEarned or 0,moneyBefore={}}
+        local salePart=api.part(target)
+        job.salePosition=salePart and salePart.Position
+        job.saleBand=tonumber(workspace:GetAttribute('InfiniteDepthOffsetMeters')) or 0
         for _,bag in ipairs(api.tagged('MoneySack'))do job.moneyBefore[bag]=true end
         if kind=='fuel' then
             for _,attachment in ipairs(api.tagged('OnboardingAttachment')) do
@@ -3446,7 +3609,7 @@ end)()
         if not cfg.classQuest or not ctx.questChestCandidate or not api.chestCandidate or ctx.currentChest
             or ctx.featureHold or ctx.defenseMoving or ctx.dodgeUntil and now()<ctx.dodgeUntil
             or s.questDelivery or s.questCashJob or s.bringDelivery or s.lootRequest or s.equipmentRequest
-            or ctx.questMineEntry or ctx.questPotionUsing or api.Players.LocalPlayer:GetAttribute('InDungeon')==true or Q.manual()
+            or ctx.questMineEntry or ctx.questPotionUsing or Q.drillSupport.inDungeon(ctx) or Q.manual()
             or not Q.activePlan(plan) then return false end
         ctx.questChestDue=ctx.questChestDue or now()+8
         if now()<ctx.questChestDue then return false end
@@ -3477,6 +3640,7 @@ end)()
             if ctx.questOwns or ctx.questDriving or s.questDelivery or s.questCashJob then Q.cleanup(ctx) end
             return false
         end
+        Q.drillSupport.observeDoors(ctx)
         Q.poll()
         local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if not enabled(ctx) then ctx.questProgressAt=now(); Q.cleanup(ctx); return false end
@@ -3506,7 +3670,7 @@ end)()
             end
             Q.cleanup(ctx); return false
         end
-        if api.Players.LocalPlayer:GetAttribute('InDungeon')==true and not Q.drillSupport.activeMine()then
+        if Q.drillSupport.inDungeon(ctx) and not Q.drillSupport.activeMine()then
             local c=api.controller('DungeonUIController')
             if c and type(c.TryBindActiveDungeon)=='function' and now()>=(ctx.questBindMineAt or 0)then
                 ctx.questBindMineAt=now()+2;pcall(c.TryBindActiveDungeon,c)
@@ -3519,6 +3683,7 @@ end)()
         if Q.loadout.recover(ctx,plan)then return true end
         if Q.drillSupport.threat(ctx,plan)then return true end
         if Q.loadout.step(ctx,plan)then return true end
+        if plan.kind=='combat' and plan.weapon and api.enforceClassWeapon then api.enforceClassWeapon(ctx,plan.weapon,Q.preferred(ctx))end
         Q.drillSupport.upgrades(ctx,plan)
         if Q.cashStep(ctx) then return true end
         if Q.activePlan(plan) and not s.questCashJob and Q.collectMoney(ctx)then return true end
@@ -3574,7 +3739,8 @@ end)()
         local canWork,reason=runnable(ctx,plan)
         if not canWork then
             Q.stopDrive(ctx);ctx.questOwns=nil;ctx.combatTarget=nil;s.questIdle=true
-            setStatus(reason..'; chest farming continues');return false
+            setStatus(plan.weapon and not Q.preferred(ctx) and ('Required '..plan.weapon..' is missing; looking for own gear / free or coin stock; chest farming continues')
+                or reason..'; chest farming continues');return false
         end
         s.questIdle=nil
         if not holdRoute(ctx) then return true end
@@ -4354,7 +4520,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 27 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 28 }
     end
     local loaded=saveStore:get('settings')
     -- Only the currently running legacy client can migrate its untagged config.
@@ -4429,7 +4595,9 @@ end)()
                 end
             end
         end
-        local reason = now()-s.lootStarted >= 35*60 and '35-minute quest run limit reached'
+        local plan=quest and quest.plan(s.classData,s.questCatalog,cfg.driveDepth)
+        local minutes=plan and plan.kind=='depth' and cfg.driveDepth and 35 or 20
+        local reason = now()-s.lootStarted >= minutes*60 and tostring(minutes)..'-minute quest run limit reached'
             or now()-watch.at >= 90 and 'No meaningful progress for 1.5 minutes'
         if reason then
             s.questChurchExit = {reason=reason, requestedAt=now()}
@@ -4577,9 +4745,9 @@ return function(api)
         end
         minutes.TextEditable = cfg.lootExtract and not cfg.classQuest
         minutes.TextTransparency = minutes.TextEditable and 0 or 0.55
-        smartHint.Text = cfg.classQuest and (cfg.lootExtract and 'Smart loot ON; quest exit at 35 min or 90s idle'
-            or 'Smart loot OFF; quest exit at 35 min or 90s idle') or 'Collect useful gear and relics; save at an altar'
-        minimumHint.Text = cfg.classQuest and 'Quest limits: 35 min total / 90s without progress' or 'Only applies when loot + extraction is ON'
+        local limit=s.questPlan and s.questPlan.kind=='depth' and cfg.driveDepth and 35 or 20
+        smartHint.Text = cfg.classQuest and ((cfg.lootExtract and 'Smart loot ON' or 'Smart loot OFF')..'; quest exit at '..limit..' min or 90s idle') or 'Collect useful gear and relics; save at an altar'
+        minimumHint.Text = cfg.classQuest and 'Quest limits: 20 min; depth 35 min / 90s idle' or 'Only applies when loot + extraction is ON'
         queueInput.TextEditable = cfg.classQuest
         queueInput.TextTransparency = cfg.classQuest and 0 or 0.55
         local elapsed = math.max(0, api.now() - (s.lootStarted or api.now()))
@@ -4703,6 +4871,7 @@ end)()
         for _, npc in ipairs(children(workspace:FindFirstChild('Npc'))) do add(npc) end
         -- DungeonUIController discovers dungeon bosses through NpcManager.Parent.
         for _, manager in ipairs(tagged('NpcManager')) do add(manager.Parent) end
+        for _, npc in ipairs(tagged('Watcher')) do add(npc) end
         return result
     end
     function F.swordTargetAllowed(npc)
@@ -5096,7 +5265,7 @@ end)()
             return not before[item] and not tag(item, 'ShopItem') and (not expected or id(item) == expected)
         end, 25)
     end
-    local function firePrompt(ctx, prompt)
+    local function firePrompt(ctx, prompt, dungeon)
         if not prompt or not prompt.Parent or prompt.Enabled == false then return false end
         if not F.chestFallbackAllowed(prompt) then return false end
         local ready = prompt:GetAttribute('DungeonDoorReady')
@@ -5109,6 +5278,16 @@ end)()
             status('Prompt waiting for loaded content and its actual activation range'); return false
         end
         local original = prompt.HoldDuration
+        if dungeon and type(prompt.InputHoldBegin)=='function' and type(prompt.InputHoldEnd)=='function' then
+            -- Use the real E-hold duration for dungeon doors: changing the local
+            -- duration to zero does not change the server's entrance requirement.
+            if not finite(original) or original<0 or original>10 then return false end
+            ctx.heldPrompts=ctx.heldPrompts or {};ctx.heldPrompts[prompt]=true
+            local ok,why=pcall(function()prompt:InputHoldBegin();wait(ctx,original+.15)end)
+            pcall(function()prompt:InputHoldEnd()end);ctx.heldPrompts[prompt]=nil
+            if not ok then error(why,0)end
+            return true
+        end
         ctx.instantPrompts = ctx.instantPrompts or {}; ctx.instantPrompts[prompt] = original
         prompt.HoldDuration = 0
         local fire = api.env.fireproximityprompt or fireproximityprompt
@@ -5432,7 +5611,27 @@ end)()
             return true
         end,
         miningDoorAllowed=function(prompt)return F.chestFallbackAllowed(prompt) and not F.skipLootArea(prompt)end,
-        fireMiningPrompt=function(ctx,prompt)return firePrompt(ctx,prompt)end,
+        fireMiningPrompt=function(ctx,prompt)return firePrompt(ctx,prompt,true)end,
+        enforceClassWeapon=function(ctx,wanted,tool)
+            if ctx.questMining or ctx.questHealing or ctx.questStartup or ctx.questRecovering
+                or ctx.questPotionUsing or ctx.bringEquipmentLock then return end
+            local c=controller('ToolController');local active=c and c.ActiveTool
+            if not active or active._Destroyed or not active.Tool or active.Tool.Parent~=ctx.character then ctx.questWrongWeapon=nil;return end
+            local inventory
+            for _,candidate in ipairs(tools(ctx))do
+                if id(candidate)=='Sword_Void' and (active.Tool==candidate or active.DisplayTool==candidate
+                    or active.Tool.Name=='Sword_Void'..tostring(api.Players.LocalPlayer.UserId))then inventory=candidate;break end
+            end
+            if not inventory or wanted=='Sword_Void' then ctx.questWrongWeapon=nil;return end
+            if tool then equip(ctx,tool);return end
+            local record=ctx.questWrongWeapon
+            if record and record.active==active then return end -- Native equip toggles; unknown replies are not resent.
+            record={active=active};ctx.questWrongWeapon=record
+            local issued=api.request('equip-weapon','ToolService','EquipTool',api.pack(inventory),function(result)
+                record.accepted=api.accepted(result)
+            end)
+            if not issued then ctx.questWrongWeapon=nil end
+        end,
         releaseHover=function(ctx)
             if ctx.hoverConnection then pcall(function()ctx.hoverConnection:Disconnect()end);ctx.hoverConnection=nil end
             if ctx.hoverForce then ctx.hoverForce:Destroy();ctx.hoverForce=nil end
@@ -5745,6 +5944,14 @@ end)()
         if type(active.CanUseAction) ~= 'function' or type(active.RecordUseCooldown) ~= 'function' then return false end
         local class, hammer = auraClass(active)
         if class ~= 'Sword' and class ~= 'Pickaxe' then return false end
+        if cfg.classQuest and quest then
+            local required,requiredClass,strict=quest.required(ctx)
+            local held=id(active.DisplayTool or active.Tool)
+            if strict and (required and held~=required and active.Tool.Name~=required
+                    and active.Tool.Name~=required..tostring(api.Players.LocalPlayer.UserId)
+                or requiredClass and requiredClass~=class
+                or not required and not requiredClass)then return false end
+        end
         if hammer and (active.InputDown or active.PendingAttackType) then return false end
         local interval
         if type(active.GetAttackInterval) == 'function' then interval = active:GetAttackInterval(hammer and 'Weak' or nil)
