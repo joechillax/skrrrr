@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 24: executor auto-execute handles startup; no self-queued teleport execution.
+-- Revision 25: release broken ore/corpses and stalled targets; open Common Chests, skip Mimics.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 35 minutes or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 24
-    local BUILD = "r24-executor-autoexecute-only"
+    local REVISION = 25
+    local BUILD = "r25-finished-targets-mimic-only"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2149,6 +2149,7 @@ return function(api,Q)
                 or plan.weaponClass=='Rifle' or plan.weaponClass=='Shotgun'
                 or plan.kind~='combat' and api.findTool(ctx,'Pickaxe')~=nil
             if (watcher or blinker) and p and npc:IsDescendantOf(workspace) and hp and hp>0
+                and (not api.enemyAlive or api.enemyAlive(npc))
                 and canHit
                 and npc:GetAttribute('Category')~='Corpse' and npc:GetAttribute('NpcFaction')~='FriendlyCompanion' then
                 local distance=(p.Position-ctx.root.Position).Magnitude
@@ -2671,6 +2672,7 @@ end)()
         end
         ctx.questOwns,ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass,ctx.questAimHead=nil,nil,nil,nil,nil
         ctx.questStartup=nil;ctx.questRecovering=nil;ctx.questThreat=nil;ctx.questChestTaking=nil;ctx.questChestDue=nil
+        ctx.questDamageWatch=nil;ctx.questTargetRetry=nil
         if not ctx.currentChest then ctx.questChestLease=nil end
     end
     function Q.abortResources(ctx)
@@ -3003,7 +3005,19 @@ end)()
             local h=npc:FindFirstChildOfClass('Humanoid')
             local p=api.part(npc)
             local allowed=npc:GetAttribute('NpcFaction')~='FriendlyCompanion' and h and h.Health>0 and p
+                and (not api.enemyAlive or api.enemyAlive(npc)) and (not api.questTargetAllowed or api.questTargetAllowed(ctx,npc))
                 and (gun or api.swordTargetAllowed(npc))
+            local check=ctx.questDamageWatch and ctx.questDamageWatch[npc]
+            if allowed and check then
+                if h.Health<check.health then check.health,check.progressAt,check.attempts=h.Health,now(),0
+                elseif check.attempts>=3 and now()-check.progressAt>=10 then
+                    ctx.questTargetRetry=ctx.questTargetRetry or setmetatable({}, {__mode='k'})
+                    ctx.questTargetRetry[npc]={untilAt=now()+10,health=h.Health}
+                    ctx.questDamageWatch[npc]=nil;allowed=false
+                    if ctx.combatTarget==npc then ctx.combatTarget=nil end
+                    setStatus('Quest target took no damage for 10s; trying other loaded work')
+                end
+            end
             if allowed and plan.objective=='VampireKills' then allowed=tostring(npc:GetAttribute('RealName') or npc.Name):find('Vampire',1,true)~=nil end
             if allowed and (plan.objective=='CrazyMinerKills' or plan.objective=='BanditMinerKills') then
                 allowed=normalize(npc:GetAttribute('RealName') or npc.Name)==normalize(plan.objective:gsub('Kills',''))
@@ -3026,7 +3040,8 @@ end)()
         local class=api.attr(tool,'Class');local gun=class=='Revolver' or class=='Rifle' or class=='Shotgun'
         if gun and (tonumber(api.attr(tool,'Ammo')) or 0)<=0
             and (tonumber(api.Players.LocalPlayer:GetAttribute(class=='Revolver' and 'Pistol_Ammo' or class..'_Ammo')) or 0)<=0 then return false end
-        local npc=combatTarget(ctx,plan,gun);if not npc then return false end
+        local npc=combatTarget(ctx,plan,gun)
+        if not npc then ctx.combatTarget=nil;ctx.questCombat=nil;return false end
         Q.drillSupport.stopMine(ctx)
         s.questIdle=nil;s.questStalled=nil
         if not holdRoute(ctx) then return true end
@@ -4025,7 +4040,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 24 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 25 }
     end
     local loaded=saveStore:get('settings')
     -- Only the currently running legacy client can migrate its untagged config.
@@ -4325,10 +4340,35 @@ end)()
         return false
     end
     local function children(item) return item and item:GetChildren() or {} end
+    local function finite(value)
+        return type(value) == 'number' and value == value and math.abs(value) < math.huge
+    end
+    function F.enemyAlive(npc)
+        if not npc or not npc.Parent or not npc:IsA('Model') or not npc:IsDescendantOf(workspace)
+            or npc:GetAttribute('Category')=='Corpse' or npc:GetAttribute('NpcFaction')=='FriendlyCompanion' then return false end
+        local h=npc:FindFirstChildOfClass('Humanoid')
+        local hp=h and tonumber(h.Health) or tonumber(npc:GetAttribute('FuelLeechHealth'))
+        if not finite(hp) or hp<=0 then return false end
+        if h and type(h.GetState)=='function' and Enum.HumanoidStateType.Dead then
+            local ok,state=pcall(h.GetState,h)
+            if ok and state==Enum.HumanoidStateType.Dead then return false end
+        end
+        return true
+    end
+    function F.questTargetAllowed(ctx,npc)
+        if not cfg.classQuest or ctx.questThreat==npc then return true end
+        local retry=ctx.questTargetRetry and ctx.questTargetRetry[npc]
+        if not retry then return true end
+        local h=npc:FindFirstChildOfClass('Humanoid')
+        if now()>=retry.untilAt or h and h.Health<retry.health then
+            ctx.questTargetRetry[npc]=nil;return true
+        end
+        return false
+    end
     function F.enemies()
         local result, seen = {}, {}
         local function add(npc)
-            if npc and npc.Parent and npc:IsA('Model') and not seen[npc] then
+            if F.enemyAlive(npc) and not seen[npc] then
                 seen[npc] = true; result[#result + 1] = npc
             end
         end
@@ -4354,10 +4394,56 @@ end)()
         if item:IsA('Attachment') then return item.WorldPosition end
         local p = part(item); return p and p.Position
     end
+    function F.oreBroken(packet)
+        if type(packet)~='table' then return end
+        local node=packet.Node
+        if node and type(node.GetAttribute)=='function' and tag(node,'Ore') and node:IsDescendantOf(workspace) then
+            s.questBrokenNodes=s.questBrokenNodes or setmetatable({}, {__mode='k'})
+            s.questBrokenNodes[node]={session=node:GetAttribute('SessionOreId'),model=node:GetAttribute('Ore_Model')}
+        end
+        local key=packet.Id
+        if type(key)=='string' or type(key)=='number' and finite(key) then
+            s.questBrokenOreIds=s.questBrokenOreIds or {};s.questBrokenOreOrder=s.questBrokenOreOrder or {}
+            if not s.questBrokenOreIds[key] then
+                s.questBrokenOreOrder[#s.questBrokenOreOrder+1]=key;s.questBrokenOreIds[key]=true
+                if #s.questBrokenOreOrder>256 then s.questBrokenOreIds[table.remove(s.questBrokenOreOrder,1)]=nil end
+            end
+        end
+    end
+    function F.liveOre(node)
+        if not node or not node.Parent then return false end
+        local session=node:GetAttribute('SessionOreId')
+        local record=s.questBrokenNodes and s.questBrokenNodes[node]
+        if record and record.session==session and record.model==node:GetAttribute('Ore_Model') then return false end
+        if session~=nil and s.questBrokenOreIds and s.questBrokenOreIds[session] then return false end
+        -- OreComponent's proxy is CanQuery=false; its loaded child meshes are
+        -- queryable. MiningFeedback hides broken meshes without disabling query.
+        local function visible(p)
+            return p:IsA('BasePart') and p.CanQuery~=false
+                and (tonumber(p.Transparency) or 0)<1 and (tonumber(p.LocalTransparencyModifier) or 0)<1
+        end
+        if visible(node)then return true end
+        for _,p in ipairs(node:GetDescendants())do if visible(p)then return true end end
+        return false
+    end
+    function F.bindOreBreaks(ctx)
+        if not cfg.classQuest or ctx.oreBreakBound or not api.event or not ctx.connect or now()<(ctx.oreBreakBindAt or 0)then return end
+        ctx.oreBreakBindAt=now()+2
+        local signal=api.event('OreService','OreBroken')
+        if signal then
+            ctx.oreBreakBound=true
+            ctx.connect(signal,function(packet)
+                if ctx.active and api.owned() and cfg.classQuest then F.oreBroken(packet)end
+            end)
+        end
+    end
     F.promptPosition = position
     function F.chestFallbackAllowed(item)
         while item and item ~= workspace do
-            if item.Name == 'CommonChest' or item:GetAttribute('RealName') == 'CommonChest' then return false end
+            local name=tostring(item.Name):lower():gsub('[%s_%-]','')
+            local real=tostring(item:GetAttribute('RealName') or ''):lower():gsub('[%s_%-]','')
+            if name=='mimic' or name=='mimicchest' or name=='chestmimic'
+                or real=='mimic' or real=='mimicchest' or real=='chestmimic' then return false end
             if tag(item, 'ShopItem') or (tonumber(item:GetAttribute('Cost')) or 0) > 0
                 or item:GetAttribute('Robux') == true or item:GetAttribute('ProductId') ~= nil
                 or item:GetAttribute('RobuxProductId') ~= nil then return false end
@@ -4926,7 +5012,8 @@ end)()
         -- upgrade disposable gold. Sale protection tests value, not free slots.
         useful=function(ctx,item)local _,useful=usefulSnapshot(ctx,true);return useful(item) end,
         snapshot=function(ctx)local _,useful=usefulSnapshot(ctx,true);return useful end,
-        findTool=findTool, hasRoom=hasRoom, enemies=F.enemies, swordTargetAllowed=F.swordTargetAllowed, persist=persist, hover=movement.hover,
+        findTool=findTool, hasRoom=hasRoom, enemies=F.enemies, enemyAlive=F.enemyAlive, questTargetAllowed=F.questTargetAllowed,
+        swordTargetAllowed=F.swordTargetAllowed, persist=persist, hover=movement.hover,
         miningBounds=function(node)
             local cf,size
             local model=node:IsA('Model')
@@ -4941,13 +5028,15 @@ end)()
             end
             return cf.Position,size
         end,
-        miningNodeAllowed=function(node)return not F.skipLootArea(node)end,
+        miningNodeAllowed=function(node)return not F.skipLootArea(node) and F.liveOre(node)end,
         chestCandidate=function(ctx,radius)return ctx.questChestCandidate and ctx.questChestCandidate(radius)end,
         openChest=function(ctx,entry)return ctx.helpers[16361397](entry)end,
         miningSurface=function(ctx,node)
             local best,distance
-            for _,p in ipairs(node:IsA('BasePart') and {node} or node:GetDescendants())do
-                if p:IsA('BasePart') and p.CanQuery~=false then
+            local parts=node:GetDescendants();if node:IsA('BasePart')then parts[#parts+1]=node end
+            for _,p in ipairs(parts)do
+                if p:IsA('BasePart') and p.CanQuery~=false and (tonumber(p.Transparency) or 0)<1
+                    and (tonumber(p.LocalTransparencyModifier) or 0)<1 then
                     local d=(p.Position-ctx.root.Position).Magnitude
                     if not distance or d<distance then best,distance=p,d end
                 end
@@ -4973,7 +5062,7 @@ end)()
                 for _,p in ipairs(workspace:GetPartBoundsInBox(box,Vector3.new(range,range,range),params))do
                     while p and p~=workspace do
                         if tag(p,'Ore')then
-                            if p==node then return true end
+                            if p==node then return F.liveOre(node) end
                             break
                         end
                         p=p.Parent
@@ -5205,9 +5294,6 @@ end)()
         local h = npc:FindFirstChildOfClass('Humanoid')
         return h and h.Health or tonumber(npc:GetAttribute('FuelLeechHealth')) or 0
     end
-    local function finite(value)
-        return type(value) == 'number' and value == value and math.abs(value) < math.huge
-    end
     auraModule=function(name)
         s.auraModules, s.auraModuleRetry = s.auraModules or {}, s.auraModuleRetry or {}
         if s.auraModules[name] then return s.auraModules[name] end
@@ -5306,7 +5392,7 @@ end)()
                 local isPlayer = npc == ctx.character or (type(api.Players.GetPlayerFromCharacter) == 'function'
                     and api.Players:GetPlayerFromCharacter(npc) ~= nil)
                 if npc:IsA('Model') and not isPlayer and npc:GetAttribute('NpcFaction') ~= 'FriendlyCompanion'
-                    and (class~='Sword' or F.swordTargetAllowed(npc)) then
+                    and F.questTargetAllowed(ctx,npc) and (class~='Sword' or F.swordTargetAllowed(npc)) then
                     local point = bounds.GetModelHitPosition(npc, { Position = ctx.root.Position })
                     if point and (point - ctx.root.Position).Magnitude <= range then add(npc) end
                 end
@@ -5370,6 +5456,13 @@ end)()
         if ctx.pickaxeTargets and ctx.pickaxeTargets[target] then return 'Pickaxe' end
     end
     function F.afterAttack(ctx, target, class, before)
+        if cfg.classQuest and ctx.questCombat and target and F.enemyAlive(target) then
+            ctx.questDamageWatch=ctx.questDamageWatch or setmetatable({}, {__mode='k'})
+            local check=ctx.questDamageWatch[target]
+            local hp=npcHealth(target)
+            if not check or hp<check.health then check={health=hp,progressAt=now(),attempts=0};ctx.questDamageWatch[target]=check end
+            check.attempts=check.attempts+1;check.lastAttempt=now()
+        end
         if class ~= 'Sword' or not target or not target.Parent then return end
         local record = ctx.damageChecks[target] or { failures = 0 }
         ctx.damageChecks[target] = record
@@ -5383,10 +5476,10 @@ end)()
     function F.watcher(ctx)
         if now() >= (ctx.watcherSearchAt or 0) then
             ctx.watcherSearchAt = now() + 0.15
-            ctx.watcher = nearest(ctx, tagged('Watcher'), function(item) return npcHealth(item) > 0 and item:GetAttribute('Category') ~= 'Corpse' end, 400)
+            ctx.watcher = nearest(ctx, tagged('Watcher'), F.enemyAlive, 400)
         end
         local closest = ctx.watcher
-        if closest and (not closest.Parent or npcHealth(closest) <= 0) then closest = nil end
+        if closest and not F.enemyAlive(closest) then closest = nil end
         ctx.watcher = closest
         if closest and workspace.CurrentCamera then
             local eyes = closest:FindFirstChild('Head', true) or closest:FindFirstChild('Eyes', true) or part(closest)
@@ -5894,6 +5987,7 @@ end)()
     end
     function F.watchdog(ctx)
         F.checkQuestExit(ctx)
+        if ctx.active then F.bindOreBreaks(ctx) end
         if ctx.active then F.startDefense(ctx) end
         if not ctx.active or not ctx.initialized or not ctx.featureThread then return end
         local worker = ctx.featureThread
@@ -5916,6 +6010,7 @@ end)()
         F.runWorker(ctx)
     end
     function F.start(ctx)
+        F.bindOreBreaks(ctx)
         s.equipRecords = s.equipRecords or setmetatable({}, { __mode = 'k' })
         s.lootStarted = s.lootStarted or now()
         s.sackSize, s.sackCapacity = nil, nil
@@ -6074,7 +6169,7 @@ end
             local npcFolder = workspace:FindFirstChild("Npc")
             local target, targetPart, distance
             for _, npc in ipairs(features and features.enemies() or (npcFolder and npcFolder:GetChildren() or {})) do
-                if npc:IsA("Model") and npc:GetAttribute("NpcFaction") ~= "FriendlyCompanion"
+                if features.enemyAlive(npc) and features.questTargetAllowed(ctx,npc)
                     and (class~='Sword' or features.swordTargetAllowed(npc)) then
                     local health = npc:FindFirstChildOfClass("Humanoid")
                     local living = health and health.Health > 0 or (tonumber(npc:GetAttribute("FuelLeechHealth")) or 0) > 0
@@ -6161,7 +6256,8 @@ end
             local radius = selected.melee and features.weaponRange(active, selected.tool) or 80
             local auraTargets = selected.melee and features and features.auraTargets(ctx, active)
             local target, part = nearestHostile(radius, selected.class)
-            if ctx.combatTarget and ctx.combatTarget.Parent and (selected.class~='Sword' or features.swordTargetAllowed(ctx.combatTarget)) then
+            if ctx.combatTarget and features.enemyAlive(ctx.combatTarget) and features.questTargetAllowed(ctx,ctx.combatTarget)
+                and (selected.class~='Sword' or features.swordTargetAllowed(ctx.combatTarget)) then
                 local desiredPart = ctx.combatTarget:FindFirstChild("HumanoidRootPart") or ctx.combatTarget.PrimaryPart
                 if desiredPart and (desiredPart.Position - root.Position).Magnitude <= radius then target, part = ctx.combatTarget, desiredPart end
             end
