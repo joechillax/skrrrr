@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 22: no fixed coin reserve; selective card saving, quest progress reports and native mining facing/readiness fixes.
+-- Revision 23: native ore hitbox validation and nearby chest turns during class quests.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 35 minutes or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 22
-    local BUILD = "r22-card-budget-quest-reports-mining"
+    local REVISION = 23
+    local BUILD = "r23-native-ore-overlap-quest-chests"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2273,7 +2273,7 @@ return function(api,Q)
         return false
     end
     local function miningPose(ctx,mine,active)
-        local ok,center,size=pcall(api.miningBounds,mine.node)
+        local ok,center,size=pcall(api.miningBounds,mine.surface or mine.node)
         if not ok or not center or not size or size.X<=0 or size.Y<=0 or size.Z<=0 then return false end
         if not mine.anchor or (center-mine.center).Magnitude>2 or not mine.boundsSize or (size-mine.boundsSize).Magnitude>.5 then
             local delta=ctx.root.Position-center
@@ -2281,11 +2281,18 @@ return function(api,Q)
             if side.Magnitude<.1 then side=Vector3.new(0,0,1)else side=side.Unit end
             if mine.alternate then side=side*-1 end
             local extent=(math.abs(side.X)*size.X+math.abs(side.Z)*size.Z)*.5
-            local gap=math.min(3,math.max(1,(tonumber(active.Range) or 13)*.25))
+            local range=tonumber(active.Range) or 13
+            local gap=math.min(2,math.max(.5,range*.2))
             mine.center,mine.boundsSize=center,size
             -- Native pickaxe checks a forward box and rejects ore below pivotY-2.
-            -- Stand above the vein's top, outside its surface, facing horizontally.
-            mine.anchor=Vector3.new(center.X,center.Y+size.Y*.5+1,center.Z)+side*(extent+gap)
+            -- GetSwingCFrame raises the native box another TWO studs. Standing
+            -- above the top puts a short-range pickaxe's entire box in the air.
+            local height=center.Y+size.Y*.5+math.min(0,range*.5-2-.5)
+            if mine.surface then
+                local nc,ns=api.miningBounds(mine.node)
+                if nc and ns then height=math.min(height,nc.Y+ns.Y*.5+1)end
+            end
+            mine.anchor=Vector3.new(center.X,height,center.Z)+side*(extent+gap)
             mine.frame=CFrame.lookAt(mine.anchor,Vector3.new(center.X,mine.anchor.Y,center.Z))
             mine.placed=nil
         end
@@ -2315,12 +2322,16 @@ return function(api,Q)
         if active.AutoFaceAligner then active.AutoFaceAligner.Enabled=false end
         if ctx.questMineRotate==nil then ctx.questMineRotate=ctx.humanoid.AutoRotate end
         ctx.humanoid.AutoRotate=false
-        if not mine.placed or (ctx.root.Position-mine.anchor).Magnitude>2 then
-            ctx.root.CFrame=mine.frame;mine.placed=true
-        elseif ctx.root.CFrame.LookVector then
-            local direction=Vector3.new(center.X-ctx.root.Position.X,0,center.Z-ctx.root.Position.Z)
-            if direction.Magnitude>.1 and ctx.root.CFrame.LookVector:Dot(direction.Unit)<.98 then
-                ctx.root.CFrame=CFrame.lookAt(ctx.root.Position,Vector3.new(center.X,ctx.root.Position.Y,center.Z))
+        local pivot=type(ctx.character.GetPivot)=='function' and ctx.character:GetPivot() or ctx.root.CFrame
+        if not mine.placed or (pivot.Position-mine.anchor).Magnitude>2 then
+            if type(ctx.character.PivotTo)=='function' then ctx.character:PivotTo(mine.frame)
+            else ctx.root.CFrame=mine.frame end
+            mine.placed=true
+        elseif pivot.LookVector then
+            local direction=Vector3.new(center.X-pivot.Position.X,0,center.Z-pivot.Position.Z)
+            if direction.Magnitude>.1 and pivot.LookVector:Dot(direction.Unit)<.98 then
+                local facing=CFrame.lookAt(pivot.Position,Vector3.new(center.X,pivot.Position.Y,center.Z))
+                if type(ctx.character.PivotTo)=='function'then ctx.character:PivotTo(facing)else ctx.root.CFrame=facing end
             end
         end
         return true
@@ -2366,6 +2377,20 @@ return function(api,Q)
             local hp=health(mine.node)
             if hp<mine.health then mine.health,mine.progressAt=hp,now()end
             if not miningPose(ctx,mine,active)then return miningPause(ctx,mine.node,'Vein geometry is not loaded',3)end
+            if api.miningHitReady then
+                local hit,why=api.miningHitReady(ctx,active,mine.node)
+                if not hit then
+                    if not mine.surfaceTried and api.miningSurface then
+                        mine.surfaceTried=true;mine.surface=api.miningSurface(ctx,mine.node);mine.anchor=nil;mine.progressAt=nil
+                        if mine.surface then status('Mining approach adjusts to a loaded ore part');return true end
+                    end
+                    if not mine.alternate then
+                        mine.alternate=true;mine.anchor=nil;mine.progressAt=nil
+                        status('Mining approach missed the native ore hitbox; trying the other side');return true
+                    end
+                    return miningPause(ctx,mine.node,'Mining blocked: '..(why or 'ore outside native hitbox'),5)
+                end
+            end
             api.watch(ctx)
             if not api.watcherReady(ctx)then mine.progressAt=nil;status('Mining pauses for Watcher camera attention');return true end
             if mine.progressAt and now()-mine.progressAt>=8 then
@@ -2666,7 +2691,8 @@ end)()
             if not calls.cash then s.questCashJob=nil end
         end
         ctx.questOwns,ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass,ctx.questAimHead=nil,nil,nil,nil,nil
-        ctx.questStartup=nil;ctx.questRecovering=nil;ctx.questThreat=nil
+        ctx.questStartup=nil;ctx.questRecovering=nil;ctx.questThreat=nil;ctx.questChestTaking=nil;ctx.questChestDue=nil
+        if not ctx.currentChest then ctx.questChestLease=nil end
     end
     function Q.abortResources(ctx)
         if s.questDelivery and s.questDelivery.ctx==ctx then release(s.questDelivery)end
@@ -3197,6 +3223,34 @@ end)()
         end
         return requiredClass and api.findTool(ctx,requiredClass) or nil,true
     end
+    function Q.chestTurn(ctx,plan)
+        if not cfg.classQuest or not ctx.questChestCandidate or not api.chestCandidate or ctx.currentChest
+            or ctx.featureHold or ctx.defenseMoving or ctx.dodgeUntil and now()<ctx.dodgeUntil
+            or s.questDelivery or s.questCashJob or s.bringDelivery or s.lootRequest or s.equipmentRequest
+            or ctx.questMineEntry or api.Players.LocalPlayer:GetAttribute('InDungeon')==true or Q.manual()
+            or plan.kind~='combat' and plan.kind~='mining' and plan.kind~='depth' and plan.kind~='gold' then return false end
+        ctx.questChestDue=ctx.questChestDue or now()+8
+        if now()<ctx.questChestDue then return false end
+        if not Q.holdRoute(ctx)then return true end
+        ctx.questChestTaking=true;ctx.questChestLease=coroutine.running()
+        local ok,entry=pcall(api.chestCandidate,ctx,250)
+        if not ok then ctx.questChestTaking=nil;ctx.questChestLease=nil;error(entry,0)end
+        if not entry then ctx.questChestTaking=nil;ctx.questChestLease=nil;ctx.questChestDue=now()+3;return false end
+        Q.drillSupport.stopMine(ctx);Q.stopDrive(ctx)
+        if ctx.humanoid.SeatPart or ctx.humanoid.Sit then
+            ctx.humanoid.Sit=false;ctx.humanoid.Jump=true;ctx.questChestTaking=nil;ctx.questChestLease=nil
+            setStatus('Leaving drill seat for a nearby quest chest');return true
+        end
+        ctx.questCombat=nil;ctx.combatTarget=nil
+        ctx.questChestDue=now()+10
+        setStatus('Opening a nearby chest alongside class quests')
+        local result,why=pcall(api.openChest,ctx,entry)
+        ctx.questChestTaking=nil;ctx.questChestLease=nil
+        if not result then error(why,0)end
+        -- Receipt/cooldown/loot handling is the original chest helper's job.
+        -- Moving or attempting a chest does not fabricate quest progress.
+        return true
+    end
     function Q.step(ctx)
         Q.recoverDrive()
         if not cfg.classQuest then
@@ -3241,6 +3295,7 @@ end)()
                 if goal.key=='SellGoldItems' and tryGold(ctx,plan)then Q.drillSupport.stopMine(ctx);return true end
             end
         end
+        if Q.chestTurn(ctx,plan)then return true end
         if combatWork(ctx,plan)then return true end
         if Q.drillSupport.step(ctx,plan)then return true end
         if plan.kind=='mining' then
@@ -3991,7 +4046,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 22 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 23 }
     end
     local loaded=saveStore:get('settings')
     -- Only the currently running legacy client can migrate its untagged config.
@@ -4883,7 +4938,9 @@ end)()
         roomPending = function() return s.rareShardDrop ~= nil end,
         receipt = pickupRecord, received = gearReceipt, confirm = finishGearReceipt, accepted = api.accepted,
         interact = function(ctx, item, callback) return operation(ctx, 'InteractionService', 'Interact', item, callback) end})
-    local questApi = {state=s, now=now, controller=controller, remote=api.remote, RS=api.RS,
+    local auraModule
+    local questApi
+    questApi = {state=s, now=now, controller=controller, remote=api.remote, RS=api.RS,
         Players=api.Players, owned=api.owned, observeClass=api.observeClass or function(data)s.classData=data;s.classObservedAt=now()end,
         free=F.freeWorldItemAllowed, part=part, position=position, tag=tag, tagged=tagged, id=id, attr=attr,
         -- A full toolbar can block picking up an upgrade without making that
@@ -4906,6 +4963,48 @@ end)()
             return cf.Position,size
         end,
         miningNodeAllowed=function(node)return not F.skipLootArea(node)end,
+        chestCandidate=function(ctx,radius)return ctx.questChestCandidate and ctx.questChestCandidate(radius)end,
+        openChest=function(ctx,entry)return ctx.helpers[16361397](entry)end,
+        miningSurface=function(ctx,node)
+            local best,distance
+            for _,p in ipairs(node:IsA('BasePart') and {node} or node:GetDescendants())do
+                if p:IsA('BasePart') and p.CanQuery~=false then
+                    local d=(p.Position-ctx.root.Position).Magnitude
+                    if not distance or d<distance then best,distance=p,d end
+                end
+            end
+            return best
+        end,
+        miningHitReady=function(ctx,active,node)
+            local bounds=auraModule('MeleeSwingBounds')
+            if not bounds or type(bounds.GetSwingCFrame)~='function' then return false,'native swing bounds unavailable' end
+            local range=tonumber(active.Range)
+            if not range or range<=0 or range~=range or range==math.huge then return false,'invalid pickaxe range' end
+            local ok,hit=pcall(function()
+                local pivot=ctx.character:GetPivot()
+                local top
+                if node:IsA('Model')then local cf,sz=node:GetBoundingBox();top=cf.Position.Y+sz.Y*.5
+                elseif type(bounds.GetPartTopY)=='function'then top=bounds.GetPartTopY(node)
+                else local center,sz=questApi.miningBounds(node);top=center and center.Y+sz.Y*.5 end
+                if not top or top<pivot.Position.Y-2 then return false end
+                local box=bounds.GetSwingCFrame(pivot,-math.min(range,30000)/4)
+                local params=OverlapParams.new()
+                params.FilterType=Enum.RaycastFilterType.Exclude
+                params.FilterDescendantsInstances={ctx.character}
+                for _,p in ipairs(workspace:GetPartBoundsInBox(box,Vector3.new(range,range,range),params))do
+                    while p and p~=workspace do
+                        if tag(p,'Ore')then
+                            if p==node then return true end
+                            break
+                        end
+                        p=p.Parent
+                    end
+                end
+                return false
+            end)
+            if not ok then return false,'native ore overlap unavailable' end
+            return hit,hit and nil or 'target ore outside native swing box'
+        end,
         cancelTravel=movement.cancel, extractionReady=F.extractionReady,
         equip=equip,readyAction=readyAction,stackCount=stackCount,
         findOwned=function(ctx,wanted)for _,tool in ipairs(tools(ctx))do if id(tool)==wanted then return tool end end end,
@@ -5130,7 +5229,7 @@ end)()
     local function finite(value)
         return type(value) == 'number' and value == value and math.abs(value) < math.huge
     end
-    local function auraModule(name)
+    auraModule=function(name)
         s.auraModules, s.auraModuleRetry = s.auraModules or {}, s.auraModuleRetry or {}
         if s.auraModules[name] then return s.auraModules[name] end
         if now() < (s.auraModuleRetry[name] or 0) then return nil end
@@ -6332,12 +6431,16 @@ end
             if ctx.currentChest and ctx.defenseAbort and coroutine.running() == ctx.lootThread then
                 error('__EARTH_DEFENSE_RETRY', 0)
             end
+            if ctx.questChestLease and coroutine.running() == ctx.questChestLease and not s.config.classQuest then
+                error('__EARTH_DEFENSE_RETRY', 0)
+            end
             if coroutine.running() == ctx.featureThread and (ctx.defenseMoving or now() < (ctx.dodgeUntil or 0)) then
                 error('__EARTH_DEFENSE_RETRY', 0)
             end
         end
         function ctx.awaitCombat()
-            while ctx.active and (ctx.questOwns or (ctx.featureHold and coroutine.running() ~= ctx.featureThread)
+            while ctx.active and ((ctx.questOwns and not (ctx.questChestTaking and coroutine.running() == ctx.featureThread)) or (ctx.featureHold and coroutine.running() ~= ctx.featureThread)
+                or (ctx.questChestLease and coroutine.running() ~= ctx.questChestLease)
                 or (features.smartLootPending(ctx) and coroutine.running() ~= ctx.featureThread)
                 or ctx.defenseMoving
                 or (ctx.dodgeUntil and now() < ctx.dodgeUntil)) do
@@ -6346,6 +6449,15 @@ end
                 task.wait(0.05)
             end
             if coroutine.running() ~= ctx.featureThread then ctx.routeParked = nil end
+        end
+        function ctx.questChestCandidate(radius)
+            -- Only the owning optional worker may borrow one chest action;
+            -- the discovery route stays parked throughout the detour.
+            if not s.config.classQuest or not ctx.questChestTaking
+                or coroutine.running() ~= ctx.featureThread or ctx.currentChest then return end
+            for _,entry in ipairs(ctx.helpers[9164528]())do
+                if entry.Dist<=radius then return entry end
+            end
         end
         local function run(fn, ...)
             if not ctx.active then return end
