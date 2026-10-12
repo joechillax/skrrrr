@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 28: mine gate transitions, native door holds, Watcher discovery and 20/35-minute quest exits.
+-- Revision 29: death gear receipts, remaining-item claims and respawn loadouts.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 28
-    local BUILD = "r28-mine-gate-transitions-quest-limits"
+    local REVISION = 29
+    local BUILD = "r29-death-gear-reconciliation"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -1651,6 +1651,8 @@ return function(api,Q)
         local c=api.controller('CrateController')
         if c and (c.DeathChest or c.ClaimPending)then return false end
         local job=s.questCrateLoadout
+        if job and job.ctx~=ctx and not s.questCalls.crateClaim then s.questCrateLoadout=nil;s.questCrateProbeAt=nil;job=nil end
+        if s.questDeathClaim or s.questCalls.deathClaim then return false end
         if not job then
             if now()<(s.questCrateProbeAt or 0)then return false end
             s.questCrateProbeAt=now()+2
@@ -1703,86 +1705,202 @@ return function(api,Q)
         end
         return total
     end
+    function L.remember(ctx)
+        if not cfg.classQuest or ctx.humanoid.Health<=0 or now()<(ctx.questGearRememberAt or 0)then return end
+        ctx.questGearRememberAt=now()+.5
+        local ids={}
+        for _,container in ipairs({ctx.character,api.Players.LocalPlayer:FindFirstChild('Backpack')})do
+            if container then for _,item in ipairs(container:GetChildren())do
+                local id=item:GetAttribute('ArmorName')
+                if not id and item:IsA('Tool')then id=api.id(item)end
+                if type(id)=='string' and id~=''then ids[id]=true end
+            end end
+        end
+        ctx.questGearSnapshot=ids
+    end
+    function L.stopped(ctx)
+        if cfg.classQuest and ctx.questGearSnapshot and (ctx.humanoid.Health<=0
+            or api.Players.LocalPlayer.Character~=ctx.character)then s.questDeathGear=ctx.questGearSnapshot end
+    end
+    local function contentCounts(data)
+        if type(data)~='table'then return end
+        local result={}
+        for _,id in pairs(data)do
+            if type(id)~='string' or id==''then return end -- Native DrawCrate counts a list of IDs.
+            result[id]=(result[id] or 0)+1
+        end
+        return result
+    end
+    local function ownChest(chest)
+        if not chest or type(chest.GetAttribute)~='function' or not chest.Parent or not chest:IsDescendantOf(workspace)
+            or chest:GetAttribute('DeathChest')~=true or tonumber(chest:GetAttribute('Owner'))~=api.Players.LocalPlayer.UserId then return false end
+        local expires=tonumber(chest:GetAttribute('DeathChestDespawnExpiresAt'))
+        return (not expires or expires>workspace:GetServerTimeNow()) and api.position(chest)~=nil
+    end
+    local function missing(ctx,job)
+        local ids={}
+        for id in pairs(job.expected or {})do if count(ctx,id)==0 then ids[#ids+1]=id end end
+        table.sort(ids,function(a,b)
+            local preferred=s.questDeathGear or {}
+            local pa=preferred[a] or a:find('Void',1,true) or a=='Sword_Pirate' or a=='Flintlock'
+            local pb=preferred[b] or b:find('Void',1,true) or b=='Sword_Pirate' or b=='Flintlock'
+            if (not not pa)~=(not not pb) then return not not pa end
+            return a<b
+        end)
+        return ids
+    end
+    local function releaseRecovery(ctx,job,text,keepPriority)
+        ctx.questRecovering=nil;ctx.questOwns=nil
+        if not keepPriority then ctx.questRecoveryDue=nil end
+        if text then s.questStatus=text end
+        return false
+    end
+    local function readChest(ctx,job)
+        if job.reading or s.questCalls.deathContents or now()<(job.nextReadAt or 0)then return false end
+        job.reading=true;local life=ctx;local started=now()
+        local issued=Q.call('deathContents','DeathChestService','GetContents',{job.chest},function(ok,data)
+            job.reading=nil
+            if job.ctx~=life then job.nextReadAt=now();return end
+            local counts=ok and contentCounts(data)
+            if not counts then
+                job.nextReadAt=now()+10;job.readFailed=true
+                s.questStatus='Death chest contents unavailable; retrying the read, not an uncertain claim';return
+            end
+            job.readFailed=nil;job.remaining=counts;job.readAt=started;job.nextReadAt=now()+2
+            if not job.expected then job.expected=counts;job.before={};job.credited={}
+                for id in pairs(counts)do job.before[id]=count(ctx,id)end
+            end
+        end,function()return Q.enabled(life) and ownChest(job.chest) and not Q.manual()
+            and (api.position(job.chest)-life.root.Position).Magnitude<=10 end)
+        if not issued then job.reading=nil;job.nextReadAt=now()+2 end
+        return issued
+    end
     function L.recover(ctx,plan)
         ctx.questRecovering=nil
         if not Q.enabled(ctx) or api.extractionReady() or lobby() or Q.manual()
-            or api.Players.LocalPlayer:GetAttribute('InitialInventoryLoaded')~=true
-            or s.questDelivery or s.bringDelivery or s.lootRequest then return false end
+            or api.Players.LocalPlayer:GetAttribute('InitialInventoryLoaded')~=true then ctx.questRecoveryDue=nil;return false end
         local c=api.controller('CrateController')
-        if c and c.ClaimPending then return false end
+        if c and c.ClaimPending then ctx.questRecoveryDue=nil;return false end
         local records=s.questDeathClaims or setmetatable({}, {__mode='k'});s.questDeathClaims=records
         local job=s.questDeathClaim
-        if job and job.issued and not job.done then
-            local gained=0
-            for id,before in pairs(job.before)do gained=gained+math.max(0,count(ctx,id)-before)end
-            if gained>0 then
-                s.stats.smartPickups=(s.stats.smartPickups or 0)+gained
-                s.questStatus='Death gear recovery confirmed: '..gained..' inventory / worn-gear additions'
-                job.done=true;s.questDeathLocation=nil
-            end
-        end
-        if job and (not job.chest.Parent or job.done or now()-job.started>=15)then
-            if not job.done then s.questStatus='Death gear recovery unconfirmed; continuing without duplicate claims'end
-            records[job.chest]=job.issued and true or now()+10;s.questDeathClaim=nil;job=nil
+        if job and job.ctx~=ctx then
+            job.ctx=ctx;job.leaseUntil=now()+12;job.nextReadAt=now();job.done=nil
+            job.expected=nil;job.remaining=nil;job.readAt=nil;job.before={};job.credited={}
         end
         if not job then
             if now()<(s.questDeathProbeAt or 0)then return false end
             s.questDeathProbeAt=now()+.5
-            local candidates={}
-            for _,chest in ipairs(api.tagged('SupplyCrate'))do
-                local expires=tonumber(chest:GetAttribute('DeathChestDespawnExpiresAt'))
-                if chest.Parent and chest:IsDescendantOf(workspace) and chest:GetAttribute('DeathChest')==true
-                    and chest:GetAttribute('Owner')==api.Players.LocalPlayer.UserId
-                    and (not records[chest] or type(records[chest])=='number' and now()>=records[chest])
-                    and api.position(chest) and (not expires or expires>workspace:GetServerTimeNow())then
-                    candidates[#candidates+1]=chest
-                end
+            local candidates,seen={},{}
+            local function candidate(chest)
+                if seen[chest] or not ownChest(chest)then return end
+                seen[chest]=true
+                local record=records[chest]
+                if type(record)=='table' and (record.emptyVerified or record.done and record.ctx==ctx)then return end
+                candidates[#candidates+1]=chest
             end
-            local chest=Q.nearest(candidates,ctx.root.Position)
+            -- The UI holds the real supply instance, not its separately cloned visible crate.
+            if c and c.DeathChest then candidate(c.DeathChest)end
+            for _,chest in ipairs(api.tagged('SupplyCrate'))do candidate(chest)end
+            local chest=c and c.DeathChest
+            if not seen[chest]then chest=Q.nearest(candidates,ctx.root.Position)end
             if not chest then return false end
-            if not Q.holdRoute(ctx)then return true end
-            Q.stopDrive(ctx);api.hover(ctx);api.watch(ctx)
-            local point=api.position(chest)
-            if (point-ctx.root.Position).Magnitude>6 then
-                ctx.root.CFrame=CFrame.new(point+Vector3.new(0,2,3));s.questDeathProbeAt=0
-                ctx.questRecovering=true;return true
-            end
-            job={chest=chest,started=now()};s.questDeathClaim=job
-            if not Q.call('deathContents','DeathChestService','GetContents',{chest},function(ok,data)
-                if ok and type(data)=='table'then job.contents=data;job.before={}
-                    for _,id in ipairs(data)do if type(id)=='string'then job.before[id]=count(ctx,id)end end
-                else job.done=true end
-            end,function()return Q.enabled(ctx) and not api.extractionReady() and chest.Parent~=nil
-                and chest:GetAttribute('Owner')==api.Players.LocalPlayer.UserId
-                and (api.position(chest)-ctx.root.Position).Magnitude<=10 end)then s.questDeathClaim=nil end
-            return false
+            local record=records[chest]
+            job=type(record)=='table' and record or {chest=chest,attempts=0}
+            if type(record)=='boolean' and record then job.unknown=true end -- Old uncertain claim cannot be blindly replayed.
+            if job.ctx and job.ctx~=ctx then job.expected=nil;job.remaining=nil;job.readAt=nil;job.before={};job.credited={};job.nextReadAt=now()end
+            job.ctx=ctx;job.done=nil;job.leaseUntil=now()+12
+            records[chest]=job;s.questDeathClaim=job
         end
-        if not job.contents then return false end
-        if not next(job.contents)then job.done=true;return false end
-        if job.issued then
-            if job.failed or now()-job.issuedAt>=8 then
-                job.done=true;s.questStatus='Death gear claim not confirmed; no repeated TakeAllItems';return false
+        if job.expected and job.mutationFinished and not job.rejected then
+            local gained=0
+            for id,amount in pairs(job.expected)do
+                local observed=math.min(amount,math.max(0,count(ctx,id)-(job.before[id] or 0)))
+                local previous=job.credited[id] or 0
+                if observed>previous then gained=gained+observed-previous;job.credited[id]=observed end
             end
-            ctx.questRecovering=true;Q.stopDrive(ctx);return true
+            if gained>0 then
+                s.stats.smartPickups=(s.stats.smartPickups or 0)+gained;job.leaseUntil=now()+8
+                s.questStatus='Death gear received: '..gained..'; checking remaining equipment'
+            end
         end
-        local chest=job.chest;local point=api.position(chest)
-        if not point or chest:GetAttribute('Owner')~=api.Players.LocalPlayer.UserId then job.done=true;return false end
+        local absent=job.expected and missing(ctx,job)
+        if job.expected and not next(job.expected)then
+            job.done=true;job.emptyVerified=true;records[job.chest]=job;s.questDeathClaim=nil
+            return releaseRecovery(ctx,job,'Own death chest is empty; checking other gear sources')
+        end
+        if absent and #absent==0 then
+            job.done=true;records[job.chest]=job;s.questDeathClaim=nil;s.questDeathLocation=nil
+            if c and c.DeathChest==job.chest and c.Frame and c.Frame.Visible and not c.ClaimPending then
+                local ui=api.controller('UIController')
+                if ui and type(ui.ToggleFrame)=='function'then pcall(ui.ToggleFrame,ui,'Crate',false)end
+            end
+            return releaseRecovery(ctx,job,job.issued and 'Death gear restored; all listed equipment is available'
+                or 'Listed death gear is already carried; no duplicate claim needed')
+        end
+        if not ownChest(job.chest)then
+            s.questDeathClaim=nil;job.nextReadAt=now()+10
+            return releaseRecovery(ctx,job,'Own death chest is unloaded or unavailable; continuing loaded work')
+        end
+        if s.questDelivery or s.bringDelivery or s.lootRequest then
+            ctx.questRecoveryDue=true
+            return releaseRecovery(ctx,job,'Death gear recovery queued behind the current item transaction',true)
+        end
+        ctx.questRecoveryDue=nil
+        local point=api.position(job.chest)
+        local waiting=job.unknown or s.questCalls.deathClaim or now()<(job.cooldown or 0)
+        if waiting and now()>=(job.leaseUntil or 0)then
+            -- Retain the transaction and read receipts, while independent chest work resumes.
+            if (point-ctx.root.Position).Magnitude<=10 then readChest(ctx,job)end
+            return releaseRecovery(ctx,job,'Death claim unresolved; missing '..table.concat(absent or {},', ')..'; other work continues')
+        end
         if not Q.holdRoute(ctx)then return true end
-        Q.stopDrive(ctx);api.hover(ctx);api.watch(ctx)
-        if (point-ctx.root.Position).Magnitude>6 then ctx.root.CFrame=CFrame.new(point+Vector3.new(0,2,3));return true end
-        if c and c.DeathChest and c.DeathChest~=chest then return false end
-        -- A respawn can replace the character while the read was pending.
-        -- Capture the current life immediately before claiming, not the old one.
-        job.before={}
-        for _,id in ipairs(job.contents)do if type(id)=='string'then job.before[id]=count(ctx,id)end end
-        if Q.call('deathClaim','DeathChestService','TakeAllItems',{chest},function(ok)job.failed=not ok end,
-            function()return Q.enabled(ctx) and not api.extractionReady() and not Q.manual() and chest.Parent~=nil
-                and chest:GetAttribute('Owner')==api.Players.LocalPlayer.UserId
-                and (api.position(chest)-ctx.root.Position).Magnitude<=10 and not (c and c.ClaimPending)end)then
-            job.issued,job.issuedAt=true,now();records[chest]=true;ctx.questRecovering=true
-            s.questStatus='Recovering own dropped gear through native death-chest TakeAllItems';return true
+        Q.stopDrive(ctx);api.hover(ctx);api.watch(ctx);ctx.questRecovering=true
+        if (point-ctx.root.Position).Magnitude>6 then
+            ctx.root.CFrame=CFrame.new(point+Vector3.new(0,2,3));s.questDeathProbeAt=0
+            s.questStatus='Returning to own death chest before collecting replacement gear';return true
         end
-        return false
+        if not job.expected or job.issued and (not job.readAt or job.readAt<=math.max(job.issuedAt,job.finishedAt or 0))then
+            readChest(ctx,job)
+            if job.readFailed then return releaseRecovery(ctx,job,'Death contents read failed; other work continues until retry')end
+            return true
+        end
+        if job.unknown or s.questCalls.deathClaim then return true end
+        if job.issued and now()<job.retryAt then return true end
+        if job.issued and not job.mutationFinished then return true end
+        if job.issued and not next(job.remaining or {})then
+            -- Empty stock alone does not prove inventory replication. Give it a bounded settling window.
+            if now()>=(job.leaseUntil or 0)then
+                return releaseRecovery(ctx,job,'Death chest is empty; missing gear replication remains unconfirmed')
+            end
+            return true
+        end
+        if now()<(job.cooldown or 0)then return releaseRecovery(ctx,job,'Death recovery cooling down; other work continues')end
+        if job.attempts>=3 then job.attempts=0;job.cooldown=now()+30
+            return releaseRecovery(ctx,job,'Death claims were rejected or incomplete; retrying after cooldown')end
+        local payload={}
+        for _,id in ipairs(absent or {})do if (job.remaining[id] or 0)>0 then payload[id]=job.remaining[id]end end
+        if job.issued and not next(payload)then
+            return releaseRecovery(ctx,job,'Missing death gear is no longer in the chest; other work continues')
+        end
+        local method=job.issued and 'TakeItems' or 'TakeAllItems'
+        local args=method=='TakeItems' and {job.chest,payload} or {job.chest}
+        local life=ctx
+        job.mutationFinished=nil;job.rejected=nil;job.issuedAt=now();job.nextReadAt=now()+1
+        local issued=Q.call('deathClaim','DeathChestService',method,args,function(ok,value,_,dispatch)
+            job.finishedAt=now()
+            job.mutationFinished=true;job.rejected=ok and value==false or dispatch=='not-sent'
+            job.unknown=not ok and dispatch~='not-sent'
+            job.retryAt=now()+(job.rejected and 5 or 3)
+            job.nextReadAt=now()+1
+        end,function()return Q.enabled(life) and not api.extractionReady() and not Q.manual() and ownChest(job.chest)
+            and (api.position(job.chest)-life.root.Position).Magnitude<=10 and not (c and c.ClaimPending)end)
+        if issued then
+            job.issued=true;job.attempts=job.attempts+1;job.leaseUntil=now()+12
+            s.questStatus=method=='TakeAllItems' and 'Recovering own dropped gear; observing all equipment receipts'
+                or 'Recovering verified remaining death gear through native TakeItems'
+            return true
+        end
+        return releaseRecovery(ctx,job,'Death claim prerequisites changed; retrying the read before acting')
     end
     return L
 end
@@ -2046,7 +2164,7 @@ return function(api,Q)
         local function dispatch(wallet)
             s.questWallet=wallet
             if not Q.enabled(ctx) or api.extractionReady()then return end
-            if s.questDelivery or calls.shop or calls.wallet then info('waiting for current item transaction');return end
+            if s.questDelivery and s.questDelivery.shop or calls.shop or calls.wallet then info('waiting for shop checkout / currency transaction');return end
             if c.PurchasePending or c.RerollPending or c.CardsLocked then info('native cards locked / purchase pending');return end
             if now()<(ctx.questUpgradeAt or 0)then return end
             local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
@@ -2075,8 +2193,9 @@ return function(api,Q)
                 end
             end,function()
                 local picked,pickedKey,pickedVersion=D.choose(ctx,Q.plan(s.classData,s.questCatalog,cfg.driveDepth),c,wallet)
-                return Q.enabled(ctx) and not api.extractionReady() and not s.questDelivery and not calls.shop and not calls.wallet
-                    and not c.PurchasePending and picked==offer and pickedKey==key and pickedVersion==version
+                return Q.enabled(ctx) and not api.extractionReady() and not(s.questDelivery and s.questDelivery.shop) and not calls.shop and not calls.wallet
+                    and not c.PurchasePending and not c.RerollPending and not c.CardsLocked
+                    and picked==offer and pickedKey==key and pickedVersion==version
             end)then
                 ledger[key]=true;s.questUpgradeJob=job
                 ctx.questUpgradeAt=now()+3
@@ -3050,6 +3169,7 @@ end)()
         end)
     end
     function Q.cleanup(ctx)
+        if Q.loadout then pcall(Q.loadout.stopped,ctx)end
         if Q.healing then pcall(Q.healing.cleanup,ctx)end
         if Q.drillSupport then pcall(Q.drillSupport.cleanup,ctx)end
         pcall(Q.stopDrive,ctx)
@@ -3061,6 +3181,7 @@ end)()
         ctx.questOwns,ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass,ctx.questAimHead=nil,nil,nil,nil,nil
         ctx.questStartup=nil;ctx.questRecovering=nil;ctx.questThreat=nil;ctx.questChestTaking=nil;ctx.questChestDue=nil
         ctx.questPotionUsing=nil
+        ctx.questRecoveryDue=nil
         ctx.questExitCombat=nil
         ctx.questDamageWatch=nil;ctx.questTargetRetry=nil
         if not ctx.currentChest then ctx.questChestLease=nil end
@@ -3637,13 +3758,14 @@ end)()
     function Q.step(ctx)
         Q.recoverDrive()
         if not cfg.classQuest then
-            if ctx.questOwns or ctx.questDriving or s.questDelivery or s.questCashJob then Q.cleanup(ctx) end
+            if ctx.questOwns or ctx.questDriving or ctx.questRecoveryDue or ctx.questRecovering or s.questDelivery or s.questCashJob then Q.cleanup(ctx) end
             return false
         end
         Q.drillSupport.observeDoors(ctx)
         Q.poll()
         local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if not enabled(ctx) then ctx.questProgressAt=now(); Q.cleanup(ctx); return false end
+        Q.loadout.remember(ctx)
         s.questPlan=plan
         if plan.kind~='potion' and ctx.questPotion then
             ctx.questPotion=nil;ctx.questPotionUsing=nil;ctx.questOwns=nil
@@ -4520,7 +4642,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 28 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 29 }
     end
     local loaded=saveStore:get('settings')
     -- Only the currently running legacy client can migrate its untagged config.
@@ -5651,7 +5773,8 @@ end)()
         F.smartLootPending(ctx)
         if not settleGear(ctx) then return false end
         if s.lootRequest then return false end
-        if bring.available() then return bring.step(ctx, not F.extractionReady()) end
+        if bring.available() then return bring.step(ctx, not F.extractionReady() and not ctx.questRecoveryDue and not ctx.questRecovering) end
+        if ctx.questRecoveryDue or ctx.questRecovering then return false end
         -- Snapshot only for this non-yielding candidate pass. Inventory receipts
         -- and packing still read live state after every asynchronous action.
         local armor = armorState(ctx)
