@@ -1,6 +1,6 @@
 task.wait(7)
--- ChestFarmAutoLoop.lua: put this complete file in the executor's auto-execute folder.
--- Revision 18: saved-crate Void gear, native mining quests and contextual quest upgrades/funding.
+-- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
+-- Revision 20: individual account profiles in DTEC JoeJoe Automation; full revision 19 automation preserved.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 35 minutes or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 18
-    local BUILD = "r18-quest-mining-and-void-crate"
+    local REVISION = 20
+    local BUILD = "r20-account-profiles-joejoe"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -40,7 +40,7 @@ return function(source)
     end
     if previous and previous.gui then pcall(previous.gui.dispose); previous.gui = nil end
     local s = previous and previous.job == job and previous or {}
-    if s.revision ~= REVISION or s.build ~= BUILD then s.queueArmed = nil end
+    if s.revision ~= REVISION or s.build ~= BUILD then s.queueArmed = nil;s.freshChecked=nil end
     s.revision, s.build = REVISION, BUILD
     s.pauseNoticeHidden, s.pauseNoticeRetryAt, s.pauseNoticeWarned = nil, nil, nil
     s.job, s.owner, s.connections = job, {}, {}
@@ -57,12 +57,103 @@ return function(source)
     local RunService = game:GetService("RunService")
     local CollectionService = game:GetService("CollectionService")
     local TeleportService = game:GetService("TeleportService")
-    local FRESH_SETTING = "ChestFarmAutoLoop_FreshRun"
-    if not s.freshChecked then
-        local ok, value = pcall(function() return TeleportService:GetTeleportSetting(FRESH_SETTING) end)
-        if ok and value == true then s.forceFresh = true end
-        s.freshChecked = true
+    local buildStore = (function()
+-- One executor file, separate profiles by immutable Roblox UserId.
+-- Native teleport settings are account-tagged backups, never a global profile.
+return function(api)
+    local s,env=api.state,api.env or _G
+    local FILE='DTEC JoeJoe Automation'
+    local player=(api.Players or game:GetService('Players')).LocalPlayer
+    local user=player and tonumber(player.UserId)
+    local key=user and user==user and user>0 and user<math.huge and tostring(user) or nil
+    s.accountStores=s.accountStores or {}
+    if key and s.accountStores[key]then return s.accountStores[key]end
+    local store={accountId=key,file=FILE}
+    local profile
+    local http
+    pcall(function()http=game:GetService('HttpService')end)
+    local function resolve()
+        if not key then
+            local current=(api.Players or game:GetService('Players')).LocalPlayer
+            local id=current and tonumber(current.UserId)
+            if id and id==id and id>0 and id<math.huge then
+                key=tostring(id);store.accountId=key;profile=nil
+                if not s.accountStores[key]then s.accountStores[key]=store end
+            end
+        end
+        return key and s.accountStores[key]
     end
+    local function readDocument()
+        local reader=env.readfile or readfile
+        if type(reader)~='function' or not http then return {schema=1,accounts={}},false end
+        local found,body=pcall(reader,FILE)
+        if not found then return {schema=1,accounts={}},true end
+        local decoded,data=pcall(http.JSONDecode,http,body)
+        if not decoded or type(data)~='table' or data.schema~=1 or type(data.accounts)~='table'then
+            return {schema=1,accounts={}},false -- Preserve corrupt/unsupported files instead of erasing other accounts.
+        end
+        return data,true
+    end
+    local function load()
+        if profile then return profile end
+        profile={}
+        if not key then return profile end
+        local ok,value=pcall(function()return api.TeleportService:GetTeleportSetting('DTEC JoeJoe Automation:'..key)end)
+        if ok and type(value)=='table' and value.accountId==key and type(value.profile)=='table'then profile=value.profile
+        else
+            local document=readDocument()
+            if type(document.accounts[key])=='table'then profile=document.accounts[key]end
+        end
+        return profile
+    end
+    function store:get(section)
+        local canonical=resolve()
+        if canonical and canonical~=store then return canonical:get(section)end
+        return load()[section]
+    end
+    function store:set(section,value)
+        local canonical=resolve()
+        if canonical and canonical~=store then return canonical:set(section,value)end
+        if not key then return false end
+        local data=load()
+        if type(value)~='table' and data[section]==value then return true end
+        data[section]=value
+        pcall(function()api.TeleportService:SetTeleportSetting('DTEC JoeJoe Automation:'..key,
+            {accountId=key,profile=data})end)
+        local writer=env.writefile or writefile
+        local document,writable=readDocument()
+        if type(writer)~='function' or not http or not writable then
+            if not s.accountSaveNotice then
+                s.accountSaveNotice=true
+                warn('[DTEC JoeJoe Automation] File save unavailable or invalid; using account-tagged session/teleport settings.')
+            end
+            return false
+        end
+        document.accounts[key]=data -- Re-read each write to preserve other accounts and other save sections.
+        local encoded,body=pcall(http.JSONEncode,http,document)
+        if not encoded then return false end
+        local saved=pcall(writer,FILE,body)
+        if saved then s.accountSaveNotice=nil end
+        return saved
+    end
+    if key then s.accountStores[key]=store end
+    return store
+end
+
+end)()
+    local saveStore=buildStore({state=s,env=env,Players=Players,TeleportService=TeleportService})
+    local function saveFresh(value)return saveStore:set('freshRun',value)end
+    local function loadFresh()
+        if not s.freshChecked then
+            local value=saveStore:get('freshRun')
+            if saveStore.accountId then
+                if value==true then s.forceFresh=true end
+                if s.forceFresh==true then saveStore:set('freshRun',true)end
+                s.freshChecked=true
+            end
+        end
+    end
+    loadFresh()
     local unpackValues = table.unpack or unpack
     local function pack(...) return { n = select("#", ...), ... } end
     local function now() return os.clock() end
@@ -140,36 +231,118 @@ return function(source)
     local s, env, now = api.state, api.env, api.now
     local R = {}
     local URL = 'https://discord.com/api/webhooks/1551830162650435584/V_EItPsWyCQDQgEvZlAGjaH4XoKXchAD6UbPwEiiJ6mPUmiU-2cOlioFzvPW79KlZGgu?wait=true'
-    local SETTING, FILE = 'EarthAutofarm_Reports_v1', 'EarthAutofarmReports.json'
-    local ok, http = pcall(function() return game:GetService('HttpService') end)
-    if not ok then http = nil end
-    local function notice(message)
-        if s.reportNotice ~= message then s.reportNotice = message; warn('[Earth Results] ' .. message) end
-    end
-    local function clock() return os.time() end
-    local ledger = s.reportLedger
-    if not ledger then
-        local read, value = pcall(function() return api.TeleportService:GetTeleportSetting(SETTING) end)
-        if read and type(value) == 'table' then ledger = value end
-        local reader = env.readfile or readfile
-        if not ledger and http and type(reader) == 'function' then
-            local found, body = pcall(reader, FILE)
-            if found then
-                local decoded, data = pcall(function() return http:JSONDecode(body) end)
-                if decoded and type(data) == 'table' then ledger = data end
+    local buildStore = (function()
+-- One executor file, separate profiles by immutable Roblox UserId.
+-- Native teleport settings are account-tagged backups, never a global profile.
+return function(api)
+    local s,env=api.state,api.env or _G
+    local FILE='DTEC JoeJoe Automation'
+    local player=(api.Players or game:GetService('Players')).LocalPlayer
+    local user=player and tonumber(player.UserId)
+    local key=user and user==user and user>0 and user<math.huge and tostring(user) or nil
+    s.accountStores=s.accountStores or {}
+    if key and s.accountStores[key]then return s.accountStores[key]end
+    local store={accountId=key,file=FILE}
+    local profile
+    local http
+    pcall(function()http=game:GetService('HttpService')end)
+    local function resolve()
+        if not key then
+            local current=(api.Players or game:GetService('Players')).LocalPlayer
+            local id=current and tonumber(current.UserId)
+            if id and id==id and id>0 and id<math.huge then
+                key=tostring(id);store.accountId=key;profile=nil
+                if not s.accountStores[key]then s.accountStores[key]=store end
             end
         end
+        return key and s.accountStores[key]
     end
-    ledger = type(ledger) == 'table' and ledger or {}
-    ledger.records = type(ledger.records) == 'table' and ledger.records or {}
-    s.reportLedger = ledger
-    local function persist()
-        pcall(function() api.TeleportService:SetTeleportSetting(SETTING, ledger) end)
-        local writer = env.writefile or writefile
-        if http and type(writer) == 'function' then
-            pcall(function() writer(FILE, http:JSONEncode(ledger)) end)
+    local function readDocument()
+        local reader=env.readfile or readfile
+        if type(reader)~='function' or not http then return {schema=1,accounts={}},false end
+        local found,body=pcall(reader,FILE)
+        if not found then return {schema=1,accounts={}},true end
+        local decoded,data=pcall(http.JSONDecode,http,body)
+        if not decoded or type(data)~='table' or data.schema~=1 or type(data.accounts)~='table'then
+            return {schema=1,accounts={}},false -- Preserve corrupt/unsupported files instead of erasing other accounts.
         end
+        return data,true
     end
+    local function load()
+        if profile then return profile end
+        profile={}
+        if not key then return profile end
+        local ok,value=pcall(function()return api.TeleportService:GetTeleportSetting('DTEC JoeJoe Automation:'..key)end)
+        if ok and type(value)=='table' and value.accountId==key and type(value.profile)=='table'then profile=value.profile
+        else
+            local document=readDocument()
+            if type(document.accounts[key])=='table'then profile=document.accounts[key]end
+        end
+        return profile
+    end
+    function store:get(section)
+        local canonical=resolve()
+        if canonical and canonical~=store then return canonical:get(section)end
+        return load()[section]
+    end
+    function store:set(section,value)
+        local canonical=resolve()
+        if canonical and canonical~=store then return canonical:set(section,value)end
+        if not key then return false end
+        local data=load()
+        if type(value)~='table' and data[section]==value then return true end
+        data[section]=value
+        pcall(function()api.TeleportService:SetTeleportSetting('DTEC JoeJoe Automation:'..key,
+            {accountId=key,profile=data})end)
+        local writer=env.writefile or writefile
+        local document,writable=readDocument()
+        if type(writer)~='function' or not http or not writable then
+            if not s.accountSaveNotice then
+                s.accountSaveNotice=true
+                warn('[DTEC JoeJoe Automation] File save unavailable or invalid; using account-tagged session/teleport settings.')
+            end
+            return false
+        end
+        document.accounts[key]=data -- Re-read each write to preserve other accounts and other save sections.
+        local encoded,body=pcall(http.JSONEncode,http,document)
+        if not encoded then return false end
+        local saved=pcall(writer,FILE,body)
+        if saved then s.accountSaveNotice=nil end
+        return saved
+    end
+    if key then s.accountStores[key]=store end
+    return store
+end
+
+end)()
+    local saveStore=buildStore(api)
+    local function notice(message)
+        if s.reportNotice~=message then s.reportNotice=message;warn('[DTEC JoeJoe Automation Results] '..message)end
+    end
+    local function clock()return os.time()end
+    local ok,http=pcall(function()return game:GetService('HttpService')end)
+    if not ok then http=nil end
+    local ledger=saveStore:get('reports')
+    local migrate=saveStore.accountId and s.reportLedger and s.reportAccountId==nil
+    if s.reportLedger and (s.reportAccountId==nil or s.reportAccountId==saveStore.accountId)then ledger=s.reportLedger end
+    if s.reportAccountId and s.reportAccountId~=saveStore.accountId then s.reportRun=nil;s.reportFlight=nil end
+    ledger=type(ledger)=='table' and ledger or {}
+    ledger.records=type(ledger.records)=='table' and ledger.records or {}
+    s.reportLedger,s.reportAccountId=ledger,saveStore.accountId
+    if migrate then saveStore:set('reports',ledger)end
+    local ledgerAccount=saveStore.accountId
+    local function readyLedger()
+        local saved=saveStore:get('reports')
+        local account=saveStore.accountId
+        if not account then return false end
+        if ledgerAccount~=account then
+            ledger=type(saved)=='table' and saved or {}
+            ledger.records=type(ledger.records)=='table' and ledger.records or {}
+            ledgerAccount=account;s.reportLedger,s.reportAccountId=ledger,account
+        end
+        return true
+    end
+    local function persist()return saveStore:set('reports',ledger)end
     local function clean(text, limit)
         text = tostring(text):gsub('[%c]', ' '):gsub('[@`*_~|<>]', '')
         return text:sub(1, limit or 100)
@@ -219,6 +392,7 @@ return function(source)
         return counts
     end
     function R.observe(player, isPlanet, live)
+        if not readyLedger()then return end
         if not isPlanet then return end
         local run = s.reportRun
         if not run then
@@ -274,7 +448,7 @@ return function(source)
             and string.format('%.1f', run.cores * 60 / math.max(1, now() - run.started)) or 'Unavailable', inline = true}
         fields[#fields + 1] = {name = 'Account', value = tostring(run.account or 'Unavailable'):gsub('[^%w_]', ''):sub(1,256), inline = true}
         return {id = run.id, status = 'queued', attempts = 0, created = clock(), body = {
-            username = 'Earth Autofarm',
+            username = 'DTEC JoeJoe Automation',
             embeds = {{title = 'Earth run - ' .. outcome, color = outcome == 'LOSS' and 15158332
                 or (outcome == 'EXTRACTED' and 3066993 or 15844367), description = clean(reason, 250), fields = fields,
                 footer = {text = 'Item observations are not proof of loot saved. Run ' .. clean(run.id, 100)}}}
@@ -288,6 +462,7 @@ return function(source)
         persist()
     end
     function R.finish(outcome, reason)
+        if not readyLedger()then return end
         local record = payload(outcome, reason)
         if not record then return end
         s.reportRun.ended = true
@@ -296,19 +471,23 @@ return function(source)
         R.pump()
     end
     function R.departing(outcome, reason)
+        if not readyLedger()then return end
         local record = payload(outcome, reason)
         if record then ledger.departure = record; persist() end
     end
     function R.failedTeleport()
+        if not readyLedger()then return end
         if ledger.departure and ledger.departure.id == s.job then ledger.departure = nil; persist() end
     end
     function R.arrived(isLobby)
+        if not readyLedger()then return end
         local staged = ledger.departure
         if isLobby and staged and staged.id ~= s.job then
             ledger.departure = nil; enqueue(staged)
         end
     end
     function R.pump()
+        if not readyLedger()then return end
         local waiting = false
         for _, record in ipairs(ledger.records) do if record.status == 'queued' then waiting = true; break end end
         if not waiting then return end
@@ -422,7 +601,7 @@ end
             return
         end
         local resume = "task.wait(7)\nlocal source=" .. string.format("%q", source)
-            .. "\nlocal loader=loadstring or load; local chunk,why=loader(source,'@ChestFarmAutoLoop'); assert(chunk,why); chunk()(source)"
+            .. "\nlocal loader=loadstring or load; local chunk,why=loader(source,'@DTEC JoeJoe Automation'); assert(chunk,why); chunk()(source)"
         local ok, why = pcall(queue, resume)
         if ok then s.queueArmed = true
         elseif not s.queueNotice then s.queueNotice = true; warn("[ChestFarm Auto] Could not queue teleport resume: " .. tostring(why)) end
@@ -1363,6 +1542,97 @@ return function(api,Q)
         end
         return false
     end
+    local function count(ctx,id)
+        local total=0
+        for _,container in ipairs({ctx.character,api.Players.LocalPlayer:FindFirstChild('Backpack')})do
+            if container then for _,item in ipairs(container:GetChildren())do
+                if item:GetAttribute('ArmorName')==id then total=total+1
+                elseif api.id(item)==id then total=total+(tonumber(api.stackCount(item)) or 1)end
+            end end
+        end
+        return total
+    end
+    function L.recover(ctx,plan)
+        ctx.questRecovering=nil
+        if not Q.enabled(ctx) or api.extractionReady() or lobby() or Q.manual()
+            or api.Players.LocalPlayer:GetAttribute('InitialInventoryLoaded')~=true
+            or s.questDelivery or s.bringDelivery or s.lootRequest then return false end
+        local c=api.controller('CrateController')
+        if c and c.ClaimPending then return false end
+        local records=s.questDeathClaims or setmetatable({}, {__mode='k'});s.questDeathClaims=records
+        local job=s.questDeathClaim
+        if job and job.issued and not job.done then
+            local gained=0
+            for id,before in pairs(job.before)do gained=gained+math.max(0,count(ctx,id)-before)end
+            if gained>0 then
+                s.stats.smartPickups=(s.stats.smartPickups or 0)+gained
+                s.questStatus='Death gear recovery confirmed: '..gained..' inventory / worn-gear additions'
+                job.done=true;s.questDeathLocation=nil
+            end
+        end
+        if job and (not job.chest.Parent or job.done or now()-job.started>=15)then
+            if not job.done then s.questStatus='Death gear recovery unconfirmed; continuing without duplicate claims'end
+            records[job.chest]=job.issued and true or now()+10;s.questDeathClaim=nil;job=nil
+        end
+        if not job then
+            if now()<(s.questDeathProbeAt or 0)then return false end
+            s.questDeathProbeAt=now()+.5
+            local candidates={}
+            for _,chest in ipairs(api.tagged('SupplyCrate'))do
+                local expires=tonumber(chest:GetAttribute('DeathChestDespawnExpiresAt'))
+                if chest.Parent and chest:IsDescendantOf(workspace) and chest:GetAttribute('DeathChest')==true
+                    and chest:GetAttribute('Owner')==api.Players.LocalPlayer.UserId
+                    and (not records[chest] or type(records[chest])=='number' and now()>=records[chest])
+                    and api.position(chest) and (not expires or expires>workspace:GetServerTimeNow())then
+                    candidates[#candidates+1]=chest
+                end
+            end
+            local chest=Q.nearest(candidates,ctx.root.Position)
+            if not chest then return false end
+            if not Q.holdRoute(ctx)then return true end
+            Q.stopDrive(ctx);api.hover(ctx);api.watch(ctx)
+            local point=api.position(chest)
+            if (point-ctx.root.Position).Magnitude>6 then
+                ctx.root.CFrame=CFrame.new(point+Vector3.new(0,2,3));s.questDeathProbeAt=0
+                ctx.questRecovering=true;return true
+            end
+            job={chest=chest,started=now()};s.questDeathClaim=job
+            if not Q.call('deathContents','DeathChestService','GetContents',{chest},function(ok,data)
+                if ok and type(data)=='table'then job.contents=data;job.before={}
+                    for _,id in ipairs(data)do if type(id)=='string'then job.before[id]=count(ctx,id)end end
+                else job.done=true end
+            end,function()return Q.enabled(ctx) and not api.extractionReady() and chest.Parent~=nil
+                and chest:GetAttribute('Owner')==api.Players.LocalPlayer.UserId
+                and (api.position(chest)-ctx.root.Position).Magnitude<=10 end)then s.questDeathClaim=nil end
+            return false
+        end
+        if not job.contents then return false end
+        if not next(job.contents)then job.done=true;return false end
+        if job.issued then
+            if job.failed or now()-job.issuedAt>=8 then
+                job.done=true;s.questStatus='Death gear claim not confirmed; no repeated TakeAllItems';return false
+            end
+            ctx.questRecovering=true;Q.stopDrive(ctx);return true
+        end
+        local chest=job.chest;local point=api.position(chest)
+        if not point or chest:GetAttribute('Owner')~=api.Players.LocalPlayer.UserId then job.done=true;return false end
+        if not Q.holdRoute(ctx)then return true end
+        Q.stopDrive(ctx);api.hover(ctx);api.watch(ctx)
+        if (point-ctx.root.Position).Magnitude>6 then ctx.root.CFrame=CFrame.new(point+Vector3.new(0,2,3));return true end
+        if c and c.DeathChest and c.DeathChest~=chest then return false end
+        -- A respawn can replace the character while the read was pending.
+        -- Capture the current life immediately before claiming, not the old one.
+        job.before={}
+        for _,id in ipairs(job.contents)do if type(id)=='string'then job.before[id]=count(ctx,id)end end
+        if Q.call('deathClaim','DeathChestService','TakeAllItems',{chest},function(ok)job.failed=not ok end,
+            function()return Q.enabled(ctx) and not api.extractionReady() and not Q.manual() and chest.Parent~=nil
+                and chest:GetAttribute('Owner')==api.Players.LocalPlayer.UserId
+                and (api.position(chest)-ctx.root.Position).Magnitude<=10 and not (c and c.ClaimPending)end)then
+            job.issued,job.issuedAt=true,now();records[chest]=true;ctx.questRecovering=true
+            s.questStatus='Recovering own dropped gear through native death-chest TakeAllItems';return true
+        end
+        return false
+    end
     return L
 end
 
@@ -1446,19 +1716,42 @@ return function(api,Q)
     local calls=s.questCalls
     local weights={DrillPower=120,RPMOverclock=140,UltraDrill=130,MegaDrill=110,PowerSlam=100,
         DriveSpeed=140,PowerDrive=100,EngineOverdrive=90,FuelStorage=45,MoneyDrill=60,
-        TeamMeleeDamage=100,TeamPickaxeDamage=60,TeamHealth=35,SackStorage=20}
-    local blocked={HealthRegen=true,TeamGunDamage=true,TeamExplosiveDamage=true,LifeSteal=true,
-        CartExtension=true,MountedGunner=true}
+        TeamMeleeDamage=100,TeamPickaxeDamage=100,TeamGunDamage=100,TeamExplosiveDamage=100,TeamHealth=70,SackStorage=20,PowerBurst=120}
+    local blocked={CartExtension=true,MountedGunner=true}
+    local lastResort={LifeSteal=true,HealthRegen=true}
+    local damage={TeamMeleeDamage=true,TeamPickaxeDamage=true,TeamGunDamage=true,TeamExplosiveDamage=true}
     local ores={Ore_Iron=true,Ore_Gold=true,Ore_Diamond=true,Ore_Emerald=true,Ore_Ruby=true}
     local ledger=s.questUpgradeLedger or {};s.questUpgradeLedger=ledger
     local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
     local function status(text)s.questStatus=text end
+    function D.capAllowed(ctx,offer,c)
+        local name=offer.UpgradeName
+        if not damage[name]then return true end
+        local count=math.max(tonumber(ctx.drill:GetAttribute(name)) or 0,tonumber(c and c.Owned and c.Owned[name]) or 0)
+        local info=c and c.DisplayInfo and c.DisplayInfo[name]
+        local increment=tonumber(info and info.Increment) or 20 -- native damage cards: +20% per tier
+        local amount=tonumber(offer.UpgradeAmount) or 1
+        return finite(count) and finite(increment) and increment>0 and finite(amount) and amount>0
+            and count*increment<500
+    end
     function D.score(ctx,plan,offer)
         if type(offer)~='table' or not weights[offer.UpgradeName] or blocked[offer.UpgradeName] then return end
         local name=offer.UpgradeName;local weight=weights[name]
-        if plan.kind~='depth' and name~='TeamMeleeDamage' and name~='TeamHealth' and name~='SackStorage'
-            and not ((plan.kind=='mining' or ctx.questMining) and name=='TeamPickaxeDamage') then return end
-        if name=='TeamMeleeDamage' and plan.weaponClass~='Sword' and plan.weapon~='Sword_Pirate' then return end
+        if not D.capAllowed(ctx,offer,api.controller('DrillUpgradeController'))then return end
+        local needed=plan.kind=='depth' and cfg.driveDepth and name~='TeamMeleeDamage' and name~='TeamPickaxeDamage'
+            and name~='TeamHealth' and name~='SackStorage' and name~='TeamGunDamage' and name~='TeamExplosiveDamage'
+        for _,goal in ipairs(plan.unmet or {})do
+            local key=goal.key or ''
+            if name=='TeamMeleeDamage' and (key=='CutlassKills' or key:find('Melee',1,true) or key=='VampireKills'
+                or key=='EnemyKills' or key=='CrazyMinerKills' or key=='BanditMinerKills' or key=='DarknessEnemyKills')then needed=true end
+            if name=='TeamPickaxeDamage' and key:find('Mine',1,true)==1 then needed=true end
+            if name=='TeamGunDamage' and (key=='FlintlockKills' or key=='HeadShot' or key:find('Gun',1,true)
+                or key=='RifleKills' or key=='ShotgunKills')then needed=true end
+            if name=='TeamExplosiveDamage' and key:find('Explosive',1,true)then needed=true end
+        end
+        if name=='TeamGunDamage' or name=='TeamExplosiveDamage' then if not needed then return end end
+        local general=name=='TeamMeleeDamage' or name=='TeamPickaxeDamage' or name=='TeamHealth' or name=='SackStorage'
+        if not needed and not general then return end
         local hp=ctx.humanoid.MaxHealth>0 and ctx.humanoid.Health/ctx.humanoid.MaxHealth or 1
         if name=='TeamHealth' then weight=weight*(hp<.7 and 3 or hp<.9 and 1.75 or 1)end
         if name=='TeamPickaxeDamage' and ctx.questMining then weight=weight*2 end
@@ -1467,15 +1760,14 @@ return function(api,Q)
             weight=weight*(capacity and fill and fill>=capacity*.75 and 3 or .5)
         end
         local level=tonumber(ctx.drill:GetAttribute(name)) or 0
-        if plan.kind=='depth' then
-            local stalled=now()-(ctx.questProgressAt or now())>=10
-            if stalled and (name=='DrillPower' or name=='RPMOverclock' or name=='UltraDrill' or name=='MegaDrill' or name=='PowerSlam') then weight=weight*2 end
-            if stalled and (name=='DriveSpeed' or name=='PowerDrive')then weight=weight*.5 end
+        if plan.kind=='depth' and now()-(ctx.questProgressAt or now())>=10 then
+            if name=='DrillPower' or name=='RPMOverclock' or name=='UltraDrill' or name=='MegaDrill' or name=='PowerSlam'then weight=weight*2 end
+            if name=='DriveSpeed' or name=='PowerDrive'then weight=weight*.5 end
         end
         local amount=tonumber(offer.UpgradeAmount) or 1
         if not finite(amount) or amount<=0 then return end
         local cost=tonumber(offer.Cost) or 0
-        return weight*amount/(1+math.max(0,level)/8)/math.max(1,cost)^.35
+        return (needed and 2000000 or 1000000)+weight*amount/(1+math.max(0,level)/8)/math.max(1,cost)^.35
     end
     function D.choose(ctx,plan,c,wallet)
         local reward=c.ActiveClassReward
@@ -1484,7 +1776,7 @@ return function(api,Q)
         if type(options)~='table' or not finite(version) or version<=0 then return end
         local key=tostring(game.JobId or '')..':'..(reward and 'reward:' or 'coins:')..version
         if ledger[key]then return end
-        local best,score,fallback,fallbackCost,hasUseful
+        local best,score,fallback,fallbackCost,desperate,desperateCost,hasUseful
         for _,offer in ipairs(options)do
             local free=reward and offer.Type=='ClassReward'
             local cost=tonumber(offer.Cost)
@@ -1496,11 +1788,15 @@ return function(api,Q)
                 local value=D.score(ctx,plan,offer)
                 if value and (not score or value>score)then best,score=offer,value end
                 local name=offer.UpgradeName
-                local known=type(name)=='string' and (weights[name] or type(c.DisplayInfo)=='table' and c.DisplayInfo[name])
-                if known and not blocked[name] and (not fallbackCost or (cost or 0)<fallbackCost)then fallback,fallbackCost=offer,cost or 0 end
+                local known=type(name)=='string' and (weights[name] or lastResort[name] or type(c.DisplayInfo)=='table' and c.DisplayInfo[name])
+                if known and not blocked[name] and D.capAllowed(ctx,offer,c)then
+                    if lastResort[name]then
+                        if not desperateCost or (cost or 0)<desperateCost then desperate,desperateCost=offer,cost or 0 end
+                    elseif (name~='TeamGunDamage' and name~='TeamExplosiveDamage' or value) and (not fallbackCost or (cost or 0)<fallbackCost)then fallback,fallbackCost=offer,cost or 0 end
+                end
             end
         end
-        return best or not hasUseful and fallback or nil,key,version,reward~=nil
+        return best or not hasUseful and (fallback or desperate) or nil,key,version,reward~=nil
     end
     function D.fundingTarget(ctx,plan)
         local c=api.controller('DrillUpgradeController');local target,score
@@ -1574,7 +1870,7 @@ return function(api,Q)
     function D.nodeAllowed(node,coal)
         local model=node and node:GetAttribute('Ore_Model')
         local hp=health(node)
-        return node and node.Parent and node:IsDescendantOf(workspace) and api.tag(node,'Ore') and D.mineshaft(node) and type(model)=='string'
+        return node and node.Parent and node:IsDescendantOf(workspace) and api.tag(node,'Ore') and type(model)=='string'
             and hp and hp>0 and api.part(node) and (not coal or model:lower():find('coal',1,true)~=nil)
     end
     function D.goalEligible(node,plan)
@@ -1602,6 +1898,11 @@ return function(api,Q)
         local root=c and c._BoundDungeon
         return root and root.Parent and root:IsDescendantOf(workspace)
             and api.Players.LocalPlayer:GetAttribute('InDungeon')==true and D.mineshaft(root) or nil
+    end
+    function D.accessible(node)
+        local mine=D.mineshaft(node)
+        if api.Players.LocalPlayer:GetAttribute('InDungeon')==true then return mine~=nil and mine==D.activeMine() end
+        return mine==nil
     end
     local function readyPrompt(prompt)
         local player=api.Players.LocalPlayer
@@ -1703,6 +2004,69 @@ return function(api,Q)
             s.questUpgradeJob=nil
         end
     end
+    function D.threat(ctx,plan)
+        if not cfg.classQuest or api.extractionReady() or Q.manual()
+            or s.lootRequest or ctx.questStartup or ctx.questRecovering then return false end
+        local best,score
+        local list,seen={},{}
+        for _,group in ipairs({api.enemies(),api.tagged('Watcher')})do
+            for _,npc in ipairs(group)do if not seen[npc]then seen[npc]=true;list[#list+1]=npc end end
+        end
+        for _,npc in ipairs(list)do
+            local real=tostring(npc:GetAttribute('RealName') or npc.Name):lower()
+            local watcher=api.tag(npc,'Watcher') or real:find('watcher',1,true)
+            local blinker=real:find('blinker',1,true)
+            local h=npc:FindFirstChildOfClass('Humanoid') or npc:FindFirstChild('Health')
+            local hp=h and tonumber(h.Health or h.Value)
+            local p=api.part(npc)
+            if (watcher or blinker) and p and npc:IsDescendantOf(workspace) and hp and hp>0
+                and npc:GetAttribute('Category')~='Corpse' and npc:GetAttribute('NpcFaction')~='FriendlyCompanion' then
+                local distance=(p.Position-ctx.root.Position).Magnitude
+                if distance<=400 then
+                    local value=(watcher and 0 or 1000)+distance
+                    if not score or value<score then best,score=npc,value end
+                end
+            end
+        end
+        if not best then
+            if ctx.questThreat then ctx.questThreat=nil;ctx.combatTarget=nil;ctx.questCombat=nil;ctx.questOwns=nil end
+            return false
+        end
+        Q.abortResources(ctx)
+        if not Q.holdRoute(ctx)then return true end
+        Q.stopDrive(ctx);ctx.questMining=nil;ctx.questThreat=best
+        ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass=true,plan.weapon,plan.weaponClass or 'Sword'
+        local tool=Q.preferred(ctx)
+        ctx.combatTarget=best
+        if not tool then status('Urgent threat: waiting for the permitted quest weapon');api.watch(ctx);return true end
+        local p=api.part(best);api.hover(ctx)
+        if not ctx.defenseMoving and now()>=(ctx.dodgeUntil or 0) and (p.Position-ctx.root.Position).Magnitude>8 then
+            ctx.root.CFrame=CFrame.new(p.Position+Vector3.new(0,2,6))
+        end
+        api.watch(ctx)
+        status('Urgent threat: '..tostring(best:GetAttribute('RealName') or best.Name)..'; mining paused')
+        return true
+    end
+    function D.boost(ctx)
+        local drill=ctx.drill;local user=api.Players.LocalPlayer.UserId
+        if not cfg.classQuest or not cfg.driveDepth or not ctx.questDriving or api.extractionReady()
+            or drill:GetAttribute('DriverUserId')~=user or (tonumber(drill:GetAttribute('PowerBurst')) or 0)<=0
+            or now()<(s.questBoostAt or 0) or calls.boost then return false end
+        local seat=drill:FindFirstChild('LocalDriverSeat') or drill:FindFirstChild('VehicleSeat')
+        if not seat or seat.Occupant~=ctx.humanoid and ctx.humanoid.SeatPart~=seat then return false end
+        local serverNow=workspace:GetServerTimeNow();local last=tonumber(drill:GetAttribute('LastBoost'))
+        if last and serverNow-last<60 then return false end
+        if Q.call('boost','DrillService','ActivateBoost',{},function(ok,accepted,cooldown)
+            if ok and accepted==false and finite(tonumber(cooldown))then
+                s.questBoostAt=math.max(s.questBoostAt or 0,now()+math.max(1,tonumber(cooldown)))
+            end
+        end,function()return Q.enabled(ctx) and ctx.questDriving and not api.extractionReady()
+            and drill:GetAttribute('DriverUserId')==user end)then
+            s.questBoostAt=now()+60;status('Requested native drill Power Burst; observing its 60-second cooldown')
+            return true
+        end
+        return false
+    end
     function D.leaveMine(ctx,plan)
         local mine=D.activeMine()
         if not mine then ctx.questFundingMine=nil;return false end
@@ -1750,7 +2114,7 @@ return function(api,Q)
         local needCoins=not goal and finite(s.questWallet) and s.questWallet<D.fundingTarget(ctx,plan)
         local mine=ctx.questMineJob
         if mine then
-            if not D.nodeAllowed(mine.node,mine.coal) or goal and (not D.goalEligible(mine.node,plan) or D.mineshaft(mine.node)~=D.activeMine())
+            if not D.nodeAllowed(mine.node,mine.coal) or not D.accessible(mine.node) or goal and not D.goalEligible(mine.node,plan)
                 or not goal and not needFuel and not needCoins
                 or now()-mine.started>=(goal and 120 or 20) or now()-mine.progressAt>=8 then
                 ctx.questMineRetry=ctx.questMineRetry or setmetatable({}, {__mode='k'});ctx.questMineRetry[mine.node]=now()+60
@@ -1768,13 +2132,12 @@ return function(api,Q)
             api.watch(ctx)
             if not api.watcherReady(ctx)then status('Mining pauses for Watcher camera attention');return true end
             api.mine(ctx,active);status(goal and 'Mining class objectives with '..api.id(pickaxe)..'; awaiting server counters'
-                or mine.coal and 'Mining mineshaft coal for fuel' or 'Mining mineshaft ore for upgrade coins');return true
+                or mine.coal and 'Mining loaded coal for fuel' or 'Mining loaded ore for upgrade coins');return true
         end
         if goal and not (api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe'))then
             s.questMiningProblem='Mining quest requires an owned pickaxe';return false
         end
         s.questMiningProblem=nil
-        if goal and not D.activeMine()then return D.entry(ctx)end
         if not goal and not needFuel and not needCoins then
             ctx.questMining=nil
             if ctx.questFundingMine then return D.leaveMine(ctx,plan)end
@@ -1808,16 +2171,11 @@ return function(api,Q)
                 end
             end
         end
-        if needCoins and not depth and not D.activeMine()then
-            if #Q.sellers(ctx)>0 then ctx.questFundingMine=true;return D.entry(ctx)end
-            return false
-        end
         local pickaxe=api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe')
         if not pickaxe then return false end
         local nodes={}
         for _,node in ipairs(api.tagged('Ore'))do
-            if D.nodeAllowed(node,needFuel) and (not goal or D.goalEligible(node,plan) and D.mineshaft(node)==D.activeMine())
-                and (depth or D.mineshaft(node)==D.activeMine())
+            if D.nodeAllowed(node,needFuel) and D.accessible(node) and (not goal or D.goalEligible(node,plan))
                 and (goal or needFuel or D.moneyNode(node))
                 and now()>=((ctx.questMineRetry or {})[node] or 0)then nodes[#nodes+1]=node end
         end
@@ -1829,11 +2187,14 @@ return function(api,Q)
         end
         if node and Q.holdRoute(ctx)then
             Q.stopDrive(ctx);ctx.questMining=true
-            if not goal and not depth then ctx.questFundingMine=true end
+            if not goal and not depth and D.activeMine()then ctx.questFundingMine=true end
             ctx.questMineJob={node=node,coal=needFuel,started=now(),progressAt=now(),health=health(node)}
             return true
         end
-        if goal or ctx.questFundingMine then return D.leaveMine(ctx,plan)end
+        if goal or ctx.questFundingMine then
+            if D.activeMine()then return D.leaveMine(ctx,plan)end
+            if goal or needCoins and #Q.sellers(ctx)>0 then ctx.questFundingMine=not goal;return D.entry(ctx)end
+        end
         return false
     end
     return D
@@ -2044,7 +2405,14 @@ end)()
             if not calls.cash then s.questCashJob=nil end
         end
         ctx.questOwns,ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass,ctx.questAimHead=nil,nil,nil,nil,nil
-        ctx.questStartup=nil
+        ctx.questStartup=nil;ctx.questRecovering=nil;ctx.questThreat=nil
+    end
+    function Q.abortResources(ctx)
+        if s.questDelivery and s.questDelivery.ctx==ctx then release(s.questDelivery)end
+        if s.questCashJob and s.questCashJob.ctx==ctx then
+            s.questCashJob.cancelled=true
+            if not calls.cash then s.questCashJob=nil end
+        end
     end
     local function free(item,allowFuelOre)
         if not api.free(item) or not api.part(item) or item:GetAttribute('Welded') or api.tag(item,'Welded')
@@ -2351,6 +2719,7 @@ end)()
                 then ctx.questThrottleAt=now()+.25 end
         end
         setStatus('Driving drill; waiting for credited TotalDepth progress')
+        Q.drillSupport.boost(ctx)
         return true
     end
     function Q.darknessActive()
@@ -2504,6 +2873,10 @@ end)()
             return plan.weapon,plan.weaponClass,true
         end
         if plan.kind=='waiting'then return nil,nil,true end
+        if ctx.questThreat then
+            if api.findOwned(ctx,'Sword_Void')then return 'Sword_Void','Sword',true end
+            return nil,'Sword',true
+        end
         if plan.kind=='mining' then
             if ctx.questMining then
                 if api.findOwned(ctx,'Pickaxe_Void')then return 'Pickaxe_Void','Pickaxe',true end
@@ -2559,6 +2932,8 @@ end)()
         s.questPlan=plan
         if api.extractionReady() then Q.cleanup(ctx); return false end
         if Q.healing.step(ctx,plan)then return true end
+        if Q.loadout.recover(ctx,plan)then return true end
+        if Q.drillSupport.threat(ctx,plan)then return true end
         if Q.loadout.step(ctx,plan)then return true end
         if Q.cashStep(ctx) then return true end
         local outstanding=s.questDelivery
@@ -2573,7 +2948,7 @@ end)()
         if Q.drillSupport.step(ctx,plan)then return true end
         if plan.kind=='mining' then
             ctx.questOwns=nil;s.questIdle=true
-            setStatus((s.questMiningProblem or 'Mining quest: no eligible loaded mineshaft veins / ready entrance')..'; chest discovery continues')
+            setStatus((s.questMiningProblem or 'Mining quest: no eligible loaded veins / ready mineshaft entrance')..'; chest discovery continues')
             return false
         end
         if now()<(ctx.questTickAt or 0) then return ctx.questOwns end
@@ -2850,7 +3225,7 @@ end)()
         return Q.loadout.lobby()
     end
     function Q.pauseCombat(ctx)
-        return s.questChurchExit ~= nil or cfg.classQuest and (ctx.questMining or ctx.questHealing or ctx.questStartup
+        return s.questChurchExit ~= nil or cfg.classQuest and (ctx.questMining or ctx.questHealing or ctx.questStartup or ctx.questRecovering
             or ctx.humanoid.MaxHealth>0 and ctx.humanoid.Health/ctx.humanoid.MaxHealth<=.3)
     end
     return Q
@@ -3207,8 +3582,92 @@ end)()
     F.syncRoute, F.initializeRoute, F.travelRoute = movement.syncRoute, movement.initializeRoute, movement.travelRoute
     F.hover = movement.hover
     local DEFAULTS = { lootExtract = false, minutes = 10, classQuest = false, driveDepth = true, questQueue = '' }
-    local SETTINGS = 'EarthAutofarm_Settings_v7'
-    local FILE = 'EarthAutofarmSettings.json'
+    local buildStore = (function()
+-- One executor file, separate profiles by immutable Roblox UserId.
+-- Native teleport settings are account-tagged backups, never a global profile.
+return function(api)
+    local s,env=api.state,api.env or _G
+    local FILE='DTEC JoeJoe Automation'
+    local player=(api.Players or game:GetService('Players')).LocalPlayer
+    local user=player and tonumber(player.UserId)
+    local key=user and user==user and user>0 and user<math.huge and tostring(user) or nil
+    s.accountStores=s.accountStores or {}
+    if key and s.accountStores[key]then return s.accountStores[key]end
+    local store={accountId=key,file=FILE}
+    local profile
+    local http
+    pcall(function()http=game:GetService('HttpService')end)
+    local function resolve()
+        if not key then
+            local current=(api.Players or game:GetService('Players')).LocalPlayer
+            local id=current and tonumber(current.UserId)
+            if id and id==id and id>0 and id<math.huge then
+                key=tostring(id);store.accountId=key;profile=nil
+                if not s.accountStores[key]then s.accountStores[key]=store end
+            end
+        end
+        return key and s.accountStores[key]
+    end
+    local function readDocument()
+        local reader=env.readfile or readfile
+        if type(reader)~='function' or not http then return {schema=1,accounts={}},false end
+        local found,body=pcall(reader,FILE)
+        if not found then return {schema=1,accounts={}},true end
+        local decoded,data=pcall(http.JSONDecode,http,body)
+        if not decoded or type(data)~='table' or data.schema~=1 or type(data.accounts)~='table'then
+            return {schema=1,accounts={}},false -- Preserve corrupt/unsupported files instead of erasing other accounts.
+        end
+        return data,true
+    end
+    local function load()
+        if profile then return profile end
+        profile={}
+        if not key then return profile end
+        local ok,value=pcall(function()return api.TeleportService:GetTeleportSetting('DTEC JoeJoe Automation:'..key)end)
+        if ok and type(value)=='table' and value.accountId==key and type(value.profile)=='table'then profile=value.profile
+        else
+            local document=readDocument()
+            if type(document.accounts[key])=='table'then profile=document.accounts[key]end
+        end
+        return profile
+    end
+    function store:get(section)
+        local canonical=resolve()
+        if canonical and canonical~=store then return canonical:get(section)end
+        return load()[section]
+    end
+    function store:set(section,value)
+        local canonical=resolve()
+        if canonical and canonical~=store then return canonical:set(section,value)end
+        if not key then return false end
+        local data=load()
+        if type(value)~='table' and data[section]==value then return true end
+        data[section]=value
+        pcall(function()api.TeleportService:SetTeleportSetting('DTEC JoeJoe Automation:'..key,
+            {accountId=key,profile=data})end)
+        local writer=env.writefile or writefile
+        local document,writable=readDocument()
+        if type(writer)~='function' or not http or not writable then
+            if not s.accountSaveNotice then
+                s.accountSaveNotice=true
+                warn('[DTEC JoeJoe Automation] File save unavailable or invalid; using account-tagged session/teleport settings.')
+            end
+            return false
+        end
+        document.accounts[key]=data -- Re-read each write to preserve other accounts and other save sections.
+        local encoded,body=pcall(http.JSONEncode,http,document)
+        if not encoded then return false end
+        local saved=pcall(writer,FILE,body)
+        if saved then s.accountSaveNotice=nil end
+        return saved
+    end
+    if key then s.accountStores[key]=store end
+    return store
+end
+
+end)()
+    local saveStore=buildStore(api)
+    local accountId=saveStore.accountId
     local function clamp(value, low, high, fallback)
         value = tonumber(value)
         if not value or value ~= value or math.abs(value) == math.huge then return fallback end
@@ -3227,33 +3686,19 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 18 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 20 }
     end
-    local loaded = s.config
-    if not loaded then
-        local ok, value = pcall(function() return api.TeleportService:GetTeleportSetting(SETTINGS) end)
-        if ok and type(value) == 'table' then loaded = value end
-        local reader = api.env.readfile or readfile
-        local http = getService('HttpService')
-        if not loaded and type(reader) == 'function' and http then
-            local read, text = pcall(reader, FILE)
-            if read then local decoded, data = pcall(function() return http:JSONDecode(text) end); if decoded then loaded = data end end
-        end
-    end
-    s.config = validate(loaded)
-    local cfg = s.config
-    local function persist()
-        pcall(function() api.TeleportService:SetTeleportSetting(SETTINGS, cfg) end)
-        local writer = api.env.writefile or writefile
-        local http = getService('HttpService')
-        if type(writer) == 'function' and http then
-            pcall(function() writer(FILE, http:JSONEncode(cfg)) end)
-        end
-    end
+    local loaded=saveStore:get('settings')
+    -- Only the currently running legacy client can migrate its untagged config.
+    -- Never import a shared legacy disk/teleport profile into an unknown account.
+    if s.config and (s.configAccountId==accountId or s.configAccountId==nil)then loaded=s.config end
+    s.config=validate(loaded);s.configAccountId=accountId
+    local cfg=s.config
+    local function persist()return saveStore:set('settings',cfg)end
     local function status(text)
         if s.featureStatus ~= text then
             s.featureStatus, s.featureStatusAt = text, now()
-            print('[Earth Autofarm] ' .. text)
+            print('[DTEC JoeJoe Automation] ' .. text)
         end
     end
     function F.change(key, value)
@@ -3353,9 +3798,9 @@ return function(api)
     end
     parent = parent or api.player:FindFirstChild('PlayerGui')
     if not parent then error('Waiting for PlayerGui') end
-    local existing = parent:FindFirstChild('EarthAutofarmPanel')
+    local existing = parent:FindFirstChild('DTECJoeJoeAutomationPanel')
     if existing then existing:Destroy() end
-    ui.screen = make('ScreenGui', parent, { Name = 'EarthAutofarmPanel', ResetOnSpawn = false,
+    ui.screen = make('ScreenGui', parent, { Name = 'DTECJoeJoeAutomationPanel', ResetOnSpawn = false,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 1500, IgnoreGuiInset = false })
     local panel = make('Frame', ui.screen, { Name = 'Panel', AnchorPoint = Vector2.new(1, 0),
         Position = UDim2.new(1, -20, 0, 30), Size = UDim2.new(0, 410, 0, 630),
@@ -3366,8 +3811,8 @@ return function(api)
     local header = make('Frame', panel, { Size = UDim2.new(1, 0, 0, 64), BackgroundTransparency = 1, Active = true })
     local mark = label(header, 'E', 18, 16, 32, 32, 22, color.accent, true)
     mark.TextXAlignment = Enum.TextXAlignment.Center
-    label(header, 'EARTH / AUTOFARM', 62, 13, 260, 23, 17, color.text, true)
-    label(header, 'Chest farm starts automatically.', 62, 36, 270, 16, 11, color.muted)
+    label(header, 'DTEC JoeJoe Automation', 62, 13, 260, 23, 17, color.text, true)
+    label(header, 'Account settings · Chest farm starts automatically.', 62, 36, 270, 16, 11, color.muted)
     local minimize = make('TextButton', header, { Text = '−', Font = bold, TextSize = 24,
         TextColor3 = color.muted, BackgroundTransparency = 1, Position = UDim2.new(1, -46, 0, 13),
         Size = UDim2.new(0, 32, 0, 34), AutoButtonColor = false })
@@ -4141,7 +4586,7 @@ end)()
         equip=equip,readyAction=readyAction,stackCount=stackCount,
         findOwned=function(ctx,wanted)for _,tool in ipairs(tools(ctx))do if id(tool)==wanted then return tool end end end,
         watch=function(ctx)return F.watcher(ctx)end,
-        watcherReady=function(ctx)return not ctx.watcher or workspace.CurrentCamera and workspace.CurrentCamera.CFrame==ctx.watcherFrame end,
+        watcherReady=function(ctx)return F.watcherVisible(ctx)end,
         retreat=function(ctx)return F.questRetreat(ctx)end,
         mine=function(ctx,active)
             local c=controller('ToolController')
@@ -4532,19 +4977,42 @@ end)()
         if closest and (not closest.Parent or npcHealth(closest) <= 0) then closest = nil end
         ctx.watcher = closest
         if closest and workspace.CurrentCamera then
-            local eyes = closest:FindFirstChild('Eyes', true) or part(closest)
+            local eyes = closest:FindFirstChild('Head', true) or closest:FindFirstChild('Eyes', true) or part(closest)
             if eyes then
                 local camera = workspace.CurrentCamera
                 ctx.watcherCamera = camera
                 ctx.cameraBeforeWatcher = ctx.cameraBeforeWatcher or camera.CFrame
                 camera.CFrame = CFrame.lookAt(camera.CFrame.Position, eyes.Position)
                 ctx.watcherFrame = camera.CFrame
+                if cfg.classQuest and not F.watcherVisible(ctx) and now()>=(ctx.watcherViewTryAt or 0) then
+                    -- The native controller checks real visibility. A near-character
+                    -- viewpoint can clear a third-person camera blocked by an ore.
+                    ctx.watcherViewTryAt=now()+.15
+                    local origin=ctx.root.Position+Vector3.new(0,2,0)
+                    for _,offset in ipairs({Vector3.zero,Vector3.new(3,0,0),Vector3.new(-3,0,0),Vector3.new(0,0,3),Vector3.new(0,0,-3)})do
+                        camera.CFrame = CFrame.lookAt(origin+offset,eyes.Position)
+                        ctx.watcherFrame = camera.CFrame
+                        if F.watcherVisible(ctx)then break end
+                    end
+                end
             end
         elseif ctx.cameraBeforeWatcher then
             local camera = ctx.watcherCamera
             if camera and camera.CFrame == ctx.watcherFrame then camera.CFrame = ctx.cameraBeforeWatcher end
             ctx.cameraBeforeWatcher, ctx.watcherFrame = nil, nil
         end
+    end
+    function F.watcherVisible(ctx)
+        if not ctx.watcher or not ctx.watcher.Parent or npcHealth(ctx.watcher)<=0 then return true end
+        local camera=workspace.CurrentCamera
+        if not camera or camera.CFrame~=ctx.watcherFrame then return false end
+        local native=controller('WatcherController')
+        if native and type(native.IsWatcherVisible)=='function'then
+            local ok,visible=pcall(native.IsWatcherVisible,native,ctx.watcher)
+            return ok and visible==true
+        end
+        -- Missing native controller is not proof of a clear line of sight.
+        return false
     end
     function F.questRetreat(ctx)
         if not cfg.classQuest or not ctx.questHealing or ctx.humanoid.SeatPart then return false end
@@ -4827,7 +5295,7 @@ end)()
     local function savedChurchState()
         if api.Players.LocalPlayer:GetAttribute('SavedExitTeleportLocked') ~= true then return false end
         s.forceFresh = true
-        pcall(function() api.TeleportService:SetTeleportSetting('ChestFarmAutoLoop_FreshRun', true) end)
+        saveStore:set('freshRun',true)
         status('Game saved-exit state confirmed; awaiting lobby transfer')
         return true
     end
@@ -5929,7 +6397,7 @@ end
             request("start", "TeleportManagerService", "CreatedZone", pack(zone, 1, "Earth", false, false), function(result)
                 if result[1] and result[2] then
                     s.forceFresh = false
-                    pcall(function() TeleportService:SetTeleportSetting(FRESH_SETTING, false) end)
+                    pcall(function() saveFresh(false) end)
                     s.startedZone, s.zoneStartedAt = zone, now()
                     waitTransition("start", zone)
                 else status("Solo start rejected; retrying after backoff") end
@@ -6072,6 +6540,7 @@ end
         return true
     end
     local function tick()
+        loadFresh()
         s.heartbeat = now()
         local player, model, humanoid, root = character()
         if not game:IsLoaded() or not player or not child(player, "PlayerGui") then
@@ -6168,7 +6637,7 @@ end
             stopFarm()
             if not s.forceFresh then
                 s.forceFresh = true
-                pcall(function() TeleportService:SetTeleportSetting(FRESH_SETTING, true) end)
+                pcall(function() saveFresh(true) end)
             end
             local savedUI = controller('DeathScreenController')
             if player:GetAttribute('SavedExitRetryAvailable') == true and not (savedUI and savedUI.SavedExitRetryRequest) then
@@ -6214,7 +6683,7 @@ end
             s.returnReason = s.questSwitchRun and 'Class quest queue requested the next owned class'
                 or s.seatBlockedSince and 'Seat recovery started a fresh chest run' or 'Chest route exhausted; starting a fresh run'
             s.forceFresh = true
-            local ok = pcall(function() TeleportService:SetTeleportSetting(FRESH_SETTING, true) end)
+            local ok = pcall(function() saveFresh(true) end)
             if not ok and not s.freshNotice then
                 s.freshNotice = true
                 warn("[ChestFarm Auto] Cannot persist exhausted-run intent through Roblox teleport settings; destination auto-execute may rejoin a pending session.")
@@ -6273,6 +6742,6 @@ end
 ]======]
 local loader = loadstring or load
 assert(type(loader) == "function", "ChestFarm: this executor must support loadstring")
-local entry, why = loader(SOURCE, "@ChestFarmAutoLoop")
+local entry, why = loader(SOURCE, "@DTEC JoeJoe Automation")
 assert(entry, why)
 entry()(SOURCE)
