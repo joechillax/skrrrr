@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 21: stable mining handoff/aim, low-HP kill priority and visible upgrade readiness; account profiles preserved.
+-- Revision 22: no fixed coin reserve; selective card saving, quest progress reports and native mining facing/readiness fixes.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 35 minutes or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 21
-    local BUILD = "r21-mining-handoff-and-quest-priority"
+    local REVISION = 22
+    local BUILD = "r22-card-budget-quest-reports-mining"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -391,6 +391,31 @@ end)()
         for id, count in pairs(models) do counts[id] = math.max(counts[id] or 0, count) end
         return counts
     end
+    local function observeQuest(run)
+        if not (s.config and s.config.classQuest)then return end
+        local data=s.classData
+        local name=type(data)=='table' and data.SelectedClass
+        local progress=type(name)=='string' and type(data.ClassProgress)=='table' and data.ClassProgress[name]
+        local level=type(progress)=='table' and finite(progress.Level)
+        if not level or level<1 or type(progress.Objectives)~='table'then return end
+        local quest=run.quest or {stages={},order={}};run.quest=quest
+        local key=name..':'..level
+        local stage=quest.stages[key]
+        if not stage then
+            stage={name=name,level=level,baseline={},latest={}}
+            quest.stages[key]=stage;quest.order[#quest.order+1]=key
+            for objective,count in pairs(progress.Objectives)do
+                if type(objective)=='string' and finite(count)then stage.baseline[objective]=finite(count)end
+            end
+        end
+        -- Copy values: class events can mutate the source table or replace it
+        -- when a level changes. Earlier stages must keep their own observations.
+        stage.latest={}
+        for objective,count in pairs(progress.Objectives)do
+            if type(objective)=='string' and finite(count)then stage.latest[objective]=finite(count)end
+        end
+        quest.currentName,quest.currentLevel=name,level
+    end
     function R.observe(player, isPlanet, live)
         if not readyLedger()then return end
         if not isPlanet then return end
@@ -402,6 +427,7 @@ end)()
         if run.ended then return end
         run.account = run.account or player.Name
         run.cores = finite(player:GetAttribute('CoresEarned')) or run.cores
+        observeQuest(run)
         -- Retain the last living inventory when death removes the character/tools.
         if live and s.itemDatabase then
             local counts = snapshot(player)
@@ -431,6 +457,48 @@ end)()
         end
         return text
     end
+    local function numberText(value)
+        local digits=tostring(math.floor(value))
+        while true do local nextText,count=digits:gsub('^(%d+)(%d%d%d)','%1,%2');digits=nextText;if count==0 then break end end
+        return digits
+    end
+    local objectiveNames={CutlassKills='Cutlass kills',FlintlockKills='Flintlock kills',SellGoldItems='Gold items sold',
+        MineGems='Gems mined',MineOres='Ores mined',MineCoal='Coal mined',MineDiamond='Diamonds mined',MineRuby='Rubies mined',
+        TotalDepth='Total depth',EnemyKills='Enemies defeated'}
+    local function questText(run)
+        observeQuest(run)
+        local quest=run.quest
+        if not quest then return 'Quest data not ready; progress unavailable.' end
+        local rows={clean(quest.currentName,60)..' - Lv '..numberText(quest.currentLevel)}
+        for _,key in ipairs(quest.order)do
+            local stage=quest.stages[key]
+            if #quest.order>1 then rows[#rows+1]=clean(stage.name,60)..' - Lv '..numberText(stage.level)..' objectives:'end
+            local entry=s.questCatalog and s.questCatalog[stage.name]
+            local goals=type(entry)=='table' and type(entry.Requirements)=='table' and entry.Requirements[stage.level+1]
+            local objectives={}
+            for objective in pairs(type(goals)=='table' and goals or stage.latest)do
+                if type(objective)=='string'then objectives[#objectives+1]=objective end
+            end
+            table.sort(objectives)
+            if #objectives==0 then rows[#rows+1]=type(goals)=='table' and 'No pending objectives.' or 'Objective counts unavailable.' end
+            for _,objective in ipairs(objectives)do
+                local current=stage.latest[objective] or 0
+                local before=stage.baseline[objective] or 0
+                local delta=current-before
+                local label=objectiveNames[objective] or objective:gsub('(%l)(%u)','%1 %2'):gsub('_',' ')
+                local goal=type(goals)=='table' and finite(goals[objective])
+                rows[#rows+1]=clean(label,70)..': '..numberText(current)..(goal and ' / '..numberText(goal) or '')
+                    ..(delta>=0 and ' (+'..numberText(delta)..')' or ' (counter decreased)')
+            end
+        end
+        rows[#rows+1]='+ = gain since first quest observation this run.'
+        local text=''
+        for _,row in ipairs(rows)do
+            if #text+#row>900 then return text..'\nMore objectives omitted.'end
+            text=text..(#text>0 and '\n' or '')..row
+        end
+        return text
+    end
     local function payload(outcome, reason)
         local run = s.reportRun
         if not run or run.ended then return nil end
@@ -447,6 +515,9 @@ end)()
         fields[#fields + 1] = {name = 'Run Cores/min', value = run.cores and seconds > 0
             and string.format('%.1f', run.cores * 60 / math.max(1, now() - run.started)) or 'Unavailable', inline = true}
         fields[#fields + 1] = {name = 'Account', value = tostring(run.account or 'Unavailable'):gsub('[^%w_]', ''):sub(1,256), inline = true}
+        if s.config and s.config.classQuest then
+            fields[#fields+1]={name='Quest progress (observed)',value=questText(run),inline=false}
+        end
         return {id = run.id, status = 'queued', attempts = 0, created = clock(), body = {
             username = 'DTEC JoeJoe Automation',
             embeds = {{title = 'Earth run - ' .. outcome, color = outcome == 'LOSS' and 15158332
@@ -1722,6 +1793,7 @@ return function(api,Q)
     local lastResort={LifeSteal=true,HealthRegen=true}
     local damage={TeamMeleeDamage=true,TeamPickaxeDamage=true,TeamGunDamage=true,TeamExplosiveDamage=true}
     local ores={Ore_Iron=true,Ore_Gold=true,Ore_Diamond=true,Ore_Emerald=true,Ore_Ruby=true}
+    local rarity={Common=1,Rare=2,Epic=3,Legendary=4,Mythic=5}
     local ledger=s.questUpgradeLedger or {};s.questUpgradeLedger=ledger
     local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
     local function status(text)s.questStatus=text end
@@ -1768,7 +1840,20 @@ return function(api,Q)
         local amount=tonumber(offer.UpgradeAmount) or 1
         if not finite(amount) or amount<=0 then return end
         local cost=tonumber(offer.Cost) or 0
-        return (needed and 2000000 or 1000000)+weight*amount/(1+math.max(0,level)/8)/math.max(1,cost)^.35
+        return (needed and 2000000 or 1000000)+weight*amount/(1+math.max(0,level)/8)/math.max(1,cost)^.35,needed
+    end
+    function D.worthSaving(ctx,plan,offer)
+        if offer.Type~='Coins' or (rarity[offer.Rarity] or 0)<rarity.Legendary then return end
+        local value,needed=D.score(ctx,plan,offer)
+        if not value then return end
+        local amount=tonumber(offer.UpgradeAmount) or 1
+        local name=offer.UpgradeName
+        local hp=ctx.humanoid.MaxHealth>0 and ctx.humanoid.Health/ctx.humanoid.MaxHealth or 1
+        local capacity,fill=tonumber(s.sackCapacity),tonumber(s.sackSize)
+        local strong=needed or (name=='TeamMeleeDamage' or name=='TeamPickaxeDamage') and amount>=3
+            or name=='TeamHealth' and amount>=2 and hp<.7
+            or name=='SackStorage' and amount>=2 and capacity and fill and fill>=capacity*.75
+        return strong and value or nil
     end
     function D.choose(ctx,plan,c,wallet)
         local reward=c.ActiveClassReward
@@ -1777,15 +1862,16 @@ return function(api,Q)
         if type(options)~='table' or not finite(version) or version<=0 then return end
         local key=tostring(game.JobId or '')..':'..(reward and 'reward:' or 'coins:')..version
         if ledger[key]==true or type(ledger[key])=='number' and now()<ledger[key]then return end
-        local best,score,fallback,fallbackCost,desperate,desperateCost,hasUseful
+        local best,score,fallback,fallbackCost,desperate,desperateCost,saving,savingScore
         for _,offer in ipairs(options)do
             local free=reward and offer.Type=='ClassReward'
             local cost=tonumber(offer.Cost)
-            if free or not reward and offer.Type=='Coins' and finite(cost) and cost>=0 then
-                if D.score(ctx,plan,offer)then hasUseful=true end
+            if not reward and offer.Type=='Coins' and finite(cost) and cost>=0 and finite(wallet) and cost>wallet then
+                local value=D.worthSaving(ctx,plan,offer)
+                if value and (not savingScore or value>savingScore)then saving,savingScore=offer,value end
             end
             -- Use the conservative native base quote, before any class discount.
-            if free or not reward and offer.Type=='Coins' and finite(cost) and cost>=0 and finite(wallet) and wallet-cost>=10000 then
+            if free or not reward and offer.Type=='Coins' and finite(cost) and cost>=0 and finite(wallet) and wallet>=cost then
                 local value=D.score(ctx,plan,offer)
                 if value and (not score or value>score)then best,score=offer,value end
                 local name=offer.UpgradeName
@@ -1797,17 +1883,32 @@ return function(api,Q)
                 end
             end
         end
-        return best or not hasUseful and (fallback or desperate) or nil,key,version,reward~=nil
+        local choice=best or fallback or desperate
+        local choiceScore=choice and D.score(ctx,plan,choice) or 0
+        if saving and choice and (math.floor(choiceScore/1000000)>math.floor(savingScore/1000000)
+            or (rarity[choice.Rarity] or 0)>=(rarity[saving.Rarity] or 0) and choiceScore>=savingScore)then saving=nil end
+        return not saving and choice or nil,key,version,reward~=nil,saving
     end
     function D.fundingTarget(ctx,plan)
-        local c=api.controller('DrillUpgradeController');local target,score
+        local c=api.controller('DrillUpgradeController');local fallback,desperate
+        local wallet=finite(s.questWallet) and s.questWallet or 0
+        local chosen,key,_,_,saving
+        if c then chosen,key,_,_,saving=D.choose(ctx,plan,c,wallet)end
+        if saving or chosen then return math.max(tonumber((saving or chosen).Cost) or 0,Q.supplyFundingTarget(ctx,plan))end
+        if not key then return Q.supplyFundingTarget(ctx,plan)end
         for _,offer in ipairs(c and c.Options or {})do
             local price=tonumber(offer.Cost)
             local value=D.score(ctx,plan,offer)
-            if offer.Type=='Coins' and finite(price) and price>=0 and value
-                and (not score or value>score)then target,score=price,value end
+            local name=offer.UpgradeName
+            local known=type(name)=='string' and (weights[name] or lastResort[name] or type(c.DisplayInfo)=='table' and c.DisplayInfo[name])
+            if offer.Type=='Coins' and finite(price) and price>=0 and known and not blocked[name]
+                and D.capAllowed(ctx,offer,c) and (name~='TeamGunDamage' and name~='TeamExplosiveDamage' or value)then
+                if lastResort[name]then desperate=math.min(desperate or price,price)
+                else fallback=math.min(fallback or price,price)end
+            end
         end
-        return math.max(12000,10000+(target or 0)+500)
+        -- Fund actual quoted work, with no retained balance or arbitrary buffer.
+        return math.max(fallback or desperate or 0,Q.supplyFundingTarget(ctx,plan))
     end
     function D.upgrades(ctx,plan)
         if plan.kind=='waiting' or plan.kind=='advance' or plan.kind=='complete' or plan.kind=='unsupported'then return end
@@ -1852,12 +1953,13 @@ return function(api,Q)
             if c.PurchasePending or c.RerollPending or c.CardsLocked then info('native cards locked / purchase pending');return end
             if now()<(ctx.questUpgradeAt or 0)then return end
             local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
-            local offer,key,version,reward=D.choose(ctx,current,c,wallet)
+            local offer,key,version,reward,saving=D.choose(ctx,current,c,wallet)
             if not offer then
-                if c.ActiveClassReward then info('no eligible free card')
+                if saving then info(string.format('Saving for %s %s: %.0f / %.0f Coins',saving.Rarity,saving.UpgradeName,wallet,saving.Cost))
+                elseif c.ActiveClassReward then info('no eligible free card')
                 else
-                    local target=D.fundingTarget(ctx,current)-500
-                    info(string.format('%.0f Coins; reserve 10,000; target %.0f',wallet,target))
+                    local target=D.fundingTarget(ctx,current)
+                    info(string.format('%.0f Coins; funding target %.0f',wallet,target))
                 end
                 return
             end
@@ -2030,6 +2132,11 @@ return function(api,Q)
         return false
     end
     function D.stopMine(ctx)
+        local face=ctx.questMineFacing;ctx.questMineFacing=nil
+        if face then pcall(function()
+            if face.active.FaceNearestEnemyInThirdPerson==face.wrapper then face.active.FaceNearestEnemyInThirdPerson=face.original end
+            if face.aligner and face.aligner.Parent then face.aligner.Enabled=face.enabled end
+        end)end
         if ctx.questMineRotate~=nil then ctx.humanoid.AutoRotate=ctx.questMineRotate;ctx.questMineRotate=nil end
         ctx.questMining=nil;ctx.questMineJob=nil
     end
@@ -2168,14 +2275,14 @@ return function(api,Q)
     local function miningPose(ctx,mine,active)
         local ok,center,size=pcall(api.miningBounds,mine.node)
         if not ok or not center or not size or size.X<=0 or size.Y<=0 or size.Z<=0 then return false end
-        if not mine.anchor or (center-mine.center).Magnitude>2 then
+        if not mine.anchor or (center-mine.center).Magnitude>2 or not mine.boundsSize or (size-mine.boundsSize).Magnitude>.5 then
             local delta=ctx.root.Position-center
             local side=Vector3.new(delta.X,0,delta.Z)
             if side.Magnitude<.1 then side=Vector3.new(0,0,1)else side=side.Unit end
             if mine.alternate then side=side*-1 end
             local extent=(math.abs(side.X)*size.X+math.abs(side.Z)*size.Z)*.5
             local gap=math.min(3,math.max(1,(tonumber(active.Range) or 13)*.25))
-            mine.center=center
+            mine.center,mine.boundsSize=center,size
             -- Native pickaxe checks a forward box and rejects ore below pivotY-2.
             -- Stand above the vein's top, outside its surface, facing horizontally.
             mine.anchor=Vector3.new(center.X,center.Y+size.Y*.5+1,center.Z)+side*(extent+gap)
@@ -2183,10 +2290,38 @@ return function(api,Q)
             mine.placed=nil
         end
         api.hover(ctx)
+        -- The native pickaxe auto-faces nearby enemies every 0.1s. Body
+        -- AutoRotate=false alone does not stop that AlignOrientation loop.
+        local face=ctx.questMineFacing
+        if face and face.active~=active then
+            pcall(function()
+                if face.active.FaceNearestEnemyInThirdPerson==face.wrapper then face.active.FaceNearestEnemyInThirdPerson=face.original end
+                if face.aligner and face.aligner.Parent then face.aligner.Enabled=face.enabled end
+            end)
+            ctx.questMineFacing=nil;face=nil
+        end
+        if not face and type(active.FaceNearestEnemyInThirdPerson)=='function'then
+            face={active=active,original=active.FaceNearestEnemyInThirdPerson,aligner=active.AutoFaceAligner,
+                enabled=active.AutoFaceAligner and active.AutoFaceAligner.Enabled}
+            face.wrapper=function(self,...)
+                if self==active and ctx.questMining and ctx.questMineJob==mine then
+                    if self.AutoFaceAligner then self.AutoFaceAligner.Enabled=false end
+                    return
+                end
+                return face.original(self,...)
+            end
+            active.FaceNearestEnemyInThirdPerson=face.wrapper;ctx.questMineFacing=face
+        end
+        if active.AutoFaceAligner then active.AutoFaceAligner.Enabled=false end
         if ctx.questMineRotate==nil then ctx.questMineRotate=ctx.humanoid.AutoRotate end
         ctx.humanoid.AutoRotate=false
         if not mine.placed or (ctx.root.Position-mine.anchor).Magnitude>2 then
             ctx.root.CFrame=mine.frame;mine.placed=true
+        elseif ctx.root.CFrame.LookVector then
+            local direction=Vector3.new(center.X-ctx.root.Position.X,0,center.Z-ctx.root.Position.Z)
+            if direction.Magnitude>.1 and ctx.root.CFrame.LookVector:Dot(direction.Unit)<.98 then
+                ctx.root.CFrame=CFrame.lookAt(ctx.root.Position,Vector3.new(center.X,ctx.root.Position.Y,center.Z))
+            end
         end
         return true
     end
@@ -2217,6 +2352,10 @@ return function(api,Q)
             ctx.questMining=true
             if not miningHandoff(ctx,mine)then return ctx.questOwns==true end
             Q.stopDrive(ctx);ctx.questMining=true;api.watch(ctx)
+            if ctx.humanoid.SeatPart or ctx.humanoid.Sit then
+                ctx.humanoid.Sit=false;ctx.humanoid.Jump=true
+                status('Mining waits for the player to leave the seat');return true
+            end
             mine.readyAt=mine.readyAt or now()
             local pickaxe=api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe')
             local active=pickaxe and api.equip(ctx,pickaxe)
@@ -2236,10 +2375,12 @@ return function(api,Q)
                 end
                 return miningPause(ctx,mine.node,'Vein HP unchanged after both approaches',8)
             end
-            if api.mine(ctx,active)then mine.progressAt=mine.progressAt or now()
+            local swung,why=api.mine(ctx,active)
+            if swung then mine.progressAt=mine.progressAt or now()
             else
-                if not mine.progressAt and now()-mine.readyAt>=15 then return miningPause(ctx,mine.node,'Native mining action is not ready',5)end
-                status('Mining waits for native pickaxe action / cooldown');return true
+                local reason=why or 'native pickaxe action / cooldown'
+                if not mine.progressAt and now()-mine.readyAt>=15 then return miningPause(ctx,mine.node,'Mining blocked: '..reason,5)end
+                status('Mining waits: '..reason);return true
             end
             status(goal and 'Mining class objectives with '..api.id(pickaxe)..'; awaiting server counters'
                 or mine.coal and 'Mining loaded coal for fuel' or 'Mining loaded ore for upgrade coins');return true
@@ -3241,6 +3382,13 @@ end)()
         end
         return count
     end
+    function Q.supplyFundingTarget(ctx,plan)
+        local need=s.questSupplyFunding
+        if not need or need.ctx~=ctx or need.class~=plan.name or need.objective~=plan.objective
+            or now()>=need.expires or supplyCount(ctx,need.id)>need.before
+            or api.attr(need.item,'Class')=='Medkit' and not ctx.questHealing then return 0 end
+        return need.price
+    end
     function Q.supplyReceipt(job) return supplyCount(job.ctx,job.id)>job.inventoryBefore end
     local function stock(item)
         return item and item.Parent==workspace:FindFirstChild('Items') and api.part(item) and api.tag(item,'ShopItem')
@@ -3288,10 +3436,10 @@ end)()
         if not item or not pad then ctx.questOwns=nil; setStatus('No free or coin-shop quest supply loaded: '..id); return false end
         if id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,item) then ctx.questOwns=nil; setStatus('Quest tool needs a free toolbar slot; no purchase'); return false end
         local job={ctx=ctx,item=item,target=pad,kind='supply',shop=true,id=id,class=plan.name,
-            stage='empty',started=now(),inventoryBefore=supplyCount(ctx,id)}
+            objective=plan.objective,stage='empty',started=now(),inventoryBefore=supplyCount(ctx,id)}
         if obstructed(job) then ctx.questOwns=nil; return false end
         Q.stopDrive(ctx)
-        s.questDelivery=job; ctx.bringEquipmentLock=true; setStatus('Checking coin checkout for '..id..'; reserve 10,000')
+        s.questDelivery=job; ctx.bringEquipmentLock=true; setStatus('Checking coin checkout for '..id)
         return true
     end
     function Q.shopStep(job,plan)
@@ -3333,8 +3481,15 @@ end)()
         elseif job.stage=='wallet' then
             call('wallet','CurrencyService','GetCurrency',{},function(ok,coins)
                 if not guarded() then release(job); return end
-                if ok and finite(coins) and coins-job.price>=10000 then job.balanceAt=now(); job.stage='recheck'
-                else fail('Saving 10,000 coins; quest purchase skipped') end
+                if ok and finite(coins) and coins>=job.price then
+                    job.balanceAt=now();job.stage='recheck';s.questSupplyFunding=nil
+                else
+                    if ok and finite(coins)then
+                        s.questSupplyFunding={ctx=ctx,class=job.class,objective=job.objective,id=job.id,item=job.item,
+                            before=job.inventoryBefore,price=job.price,expires=now()+120}
+                    end
+                    fail('Insufficient Coins for quest supply; earning its quoted price')
+                end
             end,guarded)
         elseif job.stage=='recheck' then
             call('shop','ShopService','GetBuyQuote',{job.target},function(ok,price)
@@ -3836,7 +3991,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 21 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 22 }
     end
     local loaded=saveStore:get('settings')
     -- Only the currently running legacy client can migrate its untagged config.
@@ -4738,13 +4893,14 @@ end)()
         findTool=findTool, hasRoom=hasRoom, enemies=F.enemies, swordTargetAllowed=F.swordTargetAllowed, persist=persist, hover=movement.hover,
         miningBounds=function(node)
             local cf,size
-            if node:IsA('Model')then cf,size=node:GetBoundingBox()
+            local model=node:IsA('Model')
+            if model then cf,size=node:GetBoundingBox()
             else local p=part(node);if p then cf,size=p.CFrame,p.Size end end
             if not cf or not size then return end
             if cf.RightVector and cf.UpVector and cf.LookVector then
                 local r,u,l=cf.RightVector,cf.UpVector,cf.LookVector
                 size=Vector3.new(math.abs(r.X)*size.X+math.abs(u.X)*size.Y+math.abs(l.X)*size.Z,
-                    math.abs(r.Y)*size.X+math.abs(u.Y)*size.Y+math.abs(l.Y)*size.Z,
+                    model and size.Y or math.abs(r.Y)*size.X+math.abs(u.Y)*size.Y+math.abs(l.Y)*size.Z,
                     math.abs(r.Z)*size.X+math.abs(u.Z)*size.Y+math.abs(l.Z)*size.Z)
             end
             return cf.Position,size
@@ -4758,9 +4914,18 @@ end)()
         retreat=function(ctx)return F.questRetreat(ctx)end,
         mine=function(ctx,active)
             local c=controller('ToolController')
-            if not c or c.ActiveTool~=active or not safeToWork(ctx) or not readyAction(active)
-                or type(active.Swing)~='function' or type(active.CanUseAction)=='function' and not active:CanUseAction()then return false end
-            return pcall(active.Swing,active)
+            if not c or c.ActiveTool~=active or active._Destroyed then return false,'equipped pickaxe handler changed' end
+            if not safeToWork(ctx)then return false,'seat or transition still active' end
+            if type(active.Swing)~='function'then return false,'native pickaxe Swing handler missing' end
+            local ending=math.max(tonumber(active.LastSwing) or 0,tonumber(active.Debounce) or 0,tonumber(active.AttackLockedUntil) or 0)
+            if now()<ending then return false,string.format('pickaxe cooldown %.1fs',ending-now())end
+            if type(active.CanUseAction)=='function'then
+                local ok,ready=pcall(active.CanUseAction,active)
+                if not ok or not ready then return false,active.CooldownOwner==nil and 'native cooldown owner not ready' or 'shared weapon cooldown' end
+            end
+            local ok,why=pcall(active.Swing,active)
+            if not ok then return false,'native Swing failed: '..tostring(why):gsub('[%c]',' '):sub(1,100) end
+            return true
         end,
         miningDoorAllowed=function(prompt)return F.chestFallbackAllowed(prompt) and not F.skipLootArea(prompt)end,
         fireMiningPrompt=function(ctx,prompt)return firePrompt(ctx,prompt)end,
