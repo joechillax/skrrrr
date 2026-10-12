@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 23: native ore hitbox validation and nearby chest turns during class quests.
+-- Revision 24: executor auto-execute handles startup; no self-queued teleport execution.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 35 minutes or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -8,21 +8,21 @@ task.wait(7)
 -- Includes Discord ending reports, cached discovery, and Blinker / identified boss ranged dodging.
 -- Optional class quests: native combat, spare-gold sales, coin supplies and drill driving.
 -- Quest mode OFF preserves chest-only travel; no healing, mining or team purchases.
--- Every fresh execution and queued teleport resume waits seven seconds first.
+-- Every execution waits seven seconds first; this script never queues itself for teleport.
 -- All additional readiness checks and recovery happen automatically.
 local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 23
-    local BUILD = "r23-native-ore-overlap-quest-chests"
+    local REVISION = 24
+    local BUILD = "r24-executor-autoexecute-only"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
         and coroutine.status(previous.thread) ~= "dead"
         and ((previous.revision or 1) > REVISION
             or ((previous.revision or 1) == REVISION and previous.build == BUILD)) then
-        return -- auto-execute and a queued resume may both arrive; only one owns this server.
+        return -- Repeated execution must not start a second owner in this server.
     end
     if previous and previous.farm then
         if previous.job==job and not previous.questDriveLease and
@@ -40,7 +40,7 @@ return function(source)
     end
     if previous and previous.gui then pcall(previous.gui.dispose); previous.gui = nil end
     local s = previous and previous.job == job and previous or {}
-    if s.revision ~= REVISION or s.build ~= BUILD then s.queueArmed = nil;s.freshChecked=nil end
+    if s.revision ~= REVISION or s.build ~= BUILD then s.freshChecked=nil end
     s.revision, s.build = REVISION, BUILD
     s.pauseNoticeHidden, s.pauseNoticeRetryAt, s.pauseNoticeWarned = nil, nil, nil
     s.job, s.owner, s.connections = job, {}, {}
@@ -656,27 +656,6 @@ end
         end
         return c
     end
-    local function armResume()
-        if s.queueArmed then return end
-        local queue = env.queue_on_teleport or env.queueonteleport or queue_on_teleport or queueonteleport
-        if type(queue) ~= "function" then
-            local synApi, fluxusApi = env.syn or syn, env.fluxus or fluxus
-            queue = (type(synApi) == "table" and synApi.queue_on_teleport)
-                or (type(fluxusApi) == "table" and fluxusApi.queue_on_teleport)
-        end
-        if type(queue) ~= "function" then
-            if not s.queueNotice then
-                s.queueNotice = true
-                warn("[ChestFarm Auto] No queue-on-teleport API. Continuation depends on executor auto-execute running after each teleport.")
-            end
-            return
-        end
-        local resume = "task.wait(7)\nlocal source=" .. string.format("%q", source)
-            .. "\nlocal loader=loadstring or load; local chunk,why=loader(source,'@DTEC JoeJoe Automation'); assert(chunk,why); chunk()(source)"
-        local ok, why = pcall(queue, resume)
-        if ok then s.queueArmed = true
-        elseif not s.queueNotice then s.queueNotice = true; warn("[ChestFarm Auto] Could not queue teleport resume: " .. tostring(why)) end
-    end
     -- Transition calls remain serialized. Independent read/reward/skip calls have
     -- bounded slots so a stuck optional feature cannot lock the gameplay loop.
     local function request(kind, service, method, args, finished)
@@ -689,7 +668,7 @@ end
             method = service .. "." .. method, character = Players.LocalPlayer and Players.LocalPlayer.Character,
             farm = s.farm, owner = owner }
         s[slot] = token
-        if slot == "request" then stopFarm(); armResume() end
+        if slot == "request" then stopFarm() end
         status("Requesting " .. method)
         task.spawn(function()
             token.result = pack(pcall(function() return rf:InvokeServer(unpackValues(args, 1, args.n or #args)) end))
@@ -892,7 +871,7 @@ end
                     if state == Enum.TeleportState.Started then reports.departing(reportDeparture()) end
                     if state == Enum.TeleportState.InProgress then reports.finish(reportDeparture()) end
                     s.teleporting, s.teleportSince = true, now()
-                    stopFarm(); armResume(); status("Teleport in progress")
+                    stopFarm(); status("Teleport in progress")
                 end
             end)
             connect(TeleportService.TeleportInitFailed, function(who, _, message)
@@ -903,7 +882,7 @@ end
             local departure = event("TeleportManagerService", "DepartureFade")
             if departure then
                 s.departureBound = true
-                connect(departure, function() stopFarm(); armResume(); s.departureAt = now() end)
+                connect(departure, function() stopFarm(); s.departureAt = now() end)
             end
         end
         if not s.signalsBound then
@@ -4046,7 +4025,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 23 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 24 }
     end
     local loaded=saveStore:get('settings')
     -- Only the currently running legacy client can migrate its untagged config.
@@ -7172,7 +7151,6 @@ end
         if not s.farm and now() >= (s.farmRestartAt or 0) then startFarm(player, model, humanoid, root, drill) end
         claimRewards(player)
     end
-    armResume()
     s.thread = task.spawn(function()
         while owned() do
             local ok, why = pcall(tick)
