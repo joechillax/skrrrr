@@ -1,6 +1,6 @@
 if game.PlaceId ~= 137477934962022 and game.PlaceId ~= 104087083666671 then return end
 game:GetService("GuiService"):SetGameplayPausedNotificationEnabled(false)
--- Crack the Egg: lobby + round progression, v28.
+-- Crack the Egg: lobby + round progression, v29.
 -- Source contracts: lobby 137477934962022 and round 104087083666671.
 -- Save this exact file as CrackTheEgg.lua in the executor workspace for teleport resume.
 -- Lobby walks; round travel uses cancellable tweens at sprint-equivalent speed.
@@ -1125,9 +1125,16 @@ do
             if p and p.id == a.Gun and p.slot == a.Slot then p.denied = true end
         elseif kind == "GunShot" and type(a) == "table" and a.Owner == player.UserId then
             local g = state.gun
-            if g and g.shots[a.Id] then
-                g.shots[a.Id] = nil
-                state.stats.gunShots = (state.stats.gunShots or 0) + 1
+            if g and finite(a.Id) then
+                local acknowledged = 0
+                -- Native GunClient.Ack retires all requests through this id.
+                for id in pairs(g.shots) do
+                    if finite(id) and id <= a.Id then g.shots[id] = nil acknowledged += 1 end
+                end
+                if acknowledged > 0 then
+                    g.ackCount = (g.ackCount or 0) + acknowledged
+                    state.stats.gunShots = (state.stats.gunShots or 0) + acknowledged
+                end
             end
         elseif kind == "Collected" then
             if finite(b) and b > 0 then state.stats.collected += b end
@@ -1423,17 +1430,30 @@ do
             end
         end
     end
+    local function gunReloadSeconds(gun)
+        local folder = folderAt("BreakTheEgg")
+        local multiplier = folder and folder:GetAttribute("GunReloadMul")
+        return math.max(0.15, gun.Reload * (finite(multiplier) and multiplier > 0 and multiplier or 1))
+    end
     local function gunState(gun)
         local ammo = player:GetAttribute("GunAmmo")
         if not finite(ammo) then return nil end
         local g = state.gun
         if not g or g.id ~= gun.Id then
             g = {id = gun.Id, ammo = math.max(0, ammo), seenAmmo = ammo, nativeAmmo = ammo,
-                nativeReloadAt = player:GetAttribute("GunReloadAt") or 0, shots = {}, nextAt = 0, burst = 0}
+                nativeReloadAt = player:GetAttribute("GunReloadAt") or 0, shots = {}, nextAt = 0, burst = 0,
+                snapshotSchema = 1, ackCount = 0, snapshotAck = 0}
             state.gun = g
         end
         local now, reloadAt = workspace:GetServerTimeNow(), player:GetAttribute("GunReloadAt") or 0
         local activeReload = finite(reloadAt) and reloadAt > now
+        if not g.snapshotSchema then
+            -- One reconciliation of an inherited v28 full-magazine stall.
+            -- Fresh instances and repeated Stop/Start never rearm this credit.
+            g.legacySnapshot = g.nativeAmmo ~= nil and (g.reloadTries or 0) >= 3
+                and (state.stats.gunShots or 0) > 0
+            g.snapshotSchema, g.ackCount, g.snapshotAck = 1, g.ackCount or 0, 0
+        end
         if g.nativeAmmo == nil then
             -- v23 retained an expired local reload after its final retry. When
             -- replacing that owner, reconcile a full native magazine only once,
@@ -1451,10 +1471,19 @@ do
         if g.reload and g.nativeReloadUntil and g.nativeReloadUntil >= (g.reload.serverAt
             or now - (os.clock() - g.reload.at)) then g.reload.observed = g.nativeReloadUntil end
         local refill = g.refill and ammo > 0 and ammo <= g.refill.ammo and not activeReload
+        local mag = player:GetAttribute("GunMag")
+        local settledReload = g.reload and now >= (g.reload.localUntil
+            or (g.reload.serverAt or now - (os.clock() - g.reload.at)) + gunReloadSeconds(gun))
+        local snapshot = not activeReload and g.ammo <= 0 and finite(mag) and mag > 0 and ammo == mag
+            and next(g.shots) == nil and equipped("Gun")
+            and (settledReload and (g.ackCount or 0) > (g.snapshotAck or 0)
+                or g.legacySnapshot and (settledReload or not g.reload))
         if g.reload and g.reload.observed and now >= g.reload.observed
-            and not activeReload and ammo > 0 or refill then
+            and not activeReload and ammo > 0 or refill or snapshot then
             g.ammo, g.reload, g.shots, g.burst, g.reloadTries = ammo, nil, {}, 0, 0
             g.refill, g.nativeReloadUntil, g.reloadRetryAt = nil, nil, nil
+            g.snapshotAck, g.legacySnapshot = g.ackCount or 0, nil
+            if snapshot then state.stats.gunReloadRecoveries = (state.stats.gunReloadRecoveries or 0) + 1 end
         elseif ammo ~= g.seenAmmo then
             -- A replicated refill can follow an unobserved short reload.
             g.ammo = ammo > g.seenAmmo and ammo or math.min(g.ammo, math.max(0, ammo))
@@ -2056,9 +2085,9 @@ do
         if g.ammo <= 0 then
             if os.clock() >= (g.reloadRetryAt or 0) then
                 if send(refs.action, "GunReload") then
-                    g.reload = {at = os.clock(), serverAt = now}
+                    g.reload = {at = os.clock(), serverAt = now, localUntil = now + gunReloadSeconds(gun)}
                     g.reloadTries = (g.reloadTries or 0) + 1
-                    g.reloadRetryAt = os.clock() + math.max(3, gun.Reload + 1)
+                    g.reloadRetryAt = os.clock() + math.max(3, gunReloadSeconds(gun) + 1)
                 end
             end
             return false
@@ -4027,6 +4056,10 @@ do
             .. "; server time=" .. tostring(workspace:GetServerTimeNow())
             .. "; predicted reload attempts=" .. tostring(state.gun and state.gun.reloadTries or 0)
             .. "; observed deadline=" .. tostring(state.gun and state.gun.reload and state.gun.reload.observed))
+        table.insert(lines, "Gun snapshot recoveries=" .. tostring(state.stats.gunReloadRecoveries or 0)
+            .. "; current gun acknowledgements=" .. tostring(state.gun and state.gun.ackCount or 0)
+            .. "; consumed snapshot acknowledgements=" .. tostring(state.gun and state.gun.snapshotAck or 0)
+            .. "; local reload deadline=" .. tostring(state.gun and state.gun.reload and state.gun.reload.localUntil))
         table.insert(lines, tostring(self.status.explosive or "Explosives: waiting for owned ready charges")
             .. "; acknowledged throws=" .. tostring(state.stats.explosives or 0))
         table.insert(lines, "Shell Magnet=" .. tostring(player:GetAttribute("VIPOwned_vip_magnet"))
@@ -4144,9 +4177,9 @@ function app:queueResume()
         return false
     end
     local ok, source = pcall(readfile, "CrackTheEgg.lua")
-    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v28.", 1, true) then
+    if not ok or type(source) ~= "string" or not string.find(source, "Crack the Egg: lobby + round progression, v29.", 1, true) then
         self:note("Teleport resume requires this exact script saved as CrackTheEgg.lua in executor workspace")
-        self.afkError = "AFK resume: save v28 as CrackTheEgg.lua in executor workspace"
+        self.afkError = "AFK resume: save v29 as CrackTheEgg.lua in executor workspace"
         return false
     end
     if self.resumeQueued then return true end
@@ -4175,7 +4208,7 @@ local function buildUI()
     new("UICorner", {CornerRadius = UDim.new(0, 8)}, window)
     local scale = new("UIScale", {}, window)
     new("TextLabel", {Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 0),
-        BackgroundTransparency = 1, Text = "Crack the Egg · v28", TextColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1, Text = "Crack the Egg · v29", TextColor3 = Color3.new(1, 1, 1),
         TextSize = 16, Font = Enum.Font.GothamBold}, window)
     pcall(function() new("UIDragDetector", {BoundingUI = bounds}, window) end)
     local body = new("Frame", {Position = UDim2.fromOffset(10, 34), Size = UDim2.new(1, -20, 1, -44),
