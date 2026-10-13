@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 33: bounded Watcher dispatch, recovered equipment and native mine exit prompts.
+-- Revision 34: native dispatch receipts, seat/respawn recovery and completed daily reward claims.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 33
-    local BUILD = "r33-watcher-dispatch-and-mine-exits"
+    local REVISION = 34
+    local BUILD = "r34-gameplay-loop-audit"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -898,7 +898,12 @@ end
                     local staleLife = (token.kind == "revive" or token.kind == "probe" or token.kind == "equip-weapon" or token.kind == "loot-action")
                         and token.character ~= (Players.LocalPlayer and Players.LocalPlayer.Character)
                     if token.kind == "loot-action" and (token.farm ~= s.farm or token.owner ~= owner) then staleLife = true end
-                    if token.callback and not staleLife then token.callback(token.result) end
+                    if token.callback and not staleLife then token.callback(token.result)
+                    elseif token.callback and staleLife and token.kind=='equip-weapon' then
+                        -- The old mutation has actually replied. Retire its local
+                        -- pending flag without applying old-character equipment.
+                        token.callback(pack(false,'Equipment reply belongs to the previous character'))
+                    end
                 end
             end
         end
@@ -2042,6 +2047,7 @@ return function(api,Q)
         Q.drillSupport.settleUpgrade(ctx)
         ctx.questCombat=nil -- Waiting for healing is not quest counter progress.
         Q.stopDrive(ctx)
+        if h.SeatPart or h.Sit then local _,holding=Q.unseat(ctx);api.watch(ctx);return holding end
         local job=s.questDelivery
         if job then
             if job.healingFunding or job.kind=='supply' and H.isMedical(job.item) then Q.deliveryStep(ctx,plan)
@@ -2446,6 +2452,9 @@ return function(api,Q)
                             if not item:IsDescendantOf(workspace)then return end
                             ctx.questMineTransition={mode='Enter',mine=mine};ctx.questMineReadyAt=now()+3
                         elseif mode=='Exit'then
+                            local current=api.controller('DungeonUIController')
+                            local bound=current and current._BoundDungeon
+                            if bound and bound~=mine and bound.Parent and bound:IsDescendantOf(workspace)then return end
                             local active=D.activeMine(ctx)
                             local pending=ctx.questMineEntry
                             if active==mine or ctx.questLastBoundMine==mine or pending and pending.mine==mine then exited(mine)end
@@ -3009,8 +3018,7 @@ return function(api,Q)
             if not miningHandoff(ctx,mine)then return ctx.questOwns==true end
             Q.stopDrive(ctx);ctx.questMining=true;api.watch(ctx)
             if ctx.humanoid.SeatPart or ctx.humanoid.Sit then
-                ctx.humanoid.Sit=false;ctx.humanoid.Jump=true
-                status('Mining waits for the player to leave the seat');return true
+                local _,holding=Q.unseat(ctx);return holding
             end
             mine.readyAt=mine.readyAt or now()
             local pickaxe=api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe')
@@ -3376,7 +3384,10 @@ return function(api,Q)
                     job.sent=nil;job.rejected=nil;job.retryAt=now()+3;c.ValidRegion=nil
                     ctx.questOwns=nil;return false
                 end
-                if job.rejected then ctx.questOwns=nil;status('Native placement rejected repeatedly; awaiting a new valid placement context');return false end
+                if job.rejected then
+                    ctx.questOwns=nil;ctx.questPlacementRetry=now()+15;S.cancelPreview(ctx)
+                    status('Native placement rejected repeatedly; cancelling the owned preview before another attempt');return false
+                end
                 if now()-job.issuedAt>=12 then ctx.questOwns=nil;status('Placement credit unconfirmed; mutation reserved, other work continues');return false end
                 status('Awaiting native turret placement quest credit');return true
             end
@@ -3390,8 +3401,14 @@ return function(api,Q)
             if c.PendingRequest or c.PendingCancel or Q.manual()then return false end
             if not Q.holdRoute(ctx)then return true end
             if type(c.UpdatePreview)~='function'then ctx.questOwns=nil;return false end
+            if c.ValidRegion and (not live(c.ValidRegion) or not c.ValidRegion:IsDescendantOf(ctx.drill))then
+                c.ValidRegion=nil;c.PlacementOffset=nil
+            end
             if not c.ValidRegion or not c.PlacementOffset then
-                if job.pose and job.pose>=9 then ctx.questOwns=nil;status('No collision-valid turret space; chest work continues');return false end
+                if job.pose and job.pose>=9 then
+                    ctx.questOwns=nil;ctx.questPlacementRetry=now()+15;S.cancelPreview(ctx)
+                    status('No collision-valid turret space; cancelled the owned preview before retrying');return false
+                end
                 S.positionPreview(ctx,c,job);pcall(c.UpdatePreview,c)
             end
             if not live(c.ValidRegion) or not c.PlacementOffset or not c.ValidRegion:IsDescendantOf(ctx.drill)then return true end
@@ -3496,7 +3513,7 @@ return function(api,Q)
     function S.observe(ctx,root)
         if not ctx.connect or not root then return end
         ctx.questCampaignRemotes=ctx.questCampaignRemotes or setmetatable({}, {__mode='k'})
-        for _,item in ipairs(root:GetDescendants())do
+        local function bind(item)
             if item.Name=='DungeonDoorTransition' and item:IsA('RemoteEvent') and item.OnClientEvent
                 and not ctx.questCampaignRemotes[item]then
                 ctx.questCampaignRemotes[item]=true
@@ -3504,12 +3521,24 @@ return function(api,Q)
                     if not ctx.active then return end
                     if mode=='Enter'then ctx.questCampaignExit=nil
                     elseif mode=='Exit' and (S.bound(ctx)==root or ctx.questCampaign and ctx.questCampaign.root==root)then
+                        local controller=api.controller('DungeonUIController')
+                        local current=controller and controller._BoundDungeon
+                        if live(current) and current~=root then return end
                         ctx.questCampaignExit={root=root};ctx.questCampaign=nil;ctx.questOwns=nil
                         ctx.questCombat=nil;ctx.questExitCombat=nil;ctx.combatTarget=nil
                     end
                 end)
             end
         end
+        ctx.questCampaignScans=ctx.questCampaignScans or setmetatable({}, {__mode='k'})
+        local scan=ctx.questCampaignScans[root]
+        if not scan then
+            scan={};ctx.questCampaignScans[root]=scan
+            if root.DescendantAdded then ctx.connect(root.DescendantAdded,bind)end
+        end
+        if now()<(scan.nextAt or 0)then return end
+        scan.nextAt=now()+2
+        for _,item in ipairs(root:GetDescendants())do bind(item)end
     end
     local function ready(prompt)
         local module=native('DungeonDoorState')
@@ -3695,6 +3724,85 @@ return function(api,Q)
 end
 
 end)()
+    local buildQuestRewards = (function()
+-- Claim only completed native daily quests. No reroll, purchase or invented credit.
+return function(api,Q)
+    local R,s,now={},api.state,api.now
+    local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
+    local function fingerprint(entry)return tostring(entry.Objective)..':'..tostring(entry.Amount)end
+    s.dailyRewardLedger=s.dailyRewardLedger or {}
+    function R.observe(data)
+        if not api.owned() or type(data)~='table' or type(data.Quests)~='table'then return end
+        s.dailyQuestData=data;s.dailyQuestAt=now();s.dailyQuestVersion=(s.dailyQuestVersion or 0)+1
+        for tier,entry in pairs(data.Quests)do
+            local record=s.dailyRewardLedger[tier]
+            if record and type(entry)=='table'then
+                local progress,amount=tonumber(entry.Progress),tonumber(entry.Amount)
+                if entry.Claimed==true and not record.confirmed then
+                    record.confirmed=true;s.stats.dailyQuestClaims=(s.stats.dailyQuestClaims or 0)+1
+                elseif entry.Claimed~=true and finite(progress) and finite(amount) and amount>0
+                    and (fingerprint(entry)~=record.fingerprint or progress<amount and record.confirmed)then
+                    -- An observed new/incomplete quest re-arms the tier. Merely
+                    -- receiving another unclaimed complete snapshot never does.
+                    s.dailyRewardLedger[tier]=nil
+                end
+            end
+        end
+    end
+    local function allowed(ctx)
+        return api.owned() and ctx.active and s.farm==ctx and ctx.humanoid.Health>0
+            and not s.teleporting and not s.request and not s.awaiting and not s.departureAt
+            and not workspace:GetAttribute('InCutScene') and not workspace:GetAttribute('InfiniteRebasing')
+    end
+    function R.step(ctx)
+        Q.poll() -- Read cancellation also runs with class quests OFF.
+        if not allowed(ctx)then return end
+        local catalog=api.sharedModule and api.sharedModule('QuestData')
+        if not catalog or type(catalog.DailyReward)~='table'then return end
+        if ctx.dailyRewardBound~=true and api.event and ctx.connect then
+            local signal=api.event('QuestService','UpdateQuests')
+            if signal then ctx.dailyRewardBound=true;ctx.connect(signal,function(data)R.observe(data)end)end
+        end
+        if now()>=(s.dailyQuestReadAt or 0) and not Q.calls.dailyQuestRead then
+            local version=s.dailyQuestVersion or 0
+            if Q.call('dailyQuestRead','QuestService','FetchQuests',{},function(ok,data)
+                if ok and (s.dailyQuestVersion or 0)==version then R.observe(data)end
+            end,function()return allowed(ctx)end)then s.dailyQuestReadAt=now()+20 end
+        end
+        local pending=Q.calls.dailyQuestClaim;local record=s.dailyClaimRecord
+        if pending and record and record.confirmed and pending.thread then
+            -- A native Claimed receipt resolves this exact mutation. Terminate
+            -- the old client waiter before permitting the next different tier.
+            pcall(task.cancel,pending.thread)
+            if coroutine.status(pending.thread)=='dead' and Q.calls.dailyQuestClaim==pending then Q.calls.dailyQuestClaim=nil end
+        end
+        if Q.calls.dailyQuestClaim or not s.dailyQuestData or now()-(s.dailyQuestAt or 0)>30 then return end
+        for _,tier in ipairs({'Hard','Medium','Easy'})do
+            local entry=s.dailyQuestData.Quests[tier];local previous=s.dailyRewardLedger[tier]
+            local progress=type(entry)=='table' and tonumber(entry.Progress)
+            local amount=type(entry)=='table' and tonumber(entry.Amount)
+            if catalog.DailyReward[tier] and finite(progress) and finite(amount) and amount>0
+                and progress>=amount and entry.Claimed~=true and not (previous and previous.sent)
+                and now()>=(previous and previous.retryAt or 0)then
+                record={tier=tier,fingerprint=fingerprint(entry),sent=true};s.dailyRewardLedger[tier]=record;s.dailyClaimRecord=record
+                local version=s.dailyQuestVersion or 0
+                local issued=Q.call('dailyQuestClaim','QuestService','ClaimQuestReward',{tier},function(ok,data,_,dispatch)
+                    if dispatch=='not-sent' or ok and data==false then record.sent=nil;record.retryAt=now()+30 end
+                    if ok and (s.dailyQuestVersion or 0)==version then R.observe(data)end
+                    s.dailyQuestReadAt=math.min(s.dailyQuestReadAt or 0,now()+2)
+                end,function()
+                    local current=s.dailyQuestData and s.dailyQuestData.Quests[tier]
+                    return allowed(ctx) and current==entry and current.Claimed~=true and fingerprint(current)==record.fingerprint
+                end)
+                if not issued then record.sent=nil;record.retryAt=now()+3 end
+                return
+            end
+        end
+    end
+    return R
+end
+
+end)()
     local unpackValues = table.unpack or unpack
     local packValues = table.pack or function(...)return {n=select('#',...),...}end
     local calls = s.questCalls or {}; s.questCalls = calls
@@ -3859,7 +3967,7 @@ end)()
         -- Reads have no spending/ownership side effects. Cancel a hung read only
         -- after its coroutine actually stops, then notify its waiting consumer.
         for key,token in pairs(calls)do
-            if (token.method=='GetClasses' or token.method=='GetBuyQuote' or token.method=='GetCurrency'
+            if (token.method=='GetClasses' or token.method=='GetBuyQuote' or token.method=='GetCurrency' or token.method=='FetchQuests'
                 or token.method=='GetState' or token.method=='GetData' or token.method=='GetEquipped' or token.method=='GetCrateItems' or token.method=='GetContents')
                 and now()-token.started>=8 and token.thread then
                 pcall(task.cancel,token.thread)
@@ -3928,6 +4036,7 @@ end)()
         end
     end
     function Q.stopDrive(ctx)
+        local wasDriving=ctx.questDriving or ctx.questSeating
         clearThrottle(ctx)
         local lease=s.questDriveLease
         if (ctx.questDriving or ctx.questSeating) and (not lease or lease.ctx~=ctx) then
@@ -3936,9 +4045,34 @@ end)()
         if lease and lease.ctx==ctx then lease.abandoned=true;Q.recoverDrive() end
         ctx.questDriving=nil
         ctx.questSeatAckAt=nil
-        if ctx.questSeating then
+        if wasDriving then
             ctx.humanoid.Sit=false; ctx.humanoid.Jump=true; ctx.questSeating=nil
         end
+    end
+    function Q.unseat(ctx)
+        local h=ctx.humanoid;local seat=h.SeatPart
+        if not seat and not h.Sit then ctx.questSeatExit=nil;return true,false end
+        if manual() or not cfg.classQuest or not enabled(ctx)then return false,false end
+        local job=ctx.questSeatExit
+        if not job or job.seat~=seat then job={seat=seat,started=now()};ctx.questSeatExit=job end
+        if now()>=(job.inputAt or 0)then
+            job.inputAt=now()+1;h.Sit=false;h.Jump=true
+            if type(h.ChangeState)=='function' and Enum.HumanoidStateType.GettingUp then pcall(h.ChangeState,h,Enum.HumanoidStateType.GettingUp)end
+        end
+        -- TrainComponent releases its own seat joint during native driver exit.
+        -- Only a joint verified to attach THIS character may be released here.
+        if seat and not job.jointReleased and now()-job.started>=1.5 and seat.Occupant==h then
+            local weld=seat:FindFirstChild('SeatWeld')
+            if weld and weld:IsA('JointInstance') and weld.Part0==seat and weld.Part1
+                and weld.Part1:IsDescendantOf(ctx.character)then
+                local ok=pcall(weld.Destroy,weld);job.jointReleased=ok or nil
+            end
+        end
+        local holding=now()-job.started<4
+        ctx.questOwns=holding or nil
+        setStatus(holding and 'Leaving the actual seat; waiting for SeatPart to clear'
+            or 'Seat exit unconfirmed; native jump retries continue without claiming escape')
+        return false,holding
     end
     local function release(job)
         job.cancelled=true
@@ -3993,6 +4127,7 @@ end)()
         ctx.questRecoveryDue=nil
         ctx.questExitCombat=nil
         ctx.questDamageWatch=nil;ctx.questTargetRetry=nil
+        ctx.questSeatExit=nil
         if not ctx.currentChest then ctx.questChestLease=nil end
     end
     function Q.abortResources(ctx)
@@ -4624,6 +4759,14 @@ end)()
         Q.poll()
         local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if not enabled(ctx) then ctx.questProgressAt=now(); Q.cleanup(ctx); return false end
+        if not ctx.humanoid.SeatPart and not ctx.humanoid.Sit then ctx.questSeatExit=nil end
+        if (plan.kind~='depth' and plan.kind~='fuel' or api.extractionReady()
+            or ctx.humanoid.MaxHealth>0 and ctx.humanoid.Health/ctx.humanoid.MaxHealth<=.3)
+            and (ctx.humanoid.SeatPart or ctx.humanoid.Sit)then
+            Q.stopDrive(ctx);api.watch(ctx)
+            local ready,holding=Q.unseat(ctx)
+            if not ready then return holding end
+        end
         Q.loadout.remember(ctx)
         if ctx.questPreviewCancel then Q.special.cancelPreview(ctx)end
         s.questPlan=plan
@@ -4886,7 +5029,7 @@ end)()
         if not holdRoute(ctx)then return ctx.questOwns==true end
         Q.stopDrive(ctx)
         if ctx.humanoid.SeatPart or ctx.humanoid.Sit then
-            ctx.humanoid.Sit=false;ctx.humanoid.Jump=true;setStatus('Leaving seat for a loaded coin bag');return true
+            local _,holding=Q.unseat(ctx);return holding
         end
         Q.drillSupport.stopMine(ctx);api.hover(ctx)
         ctx.root.CFrame=CFrame.new(api.part(item).Position+Vector3.new(0,1,2))
@@ -5077,6 +5220,7 @@ end)()
     Q.loadout=buildQuestLoadout(api,Q)
     Q.healing=buildQuestHealing(api,Q)
     Q.drillSupport=buildQuestDrill(api,Q)
+    Q.rewards=buildQuestRewards(api,Q)
     local selectLobby=Q.lobby
     function Q.lobby()
         if selectLobby()then return true end
@@ -5582,7 +5726,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 33 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 34 }
     end
     local loaded=saveStore:get('settings')
     -- Only the currently running legacy client can migrate its untagged config.
@@ -5915,6 +6059,12 @@ end)()
     end
     function F.questTargetAllowed(ctx,npc)
         if not cfg.classQuest then return true end
+        if quest and quest.drillSupport.inDungeon(ctx)then
+            local mine=quest.drillSupport.activeMine(ctx)
+            local root=not mine and quest.special.bound(ctx)
+            if mine and not quest.drillSupport.mineEnemy(npc,mine)
+                or root and not quest.special.belongs(npc,root) or not mine and not root then return false end
+        end
         local retry=ctx.questTargetRetry and ctx.questTargetRetry[npc]
         if not retry then return true end
         local h=npc:FindFirstChildOfClass('Humanoid')
@@ -6589,7 +6739,7 @@ end)()
         interact = function(ctx, item, callback) return operation(ctx, 'InteractionService', 'Interact', item, callback) end})
     local auraModule
     local questApi
-    questApi = {state=s, now=now, controller=controller, remote=api.remote, RS=api.RS,
+    questApi = {state=s, now=now, controller=controller, remote=api.remote, event=api.event, RS=api.RS,
         passives=function()
             local resolver=auraModule and auraModule('ClassResolver')
             if resolver and type(resolver.ResolvePlayerPassives)=='function'then
@@ -6800,17 +6950,20 @@ end)()
         if issued then finishGearReceipt(ctx, record) end
         release(ctx); return issued
     end
-    local function sendBag(ctx, active, payload)
+    local function sendTool(ctx, active, payload, originalFire)
         local c = controller('ToolController')
-        if not c or c.ActiveTool ~= active or active._Destroyed then return false end
+        if not ctx.active or not api.owned() or not safeToWork(ctx) or not c or c.ActiveTool ~= active or active._Destroyed
+            or not active.Tool or active.Tool.Parent~=ctx.character then return false end
         local signal = active.Execute
         local count; pcall(function() count = #signal:GetConnections() end)
         if count == 0 then
             local ok, service = pcall(function() return s.knit.GetService('ToolService') end)
             if ok and service and service.Update and type(service.Update.Fire) == 'function' and c.ActiveTool == active then
-                service.Update:Fire(payload); return true
+                service.Update:Fire(payload); return true,'ToolService.Update (listener fallback)'
             end
-        elseif signal and type(signal.Fire) == 'function' then signal:Fire(payload); return true end
+        elseif signal and type(originalFire or signal.Fire) == 'function' then
+            (originalFire or signal.Fire)(signal,payload);return true,'CustomTool.Execute'
+        end
         return false
     end
     local function bag(ctx)
@@ -6859,7 +7012,7 @@ end)()
                 observer.queryAt = now() + 2
                 -- Read-only native request, safe to retry after a lost response.
                 -- Match ToolController's forwarding when Execute has no listener.
-                local sent = sendBag(ctx, active, { 'GetStoredItems' })
+                local sent = sendTool(ctx, active, { 'GetStoredItems' })
                 status(sent and 'Church packing: waiting for the sack quantity response'
                     or 'Church packing: waiting for the native sack request listener')
                 deadline = now() + 2
@@ -6903,7 +7056,7 @@ end)()
             status('Waiting for a native sack quantity update before unloading'); return nil
         end
         ctx.sackDrop = { snapshot = worldSnapshot(), at = now() }
-        if not sendBag(ctx, active, { 'Drop' }) then
+        if not sendTool(ctx, active, { 'Drop' }) then
             ctx.sackDrop = nil; status('Church packing: waiting for the native sack drop listener'); return nil
         end
         wait(ctx, 0.35)
@@ -7064,17 +7217,8 @@ end)()
         local payload = hammer and { 'Swing', targets, 'Weak', impactDelay, workspace:GetServerTimeNow() } or { 'Swing', targets }
         local before = {}
         for _, target in ipairs(targets) do before[target] = auraHealth(target) or 0 end
-        local count
-        pcall(function() count = #signal:GetConnections() end)
-        local route = 'CustomTool.Execute'
-        if count == 0 then
-            local knit = s.knit
-            local ok, service = pcall(function() return knit.GetService('ToolService') end)
-            if not ok or not service or not service.Update or type(service.Update.Fire) ~= 'function' then
-                status('Aura signal has no listener; waiting for native ToolService.Update'); return false
-            end
-            service.Update:Fire(payload); route = 'ToolService.Update (listener fallback)'
-        else signal:Fire(payload) end
+        local sent,route=sendTool(ctx,active,payload)
+        if not sent then status('Aura signal has no listener; waiting for native ToolService.Update');return false,'native listener unavailable' end
         active.LastSwing = now() + interval
         if hammer then active.AttackLockedUntil = active.LastSwing end
         active:RecordUseCooldown(active.LastSwing)
@@ -7084,13 +7228,20 @@ end)()
         end
         return true
     end
+    function F.restoreWeaponSignal(ctx,thread)
+        local edit=ctx.swingEdit
+        if not edit or thread and edit.thread~=thread then return end
+        pcall(function()if edit.signal.Fire==edit.wrapper then edit.signal.Fire=edit.original end end)
+        if ctx.swingEdit==edit then ctx.swingEdit=nil end
+    end
     function F.miningSwing(ctx,active)
         local signal=active.Execute
         local original=signal and signal.Fire
         if type(original)~='function' or not cfg.classQuest or not ctx.questMining then return pcall(active.Swing,active)end
         -- Native Pickaxe.Swing supports ore and NPC targets in one packet. Extend
         -- that packet without changing native ore geometry, cooldown or animation.
-        local wrapper
+        if ctx.swingEdit then return false,'another native weapon dispatch is pending' end
+        local wrapper,dispatched
         wrapper=function(self,payload,...)
             if self~=signal or type(payload)~='table' or payload[1]~='Swing' or type(payload[2])~='table'then
                 return original(self,payload,...)
@@ -7105,15 +7256,38 @@ end)()
                 if not seen[target]then targets[#targets+1]=target;seen[target]=true;before[target]=auraHealth(target)end
             end
             local packet={};for i,value in ipairs(payload)do packet[i]=value end;packet[2]=targets
-            original(self,packet,...)
+            local sent=sendTool(ctx,active,packet,original)
+            if not sent then return end
+            dispatched=true
             ctx.lastMiningAura={time=now(),count=#hostiles}
             for _,target in ipairs(hostiles)do F.afterAttack(ctx,target,'Pickaxe',before[target])end
         end
         local installed=pcall(function()signal.Fire=wrapper end)
         if not installed then return false,'native mining aura signal is not writable' end
+        local edit={signal=signal,wrapper=wrapper,original=original,thread=coroutine.running()};ctx.swingEdit=edit
         local ok,why=pcall(active.Swing,active)
-        pcall(function()if signal.Fire==wrapper then signal.Fire=original end end)
-        return ok,why
+        if ctx.swingEdit==edit then F.restoreWeaponSignal(ctx,edit.thread)end
+        if not ok then return false,why end
+        return dispatched==true,dispatched and nil or 'native pickaxe produced no Swing packet'
+    end
+    function F.gunShot(ctx,active)
+        if not active or active._Destroyed or type(active.Shoot)~='function' or not safeToWork(ctx) then return false,'native gun is not ready' end
+        local signal=active.Execute;local original=signal and signal.Fire
+        if type(original)~='function' or ctx.swingEdit then return false,'native gun signal is unavailable / busy' end
+        local dispatched,action,wrapper
+        wrapper=function(self,payload,...)
+            if self~=signal or type(payload)~='table'then return original(self,payload,...)end
+            local sent=sendTool(ctx,active,payload,original)
+            if sent then action=payload[1];if action=='Shoot'then dispatched=true end end
+        end
+        local installed=pcall(function()signal.Fire=wrapper end)
+        if not installed then return false,'native gun signal is not writable' end
+        local edit={signal=signal,wrapper=wrapper,original=original,thread=coroutine.running()};ctx.swingEdit=edit
+        local ok,why=pcall(active.Shoot,active)
+        if ctx.swingEdit==edit then F.restoreWeaponSignal(ctx,edit.thread)end
+        if not ok then error(why,0)end
+        if dispatched then ctx.lastGunShot={time=now(),action='Shoot'};return true end
+        return false,action=='Reload' and 'native reload is in progress' or 'native gun produced no Shoot packet (viewmodel / aim / action not ready)'
     end
     function F.weaponClass(ctx, target)
         if ctx.pickaxeTargets and ctx.pickaxeTargets[target] then return 'Pickaxe' end
@@ -7637,7 +7811,7 @@ end)()
         pcall(movement.cleanup,ctx)
         if not ctx.active and ctx.defenseThread and ctx.defenseThread ~= coroutine.running() then pcall(task.cancel, ctx.defenseThread) end
         pcall(release,ctx); ctx.combatTarget = nil
-        pcall(function() if ctx.swingEdit and ctx.swingEdit.signal.Fire == ctx.swingEdit.wrapper then ctx.swingEdit.signal.Fire = ctx.swingEdit.original end end)
+        pcall(F.restoreWeaponSignal,ctx)
         pcall(function() if ctx.dragEdit and ctx.dragEdit.controller.ResolveLockedTargetPosition == ctx.dragEdit.wrapper then
             ctx.dragEdit.controller.ResolveLockedTargetPosition = ctx.dragEdit.original
         end end)
@@ -7722,6 +7896,7 @@ end)()
                     F.checkQuestExit(ctx)
                     F.observeChurch(ctx)
                     ctx.check()
+                    quest.rewards.step(ctx)
                     -- Progress delivery and stale ownership cleanup even while the
                     -- optional switch is OFF or a transition prevents new actions.
                     bring.step(ctx, false)
@@ -7777,7 +7952,7 @@ end
     local function startCombat(ctx, player, model, humanoid, root)
         if ctx.combatThread then return end
         s.equipRecords = s.equipRecords or setmetatable({}, { __mode = "k" })
-        local combat = { equipRecords = s.equipRecords, nextAttack = 0 }
+        local combat = { equipRecords = s.equipRecords, nextAttack = 0, pulse=now() }
         ctx.combat = combat
         local function notice(message, ready)
             if ctx.combatTarget then
@@ -7940,7 +8115,7 @@ end
             local method = selected.melee and active.Swing or active.Shoot
             if not selected.melee and type(method) ~= "function" then notice("Waiting for a supported native attack method"); return end
             if not selected.melee then
-                if ctx.watcher then return end -- Keep actual camera attention on a one-hit threat.
+                if ctx.watcher and not features.watcherVisible(ctx)then notice("Gun waits for real Watcher visibility"); return end
                 if ctx.questAimHead and target then part = target:FindFirstChild('Head') or part end
                 local camera = controller("CameraController")
                 if not camera or type(camera.GetAimRay) ~= "function" then return end
@@ -7958,10 +8133,10 @@ end
             local healthBefore = health and health.Health or (target and tonumber(target:GetAttribute("FuelLeechHealth"))) or 0
             local ok, why, blocker
             if selected.melee and features then ok, why, blocker = pcall(features.swing, ctx, active, auraTargets)
-            else ok, why = pcall(method, active) end
+            else ok, why, blocker = pcall(features.gunShot, ctx, active) end
             combat.restoreAim()
             if not ok then error(why, 0) end
-            if selected.melee and why ~= true then notice("Native melee dispatch blocked: " .. tostring(blocker or 'no eligible targets or handler')); return end
+            if why ~= true then notice("Native attack dispatch blocked: " .. tostring(blocker or 'no eligible targets or handler')); return end
             notice("Always-on aura ready: " .. selected.tool.Name, true)
             if not selected.melee and features then features.afterAttack(ctx, target, selected.class, healthBefore) end
             local endsAt = math.max(tonumber(active.LastSwing) or 0, tonumber(active.AttackLockedUntil) or 0, tonumber(active.Debounce) or 0)
@@ -7973,7 +8148,9 @@ end
             combat.target, combat.holdUntil, combat.burstUntil = target, nil, nil
         end
         ctx.combatThread = task.spawn(function()
+            combat.thread=coroutine.running()
             while ctx.active and owned() and s.farm == ctx do
+                combat.pulse=now()
                 local ok, why = pcall(step)
                 if not ok then
                     combat.restoreAim()
@@ -8912,6 +9089,19 @@ end
             print('[ChestFarm] ' .. ctx.failed)
         end
         if ctx then features.watchdog(ctx) end
+        if ctx and ctx.active and ctx.combatThread and now()>=(ctx.combatRestartAt or 0)then
+            local thread,combat=ctx.combatThread,ctx.combat
+            if coroutine.status(thread)=='dead' or combat and now()-(combat.pulse or now())>=20 then
+                ctx.combatRestartAt=now()+2
+                if coroutine.status(thread)~='dead' then pcall(task.cancel,thread)end
+                if coroutine.status(thread)=='dead' then
+                    if combat then pcall(combat.restoreAim)end
+                    pcall(features.restoreWeaponSignal,ctx,thread)
+                    ctx.combatThread=nil;startCombat(ctx,player,model,humanoid,root)
+                    status('Recovered the combat worker; native cooldowns and quest progress retained')
+                else status('Stalled native combat handler could not be cancelled; duplicate worker blocked')end
+            end
+        end
         local workerAlive = false
         if ctx then
             for thread in pairs(ctx.threads or {}) do
