@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 32: safe healing supply delivery and hostile aura alongside native mining swings.
+-- Revision 33: bounded Watcher dispatch, recovered equipment and native mine exit prompts.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 32
-    local BUILD = "r32-medical-and-mining-aura"
+    local REVISION = 33
+    local BUILD = "r33-watcher-dispatch-and-mine-exits"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2037,6 +2037,9 @@ return function(api,Q)
         end
         Q.drillSupport.stopMine(ctx)
         ctx.questHealing=true
+        -- Healing returns before the upgrade worker. Settle its old reservation
+        -- here too, or a completed/timed-out upgrade blocks every medical buy.
+        Q.drillSupport.settleUpgrade(ctx)
         ctx.questCombat=nil -- Waiting for healing is not quest counter progress.
         Q.stopDrive(ctx)
         local job=s.questDelivery
@@ -2081,10 +2084,15 @@ return function(api,Q)
             else s.questStatus='Quest healing: waiting for native medical handler / Watcher attention'end
             return true
         end
-        for _,id in ipairs(H.supplyIds(ctx))do
-            if Q.supplyReady(ctx,id) and Q.supply(ctx,plan,id)then
+        local supplies=H.supplyIds(ctx);local problem=#supplies==0 and 'no medical stock loaded' or nil
+        for _,id in ipairs(supplies)do
+            local ready,reason=Q.supplyReady(ctx,id)
+            if ready and Q.supply(ctx,plan,id)then
                 s.questStatus='Quest healing: collecting medical supplies at the current coin quote';return true
             end
+            problem=reason or s.questUpgradeJob and 'waiting for the upgrade receipt'
+                or Q.calls.upgrade and 'upgrade purchase request still pending'
+                or Q.calls.upgradeWallet and 'currency read still pending' or problem
         end
         if Q.collectMoney(ctx)then
             s.questStatus='Quest healing: collecting available Coins for medical supplies';return true
@@ -2093,7 +2101,7 @@ return function(api,Q)
             if s.questDelivery then s.questDelivery.healingFunding=true end
             s.questStatus='Quest healing: selling disposable loot for medical supplies';return true
         end
-        s.questStatus=string.format('Quest healing %.0f%% → 70%%; no usable medical item, waiting for native regeneration',ratio*100)
+        s.questStatus=string.format('Quest healing %.0f%% → 70%%; %s; native regeneration meanwhile',ratio*100,problem or 'medical supply retry pending')
         return true
     end
     return H
@@ -2237,6 +2245,21 @@ return function(api,Q)
         -- Fund actual quoted work, with no retained balance or arbitrary buffer.
         return math.max(fallback or desperate or 0,Q.supplyFundingTarget(ctx,plan))
     end
+    function D.settleUpgrade(ctx)
+        local job=s.questUpgradeJob
+        if not job then return false end
+        local count=tonumber(ctx.drill:GetAttribute(job.name)) or 0
+        if count>job.before or job.confirmed or job.rejected or now()-job.started>=8 then
+            if count>job.before or job.confirmed then
+                s.stats.confirmedQuestUpgrades=(s.stats.confirmedQuestUpgrades or 0)+1
+                s.questUpgradeStatus='Upgrades: confirmed '..job.name
+            elseif job.rejected then ledger[job.key]=now()+5;s.questUpgradeStatus='Upgrades: server rejected '..job.name..'; retry in 5s'
+            else s.questUpgradeStatus='Upgrades: '..job.name..' unconfirmed; this card will not be repeated'end
+            if job.controller and type(job.controller.SetPurchasePending)=='function'then pcall(job.controller.SetPurchasePending,job.controller,false)end
+            s.questUpgradeJob=nil
+        else s.questUpgradeStatus='Upgrades: awaiting server confirmation for '..job.name end
+        return true
+    end
     function D.upgrades(ctx,plan)
         if plan.kind=='waiting' or plan.kind=='advance' or plan.kind=='complete' or plan.kind=='unsupported'then return end
         local function info(text)s.questUpgradeStatus='Upgrades: '..text end
@@ -2252,18 +2275,7 @@ return function(api,Q)
                 else info('wallet read unavailable; purchases paused')end
             end,function()return Q.enabled(ctx) and not api.extractionReady()end)
         end
-        local job=s.questUpgradeJob
-        if job then
-            local count=tonumber(ctx.drill:GetAttribute(job.name)) or 0
-            if count>job.before or job.confirmed or job.rejected or now()-job.started>=8 then
-                if count>job.before or job.confirmed then
-                    s.stats.confirmedQuestUpgrades=(s.stats.confirmedQuestUpgrades or 0)+1
-                    info('confirmed '..job.name)
-                elseif job.rejected then ledger[job.key]=now()+5;info('server rejected '..job.name..'; retry in 5s')
-                else info(job.name..' unconfirmed; this card will not be repeated')end
-                if job.controller and type(job.controller.SetPurchasePending)=='function'then pcall(job.controller.SetPurchasePending,job.controller,false)end
-                s.questUpgradeJob=nil
-            else info('awaiting server confirmation for '..job.name)end
+        if D.settleUpgrade(ctx)then
             if not c.ActiveClassReward then readWallet()end
             return
         end
@@ -2458,10 +2470,18 @@ return function(api,Q)
     end
     function D.exitPrompt(mine)
         local prompt=mine and (mine:FindFirstChild('DungeonExitPrompt',true) or mine:FindFirstChild('ExitPrompt',true))
-        if prompt then return prompt end
+        if prompt and prompt:IsA('ProximityPrompt')then return prompt end
         for _,door in ipairs(api.tagged('DungeonDoor'))do
             if D.mineshaft(door)==mine then
                 prompt=door:FindFirstChild('DungeonExitPrompt',true) or door:FindFirstChild('ExitPrompt',true)
+                if prompt and prompt:IsA('ProximityPrompt')then return prompt end
+            end
+        end
+        -- Legacy exit gates may keep the generic ProximityPrompt name. Only
+        -- inspect the verified Gate_Cave transition part, never an entry/NPC.
+        for _,gate in ipairs(mine and mine:GetChildren() or {})do
+            if gate.Name=='Gate_Cave' and gate:IsA('BasePart') and gate:FindFirstChild('DungeonDoorTransition')then
+                prompt=gate:FindFirstChildWhichIsA('ProximityPrompt',true)
                 if prompt then return prompt end
             end
         end
@@ -2787,14 +2807,14 @@ return function(api,Q)
         ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass=true,plan.weapon,plan.weaponClass or 'Sword'
         local tool=Q.preferred(ctx)
         ctx.questTurretKills=nil
-        ctx.combatTarget=best;ctx.questExitCombat=s.questChurchExit~=nil
+        ctx.combatTarget=best;Q.armTarget(ctx,best);ctx.questExitCombat=s.questChurchExit~=nil
         if not tool then status('Urgent threat: waiting for the permitted quest weapon');api.watch(ctx);return true end
         local p=api.part(best);api.hover(ctx)
         if not ctx.defenseMoving and now()>=(ctx.dodgeUntil or 0) and (p.Position-ctx.root.Position).Magnitude>8 then
             ctx.root.CFrame=CFrame.new(p.Position+Vector3.new(0,2,6))
         end
         api.watch(ctx)
-        status('Urgent threat: '..tostring(best:GetAttribute('RealName') or best.Name)..'; mining paused')
+        status(Q.attackStatus(ctx,'Urgent threat: '..tostring(best:GetAttribute('RealName') or best.Name)..'; mining paused'))
         return true
     end
     function D.boost(ctx)
@@ -2854,11 +2874,11 @@ return function(api,Q)
             if plan.kind~='combat' and not api.swordTargetAllowed(npc)then ctx.questThreat=npc end
             local tool=Q.preferred(ctx)
             if tool then
-                ctx.combatTarget=npc;api.hover(ctx)
+                ctx.combatTarget=npc;Q.armTarget(ctx,npc);api.hover(ctx)
                 ctx.questExitCombat=s.questChurchExit~=nil
                 local point=api.part(npc).Position
                 if (point-ctx.root.Position).Magnitude>8 then ctx.root.CFrame=CFrame.new(point+Vector3.new(0,2,6))end
-                api.watch(ctx);status('Mineshaft exit gated; clearing a loaded hostile with the permitted quest weapon')
+                api.watch(ctx);status(Q.attackStatus(ctx,'Mineshaft exit gated; clearing a loaded hostile with the permitted quest weapon'))
                 return true
             end
         end
@@ -2867,7 +2887,7 @@ return function(api,Q)
         if D.entry(ctx)then return true end
         local prompt=D.exitPrompt(mine)
         local player=api.Players.LocalPlayer
-        local reason=not prompt and 'native DungeonExitPrompt not loaded'
+        local reason=ctx.questPromptProblem or not prompt and 'native exit ProximityPrompt not loaded'
             or prompt:GetAttribute('DungeonDoorReady')~=true and 'DungeonDoorReady is false'
             or prompt:GetAttribute('DungeonDoorAvailable')~=true and 'DungeonDoorAvailable is false'
             or player:GetAttribute('ActiveDungeonQueueId')~=nil and 'native queue still active'
@@ -3026,14 +3046,16 @@ return function(api,Q)
                 return miningPause(ctx,mine.node,'Vein HP unchanged after both approaches',8)
             end
             local swung,why=api.mine(ctx,active)
+            local aura=ctx.lastMiningAura
+            local auraStatus=aura and now()-aura.time<=2 and '; pickaxe aura: '..aura.count..' nearby hostiles' or ''
             if swung then mine.progressAt=mine.progressAt or now()
             else
                 local reason=why or 'native pickaxe action / cooldown'
                 if not mine.progressAt and now()-mine.readyAt>=15 then return miningPause(ctx,mine.node,'Mining blocked: '..reason,5)end
-                status('Mining waits: '..reason);return true
+                status('Mining waits: '..reason..auraStatus);return true
             end
-            status(goal and 'Mining class objectives with '..api.id(pickaxe)..'; awaiting server counters'
-                or mine.coal and 'Mining loaded coal for fuel' or 'Mining loaded ore for upgrade coins');return true
+            status((goal and 'Mining class objectives with '..api.id(pickaxe)..'; awaiting server counters'
+                or mine.coal and 'Mining loaded coal for fuel' or 'Mining loaded ore for upgrade coins')..auraStatus);return true
         end
         if goal and not (api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe'))then
             s.questMiningProblem='Mining quest requires an owned pickaxe';return false
@@ -4314,18 +4336,32 @@ end)()
         return lighting and lighting:GetAttribute('Event')=='Night'
             or api.Players.LocalPlayer:GetAttribute('InDarknessZone')==true
     end
+    function Q.armTarget(ctx,npc)
+        local h=npc and npc:FindFirstChildOfClass('Humanoid')
+        if not h then return end
+        ctx.questDamageWatch=ctx.questDamageWatch or setmetatable({}, {__mode='k'})
+        if not ctx.questDamageWatch[npc]then
+            ctx.questDamageWatch[npc]={health=h.Health,progressAt=now(),selectedAt=now(),attempts=0}
+        end
+    end
+    function Q.attackStatus(ctx,text)
+        local wait=ctx.questCombatWait
+        return wait and wait.target==ctx.combatTarget and text..'; '..wait.reason or text
+    end
     function Q.targetResponsive(ctx,npc)
         if api.questTargetAllowed and not api.questTargetAllowed(ctx,npc)then return false end
         local check=ctx.questDamageWatch and ctx.questDamageWatch[npc]
         local h=npc:FindFirstChildOfClass('Humanoid')
         if check and h then
             if h.Health<check.health then check.health,check.progressAt,check.attempts=h.Health,now(),0
-            elseif check.attempts>=3 and now()-check.progressAt>=10 then
+            elseif check.attempts>=3 and now()-check.progressAt>=10
+                or now()-(check.lastAttempt or check.selectedAt or now())>=12 then
                 ctx.questTargetRetry=ctx.questTargetRetry or setmetatable({}, {__mode='k'})
                 ctx.questTargetRetry[npc]={untilAt=now()+10,health=h.Health}
                 ctx.questDamageWatch[npc]=nil
                 if ctx.combatTarget==npc then ctx.combatTarget=nil end
-                setStatus('Quest target took no damage for 10s; trying other loaded work')
+                setStatus(check.attempts>=3 and 'Quest target took no damage for 10s; trying other loaded work'
+                    or Q.attackStatus(ctx,'Quest attack did not dispatch for 12s; releasing the target'))
                 return false
             end
         end
@@ -4367,7 +4403,7 @@ end)()
         Q.drillSupport.stopMine(ctx)
         s.questIdle=nil;s.questStalled=nil
         if not holdRoute(ctx) then return true end
-        Q.stopDrive(ctx);ctx.combatTarget=npc
+        Q.stopDrive(ctx);ctx.combatTarget=npc;Q.armTarget(ctx,npc)
         local targetPart=api.part(npc);local point=targetPart.Position;local delta=ctx.root.Position-point
         local radius=gun and 30 or math.min(4,math.max(2.5,(tonumber(api.attr(tool,'Range')) or 12)*.35))
         local velocity=targetPart.AssemblyLinearVelocity
@@ -4479,7 +4515,8 @@ end)()
         if plan.name=='Pirate' and plan.kind~='combat' and not ctx.questThreat then return 'Sword_Void','Sword',true end
         if plan.kind=='waiting'then return nil,nil,true end
         if ctx.questThreat then
-            if not api.swordTargetAllowed(ctx.questThreat)then
+            if not api.swordTargetAllowed(ctx.questThreat)
+                or ctx.pickaxeTargets and ctx.pickaxeTargets[ctx.questThreat]then
                 if api.findOwned(ctx,'Pickaxe_Void')then return 'Pickaxe_Void','Pickaxe',true end
                 return nil,'Pickaxe',true
             end
@@ -4503,6 +4540,22 @@ end)()
         if not strict and ctx.questCombat then required,requiredClass,strict=ctx.questWeapon,ctx.questWeaponClass,true end
         if not strict then return nil,false end
         if not required and not requiredClass then return nil,true end
+        local controller=api.controller('ToolController')
+        local active=controller and controller.ActiveTool
+        local display=active and active.DisplayTool
+        local backpack=api.Players.LocalPlayer:FindFirstChild('Backpack')
+        if active and not active._Destroyed and active.Tool and active.Tool.Parent==ctx.character
+            and display and (display.Parent==ctx.character or display.Parent==backpack)then
+            local name=api.id(display);local class=api.attr(display,'Class')
+            local matching=api.id(active.Tool)==name or active.Tool.Name==name
+                or active.Tool.Name==name..tostring(api.Players.LocalPlayer.UserId)
+            if matching and (required and name==required or not required and (class==requiredClass
+                or requiredClass=='Gun' and (class=='Revolver' or class=='Rifle' or class=='Shotgun')))then
+                -- The native equipped model can omit definition stats. Return
+                -- its owned display Tool, which identifies the same active handler.
+                return display,true
+            end
+        end
         for _,container in ipairs({ctx.character,api.Players.LocalPlayer:FindFirstChild('Backpack')}) do
             if container then for _,tool in ipairs(container:GetChildren()) do
                 if tool.Parent==container and required and (api.id(tool)==required or tool.Name==required..tostring(api.Players.LocalPlayer.UserId)) then return tool,true end
@@ -4872,12 +4925,22 @@ end)()
     end
     local function checkout(item) return item and item.Parent and item:IsA('BasePart') and api.tag(item,'BuyPart') and item:IsDescendantOf(workspace) end
     function Q.supplyReady(ctx,id)
-        if not supplyAllowed(id) then return false end
+        if not supplyAllowed(id) then return false,'medical item is not eligible for coin purchase' end
         local item=nearest(looseItems(),ctx.root.Position,function(item)
             return api.id(item)==id and now()>=(retries[item] or 0) and (free(item) or stock(item))
                 and (id:sub(-5)=='_Ammo' or api.hasRoom(ctx,item) or Q.healing.canMakeRoom(ctx,item))
         end)
-        return item and (free(item) or nearest(api.tagged('BuyPart'),api.part(item).Position,checkout))~=nil
+        if not item then
+            for _,found in ipairs(looseItems())do
+                if api.id(found)==id and (free(found) or stock(found))then
+                    if now()<(retries[found] or 0)then return false,'medical item is waiting for its retry / receipt' end
+                    return false,'toolbar is full; no authorized shard slot is available'
+                end
+            end
+            return false,'no eligible medical stock loaded'
+        end
+        if free(item) or nearest(api.tagged('BuyPart'),api.part(item).Position,checkout)then return true end
+        return false,'medical stock has no loaded BuyPart checkout'
     end
     local function obstructed(job)
         if not checkout(job.target) then return true end
@@ -5519,7 +5582,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 32 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 33 }
     end
     local loaded=saveStore:get('settings')
     -- Only the currently running legacy client can migrate its untagged config.
@@ -6107,15 +6170,18 @@ end)()
                 if id(piece) == id(tool) or piece.Name == id(tool) .. tostring(api.Players.LocalPlayer.UserId) then represented = true end
             end
             if not represented and other and not other._Destroyed and other.Tool
-                and other.Tool.Parent == ctx.character then record.accepted = nil end
+                and other.Tool.Parent == ctx.character and other~=record.previousActive then record.accepted = nil end
         end
         if record and (record.pending or record.accepted or now() < (record.retryAt or 0)) then return nil end
         record = record or {}; s.equipRecords[tool] = record
+        local nativeController=controller('ToolController')
+        record.previousActive=nativeController and nativeController.ActiveTool
+        record.pending = true
         local issued = api.request('equip-weapon', 'ToolService', 'EquipTool', api.pack(tool), function(result)
             record.pending = nil
             record.accepted, record.retryAt = api.accepted(result), now() + 3
         end)
-        if issued then record.pending = true end
+        if not issued then record.pending = nil end
     end
     local function wait(ctx, seconds)
         ctx.featurePulse = now()
@@ -6284,8 +6350,15 @@ end)()
             ctx.heldPrompts=ctx.heldPrompts or {};ctx.heldPrompts[prompt]=true
             local ok,why=pcall(function()prompt:InputHoldBegin();wait(ctx,original+.15)end)
             pcall(function()prompt:InputHoldEnd()end);ctx.heldPrompts[prompt]=nil
-            if not ok then error(why,0)end
-            return true
+            if ok then ctx.questPromptProblem=nil;return true end
+            if tostring(why):find('__CHESTFARM_CANCELLED',1,true) or tostring(why):find('__EARTH_',1,true)then error(why,0)end
+            -- Some executors deny native hold input. Preserve the real duration
+            -- when trying their helper, then require the actual exit receipt.
+            local helper=api.env.fireproximityprompt or fireproximityprompt
+            if type(helper)=='function'then ok,why=pcall(helper,prompt)end
+            ctx.questPromptProblem=not ok and 'ProximityPrompt input failed: '..tostring(why) or nil
+            if not ok then status(ctx.questPromptProblem)end
+            return ok
         end
         ctx.instantPrompts = ctx.instantPrompts or {}; ctx.instantPrompts[prompt] = original
         prompt.HoldDuration = 0
@@ -6302,7 +6375,10 @@ end)()
         ctx.instantPrompts[prompt] = nil
         if not ok and (tostring(why):find('__CHESTFARM_CANCELLED', 1, true)
             or tostring(why):find('__EARTH_', 1, true)) then error(why, 0) end
-        if not ok then status('Prompt action failed: ' .. tostring(why)) end
+        if not ok then
+            if dungeon then ctx.questPromptProblem='ProximityPrompt action failed: '..tostring(why)end
+            status('Prompt action failed: ' .. tostring(why))
+        elseif dungeon then ctx.questPromptProblem=nil end
         return ok
     end
     function F.prompt(ctx, prompt) return firePrompt(ctx, prompt) end
@@ -6948,10 +7024,12 @@ end)()
     end
     function F.swing(ctx, active)
         ctx.check()
-        if not active or active._Destroyed or not active.Tool or active.Tool.Parent ~= ctx.character then return false end
+        if not active or active._Destroyed or not active.Tool or active.Tool.Parent ~= ctx.character then return false,'equipped weapon is stale' end
         local c = controller('ToolController')
-        if not c or c.ActiveTool ~= active or not safeToWork(ctx) or not readyAction(active) then return false end
-        if type(active.CanUseAction) ~= 'function' or type(active.RecordUseCooldown) ~= 'function' then return false end
+        if not c or c.ActiveTool ~= active then return false,'native active weapon changed' end
+        if not safeToWork(ctx) then return false,'seat or transition is active' end
+        if not readyAction(active) then return false,'native weapon action / cooldown is not ready' end
+        if type(active.CanUseAction) ~= 'function' or type(active.RecordUseCooldown) ~= 'function' then return false,'native cooldown handler missing' end
         local class, hammer = auraClass(active)
         if class ~= 'Sword' and class ~= 'Pickaxe' then return false end
         if cfg.classQuest and quest then
@@ -6969,7 +7047,7 @@ end)()
             local speed = auraModule('AttackSpeed')
             if speed and type(speed.GetInterval) == 'function' then interval = speed.GetInterval(active.AttackSpeed or 0) end
         end
-        if not finite(interval) or interval <= 0 then return false end
+        if not finite(interval) or interval <= 0 then return false,'native attack interval unavailable' end
         local impactDelay
         if hammer then
             local timing = auraModule('ChampionHammerTiming')
@@ -6977,10 +7055,10 @@ end)()
             impactDelay = timing.GetLightImpactDelay(interval)
         end
         local signal = active.Execute
-        if not signal or type(signal.Fire) ~= 'function' then return false end
+        if not signal or type(signal.Fire) ~= 'function' then return false,'native Execute signal missing' end
         -- Refresh after any yielding native-module lookup; a previous snapshot can be stale.
         local targets = F.auraTargets(ctx, active)
-        if #targets == 0 then return false end
+        if #targets == 0 then return false,'no permitted hostile inside native hit range' end
         ctx.check()
         if c.ActiveTool ~= active or active.Tool.Parent ~= ctx.character or not safeToWork(ctx) or not readyAction(active) then return false end
         local payload = hammer and { 'Swing', targets, 'Weak', impactDelay, workspace:GetServerTimeNow() } or { 'Swing', targets }
@@ -7045,7 +7123,10 @@ end)()
             ctx.questDamageWatch=ctx.questDamageWatch or setmetatable({}, {__mode='k'})
             local check=ctx.questDamageWatch[target]
             local hp=npcHealth(target)
-            if not check or hp<check.health then check={health=hp,progressAt=now(),attempts=0};ctx.questDamageWatch[target]=check end
+            if not check or hp<check.health or check.weaponClass and check.weaponClass~=class then
+                check={health=hp,progressAt=now(),attempts=0};ctx.questDamageWatch[target]=check
+            end
+            check.weaponClass=class;ctx.questCombatWait=nil
             check.attempts=check.attempts+1;check.lastAttempt=now()
         end
         if class ~= 'Sword' or not target or not target.Parent then return end
@@ -7055,7 +7136,8 @@ end)()
         record.before = before
         if record.failures >= 3 and findTool(ctx, 'Pickaxe') then
             ctx.pickaxeTargets[target] = true
-            status('Sword attacks show no health change; trying an owned pickaxe')
+            local plan=cfg.classQuest and quest and quest.plan(s.classData,s.questCatalog,cfg.driveDepth)
+            if not plan or plan.kind~='combat'then status('Sword attacks show no health change; trying an owned pickaxe')end
         end
     end
     function F.watcher(ctx)
@@ -7697,7 +7779,10 @@ end
         s.equipRecords = s.equipRecords or setmetatable({}, { __mode = "k" })
         local combat = { equipRecords = s.equipRecords, nextAttack = 0 }
         ctx.combat = combat
-        local function notice(message)
+        local function notice(message, ready)
+            if ctx.combatTarget then
+                ctx.questCombatWait = not ready and {target=ctx.combatTarget,reason=message} or nil
+            end
             if combat.notice ~= message then combat.notice = message; print("[ChestFarm Combat] " .. message) end
         end
         local function attribute(tool, name)
@@ -7785,19 +7870,20 @@ end
             if features then pcall(features.watcher, ctx) end
             if features then
                 local ok, threat = pcall(features.observeThreat, ctx)
-                if ok and threat then combat.holdUntil, combat.burstUntil = nil, nil; return end
+                if ok and threat then notice("Dodging a current projectile cue"); combat.holdUntil, combat.burstUntil = nil, nil; return end
             end
             local scene = controller("CutSceneController")
             if workspace:GetAttribute("InCutScene") or workspace:GetAttribute("InfiniteRebasing")
                 or (scene and (scene.CurrentCutScene or scene.AbortingCutScene))
                 or s.request or s.awaiting or s.departureAt
                 or ctx.featureHold then
+                notice(ctx.featureHold and "Waiting for the current item operation" or "Waiting for the current game transition")
                 combat.holdUntil, combat.burstUntil = nil, nil
                 return
             end
-            if ctx.dodgeUntil and now() < ctx.dodgeUntil then return end
-            if features and features.dodge(ctx) then return end
-            if features and features.quest.pauseCombat(ctx)then return end
+            if ctx.dodgeUntil and now() < ctx.dodgeUntil then notice("Finishing the current dodge"); return end
+            if features and features.dodge(ctx) then notice("Dodging a current attack"); return end
+            if features and features.quest.pauseCombat(ctx)then notice("Combat paused by healing, mining or another quest action"); return end
             local _, _, questCombatRequired = features.quest.required(ctx)
             if features and not questCombatRequired and not ctx.questCombat and not ctx.bringEquipmentLock and features.usePendant(ctx) then return end
             if now() >= (combat.inventoryAt or 0) or not combat.selected
@@ -7825,23 +7911,17 @@ end
             end
             if not ready then
                 if ctx.bringEquipmentLock then return end -- Native tool changes cancel drag ownership.
-                local record = combat.equipRecords[selected.tool]
-                if selected.tool.Parent == model then notice("Waiting for the equipped weapon's native attack handler"); return end
-                if record and record.accepted then
-                    notice("Equip request accepted; waiting for replicated equipment confirmation")
-                    return -- EquipTool toggles equipment; an uncertain accepted action must not be resent.
-                end
-                if record and now() < (record.retryAt or 0) then return end
-                record = record or {}; combat.equipRecords[selected.tool] = record
-                if request("equip-weapon", "ToolService", "EquipTool", pack(selected.tool), function(result)
-                    record.accepted, record.retryAt = accepted(result), now() + 3
-                end) then notice("Equipping " .. selected.tool.Name) end
+                -- Share the receipt-aware equip path with mining and healing.
+                -- It can recover a superseded accepted request only after a
+                -- different native tool is confirmed and this one is absent.
+                features.equip(ctx, selected.tool)
+                notice(selected.tool.Parent == model and "Waiting for the equipped weapon's native attack handler"
+                    or "Equipping " .. selected.tool.Name .. "; waiting for its native handler")
                 return
             end
             combat.equipRecords[selected.tool] = nil
-            notice("Always-on aura ready: " .. selected.tool.Name)
             if now() < combat.nextAttack then return end
-            if humanoid.SeatPart or humanoid.Sit then return end
+            if humanoid.SeatPart or humanoid.Sit then notice("Leaving the seat before attacking"); return end
             local radius = selected.melee and features.weaponRange(active, selected.tool) or 80
             local auraTargets = selected.melee and features and features.auraTargets(ctx, active)
             local target, part = nearestHostile(radius, selected.class)
@@ -7851,11 +7931,12 @@ end
                 if desiredPart and (desiredPart.Position - root.Position).Magnitude <= radius then target, part = ctx.combatTarget, desiredPart end
             end
             if not target and (not auraTargets or #auraTargets == 0) then
+                notice("No permitted hostile inside the native weapon range")
                 combat.holdUntil, combat.burstUntil, combat.target = nil, nil, nil; return
             end
-            if type(active.CanUseAction) == "function" and not active:CanUseAction() then return end
+            if type(active.CanUseAction) == "function" and not active:CanUseAction() then notice("Native weapon action is not ready"); return end
             local cooldown = math.max(tonumber(active.LastSwing) or 0, tonumber(active.AttackLockedUntil) or 0, tonumber(active.Debounce) or 0)
-            if now() < cooldown then combat.nextAttack = cooldown; return end
+            if now() < cooldown then notice("Waiting for the native weapon cooldown"); combat.nextAttack = cooldown; return end
             local method = selected.melee and active.Swing or active.Shoot
             if not selected.melee and type(method) ~= "function" then notice("Waiting for a supported native attack method"); return end
             if not selected.melee then
@@ -7875,12 +7956,13 @@ end
             end
             local health = target and target:FindFirstChildOfClass("Humanoid")
             local healthBefore = health and health.Health or (target and tonumber(target:GetAttribute("FuelLeechHealth"))) or 0
-            local ok, why
-            if selected.melee and features then ok, why = pcall(features.swing, ctx, active, auraTargets)
+            local ok, why, blocker
+            if selected.melee and features then ok, why, blocker = pcall(features.swing, ctx, active, auraTargets)
             else ok, why = pcall(method, active) end
             combat.restoreAim()
             if not ok then error(why, 0) end
-            if selected.melee and why ~= true then return end
+            if selected.melee and why ~= true then notice("Native melee dispatch blocked: " .. tostring(blocker or 'no eligible targets or handler')); return end
+            notice("Always-on aura ready: " .. selected.tool.Name, true)
             if not selected.melee and features then features.afterAttack(ctx, target, selected.class, healthBefore) end
             local endsAt = math.max(tonumber(active.LastSwing) or 0, tonumber(active.AttackLockedUntil) or 0, tonumber(active.Debounce) or 0)
             combat.nextAttack = math.max(now() + 0.1, endsAt)
