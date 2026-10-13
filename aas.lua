@@ -1,4 +1,4 @@
--- JoesAAS 5.17 | standalone source | October 2026
+-- JoesAAS 5.18 | standalone source | October 2026
 -- Built against the supplied client export. See JoesAAS-README.md for limits and validation.
 -- Fluent UI from dawid-scripts/Fluent. Settings save and restore automatically; each feature uses its own toggle.
 local environment = (type(getgenv) == "function" and getgenv()) or _G
@@ -8,7 +8,7 @@ if game.GameId ~= 10502841145 then
     warn("JoesAAS: this build targets the exported game's universe, not this experience.")
     return
 end
-local A = {version="5.17"}
+local A = {version="5.18"}
 environment.JoesAAS = A
 environment.AnimeSuite = A -- Compatibility with older running versions.
 A.Core = (function()
@@ -18,6 +18,24 @@ Core.priorityLabels={MaxTac='MaxTac',Tower='Tower',TimeTrial='Time Trials',Dunge
 -- Both Cursed Rush variants (including King of Curses) share the Rush tier.
 local rushKeys={CursedRush=true,ZabanRush=true,StandRush=true}
 function Core.isRush(key) return rushKeys[key]==true end
+function Core.systemWorld(worlds,kind,key,explicit,aliases)
+    aliases=type(aliases)=='table' and aliases or {}
+    local wanted=aliases[kind] or kind
+    local fallback
+    for _,id in ipairs(Core.keys(worlds)) do
+        local world=worlds[id]
+        for name,entry in pairs(type(world.Systems)=='table' and world.Systems or {}) do
+            local systemType=type(entry)=='table' and (entry.Type or name) or name
+            systemType=aliases[systemType] or systemType
+            if systemType==wanted then
+                local systemKey=type(entry)=='table' and (entry.Key or entry.SystemKey or entry[1]) or entry
+                if systemKey==key then return tonumber(id) end
+                if wanted=='TimeTrial' then fallback=fallback or tonumber(id) end
+            end
+        end
+    end
+    return fallback or tonumber(explicit)
+end
 function Core.copy(t)
     if type(t) ~= 'table' then return t end
     local out = {}; for k,v in pairs(t) do out[k] = Core.copy(v) end; return out
@@ -175,7 +193,7 @@ return function(A)
         pingEvents={Disconnect=true,Error=true,Mode=false,Progress=false,Inventory=false},
         blackScreen=false,moveStyle='Walk',distance=5,saveSecrets=false,ripperdocAuto=false,ripperdocSlots={},
         autoLeaveStuck=true,stuckSeconds=10,trialDungeonStuckSeconds=20,fixerAutoClaim=false,fixerAutoDeploy=false,fixerPreference='Board order',pendingGuildAutoClaim=false,overclockAuto=false,overclockSelection={},
-        cyberPlanAuto=false,cyberPlanOrder={},cyberPlanTargets={},loadoutAuto=false,loadoutStat='Power'}
+        cyberPlanAuto=false,cyberPlanOrder={},cyberPlanTargets={},loadoutAuto=false,loadoutStat='Power',tarotAuto=false,tarotFateCard='World'}
     A.legacyFolder='AnimeSuite_'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.folder='JoesAAS/'..tostring(game.GameId)..'_'..tostring(A.player.UserId)
     A.file=A.folder..'/settings.json'
@@ -887,6 +905,18 @@ end)()(A);
 return function(A)
     local pets,equipped,sequence=nil,nil,nil
     local listeners={}
+    function A.petOnGig(data,id)
+        local util=A.util('FixerGigUtil')
+        if util and type(util.IsPetOnGig)=='function' then
+            local ok,busy=pcall(util.IsPetOnGig,data,id)
+            if ok then return busy==true end
+        end
+        local board=data and type(data.FixerGigs)=='table' and data.FixerGigs.Board
+        for _,gig in ipairs(type(board)=='table' and board or {}) do
+            if type(gig)=='table' and gig.PetUid==id then return true end
+        end
+        return false
+    end
     local function publish(ids)
         for _,fn in ipairs(listeners) do
             local ok,err=pcall(fn,ids)
@@ -1001,7 +1031,8 @@ return function(A)
     A.sessionNamed={}
     local eligibility,acceptedUntil,serverConfirmed={},{},{}
     local candidates,dirty,reconcileAt={},nil,0
-    local function inspect(id,pet,named,stats)
+    local function inspect(id,pet,named,stats,data)
+        if A.petOnGig(data,id) then return false,'pet on Fixer gig',type(pet)=='table' and pet.Rarity or 'unknown' end
         local row=eligibility[id]
         local record=type(named)=='table' and named[id]
         if not row or row.pet~=pet or row.petId~=(type(pet)=='table' and pet.PetId)
@@ -1025,6 +1056,10 @@ return function(A)
         if A.tasks.Renaming then A.tasks.Renaming.next=0 end
     end
     A.onPetInventory(invalidate)
+    if A.container and type(A.container.OnChange)=='function' then
+        local ok,c=pcall(A.container.OnChange,A.container,{'FixerGigs'},function() invalidate() end)
+        if ok and c then A.connections[#A.connections+1]=c end
+    end
     function A.renameDiagnostics()
         local d=A.petData() or {}; local stats=A.util('PetStatsUtil')
         local report={version=A.version,status=A.status.Rename,inventoryType=type(d.Pets),namedType=type(d.NamedPets),total=0,reasons={},rarities={},samples={},
@@ -1033,7 +1068,7 @@ return function(A)
         local sampled={}
         for _,id in ipairs(C.keys(type(d.Pets)=='table' and d.Pets or {})) do
             local pet=d.Pets[id]; report.total=report.total+1
-            local eligible,reason,rarity=inspect(id,pet,named,stats)
+            local eligible,reason,rarity=inspect(id,pet,named,stats,d)
             reason=A.sessionNamed[id] and 'renamed this session' or reason
             report.reasons[reason]=(report.reasons[reason] or 0)+1
             rarity=tostring(rarity)
@@ -1129,14 +1164,14 @@ return function(A)
         if not dirty or os.clock()>=reconcileAt then
             candidates={}
             for petId,pet in pairs(d.Pets) do
-                local eligible=inspect(petId,pet,d.NamedPets or {},stats)
+                local eligible=inspect(petId,pet,d.NamedPets or {},stats,d)
                 if eligible then candidates[petId]=true end
             end
             dirty={}; reconcileAt=os.clock()+5
         else
             for petId in pairs(dirty) do
                 local pet=d.Pets[petId]
-                candidates[petId]=pet~=nil and inspect(petId,pet,d.NamedPets or {},stats)==true or nil
+                candidates[petId]=pet~=nil and inspect(petId,pet,d.NamedPets or {},stats,d)==true or nil
             end
             dirty={}
         end
@@ -1155,7 +1190,7 @@ return function(A)
         end
         for _,petId in ipairs(C.keys(candidates)) do
             -- A partially replicated or malformed entry must not block the rest.
-            local canRename,skip=inspect(petId,d.Pets[petId],d.NamedPets or {},stats)
+            local canRename,skip=inspect(petId,d.Pets[petId],d.NamedPets or {},stats,d)
             if retryAfter[petId] and os.clock()>=retryAfter[petId] then
                 retries[petId]=nil; retryAfter[petId]=nil
             end
@@ -1259,6 +1294,7 @@ return function(A)
         local dirty,nextScan,passiveReady=true,0,false
         local deadline,nextAction,nextState,advanceUntil=0,0,0,0
         local amount,lastRaw,cost,blockedAmount=nil,nil,nil,nil
+        local nativeWait,waitingForTokens=false,false
         local function kick()
             if A.tasks[title] then A.tasks[title].next=0 end
         end
@@ -1295,7 +1331,7 @@ return function(A)
         end
         local function stop()
             if not owned then return end
-            owned=false; current=nil; phase='idle'; dirty=true; blockedAmount=nil
+            owned=false; current=nil; phase='idle'; dirty=true; blockedAmount=nil; waitingForTokens=false
             lastRaw=nil; amount=nil; passiveReady=false; passives={}
             local ok,err=pcall(stopNative)
             A.status[title]=ok and 'OFF' or ('Stop failed: '..tostring(err))
@@ -1329,10 +1365,11 @@ return function(A)
             local key=type(packet)=='table' and packet.ChangedKey
             local matches=key==current.id or key==(current.passiveKey or current.id) or key==current.legacyKey
             if key and not matches then return end
-            if accepted==true then failures[current.id]=nil; return end
+            if accepted==true then failures[current.id]=nil; blockedAmount=nil; return end
             if reason=='rate_limited' or reason=='processing' then return end
             if reason=='not_enough_items' then
-                blockedAmount=amount or 0; clearing(); phase='funds'
+                blockedAmount=amount or 0
+                if not nativeWait then clearing(); phase='funds' end
             elseif spec.invalid[reason] and key and matches then
                 retryAfter[current.id]=os.clock()+60; current=nil; clearing(5.1); dirty=true
             else
@@ -1351,12 +1388,15 @@ return function(A)
         if spec.observe then spec.observe(wake) end
         if A.container and type(A.container.OnChange)=='function' then
             local observed={}
-            for _,field in ipairs({spec.inventoryField,spec.passiveField,'RollQueues','AutoRollStates'}) do
+            local fields={spec.inventoryField,spec.passiveField,'RollQueues','AutoRollStates'}; local extra={}
+            for _,field in ipairs(spec.observeFields or {}) do fields[#fields+1]=field; extra[field]=true end
+            for _,field in ipairs(fields) do
                 if not observed[field] then
                     observed[field]=true
                     local ok,connection=pcall(A.container.OnChange,A.container,{field},function()
                         if not owned and not A.settings[spec.setting] then dirty=true; passiveReady=false; return end
                         if field==spec.inventoryField and field~=spec.passiveField then dirty=true end
+                        if extra[field] then dirty=true end
                         if field==spec.passiveField then
                             local data=A.data()
                             if field==spec.inventoryField and spec.inventoryChanged and spec.inventoryChanged(data) then dirty=true end
@@ -1403,6 +1443,7 @@ return function(A)
                 A.status[title]='Native passive queue unavailable'; return false
             end
             cost=cost or A.Core.copy(cfg.ItemCost)
+            nativeWait=type(queueUtil.WaitForTokens)=='function' and type(queueUtil.ReadBalance)=='function'
             return true
         end
         local function rebuild(data)
@@ -1456,9 +1497,10 @@ return function(A)
             if not passiveReady then
                 requestState(); A.status[title]='ON — waiting for the current passive inventory'; return
             end
-            if current and not spec.owns(data,current) then dirty=true end
+            local currentOwned=current and spec.owns(data,current)
+            if current and not currentOwned then dirty=true end
             if dirty or os.clock()>=nextScan then rebuild(data) end
-            if current and (not byId[current.id] or complete(current,data)) then
+            if current and (not currentOwned or not byId[current.id] or complete(current,data)) then
                 local deleted=not byId[current.id]
                 current=nil; clearing(deleted and 5.1 or gap)
             end
@@ -1499,10 +1541,10 @@ return function(A)
                 if phase~='cost' then clearing(); phase='cost' end
                 A.status[title]='Discounted roll cost unavailable'; return
             elseif phase=='cost' then phase='clearing' end
-            if (amount or 0)<price or (blockedAmount and (amount or 0)<=blockedAmount) then
+            waitingForTokens=(amount or 0)<price or (blockedAmount~=nil and (amount or 0)<=blockedAmount)
+            if waitingForTokens and not nativeWait then
                 if phase~='funds' then clearing(); phase='funds' end
-                A.status[title]='ON — paused: need '..tostring(price)..' '..cost.ItemId..' per roll; '..label
-                return
+                A.status[title]='ON — paused: need '..tostring(price)..' '..cost.ItemId..' per roll; '..label; return
             elseif phase=='funds' then blockedAmount=nil; phase='clearing' end
             if os.clock()<nextAction then A.status[title]='ON — waiting for the previous roller to stop; '..label; return end
             local busy=queueUI.Config.IsBusy()
@@ -1545,10 +1587,12 @@ return function(A)
                     requestState(); clearing(5.1); return
                 end
             end
-            A.status[title]='ON — '..(phase=='rolling' and 'rolling ' or 'starting ')..label
+            A.status[title]=nativeWait and waitingForTokens and phase=='rolling'
+                and ('ON — native roller waiting for '..cost.ItemId..'; '..label)
+                or ('ON — '..(phase=='rolling' and 'rolling ' or 'starting ')..label)
         end
         A.passiveQueues[spec.kind]={stop=stop,wake=kick,active=function()
-            return phase=='starting' or phase=='rolling' or phase=='clearing'
+            return phase=='starting' or (phase=='rolling' and not waitingForTokens) or phase=='clearing'
         end}
         A.job(title,0.25,function()
             local ok,err=pcall(step)
@@ -1568,11 +1612,12 @@ return function(A)
         target='DivinePredator',targetName='Divine Predator',plural='pets',
         config='PetPassiveConfig',controller='PetPassiveController',discount=true,sync=true,
         inventoryField='Pets',passiveField='PetPassives',data=A.petData,
-        invalid={pet_not_owned=true},state='PetPassiveState',stateRequest='PetPassiveStateRequest',result='PetPassiveResult',
+        invalid={pet_not_owned=true,pet_on_gig=true},state='PetPassiveState',stateRequest='PetPassiveStateRequest',result='PetPassiveResult',
+        observeFields={'FixerGigs'},
         observe=A.onPetInventory,
         snapshot=function(data) return data and data.PetPassives end,
         retained=function(data,row) return type(data.PetPassives)=='table' and data.PetPassives[row.id] end,
-        owns=function(data,row) return type(data.Pets[row.id])=='table' end,
+        owns=function(data,row) return type(data.Pets[row.id])=='table' and not A.petOnGig(data,row.id) end,
         prepare=function()
             stats=A.util('PetStatsUtil')
             return stats and type(stats.GetPetData)=='function' and type(stats.GetRarity)=='function'
@@ -1581,7 +1626,7 @@ return function(A)
         rows=function(data)
             local out={}
             for id,pet in pairs(data.Pets) do
-                if type(id)=='string' and id~='' and type(pet)=='table' then
+                if type(id)=='string' and id~='' and type(pet)=='table' and not A.petOnGig(data,id) then
                     local ok,row=pcall(function()
                         local catalog=stats.GetPetData(pet)
                         if type(catalog)~='table' then return nil end
@@ -1670,18 +1715,32 @@ return function(A)
             return out
         end,
     }))
-    local swords,keys
+    local swords,keys,swordState,namedState
     A.createPassiveQueue(mapSpec({kind='SwordPassive',title='Sword passives',setting='swordPassiveAuto',
         config='SwordPassiveConfig',controller='SwordPassiveController',target='SunBreathing',targetName='Sun Breathing',
         plural='swords',inventoryField='ActiveSwords',passiveField='SwordPassives',invalid={sword_not_owned=true},
+        observeFields={'SwordCopies','NamedSwords','SwordNames'},
         prepare=function()
             swords=A.config('SwordConfig'); keys=A.util('SwordCopyKeyUtil')
+            swordState=A.util('SwordCopyStateUtil'); namedState=A.util('NamedStateUtil')
+            if swordState and (type(swordState.BuildGroups)~='function' or type(swordState.ResolveIndex)~='function'
+                or type(swordState.GetMultiplier)~='function' or not keys or type(keys.Decode)~='function') then swordState=nil end
+            if namedState and type(namedState.IsNamed)~='function' then namedState=nil end
             return swords and type(swords.GetSword)=='function' and keys and type(keys.Encode)=='function'
                 and type(keys.ToPassiveKey)=='function' and type(keys.Owns)=='function' and type(keys.CountCopies)=='function'
         end,
-        owns=function(data,item) return keys.Owns(data,item.id)==true end,
+        owns=function(data,item)
+            if not keys.Owns(data,item.id) then return false end
+            if item.copyUid then
+                local world,rarity,level,index=keys.Decode(item.id)
+                return swordState.ResolveIndex(swordState.BuildGroups(data),world,rarity,level,index)==item.copyUid
+            end
+            return true
+        end,
         rows=function(data)
             local out={}
+            local groups=swordState and swordState.BuildGroups(data)
+            local migrated=type(data.SwordCopies)=='table' and (data.SwordCopiesMigrated==true or next(data.SwordCopies)~=nil)
             for world,owned in pairs(data.ActiveSwords) do
                 local banner=type(world)=='string' and swords:GetSword(world)
                 if type(banner)=='table' and type(banner.Items)=='table' and type(owned)=='table' then
@@ -1692,9 +1751,13 @@ return function(A)
                                 local count=copies(keys.CountCopies(data,world,rarity,level))
                                 for index=1,count do
                                     local id=keys.Encode(world,rarity,level,index)
-                                    add(out,row(id,{Name=item.Name,Rarity=rarity},item.Multiplier,
-                                        {level=level,passiveKey=keys.ToPassiveKey(id),
+                                    local uid=groups and swordState.ResolveIndex(groups,world,rarity,level,index)
+                                    local named=uid and namedState and namedState.IsNamed(data,'Sword',uid)==true
+                                    local power=swordState and swordState.GetMultiplier(item,level,named,rarity) or item.Multiplier
+                                    if not migrated or uid then add(out,row(id,{Name=item.Name,Rarity=rarity},power,
+                                        {level=level,copyUid=uid,passiveKey=keys.ToPassiveKey(id),
                                             legacyKey=index==1 and (world..'_'..rarity..'_'..level) or nil}))
+                                    end
                                 end
                             end
                             if type(levels)=='number' then levelRows(0)
@@ -2427,6 +2490,15 @@ return function(A)
         local cached=choiceCache[mode]
         if cached and cached.config==cfg and cached.getter==(cfg and cfg[def.method]) and cached.revision==A.catalogRevision then return cached.value end
         local choices=cfg and type(cfg[def.method])=='function' and cfg[def.method](cfg) or {}
+        local worldConfig=A.config('WorldConfig'); local resolved={}
+        for key,entry in pairs(choices) do
+            local wid=A.Core.systemWorld(A.catalog.worlds,nativeMode(mode),key,entry.WorldId,worldConfig and worldConfig.SystemAliases)
+            if wid~=nil and wid~=entry.WorldId then
+                local copy={}; for field,value in pairs(entry) do copy[field]=value end
+                copy.WorldId=wid; resolved[key]=copy
+            else resolved[key]=entry end
+        end
+        choices=resolved
         if mode=='BossRush' or mode=='Rush' then
             local rows={}
             for key,rush in pairs(choices) do
@@ -2514,7 +2586,9 @@ return function(A)
             local cfg=choices[key]; local label=cfg.Name or key
             if mode~='TimeTrial' then
                 local id=tonumber(cfg.WorldId)
-                label=(id and ('World '..id..' | ') or 'Other | ')..label
+                local world=id and A.catalog.worlds[id]
+                local prefix=id and (id<=0 and world and world.Name or 'World '..id) or 'Other'
+                label=prefix..' | '..label
             end
             rows[#rows+1]={key=key,label=label}
         end
@@ -3664,7 +3738,7 @@ return function(A)
         for _,field in ipairs({'Accessories','AccessoryCurses','PetAccessories','NamedPets','PetPassives','ActiveSwords','SwordPassives',
             'ActiveTitans','TitanPassives','ShadowCopies','Mounts','PrimordialCopies','ActivePrimordials','RipperdocLevels','FixerGigs',
             'NamedTitans','NamedShadows','NamedPrimordials','MultiplierUpgrades','AchievementPrimordialSlots',
-            'ActiveGachas','ActiveGrimoires','GrimoirePassives','KaguneUpgrades','StandMastery'}) do
+            'ActiveGachas','ActiveGrimoires','GrimoirePassives','KaguneUpgrades','StandMastery','SwordCopies','NamedSwords','SwordNames','Tarot'}) do
             local ok,c=pcall(A.container.OnChange,A.container,{field},function() if A.alive then A.wakeLoadout() end end)
             if ok and c then A.connections[#A.connections+1]=c end
         end
@@ -3788,6 +3862,59 @@ end
 
 end)()(A);
 
+-- ===== tarot =====
+(function()
+return function(A)
+    local pending,nextAttempt=nil,0
+    function A.tarotRows()
+        local cfg=A.config('TarotConfig'); local rows={}
+        for _,card in ipairs(cfg and cfg.Cards or {}) do rows[#rows+1]={key=card.Id,label=card.Name} end
+        return rows
+    end
+    A.on('TarotActionResult',function(accepted,reason)
+        if not pending or accepted~=false then return end
+        pending=nil; nextAttempt=os.clock()+60
+        A.status.Tarot='Draw refused: '..tostring(reason)..'; waiting to retry'
+    end)
+    A.job('Tarot',2,function()
+        if not A.alive or not A.running then return end
+        if not A.settings.tarotAuto and not pending then A.status.Tarot='OFF'; return end
+        local cfg=A.config('TarotConfig'); local data=A.data()
+        if not cfg or cfg.Enabled~=true or not data or type(data.Tarot)~='table' then
+            A.status.Tarot='Waiting for Tarot data'; return
+        end
+        local now=A.serverNow()
+        if cfg:IsActive(data.Tarot,now) then
+            pending=nil
+            A.status.Tarot='Blessing active · '..tostring((cfg:GetCard(data.Tarot.CardId) or {}).Name or data.Tarot.CardId)
+            return
+        end
+        if pending then
+            if os.clock()-pending.at<15 then A.status.Tarot='Waiting for draw confirmation'; return end
+            pending=nil; nextAttempt=os.clock()+60; A.status.Tarot='Draw unconfirmed; retry in 60s'; return
+        end
+        if not A.settings.tarotAuto or os.clock()<nextAttempt then return end
+        if not A.unlocked(cfg.WorldId) then A.status.Tarot='Unlock World '..cfg.WorldId..' first'; return end
+        local ctrl=A.client('TeleportController'); if ctrl and ctrl:IsLoading() then return end
+        local action,card='autoFlip',nil
+        if (tonumber(data.Tarot.Fate) or 0)>=(tonumber(cfg.FateMeter.DrawsToFill) or 2) then
+            card=A.settings.tarotFateCard
+            if not cfg:GetCard(card) then A.status.Tarot='Choose a valid Fate card'; return end
+            action='pick'
+        end
+        pending={at=os.clock(),action=action}; nextAttempt=os.clock()+30
+        if not A.fire('TarotAction',action,card) then pending=nil; A.status.Tarot='Tarot bridge unavailable' end
+    end)
+    if A.container and type(A.container.OnChange)=='function' then
+        local ok,c=pcall(A.container.OnChange,A.container,{'Tarot'},function()
+            if A.alive then A.tasks.Tarot.next=0 end
+        end)
+        if ok and c then A.connections[#A.connections+1]=c end
+    end
+end
+
+end)()(A);
+
 -- ===== index_sources =====
 (function()
 return function(A)
@@ -3854,7 +3981,8 @@ return function(A)
             local item=resources and resources.Items and resources.Items[id]
             return esc(item and item.Name or id or 'currency')
         end
-        local function worldId(key,explicit)
+        local function worldId(key,explicit,kind)
+            if kind then return A.Core.systemWorld(worlds,kind,key,explicit,(config('WorldConfig') or {}).SystemAliases) end
             local id=tonumber(explicit)
             if id then return id end
             for wid,w in pairs(worlds) do
@@ -3866,6 +3994,7 @@ return function(A)
         end
         local function location(id)
             local w=id and (worlds[id] or worlds[tostring(id)])
+            if id and id<=0 and w then return esc(w.Name) end
             return id and ('World '..tostring(id)..' — '..esc(w and w.Name or 'world name unavailable')) or 'Global'
         end
         local function enemyName(id)
@@ -3964,7 +4093,7 @@ return function(A)
         end
         local function modes(values,kind)
             for key,mode in pairs(values) do
-                local wid=worldId(key,mode.WorldId)
+                local wid=worldId(key,mode.WorldId,kind=='Raid / Gate' and 'Raid' or kind:gsub(' ',''))
                 local name=esc(mode.Name or key)
                 local label=kind..': '..name
                 local extra=cost(mode.Cost)
@@ -3995,7 +4124,7 @@ return function(A)
         modes(dungeons,'Dungeon'); modes(towers,'Tower')
         for key,rush in pairs(rushes) do
             for _,mode in pairs(type(rush.Modes)=='table' and rush.Modes or {}) do
-                local wid=worldId(key,rush.WorldId)
+                local wid=worldId(key,rush.WorldId,'BossRush')
                 local name='Boss Rush: '..esc(mode.Name or rush.Name or key)
                 drops(mode.BossDrops,wid,name..' — boss drops','per boss kill',cost(mode.Cost))
                 drops(mode.CompletionRewards,wid,name..' — completion reward','per completed run',cost(mode.Cost))
@@ -4750,6 +4879,11 @@ return function(A)
     toggle('Settings','Auto Equip Best Loadout','loadoutAuto',A.wakeLoadout)
     note('Settings','Equipment ownership','Uses native Equip Best after inventory / upgrade changes. This can replace your equipped items. Enable only if JoesAAS should control your loadout; disable competing equipment automation. Active gig pets follow the game restrictions.')
     status('Settings','Loadout')
+    dropdown('Settings','Fate card when the meter is full','tarotFateCard',A.tarotRows,
+        function(key) return A.settings.tarotFateCard==key end,function(key) A.settings.tarotFateCard=key end)
+    toggle('Settings','Auto free daily Tarot blessing','tarotAuto')
+    note('Settings','Tarot automation','Draws a free random card after the blessing expires. With a full Fate meter, picks your selected card (default: The World). No Fortune Sight, Tickets or Robux are spent. Existing blessings stay until expiry.')
+    status('Settings','Tarot')
     dropdown('Cyber','Quickhacks to overclock','overclockSelection',A.overclockRows,
         function(id) return A.settings.overclockSelection[id]==true end,
         function(selected) A.settings.overclockSelection=C.trueKeys(selected) end,true)
