@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 31: six-class quest workflows and starter-only turret placement loops.
+-- Revision 32: safe healing supply delivery and hostile aura alongside native mining swings.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 31
-    local BUILD = "r31-six-class-quests"
+    local REVISION = 32
+    local BUILD = "r32-medical-and-mining-aura"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -1949,17 +1949,88 @@ end
 end)()
     local buildQuestHealing = (function()
 -- Quest-only 30%/70% hysteresis. HP and inventory changes, not a consume
--- dispatch, determine recovery. No forced injury, relic drops or paid revives.
+-- dispatch, determine recovery. Only authorized Rare/Epic shards may yield a
+-- full toolbar slot to medical supplies during healing; no paid revives.
 return function(api,Q)
     local H,s,cfg,now={},api.state,api.state.config,api.now
-    local medical={'Advanced_Medkit','Basic_Medkit','Bandages','Golden_Medkit'}
+    local known={Advanced_Medkit=.6,Basic_Medkit=.3,Bandages=.1,Golden_Medkit=1}
+    function H.isMedical(item)
+        if not item or Q.protectedRelic(item) or api.attr(item,'Category')=='Explosive'
+            or (tonumber(api.attr(item,'Damage')) or 0)>0 then return false end
+        if known[api.id(item)]then return true end
+        local fraction=tonumber(api.attr(item,'Health'))
+        return api.attr(item,'Class')=='Medkit' and fraction and fraction>0 and fraction<=1
+            and (api.attr(item,'Category')==nil or api.attr(item,'Category')=='Consumable')
+            and (api.attr(item,'ActionType')==nil or api.attr(item,'ActionType')=='Use')
+    end
+    local function score(ctx,item)
+        local amount=tonumber(api.attr(item,'Health')) or known[api.id(item)] or 0
+        local needed=math.max(0,.7-ctx.humanoid.Health/ctx.humanoid.MaxHealth)
+        return amount>=needed and 2-amount or amount -- sufficient heal, then less waste
+    end
+    function H.supplyIds(ctx)
+        local ids,seen={},{}
+        for _,item in ipairs(Q.looseItems())do
+            local id=api.id(item)
+            if H.isMedical(item) and not seen[id]then ids[#ids+1]={id=id,score=score(ctx,item)};seen[id]=true end
+        end
+        table.sort(ids,function(a,b)return a.score>b.score or a.score==b.score and a.id<b.id end)
+        local out={};for _,entry in ipairs(ids)do out[#out+1]=entry.id end;return out
+    end
+    local function shard(ctx)
+        for _,id in ipairs({'RareShard','EpicShard'})do
+            for _,tool in ipairs(api.ownedTools(ctx))do
+                local blocked=s.questMedicalDropBlocked and s.questMedicalDropBlocked[tool]
+                if tool:IsA('Tool') and api.id(tool)==id and (not blocked or api.stackCount(tool)<blocked)then return tool end
+            end
+        end
+    end
+    function H.canMakeRoom(ctx,item)
+        if api.hasRoom(ctx,item)then return true end
+        return cfg.classQuest and ctx.questHealing and ctx.humanoid.Health>0
+            and ctx.humanoid.Health/ctx.humanoid.MaxHealth<.7 and H.isMedical(item)
+            and not Q.manual() and api.remote('ToolService','DropSpecificItem')~=nil and shard(ctx)~=nil
+    end
+    function H.settleRoom()
+        local job=s.questMedicalDrop;if not job then return true end
+        local tool=job.tool
+        local remains=tool.Parent and (tool:IsDescendantOf(job.character) or job.backpack and tool:IsDescendantOf(job.backpack))
+        if not remains or api.stackCount(tool)<job.count then
+            s.questMedicalDrop=nil;s.questStatus='Medical room: shard drop receipt confirmed; rechecking slots';return true
+        end
+        if not job.settled then return false end
+        if job.notSent then s.questMedicalDrop=nil;return true end
+        if now()-job.started<5 or now()-(job.settledAt or job.started)<1.5 then return false end
+        s.questMedicalDropBlocked=s.questMedicalDropBlocked or setmetatable({}, {__mode='k'})
+        s.questMedicalDropBlocked[tool]=job.count;s.questMedicalDrop=nil
+        s.questStatus='Medical room: shard drop unconfirmed; no duplicate drop';return true
+    end
+    function H.makeRoom(ctx,item)
+        if not H.settleRoom()then return false end
+        if api.hasRoom(ctx,item)then return true end
+        if not H.canMakeRoom(ctx,item) or s.rareShardDrop or s.lootRequest or s.equipmentRequest
+            or Q.calls.medicalDrop then return false end
+        local tool=shard(ctx)
+        local job={ctx=ctx,tool=tool,count=api.stackCount(tool),started=now(),character=ctx.character,
+            backpack=api.Players.LocalPlayer:FindFirstChild('Backpack')};s.questMedicalDrop=job
+        local issued=Q.call('medicalDrop','ToolService','DropSpecificItem',{tool},function(ok,value,_,dispatch)
+            job.settled=true;job.settledAt=now();job.notSent=dispatch=='not-sent'
+        end,function()return Q.enabled(ctx) and ctx.questHealing and not api.extractionReady() and not Q.manual()
+            and s.questMedicalDrop==job and tool.Parent and api.stackCount(tool)==job.count
+            and not api.hasRoom(ctx,item) and ctx.humanoid.Health/ctx.humanoid.MaxHealth<.7 end)
+        if not issued then s.questMedicalDrop=nil end
+        s.questStatus='Medical room: dropping '..api.id(tool)..'; awaiting a real free slot';return false
+    end
     function H.cleanup(ctx)
+        local job=s.questDelivery
+        if job and job.healingSupply and not job.buySent then Q.release(job)end
         ctx.questHealing,ctx.questHealAttempt,ctx.questHealPoint=nil,nil,nil
     end
     function H.step(ctx,plan)
         local h=ctx.humanoid;local maximum=tonumber(h.MaxHealth)
         if not cfg.classQuest or not maximum or maximum<=0 or h.Health<=0 then H.cleanup(ctx);return false end
         local ratio=h.Health/maximum
+        H.settleRoom()
         if not ctx.questHealing and ratio>.3 then return false end
         if ratio>=.7 then
             H.cleanup(ctx);ctx.questOwns=nil;s.questStatus='Quest healing complete; resuming at 70% HP';return false
@@ -1970,7 +2041,7 @@ return function(api,Q)
         Q.stopDrive(ctx)
         local job=s.questDelivery
         if job then
-            if job.healingFunding or job.kind=='supply' and api.attr(job.item,'Class')=='Medkit' then Q.deliveryStep(ctx,plan)
+            if job.healingFunding or job.kind=='supply' and H.isMedical(job.item) then Q.deliveryStep(ctx,plan)
             else Q.release(job)end
         end
         if not Q.holdRoute(ctx)then return true end
@@ -1993,10 +2064,12 @@ return function(api,Q)
             end
             return true
         end
-        local tool
-        for _,id in ipairs(medical)do
-            local found=api.findOwned(ctx,id)
-            if found and not (ctx.questHealTried or {})[found]then tool=found;break end
+        local tool,best
+        for _,found in ipairs(api.ownedTools(ctx))do
+            if H.isMedical(found) and not (ctx.questHealTried or {})[found]then
+                local value=score(ctx,found)
+                if not best or value>best then tool,best=found,value end
+            end
         end
         if tool then
             local active=api.equip(ctx,tool)
@@ -2008,7 +2081,7 @@ return function(api,Q)
             else s.questStatus='Quest healing: waiting for native medical handler / Watcher attention'end
             return true
         end
-        for _,id in ipairs({'Bandages','Basic_Medkit','Advanced_Medkit'})do
+        for _,id in ipairs(H.supplyIds(ctx))do
             if Q.supplyReady(ctx,id) and Q.supply(ctx,plan,id)then
                 s.questStatus='Quest healing: collecting medical supplies at the current coin quote';return true
             end
@@ -3603,6 +3676,7 @@ end)()
     local unpackValues = table.unpack or unpack
     local packValues = table.pack or function(...)return {n=select('#',...),...}end
     local calls = s.questCalls or {}; s.questCalls = calls
+    Q.calls=calls
     local retries = s.questItemRetries or setmetatable({}, {__mode = 'k'}); s.questItemRetries = retries
     local weapons = {FlintlockKills = 'Flintlock', CutlassKills = 'Sword_Pirate'}
     local melee = {MeleeKills=true, MeleeDamage=true, MeleeCrits=true, EnemyKills=true, VampireKills=true,
@@ -4000,9 +4074,10 @@ end)()
         if not p or not target or not job.owns then return false end
         local cf,size
         if job.item:IsA('BasePart') then cf,size=job.item.CFrame,job.item.Size else cf,size=job.item:GetBoundingBox() end
-        local offset=CFrame.new(0,target.Size.Y*.5+size.Y*.5-.08,0)*cf:ToObjectSpace(job.item:GetPivot())
-        if job.kind=='fuel' then offset=CFrame.new() end
-        if job.kind=='supply' and not job.shop then offset=CFrame.new(3,1,-4) end
+        local offset
+        if job.kind=='supply' and not job.shop then offset=CFrame.new(3,1,-4)
+        elseif job.kind=='fuel' then offset=CFrame.new()
+        else offset=CFrame.new(0,target.Size.Y*.5+size.Y*.5-.08,0)*cf:ToObjectSpace(job.item:GetPivot())end
         local goal=job.fuelAttachment and job.fuelAttachment.Parent and job.fuelAttachment.WorldCFrame or target.CFrame*offset
         job.item:PivotTo(goal)
         p.AssemblyLinearVelocity,p.AssemblyAngularVelocity=Vector3.zero,Vector3.zero
@@ -4063,6 +4138,9 @@ end)()
         if job.pending or calls.shop or calls.wallet then return true end
         if job.shop then return Q.shopStep(job,plan) end
         if job.kind=='supply' and job.stage=='placed' and now()>=job.readyAt then
+            if Q.healing.isMedical(job.item) and not api.hasRoom(ctx,job.item)then
+                Q.healing.makeRoom(ctx,job.item);return true
+            end
             job.stage='pickup'; job.receiptUntil=now()+5
             job.pending=true
             if not call('drag','InteractionService','Interact',{job.item},function()
@@ -4677,7 +4755,7 @@ end)()
     Q.call=call
     Q.free,Q.place,Q.release,Q.startDelivery,Q.enabled,Q.manual,Q.looseItems=free,place,release,startDelivery,enabled,manual,looseItems
     local supplyIds={Flintlock=true,Sword_Pirate=true,Pistol_Ammo=true,Rifle_Ammo=true,Shotgun_Ammo=true,
-        Bandages=true,Basic_Medkit=true,Advanced_Medkit=true}
+        Bandages=true,Basic_Medkit=true,Advanced_Medkit=true,Golden_Medkit=true}
     for _,id in pairs(potions)do supplyIds[id]=true end
     function Q.potionStep(ctx,plan)
         local job=ctx.questPotion
@@ -4766,7 +4844,9 @@ end)()
         if id:sub(-5)=='_Ammo' then return tonumber(api.Players.LocalPlayer:GetAttribute(id)) or 0 end
         local count=0
         for _,container in ipairs({ctx.character,api.Players.LocalPlayer:FindFirstChild('Backpack')}) do
-            if container then for _,tool in ipairs(container:GetChildren()) do if api.id(tool)==id then count=count+1 end end end
+            if container then for _,tool in ipairs(container:GetChildren()) do
+                if api.id(tool)==id then count=count+(Q.healing.isMedical(tool) and api.stackCount(tool) or 1)end
+            end end
         end
         return count
     end
@@ -4774,22 +4854,28 @@ end)()
         local need=s.questSupplyFunding
         if not need or need.ctx~=ctx or need.class~=plan.name or need.objective~=plan.objective
             or now()>=need.expires or supplyCount(ctx,need.id)>need.before
-            or api.attr(need.item,'Class')=='Medkit' and not ctx.questHealing then return 0 end
+            or Q.healing.isMedical(need.item) and not ctx.questHealing then return 0 end
         return need.price
     end
     function Q.supplyReceipt(job) return supplyCount(job.ctx,job.id)>job.inventoryBefore end
+    local function supplyAllowed(id,item)
+        if supplyIds[id]then return true end
+        if item then return Q.healing and Q.healing.isMedical(item)end
+        for _,candidate in ipairs(looseItems())do if api.id(candidate)==id and Q.healing.isMedical(candidate)then return true end end
+        return false
+    end
     stock=function(item)
         return item and item.Parent==workspace:FindFirstChild('Items') and api.part(item) and api.tag(item,'ShopItem')
-            and supplyIds[api.id(item)] and (api.attr(item,'CostCurrency')==nil or api.attr(item,'CostCurrency')=='Coins') and not item:GetAttribute('Welded') and not api.tag(item,'Welded')
+            and supplyAllowed(api.id(item),item) and (api.attr(item,'CostCurrency')==nil or api.attr(item,'CostCurrency')=='Coins') and not item:GetAttribute('Welded') and not api.tag(item,'Welded')
             and not Q.protectedRelic(item) and item:GetAttribute('Placed')~=true
             and not item:GetAttribute('Robux') and not item:GetAttribute('ProductId') and not item:GetAttribute('RobuxProductId')
     end
     local function checkout(item) return item and item.Parent and item:IsA('BasePart') and api.tag(item,'BuyPart') and item:IsDescendantOf(workspace) end
     function Q.supplyReady(ctx,id)
-        if not supplyIds[id] then return false end
+        if not supplyAllowed(id) then return false end
         local item=nearest(looseItems(),ctx.root.Position,function(item)
             return api.id(item)==id and now()>=(retries[item] or 0) and (free(item) or stock(item))
-                and (id:sub(-5)=='_Ammo' or api.hasRoom(ctx,item))
+                and (id:sub(-5)=='_Ammo' or api.hasRoom(ctx,item) or Q.healing.canMakeRoom(ctx,item))
         end)
         return item and (free(item) or nearest(api.tagged('BuyPart'),api.part(item).Position,checkout))~=nil
     end
@@ -4802,16 +4888,20 @@ end)()
         return false
     end
     function Q.supply(ctx,plan,id)
-        if not supplyIds[id] or s.questDelivery or s.bringDelivery or calls.drag or manual() then ctx.questOwns=nil; return false end
+        if not supplyAllowed(id) or s.questDelivery or s.bringDelivery or calls.drag or manual() then ctx.questOwns=nil; return false end
         local loose=nearest(looseItems(),ctx.root.Position,function(item)return free(item) and api.id(item)==id and now()>=(retries[item] or 0)end)
         if loose then
-            if id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,loose) then ctx.questOwns=nil; setStatus('Quest tool needs a free toolbar slot'); return false end
+            if id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,loose) then
+                if Q.healing.canMakeRoom(ctx,loose)then Q.healing.makeRoom(ctx,loose);return true end
+                ctx.questOwns=nil; setStatus('Quest tool needs a free toolbar slot'); return false
+            end
             Q.stopDrive(ctx)
             local before=supplyCount(ctx,id)
             if startDelivery(ctx,loose,ctx.root,'supply',plan) then
                 local job=s.questDelivery
                 if not job then return false end
                 job.id,job.inventoryBefore=id,before
+                job.healingSupply=ctx.questHealing and Q.healing.isMedical(loose) or nil
                 return true
             end
         end
@@ -4822,9 +4912,10 @@ end)()
         local item=nearest(looseItems(),ctx.root.Position,function(item)return stock(item) and api.id(item)==id and now()>=(retries[item] or 0)end)
         local pad=item and nearest(api.tagged('BuyPart'),api.part(item).Position,checkout)
         if not item or not pad then ctx.questOwns=nil; setStatus('No free or coin-shop quest supply loaded: '..id); return false end
-        if id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,item) then ctx.questOwns=nil; setStatus('Quest tool needs a free toolbar slot; no purchase'); return false end
+        if id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,item) and not Q.healing.canMakeRoom(ctx,item) then ctx.questOwns=nil; setStatus('Quest tool needs a free toolbar slot; no purchase'); return false end
         local job={ctx=ctx,item=item,target=pad,kind='supply',shop=true,id=id,class=plan.name,
             objective=plan.objective,stage='empty',started=now(),inventoryBefore=supplyCount(ctx,id),
+            healingSupply=ctx.questHealing and Q.healing.isMedical(item) or nil,
             stockOrigin=item:GetPivot(),originOffset=workspace:GetAttribute('InfiniteDepthOffsetMeters')}
         if obstructed(job) then ctx.questOwns=nil; return false end
         Q.stopDrive(ctx)
@@ -4838,7 +4929,8 @@ end)()
         end
         if job.pending or calls.drag or calls.shop or calls.wallet or now()<(job.nextAt or 0) then return true end
         job.nextAt=now()+.25
-        local function guarded() return enabled(ctx) and s.questDelivery==job and not job.cancelled and not manual()end
+        local function guarded() return enabled(ctx) and s.questDelivery==job and not job.cancelled and not manual()
+            and (not job.healingSupply or ctx.questHealing or job.buySent)end
         local function fail(text) retries[job.item]=job.buySent and math.huge or now()+120; setStatus(text); release(job)end
         if job.stage=='empty' then
             call('shop','ShopService','GetBuyQuote',{job.target},function(ok,price)
@@ -4888,6 +4980,11 @@ end)()
                 else fail('Checkout changed; no quest purchase') end
             end,guarded)
         elseif job.stage=='buy' then
+            if job.id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,job.item)then
+                if Q.healing.isMedical(job.item)then Q.healing.makeRoom(ctx,job.item)else fail('Toolbar filled before purchase; no purchase')end
+                return true
+            end
+            if now()-(job.balanceAt or 0)>=3 then job.stage='wallet';return true end
             -- One sent Buy, including unknown replies, is never repeated for this stock.
             if job.buySent then return true end
             job.buySent=true; retries[job.item]=math.huge
@@ -4904,8 +5001,9 @@ end)()
                 if not call('drag','DragService','Request',{job.item},function(ok,value,_,dispatch)
                     job.pending=nil; job.owns=dispatch~='not-sent' and (not ok or value==true);job.ownershipConfirmed=ok and value==true
                     if not ok or not guarded() or not job.owns or not free(job.item) then release(job); return end
-                    local moved,result=pcall(place,job)
-                    if moved and result then job.stage='placed'; job.readyAt=now()+.45 else release(job) end
+                job.target=ctx.root -- Paid stock must come to the waiting player, not remain at checkout.
+                local moved,result=pcall(place,job)
+                if moved and result then job.stage='placed'; job.readyAt=now()+.45 else release(job) end
                 end,guarded) then job.pending=nil end
             elseif now()>=job.confirmUntil then fail('Purchase not confirmed by ShopItem removal; no repeat Buy') end
         end
@@ -4920,6 +5018,15 @@ end)()
     function Q.lobby()
         if selectLobby()then return true end
         return Q.loadout.lobby()
+    end
+    function Q.miningAuraAllowed(ctx)
+        local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+        return enabled(ctx) and ctx.questMining and not ctx.questHealing and not ctx.questStartup
+            and not ctx.questRecovering and not ctx.questPotionUsing and not ctx.bringEquipmentLock
+            and not s.questDelivery and not s.bringDelivery and not s.lootRequest and not manual()
+            and not api.extractionReady() and ctx.humanoid.MaxHealth>0 and ctx.humanoid.Health/ctx.humanoid.MaxHealth>.3
+            and not plan.weapon and plan.weaponClass~='Gun' and plan.weaponClass~='Revolver'
+            and plan.weaponClass~='Rifle' and plan.weaponClass~='Shotgun' and plan.objective~='TurretKills'
     end
     function Q.pauseCombat(ctx)
         local exitFight=ctx.questExitCombat and ctx.combatTarget and Q.drillSupport.activeMine()
@@ -5412,7 +5519,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 31 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 32 }
     end
     local loaded=saveStore:get('settings')
     -- Only the currently running legacy client can migrate its untagged config.
@@ -6427,7 +6534,7 @@ end)()
             local module=shared and shared:FindFirstChild(name)
             if module then local ok,value=pcall(require,module);if ok then s.questNativeModules[name]=value;return value end end
         end,
-        findTool=findTool, hasRoom=hasRoom, enemies=F.enemies, enemyAlive=F.enemyAlive, questTargetAllowed=F.questTargetAllowed,
+        findTool=findTool, hasRoom=hasRoom, ownedTools=tools, enemies=F.enemies, enemyAlive=F.enemyAlive, questTargetAllowed=F.questTargetAllowed,
         swordTargetAllowed=F.swordTargetAllowed, persist=persist, hover=movement.hover,
         miningBounds=function(node)
             local cf,size
@@ -6505,7 +6612,7 @@ end)()
                 local ok,ready=pcall(active.CanUseAction,active)
                 if not ok or not ready then return false,active.CooldownOwner==nil and 'native cooldown owner not ready' or 'shared weapon cooldown' end
             end
-            local ok,why=pcall(active.Swing,active)
+            local ok,why=F.miningSwing(ctx,active)
             if not ok then return false,'native Swing failed: '..tostring(why):gsub('[%c]',' '):sub(1,100) end
             return true
         end,
@@ -6829,6 +6936,8 @@ end)()
                 local isPlayer = npc == ctx.character or (type(api.Players.GetPlayerFromCharacter) == 'function'
                     and api.Players:GetPlayerFromCharacter(npc) ~= nil)
                 if npc:IsA('Model') and not isPlayer and npc:GetAttribute('NpcFaction') ~= 'FriendlyCompanion'
+                    and (not ctx.questMining or not quest or not quest.drillSupport.activeMine()
+                        or quest.drillSupport.mineEnemy(npc,quest.drillSupport.activeMine()))
                     and F.questTargetAllowed(ctx,npc) and (class~='Sword' or F.swordTargetAllowed(npc)) then
                     local point = bounds.GetModelHitPosition(npc, { Position = ctx.root.Position })
                     if point and (point - ctx.root.Position).Magnitude <= range then add(npc) end
@@ -6897,11 +7006,42 @@ end)()
         end
         return true
     end
+    function F.miningSwing(ctx,active)
+        local signal=active.Execute
+        local original=signal and signal.Fire
+        if type(original)~='function' or not cfg.classQuest or not ctx.questMining then return pcall(active.Swing,active)end
+        -- Native Pickaxe.Swing supports ore and NPC targets in one packet. Extend
+        -- that packet without changing native ore geometry, cooldown or animation.
+        local wrapper
+        wrapper=function(self,payload,...)
+            if self~=signal or type(payload)~='table' or payload[1]~='Swing' or type(payload[2])~='table'then
+                return original(self,payload,...)
+            end
+            if not safeToWork(ctx) or ctx.questHealing or not ctx.questMining then return end
+            local hostiles=quest.miningAuraAllowed(ctx) and F.auraTargets(ctx,active) or {}
+            local targets,seen,before={}, {}, {}
+            for _,target in ipairs(payload[2])do
+                if tag(target,'Ore') and not seen[target]then targets[#targets+1]=target;seen[target]=true end
+            end
+            for _,target in ipairs(hostiles)do
+                if not seen[target]then targets[#targets+1]=target;seen[target]=true;before[target]=auraHealth(target)end
+            end
+            local packet={};for i,value in ipairs(payload)do packet[i]=value end;packet[2]=targets
+            original(self,packet,...)
+            ctx.lastMiningAura={time=now(),count=#hostiles}
+            for _,target in ipairs(hostiles)do F.afterAttack(ctx,target,'Pickaxe',before[target])end
+        end
+        local installed=pcall(function()signal.Fire=wrapper end)
+        if not installed then return false,'native mining aura signal is not writable' end
+        local ok,why=pcall(active.Swing,active)
+        pcall(function()if signal.Fire==wrapper then signal.Fire=original end end)
+        return ok,why
+    end
     function F.weaponClass(ctx, target)
         if ctx.pickaxeTargets and ctx.pickaxeTargets[target] then return 'Pickaxe' end
     end
     function F.afterAttack(ctx, target, class, before)
-        if cfg.classQuest and ctx.questCombat and target and F.enemyAlive(target) then
+        if cfg.classQuest and (ctx.questCombat or ctx.questMining) and target and F.enemyAlive(target) then
             ctx.questDamageWatch=ctx.questDamageWatch or setmetatable({}, {__mode='k'})
             local check=ctx.questDamageWatch[target]
             local hp=npcHealth(target)
