@@ -1,12 +1,12 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 29: death gear receipts, remaining-item claims and respawn loadouts.
+-- Revision 31: six-class quest workflows and starter-only turret placement loops.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
 -- Hides the default Gameplay Paused popup after readiness; streaming pauses still apply.
 -- Includes Discord ending reports, cached discovery, and Blinker / identified boss ranged dodging.
--- Optional class quests: native combat, mining, sales, fuel, potions and upgrades.
+-- Optional class quests: native combat, mining, sales, shredding, turrets, dungeons, fuel, potions and upgrades.
 -- Quest mode OFF preserves chest-only travel; no healing, mining or team purchases.
 -- Every execution waits seven seconds first; this script never queues itself for teleport.
 -- All additional readiness checks and recovery happen automatically.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 29
-    local BUILD = "r29-death-gear-reconciliation"
+    local REVISION = 31
+    local BUILD = "r31-six-class-quests"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -1577,8 +1577,13 @@ return function(api,Q)
     end
     function L.desired(data,catalog,owned)
         local result={}
-        for _,id in ipairs({'Void_Helmet','Void_Chest','Void_Legs','Pickaxe_Void'})do if owned[id]then result[#result+1]=id end end
         local plan=Q.plan(data,catalog,cfg.driveDepth)
+        if Q.special and Q.special.fastPlacement(plan)then
+            local ids=Q.special.starterIds(plan)
+            for id in pairs(ids)do if owned[id]then result[#result+1]=id end end
+            table.sort(result);return result
+        end
+        for _,id in ipairs({'Void_Helmet','Void_Chest','Void_Legs','Pickaxe_Void'})do if owned[id]then result[#result+1]=id end end
         local id=plan.weapon or (plan.weaponClass=='Sword' or plan.kind~='combat') and 'Sword_Void'
         -- Gun-only objectives do not add a sword over their class weapon.
         if id and owned[id]then result[#result+1]=id end
@@ -1586,7 +1591,10 @@ return function(api,Q)
     end
     function L.lobby()
         if not cfg.classQuest or not api.owned() or not lobby() then return false end
-        local key=tostring(game.JobId or '')..':'..tostring(s.classData and s.classData.SelectedClass or '')
+        local desiredPlan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+        local key=tostring(game.JobId or '')..':'..tostring(s.classData and s.classData.SelectedClass or '')..':'
+            ..tostring(desiredPlan.level)..':'..tostring(desiredPlan.kind)..':'..tostring(desiredPlan.weapon)
+            ..':'..tostring(desiredPlan.weaponClass)..':'..tostring(desiredPlan.objective)
         local job=s.questLoadout
         if not job or job.key~=key then
             if s.questCalls.loadoutData or s.questCalls.loadoutRead or s.questCalls.loadoutSwap then
@@ -1603,7 +1611,20 @@ return function(api,Q)
                 if ok and type(data)=='table'then job.equipped=data else job.failed=true end
             end,function()return cfg.classQuest and api.owned() and lobby() and s.questLoadout==job end)
         end
-        if job.failed or job.done or now()-job.started>=20 then return false end
+        local preview=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+        local fast=Q.special and Q.special.fastPlacement(preview)
+        if job.done then return false end
+        if job.failed or now()-job.started>=20 then
+            if not fast then return false end
+            if job.equipped then job.loaded=true;job.failed=nil end
+            if not job.equipped and not s.questCalls.loadoutRead and now()>=(job.recheckAt or 0)then
+                job.recheckAt=now()+5
+                Q.call('loadoutRead','LobbyBackpackService','GetEquipped',{},function(ok,data)
+                    if ok and type(data)=='table'then job.equipped=data;job.loaded=true;job.failed=nil end
+                end,function()return cfg.classQuest and lobby() and s.questLoadout==job end)
+            end
+            if not job.equipped then s.questStatus='Starter-only loop waits for verified lobby equipment; saved gear is not consumed';return true end
+        end
         if not job.loaded or not job.equipped or not s.classData or not s.questCatalog then return true end
         local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if plan.kind=='waiting' then return true end
@@ -1616,6 +1637,11 @@ return function(api,Q)
         local c=api.controller('BackpackController')
         if c and (c.EquipPending or 0)>0 then return true end
         local actions={}
+        fast=Q.special and Q.special.fastPlacement(plan)
+        if fast then
+            local keep=Q.special.starterIds(plan)
+            for _,id in pairs(job.equipped)do if type(id)=='string' and not keep[id]then actions[#actions+1]={id=id,wanted=false}end end
+        end
         if plan.weapon and plan.weapon~='Sword_Void' and (plan.weaponClass~='Sword' or not job.owned[plan.weapon])
             or plan.weaponClass=='Gun' or plan.weaponClass=='Rifle' or plan.weaponClass=='Shotgun'then
             actions[#actions+1]={id='Sword_Void',wanted=false}
@@ -1623,6 +1649,15 @@ return function(api,Q)
         for _,id in ipairs(L.desired(s.classData,s.questCatalog,job.owned))do actions[#actions+1]={id=id,wanted=true}end
         for _,action in ipairs(actions)do
             local id,wanted=action.id,action.wanted
+            if fast and contains(job.equipped,id)~=wanted and job.attempted[id]then
+                if not s.questCalls.loadoutRead and not s.questCalls.loadoutSwap and now()>=(job.recheckAt or 0)then
+                    job.recheckAt=now()+5
+                    Q.call('loadoutRead','LobbyBackpackService','GetEquipped',{},function(ok,data)
+                        if ok and type(data)=='table'then job.equipped=data end
+                    end,function()return cfg.classQuest and lobby() and s.questLoadout==job end)
+                end
+                s.questStatus='Starter-only loop waits for its actual equipment-selection receipt';return true
+            end
             if contains(job.equipped,id)~=wanted and not job.attempted[id]then
                 if s.questCalls.loadoutSwap then return true end
                 local issued=Q.call('loadoutSwap','LobbyBackpackService','SetEquipped',{id},function(ok,accepted,equipped)
@@ -1646,17 +1681,23 @@ return function(api,Q)
         return api.findOwned(ctx,id)~=nil
     end
     function L.step(ctx,plan)
+        if Q.special and Q.special.fastPlacement(plan)then ctx.questStartup=nil;return false end
         if not cfg.classQuest or lobby() or api.Players.LocalPlayer:GetAttribute('InitialInventoryLoaded')~=true
             or api.extractionReady() then return false end
         local c=api.controller('CrateController')
         if c and (c.DeathChest or c.ClaimPending)then return false end
         local job=s.questCrateLoadout
+        local key=tostring(plan.name)..':'..tostring(plan.level)..':'..tostring(plan.kind)..':'..tostring(plan.weapon)
+            ..':'..tostring(plan.weaponClass)..':'..tostring(plan.objective)
+        if job and job.done and job.planKey~=key and not s.questCalls.crateClaim then
+            s.questCrateLoadout=nil;s.questCrateProbeAt=nil;job=nil
+        end
         if job and job.ctx~=ctx and not s.questCalls.crateClaim then s.questCrateLoadout=nil;s.questCrateProbeAt=nil;job=nil end
         if s.questDeathClaim or s.questCalls.deathClaim then return false end
         if not job then
             if now()<(s.questCrateProbeAt or 0)then return false end
             s.questCrateProbeAt=now()+2
-            job={ctx=ctx,started=now()};s.questCrateLoadout=job
+            job={ctx=ctx,started=now(),planKey=key};s.questCrateLoadout=job
             if not Q.call('crateRead','PlayerService','GetCrateItems',{},function(ok,data)
                 if ok and type(data)=='table'then job.owned={};add(job.owned,data);job.loaded=true
                 else job.done=true;s.questStatus='Saved startup crate unavailable; continuing without invented Void items'end
@@ -2033,7 +2074,7 @@ return function(api,Q)
             if name=='TeamMeleeDamage' and (key=='CutlassKills' or key:find('Melee',1,true) or key=='VampireKills'
                 or key=='EnemyKills' or key=='CrazyMinerKills' or key=='BanditMinerKills' or key=='DarknessEnemyKills')then needed=true end
             if name=='TeamPickaxeDamage' and key:find('Mine',1,true)==1 then needed=true end
-            if name=='TeamGunDamage' and (key=='FlintlockKills' or key=='HeadShot' or key:find('Gun',1,true)
+            if name=='TeamGunDamage' and (key=='TurretKills' or key=='FlintlockKills' or key=='HeadShot' or key:find('Gun',1,true)
                 or key=='RifleKills' or key=='ShotgunKills')then needed=true end
             if name=='TeamExplosiveDamage' and key:find('Explosive',1,true)then needed=true end
         end
@@ -2276,7 +2317,7 @@ return function(api,Q)
             D.stopGate(ctx)
             D.stopMine(ctx);ctx.questMineEntry=nil;ctx.questMineReadyAt=nil;ctx.questFundingMine=nil
             ctx.questOwns=nil;ctx.questThreat=nil;ctx.questCombat=nil;ctx.questExitCombat=nil;ctx.combatTarget=nil
-            ctx.questBindMineAt=nil
+            ctx.questBindMineAt=nil;ctx.questMineExit=nil;ctx.questMineChurchFallback=nil
             status('Native mineshaft exit confirmed; resuming outdoor work')
         end
         -- UpdateState(false) also clears the bound root after a manual exit.
@@ -2339,7 +2380,8 @@ return function(api,Q)
         if inside~=nil then return inside end
         -- Legacy Watchers can live in workspace.Npc, without wave/session fields.
         local ctx=s.farm
-        return p and ctx and api.tag(npc,'Watcher') and (p.Position-ctx.root.Position).Magnitude<=80 or false
+        local watcher=api.tag(npc,'Watcher') or tostring(npc:GetAttribute('RealName') or npc.Name):lower():find('watcher',1,true)
+        return p and ctx and watcher and (p.Position-ctx.root.Position).Magnitude<=80 or false
     end
     function D.exitPrompt(mine)
         local prompt=mine and (mine:FindFirstChild('DungeonExitPrompt',true) or mine:FindFirstChild('ExitPrompt',true))
@@ -2353,8 +2395,53 @@ return function(api,Q)
     end
     function D.accessible(node)
         local mine=D.mineshaft(node)
-        if D.inDungeon()then return mine~=nil and mine==D.activeMine() end
+        local active=D.activeMine()
+        if D.inDungeon()then
+            if not active then return false end
+            if mine then return mine==active end
+            local session=node:GetAttribute('SessionDungeonId')
+            local current=active:GetAttribute('SessionDungeonId')
+            if session~=nil and current~=nil then return session==current end
+            local p=api.part(node)
+            return p and D.contains(active,p.Position)==true or false
+        end
         return mine==nil
+    end
+    function D.exitState(ctx,mine)
+        local state=ctx.questMineExit
+        if not state or state.mine~=mine then
+            state={mine=mine,started=now(),attempts=0,failures=0};ctx.questMineExit=state
+        end
+        return state
+    end
+    function D.cancelDoor(ctx,failed)
+        local job=ctx.questMineEntry
+        D.stopGate(ctx);ctx.questMineEntry=nil
+        if job then ctx.questOwns=nil end
+        if job and failed then
+            local retries=s.questMineDoorRetries or setmetatable({}, {__mode='k'});s.questMineDoorRetries=retries
+            local door=job.gate or job.prompt
+            if door then retries[door]=now()+30 end
+            if job.exit then
+                local state=D.exitState(ctx,job.mine)
+                state.failures=state.failures+1;state.lastFailure=now()
+                status('Native mine exit produced no transition; releasing this attempt')
+            else status('Native mine entrance produced no transition; outdoor work continues')end
+        end
+    end
+    function D.churchFallback(ctx)
+        if not s.questChurchExit then return false end
+        local mine=D.activeMine(ctx)
+        if not mine then return false end
+        local state=D.exitState(ctx,mine)
+        if state.failures<2 and now()-state.started<30 then return false end
+        -- SaveGear has no client-side dungeon prerequisite. Try the real loaded
+        -- church flow instead of repeating this failed door forever. The server
+        -- still decides acceptance; no dungeon attribute or exit receipt is forged.
+        D.cancelDoor(ctx,false);D.stopMine(ctx);ctx.questExitCombat=nil;ctx.questThreat=nil
+        ctx.questCombat=nil;ctx.combatTarget=nil;ctx.questOwns=nil;ctx.questMineChurchFallback=true
+        status('Mine exit unconfirmed; switching to the native church save route')
+        return true
     end
     function D.exitGate(mine)
         if not mine or mine:FindFirstChild('QueueSpot')then return end
@@ -2380,14 +2467,23 @@ return function(api,Q)
         local begin=gate.CFrame:PointToWorldSpace(normal*offset)
         local finish=gate.CFrame:PointToWorldSpace(normal*-offset)
         local mine=D.activeMine(ctx)
-        ctx.questMineEntry={started=now(),exit=true,mine=mine,gate=gate,finish=finish,phase=0}
+        local state=D.exitState(ctx,mine)
+        state.attempts=state.attempts+1
+        if state.attempts%2==0 then begin,finish=finish,begin end
+        local distance=(finish-begin).Magnitude
+        local speed=math.max(12,math.min(40,distance/4))
+        local travel=math.min(8,distance/speed+1)
+        ctx.questMineEntry={started=now(),exit=true,mine=mine,gate=gate,finish=finish,phase=0,
+            speed=speed,travelUntil=now()+travel,lastPosition=begin,movedAt=now()}
+        ctx.nativeGateMotion=true
         api.hover(ctx);ctx.root.CFrame=CFrame.new(begin)
-        ctx.root.AssemblyLinearVelocity=(finish-begin).Unit*12
+        ctx.root.AssemblyLinearVelocity=(finish-begin).Unit*speed
         if type(ctx.humanoid.MoveTo)=='function'then ctx.humanoid:MoveTo(finish)end
         status('Crossing native Gate_Cave; waiting for the game exit transition')
         return true
     end
     function D.stopGate(ctx)
+        ctx.nativeGateMotion=nil
         if ctx.questMineEntry and ctx.questMineEntry.gate then
             ctx.root.AssemblyLinearVelocity=Vector3.zero
             if type(ctx.humanoid.MoveTo)=='function'then ctx.humanoid:MoveTo(ctx.root.Position)end
@@ -2411,12 +2507,22 @@ return function(api,Q)
                 D.stopGate(ctx)
                 ctx.questMineEntry=nil;ctx.questOwns=nil;return false
             end
-            if now()-job.started>=18 then D.stopGate(ctx);ctx.questMineEntry=nil;ctx.questOwns=nil;return false end
+            if now()-job.started>=10 then D.cancelDoor(ctx,true);return false end
             if job.gate then
-                if not job.gate.Parent or job.gate.CanTouch~=true then D.stopGate(ctx);ctx.questMineEntry=nil;ctx.questOwns=nil;return false end
-                if job.phase==0 and now()-job.started>=1.25 then
-                    D.stopGate(ctx);job.phase=1
-                end
+                if not job.gate.Parent or job.gate.CanTouch~=true then D.cancelDoor(ctx,true);return false end
+                if job.phase==0 then
+                    local point=ctx.root.CFrame.Position or ctx.root.Position
+                    local delta=job.finish-point
+                    if (point-job.lastPosition).Magnitude>=.25 then job.lastPosition=point;job.movedAt=now()end
+                    if delta.Magnitude<=1 then
+                        D.stopGate(ctx);job.phase=1;job.receiptUntil=now()+2
+                    elseif now()>=job.travelUntil or now()-job.movedAt>=1.5 then
+                        D.cancelDoor(ctx,true);return false
+                    else
+                        ctx.root.AssemblyLinearVelocity=delta.Unit*job.speed
+                        if type(ctx.humanoid.MoveTo)=='function'then ctx.humanoid:MoveTo(job.finish)end
+                    end
+                elseif now()>=(job.receiptUntil or 0)then D.cancelDoor(ctx,true);return false end
             end
             if Q.holdRoute(ctx)then status(job.exit and 'Awaiting native mineshaft exit' or 'Awaiting native mineshaft entry / queue')end
             return true
@@ -2463,7 +2569,8 @@ return function(api,Q)
         Q.stopDrive(ctx);api.watch(ctx)
         if not api.watcherReady(ctx)then ctx.questOwns=nil;return false end
         retries[prompt]=now()+60
-        ctx.questMineEntry={started=now(),exit=active~=nil,mine=active or D.mineshaft(prompt)}
+        ctx.questMineEntry={started=now(),exit=active~=nil,mine=active or D.mineshaft(prompt),prompt=prompt}
+        if active then D.exitState(ctx,active).attempts=D.exitState(ctx,active).attempts+1 end
         if api.fireMiningPrompt(ctx,prompt)then
             if ctx.questMineEntry then status(active and 'Leaving a depleted mineshaft' or 'Entering a ready Mineshaft for mining objectives')end
             return true
@@ -2476,6 +2583,8 @@ return function(api,Q)
         if not item or not ctx or not Q.free(item,'sale')then return false end
         local id=api.id(item);local class=api.attr(item,'Class');local category=api.attr(item,'Category')
         local value=tonumber(api.attr(item,'Value'))
+        local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+        if category=='Scrap' and (current.kind=='shred' or ctx.questNeedScrap)then return false end
         local fuelValue=tonumber(api.attr(item,'Fuel')) or 0
         if not finite(value) or value<=0 or Q.protectedRelic(item)
             or class=='Medkit' or class=='ReviveKit' or category=='Ammo' or id:sub(-5)=='_Ammo'
@@ -2556,6 +2665,7 @@ return function(api,Q)
         ctx.questMineEntry=nil
         ctx.questMineReadyAt=nil
         ctx.questFundingMine=nil
+        if not api.extractionReady()then ctx.questMineExit=nil;ctx.questMineChurchFallback=nil end
         if s.questUpgradeJob and s.questUpgradeJob.ctx==ctx then
             local c=s.questUpgradeJob.controller
             if c and type(c.SetPurchasePending)=='function'then pcall(c.SetPurchasePending,c,false)end
@@ -2563,7 +2673,7 @@ return function(api,Q)
         end
     end
     function D.threat(ctx,plan)
-        if not cfg.classQuest or api.extractionReady() or Q.manual()
+        if not cfg.classQuest or Q.manual()
             or s.lootRequest or ctx.questStartup or ctx.questRecovering then return false end
         local best,score
         local list,seen={},{}
@@ -2582,6 +2692,8 @@ return function(api,Q)
                 or plan.kind~='combat' and api.findTool(ctx,'Pickaxe')~=nil
             if (watcher or blinker) and p and npc:IsDescendantOf(workspace) and hp and hp>0
                 and (not api.enemyAlive or api.enemyAlive(npc))
+                and Q.targetResponsive(ctx,npc)
+                and (not D.activeMine() or D.mineEnemy(npc,D.activeMine()))
                 and canHit
                 and npc:GetAttribute('Category')~='Corpse' and npc:GetAttribute('NpcFaction')~='FriendlyCompanion' then
                 local distance=(p.Position-ctx.root.Position).Magnitude
@@ -2596,12 +2708,13 @@ return function(api,Q)
             return false
         end
         Q.abortResources(ctx)
-        D.stopMine(ctx)
+        D.cancelDoor(ctx,false);D.stopMine(ctx)
         if not Q.holdRoute(ctx)then return true end
         Q.stopDrive(ctx);ctx.questMining=nil;ctx.questThreat=best
         ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass=true,plan.weapon,plan.weaponClass or 'Sword'
         local tool=Q.preferred(ctx)
-        ctx.combatTarget=best
+        ctx.questTurretKills=nil
+        ctx.combatTarget=best;ctx.questExitCombat=s.questChurchExit~=nil
         if not tool then status('Urgent threat: waiting for the permitted quest weapon');api.watch(ctx);return true end
         local p=api.part(best);api.hover(ctx)
         if not ctx.defenseMoving and now()>=(ctx.dodgeUntil or 0) and (p.Position-ctx.root.Position).Magnitude>8 then
@@ -2635,7 +2748,7 @@ return function(api,Q)
         ctx.questExitCombat=nil
         local mine=D.activeMine()
         if not mine then ctx.questFundingMine=nil;return false end
-        if D.entry(ctx)then return true end
+        D.exitState(ctx,mine)
         -- A queued mine can keep its exit closed until its hostiles are gone.
         -- Stay in the native dungeon instead of releasing the chest route and
         -- leaving InDungeon/queue state behind during a client teleport.
@@ -2646,7 +2759,7 @@ return function(api,Q)
         end
         for _,npc in ipairs(loaded)do
             local h=npc:FindFirstChildOfClass('Humanoid')
-            if D.mineEnemy(npc,mine) and h and h.Health>0 and api.part(npc)
+            if D.mineEnemy(npc,mine) and h and h.Health>0 and api.part(npc) and Q.targetResponsive(ctx,npc)
                 and (not api.enemyAlive or api.enemyAlive(npc))
                 and (plan.weapon=='Flintlock' or plan.weaponClass=='Gun' or plan.weaponClass=='Rifle'
                     or plan.weaponClass=='Shotgun' or api.swordTargetAllowed(npc)
@@ -2663,6 +2776,7 @@ return function(api,Q)
             if not priority or value>priority or value==priority and d<distance then npc,priority,distance=candidate,value,d end
         end
         if npc then
+            D.cancelDoor(ctx,false);ctx.questOwns=true
             ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass=true,plan.weapon,plan.weaponClass or 'Sword'
             if plan.kind~='combat' and not api.swordTargetAllowed(npc)then ctx.questThreat=npc end
             local tool=Q.preferred(ctx)
@@ -2675,7 +2789,9 @@ return function(api,Q)
                 return true
             end
         end
-        ctx.combatTarget=nil
+        ctx.combatTarget=nil;ctx.questCombat=nil
+        if D.churchFallback(ctx)then return false end
+        if D.entry(ctx)then return true end
         local prompt=D.exitPrompt(mine)
         local player=api.Players.LocalPlayer
         local reason=not prompt and 'native DungeonExitPrompt not loaded'
@@ -2776,7 +2892,7 @@ return function(api,Q)
         local goal=plan.kind=='mining' or plan.objective=='SellGems'
         local depth=(plan.kind=='depth' or plan.kind=='fuel') and cfg.driveDepth
         if plan.kind=='waiting' or plan.kind=='advance' or plan.kind=='complete' or plan.kind=='unsupported' then D.cleanup(ctx);return false end
-        if ctx.questMineEntry and D.entry(ctx)then return true end
+        if ctx.questMineEntry and (not ctx.questMineEntry.exit or not D.inDungeon(ctx)) and D.entry(ctx)then return true end
         if D.activeMine() and now()<(ctx.questMineReadyAt or 0)then
             Q.holdRoute(ctx);api.watch(ctx);status('Mineshaft entry confirmed; allowing veins to stream in');return true
         end
@@ -2882,6 +2998,8 @@ return function(api,Q)
             node=Q.nearest(preferred,ctx.root.Position) or node
         end
         if node then
+            if ctx.questMineEntry and ctx.questMineEntry.exit then D.cancelDoor(ctx,false)end
+            ctx.questMineExit=nil
             if not Q.holdRoute(ctx) and not ctx.questOwns then return false end
             ctx.questMining=true
             if not goal and not depth and D.activeMine()then ctx.questFundingMine=true end
@@ -2893,6 +3011,11 @@ return function(api,Q)
         s.questMiningProblem=string.format('No eligible nearby vein (%d loading/dead, %d other dungeon, %d wrong type, %d retry, %d distant)',
             rejected.loading,rejected.unavailable,rejected.objective,rejected.retry,rejected.distant)
         if goal or ctx.questFundingMine then
+            if D.activeMine() and (rejected.retry>0 or rejected.distant>0)then
+                D.cancelDoor(ctx,false);Q.holdRoute(ctx);api.watch(ctx)
+                status('Loaded mining targets remain; waiting for their retry or nearer streaming')
+                return true
+            end
             if D.activeMine()then return D.leaveMine(ctx,plan)end
             if goal or needCoins and #Q.sellers(ctx)>0 then ctx.questFundingMine=not goal;return D.entry(ctx)end
         end
@@ -2902,20 +3025,596 @@ return function(api,Q)
 end
 
 end)()
+    local buildQuestSpecial = (function()
+-- Native crafting intake, blueprint placement and dungeon campaigns.
+-- This worker never manufactures class counters, placement validity or kills.
+return function(api,Q)
+    local S,s,cfg,now={},api.state,api.state.config,api.now
+    local calls=s.questCalls
+    local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
+    local function status(text)s.questStatus=text end
+    local function count(plan,key)return tonumber(plan.counts and plan.counts[key]) or 0 end
+    local function unmet(plan,key)
+        for _,goal in ipairs(plan.unmet or {})do if goal.key==key then return goal end end
+    end
+    local function live(item)return item and item.Parent and item:IsDescendantOf(workspace)end
+    local function native(name)return api.sharedModule and api.sharedModule(name)end
+    local function toolId(item)return item and api.id(item)end
+    local function turretId(id)
+        local catalog=native('CraftingCatalog');local entry=catalog and catalog[id]
+        if type(entry)~='table' then return false end
+        for _,tag in ipairs(entry.Tags or {})do if tag=='SentryTurret'then return true end end
+        return false
+    end
+    function S.fastPlacement(plan)
+        return cfg.classQuest and plan and plan.name=='Engineer' and unmet(plan,'PlaceTurrets')~=nil
+    end
+    function S.matches(npc,key)
+        local name=tostring(npc:GetAttribute('RealName') or npc.Name):lower():gsub('[^%w]','')
+        if key=='CrazyMinerKills'then return name:match('^crazyminer%d*$')~=nil or name:match('^voidcrazyminer%d*$')~=nil
+            or name:match('^minercrazy%d*$')~=nil or name:match('^voidminercrazy%d*$')~=nil end
+        if key=='BanditMinerKills'then return name:match('^banditminer%d*$')~=nil or name:match('^voidbanditminer%d*$')~=nil
+            or name:match('^minerbandit%d*$')~=nil or name:match('^voidminerbandit%d*$')~=nil end
+        if key=='GoblinKills'then return name:find('goblin',1,true)~=nil end
+        if key=='GoblinLordKills'then return name=='goblinlord' or name=='voidgoblinlord' end
+        return true
+    end
+    function S.matchesPlan(npc,plan)
+        if plan.objective=='CrazyMinerKills' or plan.objective=='BanditMinerKills'then
+            for _,goal in ipairs(plan.unmet or {})do
+                if (goal.key=='CrazyMinerKills' or goal.key=='BanditMinerKills') and S.matches(npc,goal.key)then return true end
+            end
+            return false
+        end
+        return S.matches(npc,plan.objective)
+    end
+    function S.starterIds(plan)
+        local entry=s.questCatalog and s.questCatalog[plan.name];local ids={}
+        for level,list in pairs(entry and entry.StarterTools or {})do
+            if type(level)=='number' and level<=plan.level then
+                for _,id in ipairs(list)do if turretId(id)then ids[id]=true end end
+            end
+        end
+        return ids
+    end
+    function S.protectedCarried(ctx,plan)
+        local entry=s.questCatalog and s.questCatalog[plan.name];local allowed={ItemBag=true,Pickaxe_Wooden=true,Sword_Wooden=true}
+        local function add(value)
+            if type(value)=='string'then allowed[value]=true
+            elseif type(value)=='table'then for _,v in pairs(value)do add(v)end end
+        end
+        add(entry and entry.StarterTools);add(entry and entry.StarterArmor)
+        for _,container in ipairs({ctx.character,api.Players.LocalPlayer:FindFirstChild('Backpack')})do
+            if container then for _,item in ipairs(container:GetChildren())do
+                local armor=item:GetAttribute('ArmorName');local id=armor or toolId(item)
+                if type(id)=='string' and not allowed[id]then
+                    for name in pairs(allowed)do if id==name..tostring(api.Players.LocalPlayer.UserId)then id=name;break end end
+                end
+                if armor and not allowed[id]then return true end
+                if (item:IsA('Tool') or api.attr(item,'Tool')==true or api.attr(item,'Class')~=nil) and not allowed[id]then return true end
+            end end
+        end
+        return false
+    end
+    function S.quickReturn(ctx)
+        local job=s.questTurretRestart
+        if not cfg.classQuest or not job or job.ctx~=ctx or not ctx.active then return false end
+        local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+        if plan.name~=job.class or plan.level~=job.level or not unmet(plan,'PlaceTurrets')then s.questTurretRestart=nil;return false end
+        if count(plan,'PlaceTurrets')<=job.before or Q.manual() or s.lootRequest or s.equipmentRequest
+            or s.questDelivery or s.bringDelivery or s.questDeathClaim or calls.place or calls.craft
+            or api.Players.LocalPlayer:GetAttribute('PlacingCraftedPlaceable')==true then return false end
+        if S.protectedCarried(ctx,plan)then
+            s.questChurchExit=s.questChurchExit or {reason='Turret placed; church save preserves carried equipment before the starter-only loop',requestedAt=now()}
+            return false
+        end
+        return not s.questChurchExit
+    end
+    function S.scrapPad(ctx)
+        local best,distance
+        local function add(part)
+            if not live(part) or not part:IsA('BasePart')then return end
+            local p=part
+            while p and p~=workspace and p.Name~='CraftingShack'do p=p.Parent end
+            if not p or p==workspace then return end
+            local d=(part.Position-ctx.root.Position).Magnitude
+            if not distance or d<distance then best,distance=part,d end
+        end
+        for _,part in ipairs(api.tagged('ScrapCollector'))do add(part)end
+        -- The exported CraftingShack SellSpot intake is distinct from TradingPost.
+        for _,item in ipairs(ctx.worldObjects or {})do
+            if item.Name=='SellSpot' and item.Parent and item.Parent.Name=='SellSpot'then add(item)end
+        end
+        return best
+    end
+    function S.scrapEligible(item,ctx)
+        return Q.free(item) and api.attr(item,'Category')=='Scrap'
+            and not Q.protectedRelic(item) and not api.useful(ctx,item)
+    end
+    function S.shred(ctx,plan)
+        local pad=S.scrapPad(ctx)
+        if not pad then status('Scrap quest: looking for a loaded CraftingShack shredder; chest discovery continues');return false end
+        local best,score
+        for _,item in ipairs(Q.looseItems())do
+            if S.scrapEligible(item,ctx) and now()>=(s.questItemRetries[item] or 0)then
+                local value=tonumber(api.attr(item,'Value')) or 0
+                if not score or value>score then best,score=item,value end
+            end
+        end
+        if not best then status('Scrap quest: collecting chests for disposable scrap');return false end
+        local request={name=plan.name,counts=plan.counts,objective='ShredScrap'}
+        if Q.startDelivery(ctx,best,pad,'shred',request)then
+            status('Delivering disposable scrap to the native shredder; awaiting Cogs-worth quest credit');return true
+        end
+        return false
+    end
+    function S.blueprint(ctx)
+        for _,container in ipairs({ctx.character,api.Players.LocalPlayer:FindFirstChild('Backpack')})do
+            if container then for _,tool in ipairs(container:GetChildren())do
+                if tool:IsA('Tool') and turretId(toolId(tool))then return tool end
+            end end
+        end
+    end
+    function S.readCraft(ctx)
+        if calls.craftState or now()<(ctx.questCraftReadAt or 0)then return end
+        ctx.questCraftReadAt=now()+3
+        Q.call('craftState','CraftingService','GetState',{},function(ok,value)
+            if ok and type(value)=='table' and finite(tonumber(value.ScrapCount))then
+                s.questCraftState=value;s.questCraftObservedAt=now()
+                local c=api.controller('CraftingController')
+                if c and type(c.ApplyState)=='function'then pcall(c.ApplyState,c,value)end
+            end
+        end,function()return Q.enabled(ctx) and not api.extractionReady()end)
+    end
+    function S.craft(ctx,plan)
+        S.readCraft(ctx)
+        local c=api.controller('CraftingController');local job=s.questCraftJob
+        if job then
+            local blueprint=S.blueprint(ctx)
+            local total=tonumber(s.questCraftState and s.questCraftState.CraftedCounts and s.questCraftState.CraftedCounts.BasicSentry)
+            if blueprint and toolId(blueprint)=='BasicSentry' and (job.accepted or total and total>job.before)then
+                local token=calls.craft
+                if token and token.thread then
+                    pcall(task.cancel,token.thread)
+                    if coroutine.status(token.thread)=='dead' and calls.craft==token then calls.craft=nil end
+                end
+                if not calls.craft then s.questCraftJob=nil end
+                return false
+            end
+            if job.rejected then s.questCraftJob=nil;ctx.questCraftRetry=now()+10;return false end
+            if now()-job.started>=12 then ctx.questOwns=nil;status('Turret craft unconfirmed; request reserved, chest work continues');return false end
+            status('Awaiting the crafted turret blueprint inventory receipt');return true
+        end
+        if not c or type(c.CanCraft)~='function' or not s.questCraftState or c.PendingCraft or calls.craft
+            or now()<(ctx.questCraftRetry or 0)then return false end
+        local catalog=native('CraftingCatalog');local entry=catalog and catalog.BasicSentry
+        if not entry or entry.UseType~='Placeable' or entry.Craftable==false then return false end
+        local portable=type(c.CanCraftAnywhere)=='function' and c:CanCraftAnywhere()
+        if not live(c.CraftSource) and not portable then
+            local source,distance
+            for _,part in ipairs(api.tagged('MagnitudeFrame'))do
+                if part.Name=='Crafting' and live(part) and api.part(part)then
+                    local d=(api.part(part).Position-ctx.root.Position).Magnitude
+                    if not distance or d<distance then source,distance=part,d end
+                end
+            end
+            if source and Q.holdRoute(ctx)then
+                Q.stopDrive(ctx);api.hover(ctx);ctx.root.CFrame=CFrame.new(api.part(source).Position+Vector3.new(0,2,0))
+                if type(c.SetCraftSource)=='function'then pcall(c.SetCraftSource,c,source)end
+                status('At a native Crafting source for turret replenishment');return true
+            end
+            status('Turret quest: looking for a loaded CraftingShack source');return false
+        end
+        if live(c.CraftSource) and api.part(c.CraftSource) and (api.part(c.CraftSource).Position-ctx.root.Position).Magnitude>10 then
+            if not Q.holdRoute(ctx)then return true end
+            api.hover(ctx);ctx.root.CFrame=CFrame.new(api.part(c.CraftSource).Position+Vector3.new(0,2,0));return true
+        end
+        local ok,can=pcall(c.CanCraft,c,'BasicSentry')
+        if not ok or not can then
+            -- Only native scrap credit funds this recipe. Coins are a different balance.
+            if (tonumber(s.questCraftState.ScrapCount) or 0)<(tonumber(entry.Price) or 0)then
+                ctx.questNeedScrap=true;return S.shred(ctx,plan)
+            end
+            status('Turret recipe is not natively craftable at this source/level');return false
+        end
+        ctx.questNeedScrap=nil
+        job={ctx=ctx,started=now(),source=c.CraftSource,
+            before=tonumber(s.questCraftState.CraftedCounts and s.questCraftState.CraftedCounts.BasicSentry) or 0};s.questCraftJob=job
+        if not Q.call('craft','CraftingService','Craft',{'BasicSentry',c.CraftSource},function(ok,value,_,dispatch)
+            job.rejected=dispatch=='not-sent' or ok and value==false
+            if ok and type(value)=='table'then job.accepted=true;s.questCraftState=value;if type(c.ApplyState)=='function'then pcall(c.ApplyState,c,value)end end
+        end,function()return Q.enabled(ctx) and not api.extractionReady() and not Q.manual() and not c.PendingCraft
+            and not calls.place and not S.blueprint(ctx) and c:CanCraft('BasicSentry')end)then s.questCraftJob=nil;return false end
+        return true
+    end
+    function S.positionPreview(ctx,c,job)
+        local regions=api.tagged('CraftPartRegion');local root=ctx.drill
+        local attempts=job.pose or 0
+        local candidate
+        for _,part in ipairs(regions)do
+            if live(part) and part:IsA('BasePart') and part:IsDescendantOf(root)then
+                if c.Item and c.Item:GetAttribute('BackOfDrillOnly')==true then
+                    local pivot=root:GetPivot()
+                    if pivot:PointToObjectSpace(part.Position).Z>=0 then candidate=part;break end
+                else candidate=part;break end
+            end
+        end
+        if not candidate then
+            for _,part in ipairs(root:GetDescendants())do
+                if part.Name=='CraftPartRegion' and part:IsA('BasePart')then candidate=part;break end
+            end
+        end
+        if not candidate then return false end
+        job.pose=attempts+1
+        local half=candidate.Size*.5
+        local x=((attempts%3)-1)*math.max(0,half.X-3)
+        local z=(math.floor(attempts/3)%3-1)*math.max(0,half.Z-3)
+        local point=candidate.CFrame:PointToWorldSpace(Vector3.new(x,half.Y+3,z))
+        local forward=candidate.CFrame.LookVector or Vector3.new(0,0,-1)
+        api.hover(ctx);ctx.root.CFrame=CFrame.lookAt(point-forward*7,point)
+        return true
+    end
+    function S.placement(ctx,plan)
+        local c=api.controller('PlaceablePlacementController')
+        local job=ctx.questPlacement
+        if job then
+            local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+            local counter=current.name==job.class and count(current,'PlaceTurrets')>job.before
+            local placed=not unmet(current,'PlaceTurrets') and job.accepted and live(job.item) and job.item:GetAttribute('Placed')==true
+            if counter or placed then
+                ctx.questPlacement=nil;ctx.questOwns=nil;ctx.questTurretKills=nil
+                local token=calls.place
+                if token and token.thread then
+                    pcall(task.cancel,token.thread)
+                    if coroutine.status(token.thread)=='dead' and calls.place==token then calls.place=nil end
+                end
+                s.questPlacedTurrets=s.questPlacedTurrets or setmetatable({}, {__mode='k'})
+                if live(job.item)then s.questPlacedTurrets[job.item]=true end
+                if S.fastPlacement(current)then
+                    s.questTurretRestart={ctx=ctx,class=job.class,level=job.level,before=job.before}
+                    status('Turret placement counter increased; preparing the starter-only lobby loop')
+                else status('Placement quota reached; staying for turret kill credit')end
+                return true
+            end
+            if job.sent then
+                if job.rejected and (job.attempts or 0)<3 and c and c.Active and c.Item==job.item then
+                    job.sent=nil;job.rejected=nil;job.retryAt=now()+3;c.ValidRegion=nil
+                    ctx.questOwns=nil;return false
+                end
+                if job.rejected then ctx.questOwns=nil;status('Native placement rejected repeatedly; awaiting a new valid placement context');return false end
+                if now()-job.issuedAt>=12 then ctx.questOwns=nil;status('Placement credit unconfirmed; mutation reserved, other work continues');return false end
+                status('Awaiting native turret placement quest credit');return true
+            end
+            if not c or not c.Active or not live(c.Item) or c.Item:GetAttribute('CraftedPlaceable')~=true
+                or c.Item:GetAttribute('PlacingUserId')~=api.Players.LocalPlayer.UserId then
+                if now()-job.started>=15 then ctx.questOwns=nil;status('Blueprint start unconfirmed; the same tool is not started again');return false end
+                status('Awaiting the native Blueprint StartPlacement state');return true
+            end
+            job.item=c.Item
+            if now()<(job.retryAt or 0)then ctx.questOwns=nil;return false end
+            if c.PendingRequest or c.PendingCancel or Q.manual()then return false end
+            if not Q.holdRoute(ctx)then return true end
+            if type(c.UpdatePreview)~='function'then ctx.questOwns=nil;return false end
+            if not c.ValidRegion or not c.PlacementOffset then
+                if job.pose and job.pose>=9 then ctx.questOwns=nil;status('No collision-valid turret space; chest work continues');return false end
+                S.positionPreview(ctx,c,job);pcall(c.UpdatePreview,c)
+            end
+            if not live(c.ValidRegion) or not c.PlacementOffset or not c.ValidRegion:IsDescendantOf(ctx.drill)then return true end
+            local region,offset,item=c.ValidRegion,c.PlacementOffset,c.Item
+            job.sent,job.issuedAt=true,now();job.attempts=(job.attempts or 0)+1
+            if not Q.call('place','PlaceableService','Place',{region,offset},function(ok,value,_,dispatch)
+                job.rejected=dispatch=='not-sent' or ok and value==false
+                if ok or dispatch=='not-sent'then c.PendingRequest=false end
+                if ok and value then
+                    job.accepted=true
+                    if c.Item==item and type(c.StopLocalPlacement)=='function'then pcall(c.StopLocalPlacement,c)end
+                end
+                s.questPollAt=0
+            end,function()
+                local allowed=Q.enabled(ctx) and not api.extractionReady() and not Q.manual() and c.Active
+                and c.Item==item and c.ValidRegion==region and c.PlacementOffset==offset
+                and not c.PendingRequest and live(region) and live(item)
+                and item:GetAttribute('PlacingUserId')==api.Players.LocalPlayer.UserId
+                if allowed then c.PendingRequest=true end
+                return allowed
+            end)then job.sent=nil;return false end
+            return true
+        end
+        if s.questCraftJob then return S.craft(ctx,plan)end
+        if not c or c.Active or c.PendingRequest or c.PendingCancel or calls.place or calls.craft or calls.placementCancel or Q.manual() or s.questDelivery or s.bringDelivery or s.lootRequest
+            or now()<(ctx.questPlacementRetry or 0)then return false end
+        local tool=S.blueprint(ctx)
+        if not tool then return S.craft(ctx,plan)end
+        if not Q.holdRoute(ctx)then return true end
+        Q.stopDrive(ctx);Q.drillSupport.stopMine(ctx);ctx.questCombat=nil;ctx.combatTarget=nil
+        local active=api.equip(ctx,tool)
+        if not active or type(active.BeginPlacement)~='function'then status('Turret quest waits for the owned Blueprint handler');return true end
+        job={tool=tool,recipe=toolId(tool),class=plan.name,level=plan.level,before=count(plan,'PlaceTurrets'),started=now()};ctx.questPlacement=job
+        pcall(active.BeginPlacement,active)
+        status('Beginning native turret placement with the owned starter blueprint');return true
+    end
+    function S.turretKills(ctx,plan)
+        local own={}
+        for _,item in ipairs(api.tagged('SentryTurret'))do
+            if live(item) and item:GetAttribute('Placed')==true and api.part(item)
+                and (item:GetAttribute('OwnerUserId')==api.Players.LocalPlayer.UserId
+                    or item:GetAttribute('PlacingUserId')==api.Players.LocalPlayer.UserId
+                    or s.questPlacedTurrets and s.questPlacedTurrets[item])then own[#own+1]=item end
+        end
+        if #own==0 then return S.placement(ctx,plan)end
+        ctx.questTurretKills=true;ctx.questCombat=nil;ctx.combatTarget=nil
+        local target,turret,distance
+        for _,item in ipairs(own)do
+            local center=api.part(item).Position;local radius=tonumber(item:GetAttribute('ActiveDistance')) or 300
+            for _,npc in ipairs(api.enemies())do
+                local p=api.part(npc)
+                if api.enemyAlive(npc) and api.questTargetAllowed(ctx,npc) and p and (p.Position-center).Magnitude<=radius then
+                    local d=(p.Position-center).Magnitude
+                    if not distance or d<distance then target,turret,distance=npc,item,d end
+                end
+            end
+        end
+        if not target then status('Turret quest: no enemy near the owned sentry; chest discovery continues');return false end
+        local h=target:FindFirstChildOfClass('Humanoid');local monitor=ctx.questTurretMonitor
+        if not monitor or monitor.target~=target or h and h.Health<monitor.health then
+            monitor={target=target,health=h and h.Health or 0,started=now()};ctx.questTurretMonitor=monitor
+        elseif now()-monitor.started>=10 then
+            ctx.questTargetRetry=ctx.questTargetRetry or setmetatable({}, {__mode='k'})
+            ctx.questTargetRetry[target]={untilAt=now()+10,health=h and h.Health or 0}
+            ctx.questTurretMonitor=nil;ctx.questOwns=nil;ctx.combatTarget=nil
+            status('Owned turret is not damaging this target; trying other loaded work');return false
+        end
+        ctx.combatTarget=target
+        if not Q.holdRoute(ctx)then return true end
+        Q.stopDrive(ctx);Q.drillSupport.stopMine(ctx);api.hover(ctx)
+        local center=api.part(turret).Position;local range=tonumber(turret:GetAttribute('TargetRange')) or 100
+        if distance>range*.8 and not ctx.questTurretLureUntil then
+            ctx.root.CFrame=CFrame.new(api.part(target).Position+Vector3.new(0,2,5));ctx.questTurretLureUntil=now()+1
+        elseif not ctx.questTurretLureUntil or now()>=ctx.questTurretLureUntil then
+            ctx.root.CFrame=CFrame.new(center+Vector3.new(0,3,8));ctx.questTurretLureUntil=nil
+        end
+        api.watch(ctx);status('Letting the owned sentry earn turret kills; ordinary aura paused')
+        return true
+    end
+    function S.root(item)
+        local state=native('DungeonDoorState')
+        if state and type(state.GetRoot)=='function'then
+            local ok,root=pcall(state.GetRoot,item)
+            if ok and live(root)then return root end
+        end
+    end
+    function S.bound(ctx)
+        if Q.drillSupport and not Q.drillSupport.inDungeon(ctx)then return nil end
+        local c=api.controller('DungeonUIController');local root=c and c._BoundDungeon
+        local old=ctx.questCampaignExit
+        if old and old.root==root then return nil end
+        return api.Players.LocalPlayer:GetAttribute('InDungeon')==true and live(root) and root or nil
+    end
+    function S.belongs(npc,root)
+        if not live(npc) or not live(root)then return false end
+        local session=root:GetAttribute('SessionDungeonId');local own=npc:GetAttribute('SessionDungeonId')
+        if session~=nil and own~=nil then return own==session and npc:GetAttribute('DungeonWaveNpc')==true end
+        local spider=root:GetAttribute('SpiderPitId');local npcSpider=npc:GetAttribute('SpiderPitId')
+        if spider~=nil and npcSpider~=nil then return spider==npcSpider and npc:GetAttribute('DungeonWaveNpc')==true end
+        return npc:IsDescendantOf(root)
+    end
+    function S.observe(ctx,root)
+        if not ctx.connect or not root then return end
+        ctx.questCampaignRemotes=ctx.questCampaignRemotes or setmetatable({}, {__mode='k'})
+        for _,item in ipairs(root:GetDescendants())do
+            if item.Name=='DungeonDoorTransition' and item:IsA('RemoteEvent') and item.OnClientEvent
+                and not ctx.questCampaignRemotes[item]then
+                ctx.questCampaignRemotes[item]=true
+                ctx.connect(item.OnClientEvent,function(mode)
+                    if not ctx.active then return end
+                    if mode=='Enter'then ctx.questCampaignExit=nil
+                    elseif mode=='Exit' and (S.bound(ctx)==root or ctx.questCampaign and ctx.questCampaign.root==root)then
+                        ctx.questCampaignExit={root=root};ctx.questCampaign=nil;ctx.questOwns=nil
+                        ctx.questCombat=nil;ctx.questExitCombat=nil;ctx.combatTarget=nil
+                    end
+                end)
+            end
+        end
+    end
+    local function ready(prompt)
+        local module=native('DungeonDoorState')
+        return live(prompt) and prompt:IsA('ProximityPrompt') and prompt.Enabled~=false
+            and prompt:GetAttribute('DungeonDoorReady')==true and prompt:GetAttribute('DungeonDoorAvailable')==true
+            and module and type(module.CanUsePlayer)=='function' and module.CanUsePlayer(api.Players.LocalPlayer)
+    end
+    function S.dungeon(ctx,plan,forceExit)
+        if forceExit and ctx.questCampaignChurch then return false end
+        local root=S.bound(ctx)
+        local job=ctx.questCampaign
+        if root then
+            S.observe(ctx,root)
+            if not job or job.root~=root then job={root=root,started=now(),entered=true};ctx.questCampaign=job end
+            if job.moving then ctx.nativeGateMotion=nil;ctx.root.AssemblyLinearVelocity=Vector3.zero;job.moving=nil end
+            job.entered=true
+            if forceExit and now()-job.started>=30 then
+                ctx.questCampaign=nil;ctx.questOwns=nil;ctx.questCombat=nil;ctx.combatTarget=nil
+                ctx.questCampaignChurch=true;return false
+            end
+            if not Q.holdRoute(ctx)then return true end
+            local target,score
+            for _,npc in ipairs(api.enemies())do
+                if api.enemyAlive(npc) and S.belongs(npc,root) and Q.targetResponsive(ctx,npc)then
+                    local h=npc:FindFirstChildOfClass('Humanoid');local p=api.part(npc)
+                    if h and p then
+                        local urgent=api.tag(npc,'Watcher') or tostring(npc:GetAttribute('RealName') or npc.Name):lower():find('blinker',1,true)
+                        local value=(urgent and -1e9 or 0)+h.Health
+                        if not score or value<score then target,score=npc,value end
+                    end
+                end
+            end
+            if target then
+                if ctx.questCampaignDoor and now()<ctx.questCampaignDoor.untilAt then ctx.questCampaignDoor=nil end
+                ctx.questExitCombat=forceExit==true
+                if not api.swordTargetAllowed(target)then ctx.questThreat=target else ctx.questThreat=nil end
+                return Q.combatWork(ctx,{kind='combat',name=plan.name,level=plan.level,counts=plan.counts,unmet=plan.unmet,
+                    objective='EnemyKills',weaponClass='Sword'},target)
+            end
+            ctx.questCombat=nil;ctx.combatTarget=nil;api.watch(ctx)
+            local exit=root:FindFirstChild('DungeonExitPrompt',true) or root:FindFirstChild('ExitPrompt',true)
+            local pending=ctx.questCampaignDoor
+            if pending then
+                if now()<pending.untilAt then status('Awaiting the native dungeon exit transition');return true end
+                ctx.questCampaignDoor=nil;ctx.questCampaignRetry=now()+30
+            end
+            if ready(exit) and now()>=(ctx.questCampaignRetry or 0)then
+                ctx.questCampaignDoor={prompt=exit,untilAt=now()+10};ctx.questCampaignRetry=now()+30
+                api.fireMiningPrompt(ctx,exit);return true
+            end
+            status('Dungeon campaign: watching for its next native wave or enabled exit');return true
+        end
+        if ctx.questCampaignChurch then return false end
+        if job and job.entered then ctx.questCampaign=nil;ctx.questCampaignDoor=nil;ctx.questOwns=nil;job=nil end
+        if api.Players.LocalPlayer:GetAttribute('InDungeon')==true and not ctx.questCampaignExit then
+            local c=api.controller('DungeonUIController')
+            if c and type(c.TryBindActiveDungeon)=='function' and now()>=(ctx.questCampaignBindAt or 0)then
+                ctx.questCampaignBindAt=now()+2;pcall(c.TryBindActiveDungeon,c)
+            end
+            if S.bound(ctx)then return S.dungeon(ctx,plan,forceExit)end
+            Q.holdRoute(ctx);api.watch(ctx);status('Dungeon campaign: waiting for the native room binding');return true
+        end
+        if forceExit then return false end
+        if job then
+            if job.queue and job.moving then
+                local point=ctx.root.CFrame.Position or ctx.root.Position
+                local delta=job.finish-point
+                if delta.Magnitude<=1 or now()-job.started>=3 then
+                    ctx.nativeGateMotion=nil;ctx.root.AssemblyLinearVelocity=Vector3.zero;job.moving=nil
+                    if type(ctx.humanoid.MoveTo)=='function'then ctx.humanoid:MoveTo(point)end
+                else ctx.root.AssemblyLinearVelocity=delta.Unit*12 end
+            end
+            if job.queue and api.Players.LocalPlayer:GetAttribute('ActiveDungeonQueueId')==job.queueId then
+                local ends=tonumber(job.queue:GetAttribute('CountdownEndsAt'))
+                if finite(ends) and job.countdownEnds~=ends and type(workspace.GetServerTimeNow)=='function'then
+                    job.countdownEnds=ends;job.untilAt=now()+math.max(0,ends-workspace:GetServerTimeNow())+10
+                elseif not job.joined then job.untilAt=now()+45 end
+                job.joined=true
+            end
+            if now()<(job.untilAt or job.started+15)then Q.holdRoute(ctx);api.watch(ctx);status('Awaiting native dungeon entry / queue receipt');return true end
+            if job.queue then ctx.nativeGateMotion=nil;ctx.root.AssemblyLinearVelocity=Vector3.zero end
+            ctx.questCampaign=nil;ctx.questOwns=nil
+            ctx.questCampaignRetries=ctx.questCampaignRetries or setmetatable({}, {__mode='k'})
+            ctx.questCampaignRetries[job.prompt or job.queue]=now()+30
+        end
+        local best,score,selectedRoot
+        local ring=unmet(plan,'CompleteGoblinRing') or unmet(plan,'GoblinLordKills')
+        for _,door in ipairs(api.tagged('DungeonDoor'))do
+            local candidate=S.root(door)
+            if candidate then
+                local prompt=door:FindFirstChildWhichIsA('ProximityPrompt',true)
+                local wave=candidate:FindFirstChild('Wave');local id=wave and wave:GetAttribute('WaveId') or candidate.Name
+                local goblin=tostring(id):lower():gsub('[^%w]',''):find('goblinring',1,true)~=nil
+                local module=native('DungeonDoorState')
+                if (not ring or goblin) and ready(prompt) and prompt.Name~='DungeonExitPrompt' and prompt.Name~='ExitPrompt'
+                    and not(module.IsCompleted and module.IsCompleted(candidate))
+                    and now()>=((ctx.questCampaignRetries or {})[prompt] or 0)then
+                    local p=api.position(prompt)
+                    if p then
+                        local value=(p-ctx.root.Position).Magnitude+(goblin and 0 or 10000)
+                        if not score or value<score then best,score,selectedRoot=prompt,value,candidate end
+                    end
+                end
+            end
+        end
+        if not best then
+            for _,spot in ipairs(api.tagged('DungeonQueueSpot'))do
+                local candidate=S.root(spot)
+                local state=spot:GetAttribute('QueueState');local id=spot:GetAttribute('QueueId')
+                local wave=candidate and candidate:FindFirstChild('Wave')
+                local kind=wave and wave:GetAttribute('WaveId') or candidate and candidate.Name or ''
+                local goblin=tostring(kind):lower():gsub('[^%w]',''):find('goblinring',1,true)~=nil
+                local module=native('DungeonDoorState')
+                if candidate and spot:IsA('BasePart') and spot.CanTouch==true and ctx.root.CanTouch~=false
+                    and type(id)=='string' and id~='' and (state=='Idle' or state=='Countdown') and (not ring or goblin)
+                    and module and module.CanUsePlayer(api.Players.LocalPlayer) and not module.IsCompleted(candidate)
+                    and now()>=((ctx.questCampaignRetries or {})[spot] or 0)then
+                    if not Q.holdRoute(ctx)then return true end
+                    Q.stopDrive(ctx);Q.drillSupport.stopMine(ctx);S.observe(ctx,candidate)
+                    -- Queue UI binds through actual InDungeon/ActiveDungeonQueueId
+                    -- changes. There is no client JoinQueue remote to fabricate.
+                    local direction=spot.CFrame.LookVector or Vector3.new(0,0,-1)
+                    local finish=spot.Position
+                    local begin=finish-direction*(spot.Size.Z*.5+3)
+                    ctx.questCampaign={root=candidate,queue=spot,queueId=id,started=now(),finish=finish,moving=true}
+                    ctx.nativeGateMotion=true;api.hover(ctx);ctx.root.CFrame=CFrame.new(begin)
+                    ctx.root.AssemblyLinearVelocity=direction*12
+                    if type(ctx.humanoid.MoveTo)=='function'then ctx.humanoid:MoveTo(finish)end
+                    status('Approaching the native dungeon queue; waiting for real queue membership');return true
+                end
+            end
+        end
+        if not best then status('Goblin campaign: seeking a loaded, ready dungeon entrance; chest discovery continues');return false end
+        if not Q.holdRoute(ctx)then return ctx.questOwns==true end
+        Q.stopDrive(ctx);Q.drillSupport.stopMine(ctx);S.observe(ctx,selectedRoot)
+        ctx.questCampaign={root=selectedRoot,prompt=best,started=now()};ctx.questCampaignExit=nil
+        if not api.fireMiningPrompt(ctx,best)then ctx.questCampaign=nil;ctx.questOwns=nil;return false end
+        return true
+    end
+    function S.cancelPreview(ctx)
+        local job=ctx.questPreviewCancel or ctx.questPlacement
+        if job then
+            local c=api.controller('PlaceablePlacementController');local item=c and c.Item
+            local own=c and c.Active and live(item) and item:GetAttribute('PlacingUserId')==api.Players.LocalPlayer.UserId
+                and toolId(item)==job.recipe and (not job.item or job.item==item)
+            ctx.questPlacement=nil
+            if not own then ctx.questPreviewCancel=nil;return end
+            ctx.questPreviewCancel=job
+            if job.cancelAt and now()-job.cancelAt>=12 then
+                -- A local preview is reversible; unknown server mutations remain
+                -- reserved. A missing cancellation reply cannot park every worker.
+                if type(c.StopLocalPlacement)=='function'then pcall(c.StopLocalPlacement,c)end
+                ctx.questPreviewCancel=nil;ctx.questOwns=nil;return
+            end
+            if not job.cancelRequested and not c.PendingCancel and not calls.placementCancel then
+                job.cancelRequested=true;job.cancelAt=now()
+                local issued=Q.call('placementCancel','PlaceableService','CancelPlacement',{},function(ok,value,_,dispatch)
+                    c.PendingCancel=false
+                    if dispatch=='not-sent'then job.cancelRequested=nil;job.cancelAt=nil;return end
+                    -- Native CancelPlacement stops its local preview on both
+                    -- fulfilled and rejected promises, including a pending Place.
+                    if c.Item==item and type(c.StopLocalPlacement)=='function'then pcall(c.StopLocalPlacement,c)end
+                    if ctx.questPreviewCancel==job then ctx.questPreviewCancel=nil end
+                end,function()
+                    if c.Active and c.Item==item and not c.PendingCancel then c.PendingCancel=true;return true end
+                    return false
+                end)
+                if not issued then job.cancelRequested=nil;job.cancelAt=nil end
+            end
+        end
+        -- Place/Craft replies stay reserved. Cleanup cannot prove an unacknowledged
+        -- consuming mutation failed, and must not permit a duplicate blueprint.
+    end
+    function S.cleanup(ctx)
+        ctx.questTurretKills=nil
+        if ctx.questCampaign and ctx.questCampaign.moving then
+            ctx.nativeGateMotion=nil;ctx.root.AssemblyLinearVelocity=Vector3.zero;ctx.questCampaign.moving=nil
+        end
+        if not api.extractionReady()then ctx.questCampaignChurch=nil end
+        S.cancelPreview(ctx)
+    end
+    return S
+end
+
+end)()
     local unpackValues = table.unpack or unpack
     local packValues = table.pack or function(...)return {n=select('#',...),...}end
     local calls = s.questCalls or {}; s.questCalls = calls
     local retries = s.questItemRetries or setmetatable({}, {__mode = 'k'}); s.questItemRetries = retries
     local weapons = {FlintlockKills = 'Flintlock', CutlassKills = 'Sword_Pirate'}
     local melee = {MeleeKills=true, MeleeDamage=true, MeleeCrits=true, EnemyKills=true, VampireKills=true,
-        CrazyMinerKills=true, BanditMinerKills=true, DarknessEnemyKills=true}
+        CrazyMinerKills=true, BanditMinerKills=true, DarknessEnemyKills=true,GoblinKills=true,GoblinLordKills=true}
     local guns = {GunKills=true, HeadShot=true, ShotgunKills='Shotgun', RifleKills='Rifle'}
     local mining = {MineCoal=true,MineDiamond=true,MineRuby=true,MineOres=true,MineGems=true}
     local sales = {SellGoldItems=true,SellCorpse=true,SellScrap=true,SellGems=true}
     local potions = {UseSpeedPotion='SpeedPotion',UseStrengthPotion='StrengthPotion',UseInvisibilityPotion='InvisibilityPotion'}
     local upgradeGoals = {BuyDriveSpeed='DriveSpeed',BuyEngineOverdrive='EngineOverdrive'}
+    local specialGoals={ShredScrap=true,PlaceTurrets=true,TurretKills=true,CompleteDungeon=true,CompleteGoblinRing=true}
     local stock
-    Q.capabilities={weapons=weapons,melee=melee,guns=guns,mining=mining,sales=sales,potions=potions,upgrades=upgradeGoals}
+    Q.capabilities={weapons=weapons,melee=melee,guns=guns,mining=mining,sales=sales,potions=potions,upgrades=upgradeGoals,special=specialGoals}
     local function finite(v) return type(v)=='number' and v==v and math.abs(v)<math.huge end
     local function setStatus(text) s.questStatus = text end
     local function normalize(v) return type(v)=='string' and v:lower():gsub('[^%w]', '') or '' end
@@ -2945,7 +3644,7 @@ end)()
         return weapons[key]~=nil or melee[key]~=nil or guns[key]~=nil
             or mining[key]==true
             or sales[key]==true or potions[key]~=nil or upgradeGoals[key]~=nil or key=='ContributeFuel'
-            or key=='OpenChest' or key=='TotalDepth' and drive==true
+            or specialGoals[key]==true or key=='OpenChest' or key=='TotalDepth' and drive==true
     end
     function Q.activePlan(plan)
         return plan and plan.kind~='waiting' and plan.kind~='complete' and plan.kind~='advance' and plan.kind~='unsupported'
@@ -2992,6 +3691,13 @@ end)()
                 plan.weaponClass=key=='CutlassKills' and 'Sword' or 'Revolver'
                 return plan
             end
+        end
+        if pending.PlaceTurrets then plan.kind,plan.objective='turret','PlaceTurrets';return plan end
+        if pending.TurretKills then plan.kind,plan.objective='turret','TurretKills';return plan end
+        if pending.ShredScrap then plan.kind,plan.objective='shred','ShredScrap';return plan end
+        if pending.CompleteDungeon or pending.CompleteGoblinRing or pending.GoblinLordKills then
+            plan.kind,plan.objective='dungeon',pending.CompleteGoblinRing and 'CompleteGoblinRing' or pending.CompleteDungeon and 'CompleteDungeon' or 'GoblinLordKills'
+            return plan
         end
         if pending.SellGoldItems then plan.kind,plan.objective='gold','SellGoldItems'; return plan end
         for _, item in ipairs(plan.unmet) do
@@ -3058,7 +3764,7 @@ end)()
         -- after its coroutine actually stops, then notify its waiting consumer.
         for key,token in pairs(calls)do
             if (token.method=='GetClasses' or token.method=='GetBuyQuote' or token.method=='GetCurrency'
-                or token.method=='GetData' or token.method=='GetEquipped' or token.method=='GetCrateItems' or token.method=='GetContents')
+                or token.method=='GetState' or token.method=='GetData' or token.method=='GetEquipped' or token.method=='GetCrateItems' or token.method=='GetContents')
                 and now()-token.started>=8 and token.thread then
                 pcall(task.cancel,token.thread)
                 if coroutine.status(token.thread)=='dead' and calls[key]==token then
@@ -3093,7 +3799,13 @@ end)()
     end
     local function manual()
         local c=api.controller('DragController')
-        return c and c.LockedTarget or api.Players.LocalPlayer:GetAttribute('PlacingCraftedPlaceable')==true
+        local job=s.farm and (s.farm.questPlacement or s.farm.questPreviewCancel)
+        local placement=api.controller('PlaceablePlacementController')
+        local own=job and placement and placement.Active and placement.Item and placement.Item.Parent
+            and placement.Item:GetAttribute('CraftedPlaceable')==true
+            and placement.Item:GetAttribute('PlacingUserId')==api.Players.LocalPlayer.UserId
+            and job.recipe==api.id(placement.Item) and (not job.item or job.item==placement.Item)
+        return c and c.LockedTarget or api.Players.LocalPlayer:GetAttribute('PlacingCraftedPlaceable')==true and not own
     end
     local function clearThrottle(ctx)
         for seat,value in pairs(ctx.questSeats or {}) do pcall(function() if seat.Parent then seat.ThrottleFloat=value end end) end
@@ -3169,6 +3881,7 @@ end)()
         end)
     end
     function Q.cleanup(ctx)
+        if Q.special then pcall(Q.special.cleanup,ctx)end
         if Q.loadout then pcall(Q.loadout.stopped,ctx)end
         if Q.healing then pcall(Q.healing.cleanup,ctx)end
         if Q.drillSupport then pcall(Q.drillSupport.cleanup,ctx)end
@@ -3324,6 +4037,7 @@ end)()
                 end
             end
         end
+        if kind=='shred'then local c=api.controller('CraftingController');job.scrapBefore=tonumber(c and c.ScrapCount) or tonumber(s.questCraftState and s.questCraftState.ScrapCount)end
         s.questDelivery=job; ctx.bringEquipmentLock=job
         job.pending=true
         if not call('drag','DragService','Request',{item},function(ok,value,_,dispatch)
@@ -3331,7 +4045,8 @@ end)()
             if not job.owns then retries[item]=now()+15 end
             if not ok or not job.owns or job.cancelled or not enabled(ctx) then release(job); return end
             if not free(item,(kind=='gold' or kind=='sale') and 'sale' or kind=='fuel') or kind=='gold' and not Q.gold(item,ctx)
-                or kind=='sale' and not Q.drillSupport.saleEligible(item,ctx,nil,job.objective) then release(job); return end
+                or kind=='sale' and not Q.drillSupport.saleEligible(item,ctx,nil,job.objective)
+                or kind=='shred' and not Q.special.scrapEligible(item,ctx) then release(job); return end
             local moved,result=pcall(place,job)
             if not moved or not result then release(job); return end
             job.stage,job.readyAt='placed',now()+.55
@@ -3376,9 +4091,12 @@ end)()
                 or plan.name==job.class and objective(plan,job.objective or 'SellGoldItems')
             local questReceipt=plan.name==job.class and (sales[job.objective] or job.objective=='ContributeFuel')
                 and objective(plan,job.objective)>job.questBefore
-            if questReceipt or job.kind=='sale' and Q.drillSupport.saleReceipt(job)
+            local c=job.kind=='shred' and api.controller('CraftingController')
+            local scrap=tonumber(c and c.ScrapCount) or tonumber(s.questCraftState and s.questCraftState.ScrapCount)
+            local shredReceipt=job.kind=='shred' and not job.item.Parent and finite(scrap) and finite(job.scrapBefore) and scrap>job.scrapBefore
+            if shredReceipt or questReceipt or job.kind=='sale' and Q.drillSupport.saleReceipt(job)
                 or job.kind~='sale' and finite(count) and finite(job.before) and count>job.before then
-                setStatus(job.kind=='fuel' and 'Drill fuel increase confirmed' or job.kind=='sale' and 'Sale receipt confirmed; observing '..tostring(job.objective)..' counter' or 'Gold-sales quest progress confirmed')
+                setStatus(job.kind=='shred' and 'Native scrap credit confirmed; observing Cogs-worth quest progress' or job.kind=='fuel' and 'Drill fuel increase confirmed' or job.kind=='sale' and 'Sale receipt confirmed; observing '..tostring(job.objective)..' counter' or 'Gold-sales quest progress confirmed')
                 retries[job.item]=math.huge;clearHold(job);s.questDelivery=nil
             elseif now()>=job.receiptUntil then
                 retries[job.item]=now()+120;clearHold(job);s.questDelivery=nil
@@ -3518,6 +4236,23 @@ end)()
         return lighting and lighting:GetAttribute('Event')=='Night'
             or api.Players.LocalPlayer:GetAttribute('InDarknessZone')==true
     end
+    function Q.targetResponsive(ctx,npc)
+        if api.questTargetAllowed and not api.questTargetAllowed(ctx,npc)then return false end
+        local check=ctx.questDamageWatch and ctx.questDamageWatch[npc]
+        local h=npc:FindFirstChildOfClass('Humanoid')
+        if check and h then
+            if h.Health<check.health then check.health,check.progressAt,check.attempts=h.Health,now(),0
+            elseif check.attempts>=3 and now()-check.progressAt>=10 then
+                ctx.questTargetRetry=ctx.questTargetRetry or setmetatable({}, {__mode='k'})
+                ctx.questTargetRetry[npc]={untilAt=now()+10,health=h.Health}
+                ctx.questDamageWatch[npc]=nil
+                if ctx.combatTarget==npc then ctx.combatTarget=nil end
+                setStatus('Quest target took no damage for 10s; trying other loaded work')
+                return false
+            end
+        end
+        return true
+    end
     local function combatTarget(ctx,plan,gun)
         if plan.objective=='DarknessEnemyKills' and not Q.darknessActive() then return nil end
         local best,score,bestDistance
@@ -3528,21 +4263,9 @@ end)()
             local allowed=npc:GetAttribute('NpcFaction')~='FriendlyCompanion' and h and h.Health>0 and p
                 and (not api.enemyAlive or api.enemyAlive(npc)) and (not api.questTargetAllowed or api.questTargetAllowed(ctx,npc))
                 and (gun or api.swordTargetAllowed(npc))
-            local check=ctx.questDamageWatch and ctx.questDamageWatch[npc]
-            if allowed and check then
-                if h.Health<check.health then check.health,check.progressAt,check.attempts=h.Health,now(),0
-                elseif check.attempts>=3 and now()-check.progressAt>=10 then
-                    ctx.questTargetRetry=ctx.questTargetRetry or setmetatable({}, {__mode='k'})
-                    ctx.questTargetRetry[npc]={untilAt=now()+10,health=h.Health}
-                    ctx.questDamageWatch[npc]=nil;allowed=false
-                    if ctx.combatTarget==npc then ctx.combatTarget=nil end
-                    setStatus('Quest target took no damage for 10s; trying other loaded work')
-                end
-            end
+            if allowed then allowed=Q.targetResponsive(ctx,npc)end
             if allowed and plan.objective=='VampireKills' then allowed=tostring(npc:GetAttribute('RealName') or npc.Name):find('Vampire',1,true)~=nil end
-            if allowed and (plan.objective=='CrazyMinerKills' or plan.objective=='BanditMinerKills') then
-                allowed=normalize(npc:GetAttribute('RealName') or npc.Name)==normalize(plan.objective:gsub('Kills',''))
-            end
+            if allowed and Q.special then allowed=Q.special.matchesPlan(npc,plan)end
             if allowed then
                 local distance=(p.Position-ctx.root.Position).Magnitude
                 -- Finishing low-health targets earns kill objectives sooner than
@@ -3553,7 +4276,7 @@ end)()
         end
         return best
     end
-    local function combatWork(ctx,plan)
+    local function combatWork(ctx,plan,override)
         if plan.kind~='combat' then return false end
         ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass=true,plan.weapon,plan.weaponClass
         ctx.questAimHead=plan.objective=='HeadShot'
@@ -3561,7 +4284,7 @@ end)()
         local class=api.attr(tool,'Class');local gun=class=='Revolver' or class=='Rifle' or class=='Shotgun'
         if gun and (tonumber(api.attr(tool,'Ammo')) or 0)<=0
             and (tonumber(api.Players.LocalPlayer:GetAttribute(class=='Revolver' and 'Pistol_Ammo' or class..'_Ammo')) or 0)<=0 then return false end
-        local npc=combatTarget(ctx,plan,gun)
+        local npc=override or combatTarget(ctx,plan,gun)
         if not npc then ctx.combatTarget=nil;ctx.questCombat=nil;return false end
         Q.drillSupport.stopMine(ctx)
         s.questIdle=nil;s.questStalled=nil
@@ -3618,6 +4341,7 @@ end)()
         if plan.kind=='depth' and cfg.driveDepth then ready,reason=driveReady(ctx) end
         return ready,reason or 'No loaded quest target or supply'
     end
+    Q.combatWork=combatWork
     local function queued(plan,reason)
         local name=Q.nextClass(s.classData,s.questCatalog,cfg.questQueue,plan.name,s.questBlocked,cfg.driveDepth)
         if name then
@@ -3674,6 +4398,7 @@ end)()
             if not plan.weapon and plan.weaponClass=='Sword' and api.findOwned(ctx,'Sword_Void')then return 'Sword_Void','Sword',true end
             return plan.weapon,plan.weaponClass,true
         end
+        if plan.name=='Pirate' and plan.kind~='combat' and not ctx.questThreat then return 'Sword_Void','Sword',true end
         if plan.kind=='waiting'then return nil,nil,true end
         if ctx.questThreat then
             if not api.swordTargetAllowed(ctx.questThreat)then
@@ -3730,16 +4455,19 @@ end)()
         if not cfg.classQuest or not ctx.questChestCandidate or not api.chestCandidate or ctx.currentChest
             or ctx.featureHold or ctx.defenseMoving or ctx.dodgeUntil and now()<ctx.dodgeUntil
             or s.questDelivery or s.questCashJob or s.bringDelivery or s.lootRequest or s.equipmentRequest
-            or ctx.questMineEntry or ctx.questPotionUsing or Q.drillSupport.inDungeon(ctx) or Q.manual()
+            or ctx.questMineEntry or ctx.questPotionUsing or Q.drillSupport.inDungeon(ctx) and not Q.drillSupport.activeMine() or Q.manual()
             or not Q.activePlan(plan) then return false end
         ctx.questChestDue=ctx.questChestDue or now()+8
         if now()<ctx.questChestDue then return false end
         if not Q.holdRoute(ctx)then return true end
         ctx.questChestTaking=true;ctx.questChestLease=coroutine.running()
         setStatus('Checking loaded chests alongside class quests')
-        local ok,entry=pcall(api.chestCandidate,ctx,250)
+        local function eligible(entry)
+            return not Q.drillSupport.inDungeon(ctx) or entry and entry.Model and Q.drillSupport.accessible(entry.Model)
+        end
+        local ok,entry=pcall(api.chestCandidate,ctx,250,eligible)
         if not ok then ctx.questChestTaking=nil;ctx.questChestLease=nil;error(entry,0)end
-        if not entry then ctx.questChestTaking=nil;ctx.questChestLease=nil;ctx.questChestDue=now()+3;return false end
+        if not entry or not eligible(entry)then ctx.questChestTaking=nil;ctx.questChestLease=nil;ctx.questChestDue=now()+3;return false end
         Q.drillSupport.stopMine(ctx);Q.stopDrive(ctx)
         if ctx.humanoid.SeatPart or ctx.humanoid.Sit then
             ctx.humanoid.Sit=false;ctx.humanoid.Jump=true;ctx.questChestTaking=nil;ctx.questChestLease=nil
@@ -3758,7 +4486,7 @@ end)()
     function Q.step(ctx)
         Q.recoverDrive()
         if not cfg.classQuest then
-            if ctx.questOwns or ctx.questDriving or ctx.questRecoveryDue or ctx.questRecovering or s.questDelivery or s.questCashJob then Q.cleanup(ctx) end
+            if ctx.questOwns or ctx.questDriving or ctx.questRecoveryDue or ctx.questRecovering or ctx.questPreviewCancel or s.questDelivery or s.questCashJob then Q.cleanup(ctx) end
             return false
         end
         Q.drillSupport.observeDoors(ctx)
@@ -3766,9 +4494,29 @@ end)()
         local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if not enabled(ctx) then ctx.questProgressAt=now(); Q.cleanup(ctx); return false end
         Q.loadout.remember(ctx)
+        if ctx.questPreviewCancel then Q.special.cancelPreview(ctx)end
         s.questPlan=plan
-        if plan.kind~='potion' and ctx.questPotion then
+        local intent=table.concat({tostring(plan.name),tostring(plan.level),tostring(plan.kind),
+            tostring(plan.objective),tostring(plan.weapon),tostring(plan.weaponClass)},':')
+        if ctx.questIntent and ctx.questIntent~=intent then
+            -- Every objective handoff uses the new replicated requirement set.
+            -- Old targeting/equipment intent cannot pin a completed weapon or job.
+            ctx.questCombat=nil;ctx.questWeapon=nil;ctx.questWeaponClass=nil;ctx.questAimHead=nil;ctx.combatTarget=nil
+            ctx.questTurretKills=nil;ctx.questTurretMonitor=nil;ctx.questTurretLureUntil=nil
+            if plan.kind~='mining'then Q.drillSupport.stopMine(ctx)end
+            if plan.kind~='depth' and plan.kind~='fuel'then Q.stopDrive(ctx)end
+        end
+        ctx.questIntent=intent
+        if plan.objective~='TurretKills'then ctx.questTurretKills=nil end
+        if plan.kind~='turret'then
+            ctx.questNeedScrap=nil
+            if ctx.questPlacement then Q.special.cancelPreview(ctx)end
+        end
+        if ctx.questPotion and (plan.kind~='potion' or ctx.questPotion.objective~=plan.objective)then
             ctx.questPotion=nil;ctx.questPotionUsing=nil;ctx.questOwns=nil
+        end
+        if plan.kind~='combat'then
+            ctx.questCombat=nil;ctx.questWeapon=nil;ctx.questWeaponClass=nil;ctx.questAimHead=nil;ctx.combatTarget=nil
         end
         if plan.kind=='combat'then
             ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass=true,plan.weapon,plan.weaponClass
@@ -3784,15 +4532,26 @@ end)()
             end
         end
         if api.extractionReady() then
-            if Q.drillSupport.activeMine()then
-                if Q.drillSupport.entry(ctx)then return true end
+            if Q.special.bound(ctx) and not Q.drillSupport.activeMine() and not ctx.questCampaignChurch then
+                Q.abortResources(ctx);Q.stopDrive(ctx)
+                return Q.special.dungeon(ctx,plan,true)
+            end
+            if Q.drillSupport.activeMine() and not ctx.questMineChurchFallback then
+                if Q.drillSupport.churchFallback(ctx)then Q.cleanup(ctx);return false end
                 if Q.healing.step(ctx,plan)then return true end
-                Q.cleanup(ctx)
+                if Q.drillSupport.threat(ctx,plan)then return true end
+                Q.abortResources(ctx);Q.stopDrive(ctx);Q.drillSupport.stopMine(ctx)
                 return Q.drillSupport.leaveMine(ctx,plan)
             end
             Q.cleanup(ctx); return false
         end
-        if Q.drillSupport.inDungeon(ctx) and not Q.drillSupport.activeMine()then
+        if Q.loadout.recover(ctx,plan)then return true end
+        if Q.special.bound(ctx) and not Q.drillSupport.activeMine() or plan.kind=='dungeon' and (ctx.questCampaign or Q.drillSupport.inDungeon(ctx) and not ctx.questCampaignExit)then
+            if Q.healing.step(ctx,plan)then return true end
+            Q.drillSupport.upgrades(ctx,plan)
+            return Q.special.dungeon(ctx,plan,false)
+        end
+        if Q.drillSupport.inDungeon(ctx) and not Q.drillSupport.activeMine() and not ctx.questCampaignExit then
             local c=api.controller('DungeonUIController')
             if c and type(c.TryBindActiveDungeon)=='function' and now()>=(ctx.questBindMineAt or 0)then
                 ctx.questBindMineAt=now()+2;pcall(c.TryBindActiveDungeon,c)
@@ -3802,11 +4561,14 @@ end)()
             end
         end
         if Q.healing.step(ctx,plan)then return true end
-        if Q.loadout.recover(ctx,plan)then return true end
+        if Q.special.fastPlacement(plan)then
+            if Q.special.quickReturn(ctx)then ctx.questOwns=true;return true end
+            return Q.special.placement(ctx,plan)
+        end
+        Q.drillSupport.upgrades(ctx,plan)
         if Q.drillSupport.threat(ctx,plan)then return true end
         if Q.loadout.step(ctx,plan)then return true end
         if plan.kind=='combat' and plan.weapon and api.enforceClassWeapon then api.enforceClassWeapon(ctx,plan.weapon,Q.preferred(ctx))end
-        Q.drillSupport.upgrades(ctx,plan)
         if Q.cashStep(ctx) then return true end
         if Q.activePlan(plan) and not s.questCashJob and Q.collectMoney(ctx)then return true end
         local outstanding=s.questDelivery
@@ -3820,6 +4582,9 @@ end)()
             return true
         end
         if Q.chestTurn(ctx,plan)then return true end
+        if plan.kind=='shred'then return Q.special.shred(ctx,plan)end
+        if plan.kind=='turret'then return Q.special.turretKills(ctx,plan)end
+        if plan.kind=='dungeon'then return Q.special.dungeon(ctx,plan,false)end
         if Q.drillSupport.sellLoose(ctx,plan)then return true end
         if plan.kind=='potion'then return Q.potionStep(ctx,plan)end
         if plan.kind=='fuel'then
@@ -4147,6 +4912,7 @@ end)()
         return true
     end
     Q.holdRoute,Q.deliveryStep,Q.nearest,Q.sellers,Q.fuelItem=holdRoute,deliveryStep,nearest,sellers,fuelItem
+    Q.special=buildQuestSpecial(api,Q)
     Q.loadout=buildQuestLoadout(api,Q)
     Q.healing=buildQuestHealing(api,Q)
     Q.drillSupport=buildQuestDrill(api,Q)
@@ -4159,7 +4925,11 @@ end)()
         local exitFight=ctx.questExitCombat and ctx.combatTarget and Q.drillSupport.activeMine()
             and Q.drillSupport.mineEnemy(ctx.combatTarget,Q.drillSupport.activeMine())
             and (not api.enemyAlive or api.enemyAlive(ctx.combatTarget))
-        return s.questChurchExit ~= nil and not exitFight or cfg.classQuest and (ctx.questMining or ctx.questHealing or ctx.questStartup or ctx.questRecovering or ctx.questPotionUsing
+        if ctx.questExitCombat and ctx.combatTarget and Q.special.bound(ctx) and Q.special.belongs(ctx.combatTarget,Q.special.bound(ctx))
+            and api.enemyAlive(ctx.combatTarget)then exitFight=true end
+        local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+        local turret=plan.objective=='TurretKills' and not ctx.questThreat
+        return s.questChurchExit ~= nil and not exitFight or cfg.classQuest and (turret or ctx.questTurretKills or ctx.questPlacement or ctx.questPreviewCancel or ctx.questMining or ctx.questHealing or ctx.questStartup or ctx.questRecovering or ctx.questPotionUsing
             or ctx.humanoid.MaxHealth>0 and ctx.humanoid.Health/ctx.humanoid.MaxHealth<=.3)
     end
     return Q
@@ -4180,7 +4950,7 @@ return function(api)
         -- Local anchoring can stop the assembly's normal physics replication.
         -- Balance gravity while keeping the character unanchored and movable.
         ctx.root.Anchored = false
-        if ctx.root.AssemblyLinearVelocity then ctx.root.AssemblyLinearVelocity = Vector3.zero end
+        if ctx.root.AssemblyLinearVelocity and (not ctx.nativeGateMotion or ctx.defenseMoving or now()<(ctx.dodgeUntil or 0))then ctx.root.AssemblyLinearVelocity = Vector3.zero end
         local mass, gravity = ctx.root.AssemblyMass, workspace.Gravity
         if not finite(mass) or not finite(gravity) or mass <= 0 or gravity < 0 then return end
         if not ctx.hoverForce then
@@ -4642,7 +5412,7 @@ end)()
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
             driveDepth = data.driveDepth ~= false, questQueue = type(data.questQueue) == 'string' and data.questQueue:sub(1,512) or '',
-            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 29 }
+            questNext = type(data.questNext) == 'string' and data.questNext:sub(1,64) or '', schema = 31 }
     end
     local loaded=saveStore:get('settings')
     -- Only the currently running legacy client can migrate its untagged config.
@@ -4974,7 +5744,7 @@ end)()
         return true
     end
     function F.questTargetAllowed(ctx,npc)
-        if not cfg.classQuest or ctx.questThreat==npc then return true end
+        if not cfg.classQuest then return true end
         local retry=ctx.questTargetRetry and ctx.questTargetRetry[npc]
         if not retry then return true end
         local h=npc:FindFirstChildOfClass('Humanoid')
@@ -5650,6 +6420,13 @@ end)()
         -- upgrade disposable gold. Sale protection tests value, not free slots.
         useful=function(ctx,item)local _,useful=usefulSnapshot(ctx,true);return useful(item) end,
         snapshot=function(ctx)local _,useful=usefulSnapshot(ctx,true);return useful end,
+        sharedModule=function(name)
+            s.questNativeModules=s.questNativeModules or {}
+            if s.questNativeModules[name]then return s.questNativeModules[name]end
+            local shared=api.RS and api.RS:FindFirstChild('Shared')
+            local module=shared and shared:FindFirstChild(name)
+            if module then local ok,value=pcall(require,module);if ok then s.questNativeModules[name]=value;return value end end
+        end,
         findTool=findTool, hasRoom=hasRoom, enemies=F.enemies, enemyAlive=F.enemyAlive, questTargetAllowed=F.questTargetAllowed,
         swordTargetAllowed=F.swordTargetAllowed, persist=persist, hover=movement.hover,
         miningBounds=function(node)
@@ -5667,7 +6444,7 @@ end)()
             return cf.Position,size
         end,
         miningNodeAllowed=function(node)return not F.skipLootArea(node) and F.liveOre(node)end,
-        chestCandidate=function(ctx,radius)return ctx.questChestCandidate and ctx.questChestCandidate(radius)end,
+        chestCandidate=function(ctx,radius,predicate)return ctx.questChestCandidate and ctx.questChestCandidate(radius,predicate)end,
         openChest=function(ctx,entry)return ctx.helpers[16361397](entry)end,
         miningSurface=function(ctx,node)
             local best,distance
@@ -5762,6 +6539,7 @@ end)()
     quest=buildQuest(questApi)
     F.quest=quest
     function F.questPreferred(ctx) return quest.preferred(ctx) end
+    function F.questQuickReturn(ctx)return ctx and quest.special.quickReturn(ctx)end
     function F.questLobby() return quest.lobby() end
     function F.questKeepsRun() return cfg.classQuest and not s.questSwitchRun and not s.questStalled and not s.questIdle and s.questPlan
         and quest.activePlan(s.questPlan) end
@@ -6728,7 +7506,7 @@ end)()
                     if quest.step(ctx) then
                         -- Native bringing is independent of quest movement. Useful
                         -- loot can arrive beside a fighting character without a trip.
-                        if cfg.lootExtract and s.itemDatabase and ctx.questCombat and not ctx.questDriving and not s.questDelivery
+                        if cfg.lootExtract and not quest.special.fastPlacement(s.questPlan) and s.itemDatabase and ctx.questCombat and not ctx.questDriving and not s.questDelivery
                             and not s.questCashJob and safeToWork(ctx) then upgradeGear(ctx) end
                         return
                     end
@@ -6750,7 +7528,7 @@ end)()
                     elseif F.extractionEnabled() and s.runExhausted then
                         status(string.format('Chest route complete; church extraction unlocks in %.0fs', cfg.minutes * 60 - (now() - s.lootStarted)))
                     end
-                    if cfg.lootExtract then
+                    if cfg.lootExtract and not quest.special.fastPlacement(s.questPlan)then
                         upgradeGear(ctx)
                     end
                 end)
@@ -7206,13 +7984,13 @@ end
             end
             if coroutine.running() ~= ctx.featureThread then ctx.routeParked = nil end
         end
-        function ctx.questChestCandidate(radius)
+        function ctx.questChestCandidate(radius,predicate)
             -- Only the owning optional worker may borrow one chest action;
             -- the discovery route stays parked throughout the detour.
             if not s.config.classQuest or not ctx.questChestTaking
                 or coroutine.running() ~= ctx.featureThread or ctx.currentChest then return end
             for _,entry in ipairs(ctx.helpers[9164528]())do
-                if entry.Dist<=radius then return entry end
+                if entry.Dist<=radius and (not predicate or predicate(entry))then return entry end
             end
         end
         local function run(fn, ...)
@@ -7878,6 +8656,11 @@ end
         if s.seatBlockedSince and now() - s.seatBlockedSince >= 30 then
             s.runExhausted = true
             status("Seat did not release after 30 seconds; recovering through a fresh solo run")
+        end
+        if s.farm and features.questQuickReturn(s.farm)then
+            s.returnReason='Engineer placement counter confirmed; starter-only lobby loop'
+            s.forceFresh=true;pcall(function()saveFresh(true)end)
+            returnToLobby();return
         end
         features.checkQuestExit(s.farm)
         if s.questSwitchRun then s.runExhausted = true end
