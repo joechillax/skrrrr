@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 35: continuous native driving, resumed map scans and ownership/receipt recovery.
+-- Revision 36: unattended wall work, coal support, safer healing funding and compatible Watcher weapons.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 35
-    local BUILD = "r35-native-driving-control"
+    local REVISION = 36
+    local BUILD = "r36-wall-healing-funding"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -1964,7 +1964,8 @@ return function(api,Q)
         end
         if not Q.holdRoute(ctx)then return true end
         api.watch(ctx)
-        if not h.SeatPart and now()>=(ctx.questHealRetreatAt or 0) then
+        if not h.SeatPart and now()>=(ctx.questHealRetreatAt or 0)
+            and (not api.healingPointSafe or not api.healingPointSafe(ctx,ctx.root.Position)) then
             ctx.questHealRetreatAt=now()+3;api.retreat(ctx);api.watch(ctx)
         end
         if Q.cashStep(ctx)then return true end
@@ -2005,6 +2006,7 @@ return function(api,Q)
             return true
         end
         if detached then
+            if Q.chestTurn(ctx,plan)then return true end
             s.questStatus='Quest healing: unresolved item request reserved; native regeneration while held medical stock is unavailable'
             return true
         end
@@ -2025,7 +2027,8 @@ return function(api,Q)
             if s.questDelivery then s.questDelivery.healingFunding=true end
             s.questStatus='Quest healing: selling disposable loot for medical supplies';return true
         end
-        s.questStatus=string.format('Quest healing %.0f%% → 70%%; %s; native regeneration meanwhile',ratio*100,problem or 'medical supply retry pending')
+        if Q.chestTurn(ctx,plan)then return true end
+        s.questStatus=string.format('Quest healing %.0f%% → 70%%; %s; seeking safer chests and sales of $150+',ratio*100,problem or 'medical supply retry pending')
         return true
     end
     return H
@@ -2626,7 +2629,7 @@ return function(api,Q)
         local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if category=='Scrap' and (current.kind=='shred' or ctx.questNeedScrap)then return false end
         local fuelValue=tonumber(api.attr(item,'Fuel')) or 0
-        if not finite(value) or value<=0 or Q.protectedRelic(item)
+        if not finite(value) or value<150 or Q.protectedRelic(item)
             or class=='Medkit' or class=='ReviveKit' or category=='Ammo' or id:sub(-5)=='_Ammo'
             or id=='Money_Sack' or api.tag(item,'MoneySack') or fuelValue>0 and (Q.fuelNeeded() or category=='Fuel' and not ores[id])
             or id=='Void_Helmet' or id=='Void_Chest' or id=='Void_Legs' or id=='Pickaxe_Void' or id=='Sword_Void'
@@ -2726,9 +2729,11 @@ return function(api,Q)
             local h=npc:FindFirstChildOfClass('Humanoid') or npc:FindFirstChild('Health')
             local hp=h and tonumber(h.Health or h.Value)
             local p=api.part(npc)
-            local canHit=api.swordTargetAllowed(npc) or plan.weapon=='Flintlock' or plan.weaponClass=='Gun'
-                or plan.weaponClass=='Rifle' or plan.weaponClass=='Shotgun'
-                or plan.kind~='combat' and api.findTool(ctx,'Pickaxe')~=nil
+            local armored=not api.swordTargetAllowed(npc)
+            local pickaxe=api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe')
+            -- Urgent native deflection needs a pickaxe even while the class
+            -- planner requires a sword/gun for its ordinary quest targets.
+            local canHit=watcher or not armored or pickaxe~=nil
             if (watcher or blinker) and p and npc:IsDescendantOf(workspace) and hp and hp>0
                 and (not api.enemyAlive or api.enemyAlive(npc))
                 and Q.targetResponsive(ctx,npc)
@@ -2805,9 +2810,7 @@ return function(api,Q)
             local h=npc:FindFirstChildOfClass('Humanoid')
             if D.mineEnemy(npc,mine) and h and h.Health>0 and api.part(npc) and Q.targetResponsive(ctx,npc)
                 and (not api.enemyAlive or api.enemyAlive(npc))
-                and (plan.weapon=='Flintlock' or plan.weaponClass=='Gun' or plan.weaponClass=='Rifle'
-                    or plan.weaponClass=='Shotgun' or api.swordTargetAllowed(npc)
-                    or plan.kind~='combat' and (api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe')))
+                and (api.swordTargetAllowed(npc) or api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe'))
                 and npc:GetAttribute('NpcFaction')~='FriendlyCompanion'then candidates[#candidates+1]=npc end
         end
         if not Q.holdRoute(ctx)then return true end
@@ -2822,7 +2825,7 @@ return function(api,Q)
         if npc then
             D.cancelDoor(ctx,false);ctx.questOwns=true
             ctx.questCombat,ctx.questWeapon,ctx.questWeaponClass=true,plan.weapon,plan.weaponClass or 'Sword'
-            if plan.kind~='combat' and not api.swordTargetAllowed(npc)then ctx.questThreat=npc end
+            ctx.questThreat=not api.swordTargetAllowed(npc) and npc or nil
             local tool=Q.preferred(ctx)
             if tool then
                 ctx.combatTarget=npc;Q.armTarget(ctx,npc);api.hover(ctx)
@@ -2935,17 +2938,25 @@ return function(api,Q)
     function D.step(ctx,plan)
         local goal=plan.kind=='mining' or plan.objective=='SellGems'
         local depth=(plan.kind=='depth' or plan.kind=='fuel') and cfg.driveDepth
+        if depth and (ctx.drill~=workspace:FindFirstChild('Drill') or not ctx.drill.Parent)then
+            D.stopMine(ctx);ctx.questOwns=nil;return false
+        end
         if plan.kind=='waiting' or plan.kind=='advance' or plan.kind=='complete' or plan.kind=='unsupported' then D.cleanup(ctx);return false end
         if ctx.questMineEntry and (not ctx.questMineEntry.exit or not D.inDungeon(ctx)) and D.entry(ctx)then return true end
         if D.activeMine() and now()<(ctx.questMineReadyAt or 0)then
             Q.holdRoute(ctx);api.watch(ctx);status('Mineshaft entry confirmed; allowing veins to stream in');return true
         end
         if now()<(ctx.questMineYieldUntil or 0)then return false end
-        if Q.moneyTarget(ctx) and not ctx.questMineJob then return false end
         if Q.manual() or s.questDelivery and not s.questDelivery.background or s.bringDelivery or s.lootRequest then return false end
         local tank=tonumber(ctx.drill:GetAttribute('Fuel'));local capacity=tonumber(ctx.drill:GetAttribute('MaxFuel'))
         local needFuel=depth and finite(tank) and finite(capacity) and capacity>0 and tank<=capacity*.2
         local needCoins=finite(s.questWallet) and s.questWallet<D.fundingTarget(ctx,plan)
+        -- A stalled empty tank needs coal ahead of optional coin bags/sales.
+        -- Reuse the native support-mine return lease; no separate dungeon state.
+        if ctx.questFundingMine=='fuel' and not needFuel then
+            D.stopMine(ctx);return D.leaveMine(ctx,plan)
+        end
+        if not needFuel and Q.moneyTarget(ctx) and not ctx.questMineJob then return false end
         local mine=ctx.questMineJob
         if mine then
             if not D.nodeAllowed(mine.node,mine.coal) or not D.accessible(mine.node) or goal and not D.goalEligible(mine.node,plan)
@@ -3024,9 +3035,12 @@ return function(api,Q)
                 return Q.startDelivery(ctx,item,furnace,'fuel',plan)
             end
         end
-        if not s.questDelivery and D.sellLoose(ctx,plan)then return true end
+        if not needFuel and not s.questDelivery and D.sellLoose(ctx,plan)then return true end
         local pickaxe=api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe')
-        if not pickaxe then return false end
+        if not pickaxe then
+            if needFuel then s.questMiningProblem='Coal fuel needs an owned pickaxe; looking for free fuel and useful gear' end
+            return false
+        end
         local nodes={};local rejected={loading=0,unavailable=0,objective=0,retry=0,distant=0}
         for _,node in ipairs(api.tagged('Ore'))do
             if not D.nodeAllowed(node,needFuel)then rejected.loading=rejected.loading+1
@@ -3047,7 +3061,7 @@ return function(api,Q)
             ctx.questMineExit=nil
             if not Q.holdRoute(ctx) and not ctx.questOwns then return false end
             ctx.questMining=true
-            if not goal and not depth and D.activeMine()then ctx.questFundingMine=true end
+            if not goal and D.activeMine()then ctx.questFundingMine=needFuel and 'fuel' or not depth and true or ctx.questFundingMine end
             ctx.questMineJob={node=node,coal=needFuel,started=now(),health=health(node)}
             if not miningHandoff(ctx,ctx.questMineJob)then return ctx.questOwns==true end
             Q.stopDrive(ctx);s.questIdle=nil
@@ -3055,14 +3069,17 @@ return function(api,Q)
         end
         s.questMiningProblem=string.format('No eligible nearby vein (%d loading/dead, %d other dungeon, %d wrong type, %d retry, %d distant)',
             rejected.loading,rejected.unavailable,rejected.objective,rejected.retry,rejected.distant)
-        if goal or ctx.questFundingMine then
+        if goal or needFuel or ctx.questFundingMine then
             if D.activeMine() and (rejected.retry>0 or rejected.distant>0)then
                 D.cancelDoor(ctx,false);Q.holdRoute(ctx);api.watch(ctx)
                 status('Loaded mining targets remain; waiting for their retry or nearer streaming')
                 return true
             end
             if D.activeMine()then return D.leaveMine(ctx,plan)end
-            if goal or needCoins and #Q.sellers(ctx)>0 then ctx.questFundingMine=not goal;return D.entry(ctx)end
+            if goal or needFuel or needCoins and #Q.sellers(ctx)>0 then
+                ctx.questFundingMine=not goal and (needFuel and 'fuel' or true) or nil
+                return D.entry(ctx)
+            end
         end
         return false
     end
@@ -3789,6 +3806,7 @@ end)()
     local calls = s.questCalls or {}; s.questCalls = calls
     Q.calls=calls
     local retries = s.questItemRetries or setmetatable({}, {__mode = 'k'}); s.questItemRetries = retries
+    local purchases = s.questPurchaseJobs or setmetatable({}, {__mode='k'}); s.questPurchaseJobs=purchases
     local weapons = {FlintlockKills = 'Flintlock', CutlassKills = 'Sword_Pirate'}
     local melee = {MeleeKills=true, MeleeDamage=true, MeleeCrits=true, EnemyKills=true, VampireKills=true,
         CrazyMinerKills=true, BanditMinerKills=true, DarknessEnemyKills=true,GoblinKills=true,GoblinLordKills=true}
@@ -4096,10 +4114,40 @@ end)()
                 and driverId(lease.drill)==api.Players.LocalPlayer.UserId end)then lease.stopIssued=nil end
         end
     end
+    local function humanDrivingInput(ctx)
+        if ctx.questDriveInput or s.questInputRelease then return false end
+        local ok,uis=pcall(function()return game:GetService('UserInputService')end)
+        if ok and uis and type(uis.IsKeyDown)=='function'then
+            for _,name in ipairs({'W','Up','S','Down'})do
+                local key=Enum.KeyCode[name]
+                if key then
+                    local read,down=pcall(uis.IsKeyDown,uis,key)
+                    if read and down then return true end
+                end
+            end
+        end
+        return false
+    end
     function Q.stopDrive(ctx)
         local wasDriving=ctx.questDriving or ctx.questSeating
-        clearThrottle(ctx)
         local lease=s.questDriveLease
+        local wall=ctx.questWallWork;local drill=ctx.drill;local attached=ctx.humanoid.SeatPart
+        local localSeat=drill and drill:FindFirstChild('LocalDriverSeat')
+        local pending=calls.drive or lease and lease.abandoned and lease.stopIssued and lease.stopAccepted~=true
+        if cfg.classQuest and enabled(ctx) and not manual() and wall and wall.drill==drill
+            and drill==workspace:FindFirstChild('Drill') and drill.Parent
+            and wall.band==workspace:GetAttribute('InfiniteDepthOffsetMeters')
+            and attached and (attached==wall.seat or attached==localSeat)
+            and driverId(drill)==api.Players.LocalPlayer.UserId and not pending and not humanDrivingInput(ctx)
+            and (not lease or lease.ctx==ctx and (not lease.abandoned or lease.stopAccepted==true and wall.released))then
+            -- A known script wall context can re-enter the native auto-start
+            -- radius during loot/healing. Only an actually attached current
+            -- local seat authorizes adopting that accidental session to stop it.
+            -- One observed release is required before rearming an accepted stop.
+            ctx.questDriving=true;wasDriving=true;wall.released=nil
+            lease={ctx=ctx,drill=drill,started=now(),confirmed=true};s.questDriveLease=lease
+        end
+        clearThrottle(ctx)
         if (ctx.questDriving or ctx.questSeating) and (not lease or lease.ctx~=ctx) then
             lease={ctx=ctx,drill=ctx.drill,started=ctx.questSeating or now()};s.questDriveLease=lease
         end
@@ -4200,6 +4248,7 @@ end)()
         ctx.questExitCombat=nil
         ctx.questDamageWatch=nil;ctx.questTargetRetry=nil
         ctx.questSeatExit=nil
+        ctx.questWallWork=nil;ctx.questWallRetryAt=nil
         if not ctx.currentChest then ctx.questChestLease=nil end
     end
     function Q.abortResources(ctx)
@@ -4223,6 +4272,8 @@ end)()
     function Q.gold(item,ctx,snapshot)
         if item and ctx and ctx.questHealing and Q.healing.isMedical(item)then return false end
         if not free(item,'sale') then return false end
+        local value=tonumber(api.attr(item,'Value'))
+        if not finite(value) or value<150 then return false end
         local id=api.id(item)
         if Q.protectedRelic(item) or (tonumber(api.attr(item,'Fuel')) or 0)>0 and Q.fuelNeeded() or api.tag(item,'MoneySack')
             or id=='Money_Sack' or id=='Flintlock' or id=='Sword_Pirate' then return false end
@@ -4335,6 +4386,13 @@ end)()
     end
     local function startDelivery(ctx,item,target,kind,plan)
         if s.questDelivery or calls.drag or s.bringDelivery or s.lootRequest or s.equipmentRequest or manual() then return false end
+        local function eligible()
+            return free(item,(kind=='gold' or kind=='sale') and 'sale' or kind=='fuel')
+                and (kind~='gold' or Q.gold(item,ctx))
+                and (kind~='sale' or Q.drillSupport.saleEligible(item,ctx,nil,plan.objective))
+                and (kind~='shred' or Q.special.scrapEligible(item,ctx))
+        end
+        if not eligible()then return false end
         local job={ctx=ctx,item=item,target=target,kind=kind,started=now(),stage='request',objective=plan.objective,
             before=kind=='fuel' and tonumber(ctx.drill:GetAttribute('Fuel')) or objective(plan,plan.objective or 'SellGoldItems'),class=plan.name,
             questBefore=objective(plan,plan.objective or 'SellGoldItems'),coinBefore=s.stats.coinEarned or 0,moneyBefore={}}
@@ -4356,13 +4414,16 @@ end)()
             local moved,result=pcall(place,job)
             if not moved or not result then release(job); return end
             job.stage,job.readyAt='placed',now()+.55
-        end,function()return enabled(ctx) and free(item,(kind=='gold' or kind=='sale') and 'sale' or kind=='fuel') and not manual()end) then
+        end,function()return enabled(ctx) and eligible() and not manual()end) then
             job.pending=nil; s.questDelivery=nil; ctx.bringEquipmentLock=nil; return false
         end
         return true
     end
     local function deliveryStep(ctx,plan)
         local job=s.questDelivery; if not job then return false end
+        if job.ctx==ctx and job.kind=='supply' and job.buySent and Q.purchaseReceipt(job) and job.cancelled then
+            release(job);return true
+        end
         -- A late real inventory receipt settles only the exact dispatched pickup,
         -- even after its movement lease has been released on timeout.
         if job.ctx==ctx and ctx.character==api.Players.LocalPlayer.Character and job.kind=='supply'
@@ -4443,7 +4504,7 @@ end)()
         if not furnace or not api.part(furnace) then return end
         local item=nearest(looseItems(),ctx.root.Position,function(item)
             local value=tonumber(api.attr(item,'Fuel'))
-            return free(item,true) and value and value>0 and not Q.protectedRelic(item)
+            return free(item,true) and finite(value) and value>0 and not Q.protectedRelic(item)
                 and now()>=(retries[item] or 0)
         end)
         return item,furnace
@@ -4494,9 +4555,85 @@ end)()
         end
         setStatus(reason..'; chest farming continues');return false
     end
+    local function wallWork(ctx)
+        local drill=ctx.drill;local wall=ctx.questWallWork
+        if drill~=workspace:FindFirstChild('Drill') or not drill.Parent then ctx.questWallWork=nil;return false end
+        local band=workspace:GetAttribute('InfiniteDepthOffsetMeters')
+        if wall and (wall.drill~=drill or wall.band~=band)then ctx.questWallWork=nil;wall=nil end
+        if drill:GetAttribute('IsDrilling')~=true then ctx.questWallWork=nil;return false end
+        if not wall then
+            if now()<(ctx.questWallRetryAt or 0) or not(ctx.questDriving or ctx.questSeating)then return false end
+            local origin=drill:GetPivot().Position
+            local node=nearest(api.tagged('RockWall'),origin,function(item)
+                local hp=tonumber(item:GetAttribute('Health'));local p=api.part(item)
+                return item.Parent and item:IsDescendantOf(workspace) and finite(hp) and hp>0 and p
+                    and (p.Position-origin).Magnitude<=160
+            end)
+            wall={drill=drill,band=band,node=node,health=node and tonumber(node:GetAttribute('Health')),
+                progressAt=now(),started=now(),seat=drill:FindFirstChild('DrillPhysicsSeat') or drill:FindFirstChild('VehicleSeat')}
+            ctx.questWallWork=wall
+            -- Native IsDrilling is independent of local seat presentation. A
+            -- fuelled drill can keep damaging its wall while we do other work.
+            -- Release only our driver lease, never write wall HP/fuel/distance.
+            Q.stopDrive(ctx)
+        end
+        if wall.node then
+            local hp=tonumber(wall.node:GetAttribute('Health'))
+            if not wall.node.Parent or not wall.node:IsDescendantOf(workspace) or finite(hp) and hp<=0 then
+                ctx.questWallWork=nil;ctx.questWallRetryAt=now()+.75;return false
+            end
+            if finite(hp) and finite(wall.health) and hp<wall.health then
+                wall.progressAt=now();ctx.questProgressAt=now();s.questStalled=nil
+            end
+            if finite(hp)then wall.health=hp end
+        end
+        -- A missing/stale wall signal is not proof that a drill is advancing.
+        -- Give it one bounded observation, then allow a native driving retry.
+        if now()-wall.progressAt>=15 then
+            ctx.questWallWork=nil;ctx.questWallRetryAt=now()+10
+            setStatus('Wall drilling has no fresh damage receipt; allowing a bounded native driving retry')
+            return false
+        end
+        local user=api.Players.LocalPlayer.UserId;local id=driverId(drill)
+        local lease=s.questDriveLease
+        if lease and lease.ctx==ctx and lease.drill==drill and lease.confirmed and id~=user and not calls.drive then
+            -- Replicated loss of our previous ownership ends that exact stop
+            -- lease before a later proximity auto-start can be considered.
+            s.questDriveLease=nil;lease=nil
+        end
+        local attached=ctx.humanoid.SeatPart
+        local localSeat=drill:FindFirstChild('LocalDriverSeat')
+        if attached and (attached==wall.seat or attached==localSeat) and id==user then
+            if humanDrivingInput(ctx)then
+                ctx.questOwns=true
+                setStatus('Wall work yields to manual driving input; owned automation keys remain released')
+                return true,true
+            end
+            Q.stopDrive(ctx)
+        end
+        if ctx.humanoid.SeatPart or ctx.humanoid.Sit then
+            local _,holding=Q.unseat(ctx);api.watch(ctx)
+            setStatus('Wall drilling continues; leaving the actual seat for chests and recovery')
+            return true,holding
+        end
+        wall.released=true
+        -- Recheck after every actual release: a later coin/chest approach can
+        -- re-enter this radius. Safely distant loot work is left where it is.
+        if wall.seat and wall.seat.Parent and (ctx.root.Position-wall.seat.Position).Magnitude<=3 then
+            api.hover(ctx);ctx.root.CFrame=wall.seat.CFrame*CFrame.new(0,5,12)
+        end
+        ctx.questOwns=nil;s.questIdle=nil
+        setStatus('Drill is engaged with a wall; collecting chests and recovering while observing native damage')
+        return true,false
+    end
     local function drive(ctx,plan)
         if plan.kind~='depth' or not cfg.driveDepth then Q.stopDrive(ctx);ctx.questOwns=nil;return false end
         if manual()then Q.stopDrive(ctx);ctx.questOwns=nil;setStatus('Quest driving yields to manual item work');return false end
+        if ctx.drill~=workspace:FindFirstChild('Drill') or not ctx.drill.Parent then
+            Q.stopDrive(ctx);ctx.questWallWork=nil;ctx.questOwns=nil;return false
+        end
+        local working,holding=wallWork(ctx)
+        if working then return holding end
         local stopping=s.questDriveLease
         -- The RPC lane outlives a retired/replaced drill lease. A pending or
         -- thrown-unknown stop cannot overlap a new script-owned driving session.
@@ -4552,6 +4689,11 @@ end)()
         lease.confirmed=true
         ctx.questDriving=true; ctx.questSeating=ctx.questSeating or now()
         ctx.questSeatAckAt=ctx.questSeatAckAt or now()
+        if ctx.drill:GetAttribute('IsDrilling')==true and now()>=(ctx.questWallRetryAt or 0)then
+            Q.drillSupport.boost(ctx)
+            local busy,waiting=wallWork(ctx)
+            if busy then return waiting end
+        end
         if presentation.Occupant~=ctx.humanoid then
             ctx.humanoid.Jump=false;ctx.humanoid.Sit=true;pcall(function()presentation:Sit(ctx.humanoid)end)
         end
@@ -4625,8 +4767,39 @@ end)()
         return true
     end
     local function depthWork(ctx,plan)
-        if plan.kind~='depth' or not cfg.driveDepth or Q.drillSupport.inDungeon(ctx) or manual()
-            or now()<(ctx.questDriveDetourUntil or 0) or not driveReady(ctx)then return nil end
+        if plan.kind~='depth' or not cfg.driveDepth or manual()then return nil end
+        if ctx.drill~=workspace:FindFirstChild('Drill') or not ctx.drill.Parent then
+            Q.stopDrive(ctx);ctx.questWallWork=nil;ctx.questOwns=nil;return false
+        end
+        local tank,capacity=tonumber(ctx.drill:GetAttribute('Fuel')),tonumber(ctx.drill:GetAttribute('MaxFuel'))
+        if finite(tank) and finite(capacity) and capacity>0 and tank<=0 then
+            Q.stopDrive(ctx)
+            if ctx.humanoid.SeatPart or ctx.humanoid.Sit then local _,holding=Q.unseat(ctx);return holding end
+            local seat=ctx.drill:FindFirstChild('DrillPhysicsSeat') or ctx.drill:FindFirstChild('VehicleSeat')
+            if seat and seat:IsA('BasePart') and (ctx.root.Position-seat.Position).Magnitude<=3 then
+                -- Coal selection and delivery receipts can take another pulse.
+                -- Leave native proximity auto-start immediately after the real
+                -- seat clears, so an empty drill cannot recapture that handoff.
+                api.hover(ctx);ctx.root.CFrame=seat.CFrame*CFrame.new(0,5,12)
+            end
+            if Q.cashStep(ctx)then return true end -- Finish an already-owned bag receipt before fuel handoff.
+            local job=s.questDelivery
+            if job and job.ctx==ctx then
+                deliveryStep(ctx,plan)
+                if s.questDelivery and not(s.questDelivery.background and not s.questDelivery.owns
+                    and not s.questDelivery.pending and not calls.drag)then return true end
+            elseif job then return false end
+            if not s.questDelivery and fuelItem(ctx)then
+                if not holdRoute(ctx)then return ctx.questOwns==true end
+                if fuel(ctx,plan)then return true end
+            end
+            if Q.drillSupport.step(ctx,plan)then return true end
+            ctx.questOwns=nil;setStatus((s.questMiningProblem or 'Searching for loaded coal / a ready mineshaft to refuel the drill')..'; chest discovery continues')
+            return false
+        end
+        local working,holding=wallWork(ctx)
+        if working then return holding and true or nil end
+        if Q.drillSupport.inDungeon(ctx) or now()<(ctx.questDriveDetourUntil or 0) or not driveReady(ctx)then return nil end
         local job=s.questDelivery
         if job and job.ctx==ctx and (job.kind=='fuel' or job.background)then deliveryStep(ctx,plan)
         elseif job then return nil end
@@ -4791,18 +4964,23 @@ end)()
     function Q.required(ctx)
         if not cfg.classQuest then return nil,nil,false end
         local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+        local threat=ctx.questThreat
+        local liveThreat=threat and threat.Parent and (not api.enemyAlive or api.enemyAlive(threat))
+        -- A native deflecting urgent enemy cannot be damaged by the quest's
+        -- sword. Use a compatible owned tool for this threat only; the
+        -- unfinished class requirement resumes when the threat clears.
+        if liveThreat and (not api.swordTargetAllowed(threat)
+            or ctx.pickaxeTargets and ctx.pickaxeTargets[threat])then
+            if api.findOwned(ctx,'Pickaxe_Void')then return 'Pickaxe_Void','Pickaxe',true end
+            return nil,'Pickaxe',true
+        end
         if plan.kind=='combat' then
             if not plan.weapon and plan.weaponClass=='Sword' and api.findOwned(ctx,'Sword_Void')then return 'Sword_Void','Sword',true end
             return plan.weapon,plan.weaponClass,true
         end
         if plan.name=='Pirate' and plan.kind~='combat' and not ctx.questThreat then return 'Sword_Void','Sword',true end
         if plan.kind=='waiting'then return nil,nil,true end
-        if ctx.questThreat then
-            if not api.swordTargetAllowed(ctx.questThreat)
-                or ctx.pickaxeTargets and ctx.pickaxeTargets[ctx.questThreat]then
-                if api.findOwned(ctx,'Pickaxe_Void')then return 'Pickaxe_Void','Pickaxe',true end
-                return nil,'Pickaxe',true
-            end
+        if liveThreat then
             if api.findOwned(ctx,'Sword_Void')then return 'Sword_Void','Sword',true end
             return nil,'Sword',true
         end
@@ -4866,24 +5044,30 @@ end)()
         return requiredClass and api.findTool(ctx,requiredClass) or nil,true
     end
     function Q.chestTurn(ctx,plan)
+        local delivery=s.questDelivery;local cash=s.questCashJob
+        local deliveryDetached=ctx.questHealing and delivery and delivery.cancelled and delivery.movementReleased
+            and not ctx.bringEquipmentLock
+        local cashDetached=ctx.questHealing and cash and cash.cancelled and not cash.movementHeld
         if not cfg.classQuest or not ctx.questChestCandidate or not api.chestCandidate or ctx.currentChest
             or ctx.featureHold or ctx.defenseMoving or ctx.dodgeUntil and now()<ctx.dodgeUntil
-            or s.questDelivery or s.questCashJob or s.bringDelivery or s.lootRequest or s.equipmentRequest
+            or delivery and not deliveryDetached or cash and not cashDetached
+            or s.bringDelivery or s.lootRequest or s.equipmentRequest
             or ctx.questMineEntry or ctx.questPotionUsing or Q.drillSupport.inDungeon(ctx) and not Q.drillSupport.activeMine()
                 and not Q.special.bound(ctx) or Q.manual()
             or not Q.activePlan(plan) then return false end
-        ctx.questChestDue=ctx.questChestDue or now()+8
+        ctx.questChestDue=ctx.questChestDue or now()+(ctx.questHealing and 0 or 8)
         if now()<ctx.questChestDue then return false end
         if not Q.holdRoute(ctx)then return true end
         ctx.questChestTaking=true;ctx.questChestLease=coroutine.running()
         setStatus('Checking loaded chests alongside class quests')
         local function eligible(entry)
+            if ctx.questHealing and api.healingChestSafe and not api.healingChestSafe(ctx,entry)then return false end
             if not Q.drillSupport.inDungeon(ctx)then return true end
             local root=Q.special.bound(ctx)
             return entry and entry.Model and (root and entry.Model:IsDescendantOf(root)
                 or Q.drillSupport.accessible(entry.Model))
         end
-        local ok,entry=pcall(api.chestCandidate,ctx,250,eligible)
+        local ok,entry=pcall(api.chestCandidate,ctx,ctx.questHealing and 1000 or 250,eligible)
         if not ok then ctx.questChestTaking=nil;ctx.questChestLease=nil;error(entry,0)end
         if not entry or not eligible(entry)then ctx.questChestTaking=nil;ctx.questChestLease=nil;ctx.questChestDue=now()+3;return false end
         Q.drillSupport.stopMine(ctx);Q.stopDrive(ctx)
@@ -5135,7 +5319,9 @@ end)()
         if calls.cash or s.questCashJob or s.questDelivery or s.bringDelivery or s.lootRequest or manual() then return nil end
         return nearest(api.tagged('MoneySack'),ctx.root.Position,function(item)
             local creator=item:GetAttribute('BagCreator')
+            local p=api.part(item)
             return free(item) and api.id(item)=='Money_Sack' and api.tag(item,'Interactive')
+                and (not ctx.questHealing or not api.healingPointSafe or p and api.healingPointSafe(ctx,p.Position))
                 and (not creator or creator=='' or creator==api.Players.LocalPlayer.Name) and now()>=(retries[item] or 0)
         end)
     end
@@ -5155,6 +5341,14 @@ end)()
             if not calls.cash then s.questCashJob=nil end
             return false
         end
+        if ctx.questHealing and api.healingPointSafe then
+            local p=api.part(job.item)
+            if not p or not api.healingPointSafe(ctx,p.Position)then
+                job.cancelled=true;releaseMovement()
+                if not calls.cash then s.questCashJob=nil end
+                setStatus('Healing cash approach became unsafe; staying clear of loaded attackers');return false
+            end
+        end
         if job.stage=='approach' and now()>=job.readyAt then
             job.stage='receipt';job.receiptUntil=now()+5
             -- DragController collects Money_Sack through Interact(item), not ItemBag.
@@ -5163,6 +5357,7 @@ end)()
                 job.rejected=not ok or value==false
                 job.sent=true;releaseMovement()
             end,function()return enabled(ctx) and not job.cancelled and free(job.item) and api.tag(job.item,'Interactive')
+                and (not ctx.questHealing or not api.healingPointSafe or api.healingPointSafe(ctx,api.part(job.item).Position))
                 and (api.part(job.item).Position-ctx.root.Position).Magnitude<=10 and not manual()end)then job.token=calls.cash
             else
                 retries[job.item]=now()+15;s.questCashJob=nil;releaseMovement()
@@ -5188,6 +5383,7 @@ end)()
         if ctx.humanoid.SeatPart or ctx.humanoid.Sit then
             local _,holding=Q.unseat(ctx);return holding
         end
+        if ctx.questHealing and api.healingPointSafe and not api.healingPointSafe(ctx,api.part(item).Position)then ctx.questOwns=nil;return false end
         Q.drillSupport.stopMine(ctx);api.hover(ctx)
         ctx.root.CFrame=CFrame.new(api.part(item).Position+Vector3.new(0,1,2))
         s.questCashJob={ctx=ctx,item=item,started=now(),readyAt=now()+.2,stage='approach',before=s.stats.coinEarned or 0,movementHeld=true}
@@ -5211,6 +5407,29 @@ end)()
         return need.price
     end
     function Q.supplyReceipt(job) return supplyCount(job.ctx,job.id)>job.inventoryBefore end
+    function Q.purchaseReceipt(job)
+        if job.purchaseConfirmed then return true end
+        local item=job.item
+        -- This exact stock becoming a free owned-eligible item is a native
+        -- purchase receipt. A reply alone never authorizes picking up stock.
+        if not job.buySent or purchases[item]~=job or not job.stockAtBuy
+            or not (job.buySettled or job.buyToken and job.buyToken.called)
+            or api.id(item)~=job.id or item.Parent~=workspace:FindFirstChild('Items')
+            or api.tag(item,'ShopItem') or not free(item)then return false end
+        if not Q.retireConfirmedCall('shop',job.buyToken)then return false end
+        job.purchaseConfirmed=true
+        retries[item]=nil -- Clear pickup suppression once, keeping the Buy ledger.
+        if not job.cancelled then job.stage='purchase-confirm';job.confirmUntil=now()+5 end
+        return true
+    end
+    local function supplyRetryReady(item)
+        local purchase=purchases[item]
+        if purchase and purchase.buySent then
+            if Q.purchaseReceipt(purchase) and purchase.cancelled then release(purchase)end
+            if stock(item)then return false end -- Never issue another Buy for this stock identity.
+        end
+        return now()>=(retries[item] or 0)
+    end
     local function supplyAllowed(id,item)
         if supplyIds[id]then return true end
         if item then return Q.healing and Q.healing.isMedical(item)end
@@ -5227,13 +5446,13 @@ end)()
     function Q.supplyReady(ctx,id)
         if not supplyAllowed(id) then return false,'medical item is not eligible for coin purchase' end
         local item=nearest(looseItems(),ctx.root.Position,function(item)
-            return api.id(item)==id and now()>=(retries[item] or 0) and (free(item) or stock(item))
+            return api.id(item)==id and supplyRetryReady(item) and (free(item) or stock(item))
                 and (id:sub(-5)=='_Ammo' or api.hasRoom(ctx,item) or Q.healing.canMakeRoom(ctx,item))
         end)
         if not item then
             for _,found in ipairs(looseItems())do
                 if api.id(found)==id and (free(found) or stock(found))then
-                    if now()<(retries[found] or 0)then return false,'medical item is waiting for its retry / receipt' end
+                    if not supplyRetryReady(found)then return false,'medical item is waiting for its retry / receipt' end
                     return false,'toolbar is full; no authorized shard slot is available'
                 end
             end
@@ -5252,7 +5471,7 @@ end)()
     end
     function Q.supply(ctx,plan,id)
         if not supplyAllowed(id) or s.questDelivery or s.bringDelivery or calls.drag or manual() then ctx.questOwns=nil; return false end
-        local loose=nearest(looseItems(),ctx.root.Position,function(item)return free(item) and api.id(item)==id and now()>=(retries[item] or 0)end)
+        local loose=nearest(looseItems(),ctx.root.Position,function(item)return free(item) and api.id(item)==id and supplyRetryReady(item)end)
         if loose then
             if id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,loose) then
                 if Q.healing.canMakeRoom(ctx,loose)then Q.healing.makeRoom(ctx,loose);return true end
@@ -5272,7 +5491,7 @@ end)()
         if s.questUpgradeJob or calls.upgrade or calls.upgradeWallet then return false end
         if now()<(ctx.questSupplyAt or 0) then ctx.questOwns=nil; return false end
         ctx.questSupplyAt=now()+3
-        local item=nearest(looseItems(),ctx.root.Position,function(item)return stock(item) and api.id(item)==id and now()>=(retries[item] or 0)end)
+        local item=nearest(looseItems(),ctx.root.Position,function(item)return stock(item) and api.id(item)==id and supplyRetryReady(item)end)
         local pad=item and nearest(api.tagged('BuyPart'),api.part(item).Position,checkout)
         if not item or not pad then ctx.questOwns=nil; setStatus('No free or coin-shop quest supply loaded: '..id); return false end
         if id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,item) and not Q.healing.canMakeRoom(ctx,item) then ctx.questOwns=nil; setStatus('Quest tool needs a free toolbar slot; no purchase'); return false end
@@ -5350,13 +5569,23 @@ end)()
             if now()-(job.balanceAt or 0)>=3 then job.stage='wallet';return true end
             -- One sent Buy, including unknown replies, is never repeated for this stock.
             if job.buySent then return true end
-            job.buySent=true; retries[job.item]=math.huge
-            call('shop','ShopService','Buy',{job.target},function(ok,value,_,dispatch)
-                if dispatch=='not-sent'then job.buySent=nil;retries[job.item]=now()+15;release(job);return end
+            job.buySent=true;job.stockAtBuy=true;purchases[job.item]=job;retries[job.item]=math.huge
+            if call('shop','ShopService','Buy',{job.target},function(ok,value,_,dispatch)
+                if dispatch=='not-sent'then
+                    job.buySent=nil;if purchases[job.item]==job then purchases[job.item]=nil end
+                    retries[job.item]=now()+15;release(job);return
+                end
+                job.buySettled=true
+                Q.purchaseReceipt(job)
                 if not guarded() then release(job); return end
-                if not ok or value==false then fail('Quest purchase rejected or unknown; no repeat Buy')
+                if job.purchaseConfirmed then job.stage='purchase-confirm';job.confirmUntil=now()+5
+                elseif not ok or value==false then fail('Quest purchase rejected or unknown; no repeat Buy')
                 else job.stage='purchase-confirm'; job.confirmUntil=now()+5 end
-            end,guarded)
+            end,guarded)then job.buyToken=calls.shop
+            else
+                job.buySent=nil;if purchases[job.item]==job then purchases[job.item]=nil end
+                retries[job.item]=now()+15;release(job)
+            end
         elseif job.stage=='purchase-confirm' then
             if not job.item.Parent then fail('Purchased stock identity lost; waiting for another supply')
             elseif not api.tag(job.item,'ShopItem') and free(job.item) then
@@ -5787,7 +6016,7 @@ end)()
         if data.lootExtract == nil then enabled = data.smartLoot == true or data.extraction == true end
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
-            driveDepth = data.driveDepth ~= false, schema = 35 }
+            driveDepth = data.driveDepth ~= false, schema = 36 }
     end
     local previousConfig,previousAccountId=s.config,s.configAccountId
     local loaded=saveStore:get('settings')
@@ -5883,6 +6112,20 @@ end)()
                     end
                 end
             end
+            local wall=ctx.questWallWork
+            local node=wall and wall.node
+            local band=workspace:GetAttribute('InfiniteDepthOffsetMeters')
+            if node and node.Parent and node:IsDescendantOf(workspace) and wall.drill==ctx.drill
+                and ctx.drill==workspace:FindFirstChild('Drill') and ctx.drill.Parent and wall.band==band then
+                local value=tonumber(node:GetAttribute('Health'))
+                if type(value)=='number' and value==value and math.abs(value)<math.huge then
+                    local previous=watch.wall
+                    local same=previous and previous.node==node and previous.drill==ctx.drill and previous.band==band
+                    local before=same and watch.health[node]
+                    if before and value<before then watch.at=now()end
+                    watch.health[node]=value;watch.wall={node=node,drill=ctx.drill,band=band}
+                else watch.wall=nil end
+            else watch.wall=nil end
         end
         local plan=quest and quest.plan(s.classData,s.questCatalog,cfg.driveDepth)
         local minutes=plan and plan.kind=='depth' and cfg.driveDepth and 35 or 20
@@ -6172,7 +6415,20 @@ end)()
         return result
     end
     function F.swordTargetAllowed(npc)
-        return npc and npc:GetAttribute('Mutation_Stone')~=true
+        if not npc or npc:GetAttribute('Mutation_Stone')==true then return false end
+        local name=tostring(npc:GetAttribute('RealName') or npc.Name)
+        if name:find('Watcher',1,true)==1 then return false end
+        -- GunRaycast uses the same native deflection attribute/tag on a hit
+        -- part or its ancestors. Stone armor can be marked only on its body.
+        local ancestor=npc
+        while ancestor and ancestor~=workspace do
+            if ancestor:GetAttribute('DeflectPart')==true or tag(ancestor,'DeflectPart')then return false end
+            ancestor=ancestor.Parent
+        end
+        for _,item in ipairs(npc:GetDescendants())do
+            if item:GetAttribute('DeflectPart')==true or tag(item,'DeflectPart')then return false end
+        end
+        return true
     end
     local function part(item)
         if not item or not item.Parent then return nil end
@@ -6187,6 +6443,40 @@ end)()
         if item:IsA('ProximityPrompt') then return position(item.Parent) end
         if item:IsA('Attachment') then return item.WorldPosition end
         local p = part(item); return p and p.Position
+    end
+    function F.healingPointSafe(ctx,point)
+        if not point or not finite(point.X) or not finite(point.Y) or not finite(point.Z) then return false end
+        local player=api.Players.LocalPlayer
+        local inside=player and player:GetAttribute('InDungeon')==true
+        local mine=inside and quest and quest.drillSupport.activeMine(ctx)
+        local room=inside and not mine and quest and quest.special.bound(ctx)
+        for _,npc in ipairs(F.enemies())do
+            local isPlayer=npc==ctx.character or type(api.Players.GetPlayerFromCharacter)=='function'
+                and api.Players:GetPlayerFromCharacter(npc)~=nil
+            -- Quest retry suppression is not protection from a living enemy.
+            -- Dungeon session ownership, however, keeps another native room's
+            -- loaded wave from blocking a chest that it cannot reach.
+            local belongs=not inside or not mine and not room or mine and quest.drillSupport.mineEnemy(npc,mine)
+                or room and quest.special.belongs(npc,room)
+            local p=position(npc)
+            if not isPlayer and belongs and p and finite(p.X) and finite(p.Y) and finite(p.Z)
+                and (p-point).Magnitude<80 then return false end
+        end
+        return true
+    end
+    function F.healingChestSafe(ctx,entry)
+        if not ctx.questHealing then return true end
+        local model=entry and entry.Model
+        if not model or not model.Parent or not F.chestAreaAllowed(ctx,model)
+            or not F.chestFallbackAllowed(model)then return false end
+        local prompt=model:FindFirstChildWhichIsA('ProximityPrompt',true)
+        if not prompt or not prompt.Parent or prompt.Enabled==false then return false end
+        local target=position(prompt)
+        local radius=tonumber(prompt.MaxActivationDistance) or 12
+        if not target or not finite(radius) or radius<=0 then return false end
+        local offset=math.min(2,radius/4)
+        return F.healingPointSafe(ctx,target)
+            and F.healingPointSafe(ctx,target+Vector3.new(0,offset,offset))
     end
     function F.oreBroken(packet)
         if type(packet)~='table' then return end
@@ -6307,16 +6597,18 @@ end)()
         return window ~= nil
     end
     local function tools(ctx)
-        local list, seen = {}, {}
+        local list, seen, instances = {}, {}, {}
         for _, container in ipairs({ ctx.character, api.Players.LocalPlayer:FindFirstChild('Backpack') }) do
             for _, tool in ipairs(children(container)) do
-                if tool:IsA('Tool') then list[#list + 1] = tool; seen[id(tool)] = true end
+                if tool:IsA('Tool') then list[#list + 1] = tool; seen[id(tool)] = true;instances[tool]=true end
             end
         end
         -- ToolController equips a Tool=true Model named item+UserId. It is owned gear,
         -- even when its backpack Tool is absent; avoid counting a retained proxy twice.
+        local native=controller('ToolController');local active=native and native.ActiveTool
         for _, model in ipairs(children(ctx.character)) do
-            if model:IsA('Model') and attr(model, 'Tool') == true and not seen[id(model)] then
+            local represented=active and active.Tool==model and instances[active.DisplayTool]
+            if model:IsA('Model') and attr(model, 'Tool') == true and not represented and not seen[id(model)] then
                 list[#list + 1] = model; seen[id(model)] = true
             end
         end
@@ -6335,9 +6627,39 @@ end)()
         for _, tool in ipairs(inventory or tools(ctx)) do if id(tool) == name then total = total + stackCount(tool) end end
         return total
     end
+    local function toolbarCapacity()
+        local hotbar=controller('HotbarController');local ui=hotbar and hotbar.BackpackUI
+        if not ui or not ui.Parent or type(ui.GetChildren)~='function' then return 6 end
+        -- Native HotbarController maps its direct ImageButtons by LayoutOrder
+        -- and binds keys 1..9. Hidden empty slots still provide real capacity.
+        local slots,maximum={},0
+        for _,slot in ipairs(ui:GetChildren())do
+            local index=slot.LayoutOrder
+            if slot:IsA('ImageButton') and type(index)=='number' and index==index
+                and index>=1 and index<=9 and index%1==0 then slots[index]=true;maximum=math.max(maximum,index)end
+        end
+        for index=1,maximum do if not slots[index]then return 6 end end
+        return maximum>0 and maximum or 6
+    end
+    local function stacksMedical(item)
+        if attr(item,'Class')~='Medkit' then return false end
+        local resolver=s.medicalStackResolver
+        if not resolver then
+            local shared=api.RS and api.RS:FindFirstChild('Shared')
+            local module=shared and shared:FindFirstChild('ClassResolver')
+            if module then
+                local ok,value=pcall(require,module)
+                if ok and type(value)=='table' then resolver=value;s.medicalStackResolver=value end
+            end
+        end
+        if not resolver or type(resolver.ResolvePlayerPassives)~='function' then return false end
+        local ok,passives=pcall(resolver.ResolvePlayerPassives,api.Players.LocalPlayer,workspace)
+        return ok and type(passives)=='table' and passives.StackMedicalTools==true
+    end
     local function hasRoom(ctx, item, inventory)
         inventory = inventory or tools(ctx)
-        return #inventory < 6 or RELICS[id(item)] == true and inventoryCount(ctx, id(item), inventory) > 0
+        return #inventory < toolbarCapacity() or (RELICS[id(item)] == true or stacksMedical(item))
+            and inventoryCount(ctx, id(item), inventory) > 0
     end
     F.isRelic, F.stackCount, F.hasRoom = isRelic, stackCount, hasRoom
     local rarity = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6, Secret = 7 }
@@ -6861,6 +7183,7 @@ end)()
         miningNodeAllowed=function(node)return not F.skipLootArea(node) and F.liveOre(node)end,
         chestCandidate=function(ctx,radius,predicate)return ctx.questChestCandidate and ctx.questChestCandidate(radius,predicate)end,
         openChest=function(ctx,entry)return ctx.helpers[16361397](entry)end,
+        healingChestSafe=F.healingChestSafe,healingPointSafe=F.healingPointSafe,
         miningSurface=function(ctx,node)
             local best,distance
             local parts=node:GetDescendants();if node:IsA('BasePart')then parts[#parts+1]=node end
@@ -7417,12 +7740,20 @@ end)()
         end
     end
     function F.watcher(ctx)
-        if now() >= (ctx.watcherSearchAt or 0) then
+        local player=api.Players.LocalPlayer
+        local inside=player and player:GetAttribute('InDungeon')==true
+        local mine=inside and quest and quest.drillSupport.activeMine(ctx)
+        local room=inside and not mine and quest and quest.special.bound(ctx)
+        local function relevant(npc)
+            return F.enemyAlive(npc) and (not inside or not mine and not room
+                or mine and quest.drillSupport.mineEnemy(npc,mine) or room and quest.special.belongs(npc,room))
+        end
+        if now() >= (ctx.watcherSearchAt or 0) or ctx.watcher and not relevant(ctx.watcher)then
             ctx.watcherSearchAt = now() + 0.15
-            ctx.watcher = nearest(ctx, tagged('Watcher'), F.enemyAlive, 400)
+            ctx.watcher = nearest(ctx, tagged('Watcher'), relevant, 400)
         end
         local closest = ctx.watcher
-        if closest and not F.enemyAlive(closest) then closest = nil end
+        if closest and not relevant(closest) then closest = nil end
         ctx.watcher = closest
         if closest and workspace.CurrentCamera then
             local eyes = closest:FindFirstChild('Head', true) or closest:FindFirstChild('Eyes', true) or part(closest)
@@ -7464,6 +7795,8 @@ end)()
     end
     function F.questRetreat(ctx)
         if not cfg.classQuest or not ctx.questHealing or ctx.humanoid.SeatPart then return false end
+        local current=ctx.root.CFrame.Position or ctx.root.Position
+        if F.healingPointSafe(ctx,current)then ctx.questHealPoint=current;return false end
         local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
         params.FilterDescendantsInstances={ctx.character,workspace:FindFirstChild('Npc'),workspace:FindFirstChild('Items')}
         local best,score
@@ -7476,7 +7809,7 @@ end)()
                     local hp=npc:FindFirstChildOfClass('Humanoid');local p=part(npc)
                     if hp and hp.Health>0 and p and npc:GetAttribute('NpcFaction')~='FriendlyCompanion'then distance=math.min(distance,(point-p.Position).Magnitude)end
                 end
-                if distance>=80 and (not score or distance>score)then best,score=point,distance end
+                if F.healingPointSafe(ctx,point) and distance>=80 and (not score or distance>score)then best,score=point,distance end
             end
         end
         if not best then return false end
@@ -8420,12 +8753,14 @@ end
             elseif id == 16361397 then
                 wrapped = function(entry, ...)
                     if not features.chestAreaAllowed(ctx,entry.Model) or not features.chestFallbackAllowed(entry.Model) then return "skipped" end
+                    if not features.healingChestSafe(ctx,entry)then return 'unsafe' end
                     if ctx.awaitCombat then ctx.awaitCombat() end
                     if not features.chestEnabled() and coroutine.running() ~= ctx.featureThread then return "disabled" end
                     local record = chestRecord(entry)
                     if record.locked or record.retired or now() < (record.retryAt or 0) then return "locked" end
                     local attempts = s.stats.promptFires
                     ctx.currentChest = record
+                    record.healingPosed=nil
                     ctx.chestStarted = now()
                     ctx.lootThread = coroutine.running()
                     local result = pack(pcall(fn, entry, ...))
@@ -8501,6 +8836,15 @@ end
             end
             if ctx.currentChest and ctx.defenseAbort and coroutine.running() == ctx.lootThread then
                 error('__EARTH_DEFENSE_RETRY', 0)
+            end
+            local chest=ctx.currentChest
+            if chest and ctx.questHealing and chest.model.Parent and coroutine.running()==ctx.lootThread then
+                local target=features.promptPosition(chest.prompt) or features.promptPosition(chest.model) or chest.entry.Pos
+                if not features.healingPointSafe(ctx,target) or chest.healingPosed
+                    and not features.healingPointSafe(ctx,root.CFrame.Position or root.Position)then
+                    s.questStatus='Healing chest interrupted: a living enemy approached'
+                    error('__EARTH_DEFENSE_RETRY',0)
+                end
             end
             if ctx.questChestLease and coroutine.running() == ctx.questChestLease and not s.config.classQuest then
                 error('__EARTH_DEFENSE_RETRY', 0)
@@ -8660,6 +9004,7 @@ end
                 return prompt and prompt.Parent and prompt.Enabled~=false and features.chestFallbackAllowed(prompt)
                     and features.chestAreaAllowed(ctx,prompt)
                     and (not ctx.currentChest or prompt:IsDescendantOf(ctx.currentChest.model))
+                    and (not ctx.questHealing or features.healingPointSafe(ctx,features.promptPosition(prompt)))
             end
             if not allowed()then return false end
             local target = features.promptPosition(prompt) or (ctx.currentChest and ctx.currentChest.entry.Pos)
@@ -8671,9 +9016,11 @@ end
             features.hover(ctx)
             local offset = math.min(2, radius / 4)
             local destination = target + Vector3.new(0, offset, offset)
+            if ctx.questHealing and not features.healingPointSafe(ctx,destination)then return false end
             if ((root.CFrame.Position or root.Position) - destination).Magnitude > 0.5 then
                 root.CFrame = CFrame.new(destination)
             end
+            if ctx.currentChest then ctx.currentChest.healingPosed=ctx.questHealing or nil end
             taskApi.wait(0.15) -- Let the unanchored character's new position propagate.
             local deadline = now() + 2
             while player.GameplayPaused == true and now() < deadline do taskApi.wait(0.1) end
@@ -8681,7 +9028,8 @@ end
                 print('[ChestFarm] Chest prompt not ready: loading pause or character outside activation range')
                 return false
             end
-            return allowed() -- Streaming/room/stock state may change during the pose wait.
+            return allowed() and (not ctx.questHealing or features.healingPointSafe(ctx,root.CFrame.Position or root.Position))
+            -- Streaming, room, stock and living enemies can change during the pose wait.
         end
         function ctx.nativeChestPrompt(prompt)
             if not ctx.prepareChestPrompt(prompt) then return false end
