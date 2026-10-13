@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 37: depth mine detours, full refuelling, fuel-leech defense and native hotbar safety.
+-- Revision 38: confirmed shop ore conversion, bounded leech defense, class-tool cleanup and medical reserve.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 37
-    local BUILD = "r37-depth-mine-fuel-leech"
+    local REVISION = 38
+    local BUILD = "r38-shop-furnace-leech-inventory"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -809,6 +809,7 @@ end
         s.nextAction = now() + 5
         status("Teleport failed; retrying automatically: " .. tostring(reason))
     end
+    local features
     local function setup(player, packages)
         local shared = child(RS, "Shared")
         for _, descriptor in ipairs({ { "achievements", "Achievements" }, { "itemCategories", "ItemCategories" }, { "itemDatabase", "ItemDatabase" } }) do
@@ -829,9 +830,18 @@ end
             local signal = event("CurrencyService", "Update")
             if signal then
                 s.currencyBound = true
-                connect(signal, function(amount, _, isCore)
+                connect(signal, function(amount, balance, isCore)
                     local key = isCore and "coreEarned" or "coinEarned"
                     s.stats[key] = s.stats[key] + math.max(0, tonumber(amount) or 0)
+                    if not isCore and type(balance)=="number" and balance==balance
+                        and balance>=0 and balance<math.huge then
+                        if features and features.quest and features.quest.observeCoins then
+                            features.quest.observeCoins(balance)
+                        else
+                            s.questWallet,s.questWalletAt=balance,now()
+                            s.questWalletVersion=(s.questWalletVersion or 0)+1
+                        end
+                    end
                 end)
             end
         end
@@ -2041,7 +2051,7 @@ end)()
 return function(api,Q)
     local D,s,cfg,now={},api.state,api.state.config,api.now
     local buildQuestProcessing = (function()
--- Physical ore processing uses an actual active placed Furnace, never a guessed shop intake.
+-- Physical ore processing uses the confirmed FurnacePost intake or an active placed Furnace.
 return function(api,Q,D)
     local M,s,now={},api.state,api.now
     local recipes={Ore_Iron='IronBar',Ore_Gold='GoldBar'}
@@ -2083,6 +2093,36 @@ return function(api,Q,D)
         for _,item in ipairs(folder and folder:GetChildren() or {})do if M.machine(item,ctx)then return item end end
         for _,item in ipairs(ctx.drill:GetDescendants())do if M.machine(item,ctx)then return item end end
     end
+    function M.shopRoot(box,ctx)
+        if not live(box) or not box:IsA('BasePart') or box.Name~='OreConvertBox' or box.CanTouch==false
+            or ctx.drill~=workspace:FindFirstChild('Drill') or not D.accessible(box)then return end
+        local convert=box.Parent;local furnace=convert and convert.Parent
+        local structure=furnace and furnace.Parent;local root=structure and structure.Parent
+        local touch=box:FindFirstChild('TouchInterest')
+        if convert and convert.Name=='OreConvert' and furnace and furnace.Name=='Furnace'
+            and structure and structure.Name=='Structure' and root and root.Name=='FurnacePost' and root.Parent==workspace
+            and root:FindFirstChild('Structure')==structure and structure:FindFirstChild('Furnace')==furnace
+            and furnace:FindFirstChild('OreConvert')==convert and convert:FindFirstChild('OreConvertBox')==box
+            and touch and touch:IsA('TouchTransmitter')then
+            for _,node in ipairs({box,convert,furnace,structure,root})do if node:GetAttribute('Deactivated')==true then return end end
+            return root,touch
+        end
+    end
+    function M.processor(item,ctx)return M.shopRoot(item,ctx)~=nil or M.machine(item,ctx)end
+    function M.findProcessor(ctx,origin)
+        local best,distance
+        for _,root in ipairs(workspace:GetChildren())do
+            if root.Name=='FurnacePost'then
+                local structure=root:FindFirstChild('Structure');local furnace=structure and structure:FindFirstChild('Furnace')
+                local convert=furnace and furnace:FindFirstChild('OreConvert');local box=convert and convert:FindFirstChild('OreConvertBox')
+                if box and M.shopRoot(box,ctx)then
+                    local value=(box.Position-(origin or ctx.root.Position)).Magnitude
+                    if not distance or value<distance then best,distance=box,value end
+                end
+            end
+        end
+        return best or M.findMachine(ctx)
+    end
     local function bounds(item)
         if item:IsA('Model') and type(item.GetBoundingBox)=='function'then
             local ok,cf,size=pcall(item.GetBoundingBox,item);if ok and cf and size then return cf,size end
@@ -2095,20 +2135,30 @@ return function(api,Q,D)
             and observed.mine==D.activeMine(ctx) and observed.mineSession==session(observed.mine)
             and observed.campaign==Q.special.bound(ctx) and observed.campaignSession==session(observed.campaign)
     end
+    local function sameProcessor(observed,ctx)
+        if not observed.shopRoot then return true end
+        local root,touch=M.shopRoot(observed.machine,ctx)
+        return root==observed.shopRoot and touch==observed.shopTouch
+            and observed.machine.Parent==observed.shopConvert and observed.shopConvert.Parent==observed.shopFurnace
+            and observed.shopFurnace.Parent==observed.shopStructure and observed.shopStructure.Parent==root
+    end
     function M.capture(ctx,item,machine)
         local cf,size=bounds(machine);if not cf or not size then return end
         local before={};for _,bar in ipairs(Q.looseItems())do before[bar]=true end
         local key=api.id(item)=='Ore_Iron' and 'SmeltIron' or 'SmeltGold'
         local plan=Q.plan(s.classData,s.questCatalog,s.config.driveDepth)
         local mine,campaign=D.activeMine(ctx),Q.special.bound(ctx)
+        local shopRoot,shopTouch=M.shopRoot(machine,ctx)
         return {input=api.id(item),output=recipes[api.id(item)],machine=machine,before=before,
             position=cf.Position,radius=math.max(12,size.Magnitude),band=workspace:GetAttribute('InfiniteDepthOffsetMeters'),
             drill=ctx.drill,mine=mine,mineSession=session(mine),campaign=campaign,campaignSession=session(campaign),
+            shopRoot=shopRoot,shopTouch=shopTouch,shopConvert=shopRoot and machine.Parent,
+            shopFurnace=shopRoot and machine.Parent.Parent,shopStructure=shopRoot and machine.Parent.Parent.Parent,
             class=plan.name,key=key,count=tonumber(plan.counts and plan.counts[key]) or 0}
     end
     function M.goal(job)
-        if not job.processing or not sameScope(job.processing,job.ctx)
-            or not M.inputEligible(job.item,job.ctx) or not M.machine(job.target,job.ctx)then return end
+        if not job.processing or not sameScope(job.processing,job.ctx) or not sameProcessor(job.processing,job.ctx)
+            or not M.inputEligible(job.item,job.ctx) or not M.processor(job.target,job.ctx)then return end
         local center=bounds(job.target);local itemCenter=bounds(job.item)
         if center and itemCenter then return center*itemCenter:ToObjectSpace(job.item:GetPivot())end
     end
@@ -2116,11 +2166,11 @@ return function(api,Q,D)
         local observed=job.processing
         if not observed or not job.processingContact or observed.machine~=job.target
             or observed.band~=workspace:GetAttribute('InfiniteDepthOffsetMeters')
-            or not sameScope(observed,job.ctx)then return false end
+            or not sameScope(observed,job.ctx) or not sameProcessor(observed,job.ctx)then return false end
         if job.item.Parent and api.id(job.item)==observed.input then return false end
         local plan=Q.plan(s.classData,s.questCatalog,s.config.driveDepth)
         if plan.name==observed.class and (tonumber(plan.counts and plan.counts[observed.key]) or 0)>observed.count then return true end
-        local center=M.machine(job.target,job.ctx) and bounds(job.target)
+        local center=M.processor(job.target,job.ctx) and bounds(job.target)
         local position=center and center.Position or observed.position
         for _,bar in ipairs(Q.looseItems())do
             if (not observed.before[bar] or bar==job.item) and api.id(bar)==observed.output and Q.free(bar,'sale')then
@@ -2136,6 +2186,12 @@ return function(api,Q,D)
             end
         end
         return false
+    end
+    function M.contactComplete(job)
+        local observed=job.processing
+        if not observed or not job.processingContact or job.item.Parent and api.id(job.item)==observed.input then return false end
+        if M.receipt(job)then job.processingConfirmed=true end
+        return true -- Consumed/reidentified input is never moved or constrained again.
     end
     function M.timeout(job)
         if job.processingTimedOut then return end
@@ -2357,10 +2413,10 @@ return function(api,Q,D)
             if M.inputEligible(candidate,ctx) and now()>=(s.questItemRetries[candidate] or 0)then item=candidate;break end
         end
         if not item then return false end
-        local machine=M.findMachine(ctx)
+        local machine=M.findProcessor(ctx,api.part(item).Position)
         if not machine then Q.special.readCraft(ctx);return M.placement(ctx,plan)end
         if Q.startDelivery(ctx,item,machine,'smelt',plan)then
-            status('Dropping '..api.id(item)..' into the actual placed Furnace; awaiting a real bar output');return true
+            status('Delivering ore to the confirmed native Furnace intake; awaiting a real bar output');return true
         end
         return false
     end
@@ -2445,13 +2501,14 @@ end)()
             or name=='TeamHealth' and amount>=2 and hp<.7
         return strong and value or nil
     end
-    function D.choose(ctx,plan,c,wallet)
+    function D.choose(ctx,plan,c,wallet,reservedKey)
+        wallet=Q.coinSpendable(wallet)
         local reward=c.ActiveClassReward
         local options=reward and reward.Options or c.Options
         local version=reward and reward.Id or c.OptionsVersion
         if type(options)~='table' or not finite(version) or version<=0 then return end
         local key=tostring(game.JobId or '')..':'..(reward and 'reward:' or 'coins:')..version
-        if ledger[key]==true or type(ledger[key])=='number' and now()<ledger[key]then return end
+        if ledger[key]==true and key~=reservedKey or type(ledger[key])=='number' and now()<ledger[key]then return end
         local best,score,fallback,fallbackCost,desperate,desperateCost,saving,savingScore
         for _,offer in ipairs(options)do
             local free=reward and offer.Type=='ClassReward'
@@ -2484,8 +2541,8 @@ end)()
         local wallet=finite(s.questWallet) and s.questWallet or 0
         local chosen,key,_,_,saving
         if c then chosen,key,_,_,saving=D.choose(ctx,plan,c,wallet)end
-        if saving or chosen then return math.max(D.cost(saving or chosen) or 0,Q.supplyFundingTarget(ctx,plan))end
-        if not key then return Q.supplyFundingTarget(ctx,plan)end
+        if saving or chosen then return math.max(Q.coinTarget(D.cost(saving or chosen) or 0,false),Q.supplyFundingTarget(ctx,plan))end
+        if not key then return math.max(Q.medicalReserve,Q.supplyFundingTarget(ctx,plan))end
         for _,offer in ipairs(c and c.Options or {})do
             local price=D.cost(offer)
             local value=D.score(ctx,plan,offer)
@@ -2497,8 +2554,8 @@ end)()
                 else fallback=math.min(fallback or price,price)end
             end
         end
-        -- Fund actual quoted work, with no retained balance or arbitrary buffer.
-        return math.max(fallback or desperate or 0,Q.supplyFundingTarget(ctx,plan))
+        -- Preserve the user's medical balance above the actual upgrade quote.
+        return math.max(Q.coinTarget(fallback or desperate or 0,false),Q.supplyFundingTarget(ctx,plan))
     end
     local function sameUpgradeUI(job)
         local c=job.controller
@@ -2537,8 +2594,11 @@ end)()
         local function readWallet(callback)
             if calls.upgradeWallet or calls.wallet or calls.shop or now()<(ctx.questUpgradeWalletAt or 0)then return end
             ctx.questUpgradeWalletAt=now()+3
+            local walletVersion=s.questWalletVersion or 0
             Q.call('upgradeWallet','CurrencyService','GetCurrency',{},function(ok,wallet)
-                if ok and finite(wallet)then s.questWallet=wallet;if callback then callback(wallet)end
+                if ok and finite(wallet) and wallet>=0 then
+                    local balance,observedAt,version=Q.observeCoins(wallet,walletVersion)
+                    if balance~=nil and callback then callback(balance,observedAt,version)end
                 else info('wallet read unavailable; purchases paused')end
             end,function()return Q.enabled(ctx) and not api.extractionReady()end)
         end
@@ -2554,8 +2614,7 @@ end)()
             end
             readWallet();return
         end
-        local function dispatch(wallet)
-            s.questWallet=wallet
+        local function dispatch(wallet,walletAt,walletVersion)
             if not Q.enabled(ctx) or api.extractionReady()then return end
             if calls.upgrade then info('previous native upgrade result remains pending; purchases paused');return end
             if s.questDelivery and s.questDelivery.shop or calls.shop or calls.wallet then info('waiting for shop checkout / currency transaction');return end
@@ -2564,7 +2623,7 @@ end)()
             local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
             local offer,key,version,reward,saving=D.choose(ctx,current,c,wallet)
             if not offer then
-                if saving then info(string.format('Saving for %s %s: %.0f / %.0f Coins',saving.Rarity,saving.UpgradeName,wallet,D.cost(saving)))
+                if saving then info(string.format('Saving for %s %s: %.0f / %.0f Coins (1000 held for medkits)',saving.Rarity,saving.UpgradeName,wallet,Q.coinTarget(D.cost(saving),false)))
                 elseif c.ActiveClassReward then info('no eligible free card')
                 else
                     local target=D.fundingTarget(ctx,current)
@@ -2593,19 +2652,25 @@ end)()
                     end
                 end
             end,function()
-                local picked,pickedKey,pickedVersion=D.choose(ctx,Q.plan(s.classData,s.questCatalog,cfg.driveDepth),c,wallet)
+                local balance=reward and wallet or Q.coinBalance(wallet,walletAt,walletVersion)
+                local reservation=s.questUpgradeJob==job and not job.rejected and not job.confirmed and sameUpgradeUI(job)
+                local picked,pickedKey,pickedVersion=D.choose(ctx,Q.plan(s.classData,s.questCatalog,cfg.driveDepth),c,balance,reservation and key or nil)
                 return Q.enabled(ctx) and not api.extractionReady() and not(s.questDelivery and s.questDelivery.shop) and not calls.shop and not calls.wallet
-                    and not c.PurchasePending and not c.RerollPending and not c.CardsLocked
+                    and (not c.PurchasePending or reservation and job.uiPendingOwned==true) and not c.RerollPending and not c.CardsLocked
+                    and (reward or Q.canSpend(balance,D.cost(offer),false))
                     and picked==offer and pickedKey==key and pickedVersion==version
             end)then
                 ledger[key]=true;s.questUpgradeJob=job
                 ctx.questUpgradeAt=now()+3
-                if not job.confirmed and sameUpgradeUI(job) and type(c.SetPurchasePending)=='function'then pcall(c.SetPurchasePending,c,true)end
+                if not job.confirmed and sameUpgradeUI(job) and type(c.SetPurchasePending)=='function'then
+                    local held=pcall(c.SetPurchasePending,c,true)
+                    job.uiPendingOwned=held and c.PurchasePending==true or nil
+                end
                 info('requested '..name..'; awaiting server receipt')
             end
         end
         local reward=c.ActiveClassReward
-        if reward then dispatch(s.questWallet or 0)
+        if reward then dispatch(s.questWallet or 0,s.questWalletAt,s.questWalletVersion or 0)
         else readWallet(dispatch)end
     end
     function D.mineshaft(item)
@@ -3083,6 +3148,60 @@ end)()
             s.questUpgradeJob=nil
         end
     end
+    function D.leechReady(ctx,npc,selected)
+        if not ctx or not npc or not npc.Parent or not api.isFuelLeech or not api.isFuelLeech(npc)
+            or ctx.drill~=workspace:FindFirstChild('Drill') or not ctx.drill.Parent then return false end
+        local hp=tonumber(npc:GetAttribute('FuelLeechHealth'))
+        if not finite(hp) or hp<=0 or not npc:IsDescendantOf(workspace)
+            or npc:GetAttribute('Category')=='Corpse' or npc:GetAttribute('NpcFaction')=='FriendlyCompanion' then return false end
+        local ancestor=npc.Parent
+        while ancestor and ancestor~=workspace do
+            if ancestor.Name=='Drill' and ancestor~=ctx.drill then return false end
+            ancestor=ancestor.Parent
+        end
+        if D.inDungeon(ctx)then
+            local mine=D.activeMine(ctx);local root=not mine and Q.special.bound(ctx)
+            if mine and not D.mineEnemy(npc,mine) or root and not Q.special.belongs(npc,root)
+                or not mine and not root then return false end
+        end
+        -- Native FuelLeechComponent defaults to Buried and plays its stealing
+        -- animation only when Attached. Native hit hints also require the
+        -- replicated Vulnerable flag. A reveal is detection, not attack proof.
+        local phase=npc:GetAttribute('FuelLeechState')
+        local vulnerable=npc:GetAttribute('FuelLeechVulnerable')==true
+        ctx.questLeechWatch=ctx.questLeechWatch or setmetatable({}, {__mode='k'})
+        local check=ctx.questLeechWatch[npc]
+        local band=workspace:GetAttribute('InfiniteDepthOffsetMeters')
+        if not check or check.drill~=ctx.drill or check.band~=band
+            or check.phase~=phase or check.vulnerable~=vulnerable then
+            check={drill=ctx.drill,band=band,phase=phase,vulnerable=vulnerable,health=hp}
+            ctx.questLeechWatch[npc]=check
+        elseif hp<check.health then
+            -- Real damage or a native vulnerability transition permits an
+            -- immediate retry; merely moving or sending Swing does not.
+            check.untilAt=nil;check.selectedAt=nil;check.progressAt=nil;check.unarmedAt=nil
+        end
+        check.health=hp
+        if phase~='Attached' or not vulnerable then return false end
+        if check.untilAt then
+            if now()<check.untilAt then return false end
+            check.untilAt=nil;check.selectedAt=nil;check.progressAt=nil;check.unarmedAt=nil
+        end
+        if check.selectedAt then
+            local pickaxe=api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe')
+            if pickaxe then check.unarmedAt=nil else check.unarmedAt=check.unarmedAt or now()end
+            if now()-(check.progressAt or check.selectedAt)>=12
+                or check.unarmedAt and now()-check.unarmedAt>=8 then
+                check.untilAt=now()+10;check.selectedAt=nil;check.progressAt=nil;check.unarmedAt=nil
+                return false
+            end
+        end
+        if selected and not check.selectedAt then
+            check.selectedAt=now();check.progressAt=now()
+            if not(api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe'))then check.unarmedAt=now()end
+        end
+        return true
+    end
     function D.threat(ctx,plan,onlyLeeches)
         local armedStartup=onlyLeeches and (api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe'))
         if not cfg.classQuest or Q.manual()
@@ -3109,7 +3228,7 @@ end)()
             local canHit=watcher or leech or not armored or pickaxe~=nil
             if (leech or not onlyLeeches and (watcher or blinker)) and p and npc:IsDescendantOf(workspace) and finite(hp) and hp>0
                 and (not api.enemyAlive or api.enemyAlive(npc))
-                and (leech or Q.targetResponsive(ctx,npc))
+                and (leech and D.leechReady(ctx,npc) or not leech and Q.targetResponsive(ctx,npc))
                 and (not D.activeMine() or D.mineEnemy(npc,D.activeMine()))
                 and canHit
                 and npc:GetAttribute('Category')~='Corpse' and npc:GetAttribute('NpcFaction')~='FriendlyCompanion' then
@@ -3127,6 +3246,7 @@ end)()
             return false
         end
         ctx.questFuelThreat=api.isFuelLeech and api.isFuelLeech(best) or nil
+        if ctx.questFuelThreat then D.leechReady(ctx,best,true)end
         if ctx.questPlacement and ctx.questPlacement.processingPlacement and D.processing then D.processing.cleanup(ctx)end
         Q.abortResources(ctx)
         D.cancelDoor(ctx,false);D.stopMine(ctx)
@@ -4306,6 +4426,200 @@ return function(api,Q)
 end
 
 end)()
+    local buildQuestInventory = (function()
+-- Class starter toolbar cleanup uses the native item-specific drop and real inventory receipts.
+return function(api,Q)
+    local I,s,cfg,now={},api.state,api.state.config,api.now
+    local blocked=s.questInventoryBlocked or setmetatable({}, {__mode='k'});s.questInventoryBlocked=blocked
+    local cached,starters
+    local shared={ItemBag=true,Money_Sack=true,Large_Sack=true,Pickaxe_Wooden=true,Sword_Wooden=true,
+        Pickaxe_Rusty=true,Sword_Rusty=true,Sword_Steel=true,Revolver=true,RPG=true}
+    local exact={CutlassKills='Sword_Pirate',FlintlockKills='Flintlock',UseSpeedPotion='SpeedPotion',
+        UseStrengthPotion='StrengthPotion',UseInvisibilityPotion='InvisibilityPotion',UseReviveKit='ReviveKit',
+        BlessTeammates='Staff_Priest',ConsumeCorpses='VampirePendant',MeleeLifestealHealing='VampirePendant'}
+    local turrets={BasicSentry=true,AdvancedSentry=true,Flamethrower=true,Frostthrower=true}
+    local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
+    local function status(text)s.questInventoryStatus=text end
+    function I.catalog()
+        local catalog=s.questCatalog or api.sharedModule and api.sharedModule('ClassCatalog')
+        if type(catalog)~='table'then return end
+        if catalog~=cached then
+            cached,starters=catalog,{}
+            local function add(value)
+                if type(value)=='string'then starters[value]=true
+                elseif type(value)=='table'then for _,entry in pairs(value)do add(entry)end end
+            end
+            for _,entry in pairs(catalog)do if type(entry)=='table'then add(entry.StarterTools)end end
+        end
+        return catalog,starters
+    end
+    local function owned(ctx,tool)
+        local backpack=api.Players.LocalPlayer:FindFirstChild('Backpack')
+        return tool and tool.Parent and tool:IsA('Tool') and (tool.Parent==ctx.character or tool.Parent==backpack)
+    end
+    local function sameTool(a,b)return a==b or a and b and api.id(a)==api.id(b)end
+    local function currentPlan(plan)
+        if not cfg.classQuest then return plan end
+        local catalog=I.catalog();local data=s.classData;local name=data and data.SelectedClass
+        local progress=data and data.ClassProgress and data.ClassProgress[name]
+        if not catalog or not name or type(progress)~='table' or not finite(progress.Level)
+            or progress.Level<1 or progress.Level%1~=0 or progress.Objectives~=nil and type(progress.Objectives)~='table'
+            or type(catalog[name])~='table' or type(catalog[name].Requirements)~='table'then return end
+        return Q.plan(data,catalog,cfg.driveDepth)
+    end
+    local function loadedPickaxeThreat(ctx)
+        local mine=Q.drillSupport.activeMine(ctx);local campaign=not mine and Q.special.bound(ctx)
+        for _,npc in ipairs(api.enemies())do
+            local p=api.part(npc);local name=tostring(npc:GetAttribute('RealName') or npc.Name):lower()
+            local leech=api.isFuelLeech and api.isFuelLeech(npc)
+            local urgent=leech or name:find('watcher',1,true) or name:find('blinker',1,true)
+                or api.tag(npc,'Watcher') or mine and not api.swordTargetAllowed(npc)
+            local belongs=not mine and not campaign or mine and Q.drillSupport.mineEnemy(npc,mine)
+                or campaign and Q.special.belongs(npc,campaign)
+            if p and urgent and belongs and (not api.enemyAlive or api.enemyAlive(npc))
+                and not api.swordTargetAllowed(npc) and (p.Position-ctx.root.Position).Magnitude<=(leech and 600 or 400)then
+                local ancestor=npc.Parent;local current=true
+                while ancestor and ancestor~=workspace do
+                    if ancestor.Name=='Drill' and ancestor~=ctx.drill then current=false;break end
+                    ancestor=ancestor.Parent
+                end
+                if current then return true end
+            end
+        end
+        return false
+    end
+    local function neededTool(ctx,tool,plan)
+        local id=api.id(tool);local unmet={}
+        for _,goal in ipairs(plan.unmet or {})do unmet[goal.key]=true end
+        for key,wanted in pairs(exact)do if unmet[key] and id==wanted then return true end end
+        if turrets[id] and (unmet.PlaceTurrets or unmet.TurretKills)then return true end
+        local placement=ctx.questPlacement or s.questFurnacePlacement
+        if placement and placement.processingPlacement and placement.tool==tool
+            and (now()-(placement.started or now())<12 or placement.token and Q.calls.place==placement.token)then return true end
+        local class=api.attr(tool,'Class')
+        if Q.healing and Q.healing.isMedical(tool)then return true end
+        local preferred=Q.preferred and Q.preferred(ctx)
+        if sameTool(preferred,tool)then return true end
+        local pick=false;local sword=false;local guns={}
+        for key in pairs(unmet)do
+            if key:find('Mine',1,true)==1 or key=='SmeltIron' or key=='SmeltGold' or key=='ContributeFuel'
+                or key=='TotalDepth' and cfg.driveDepth then pick=true end
+            if Q.capabilities.melee[key] or key=='CompleteDungeon' or key=='CompleteGoblinRing' or key=='GoblinLordKills'then sword=true end
+            local gun=Q.capabilities.guns[key]
+            if gun then
+                if type(gun)=='string' and gun~='Gun'then guns[gun]=true
+                else guns.Revolver,guns.Rifle,guns.Shotgun=true,true,true end
+            end
+        end
+        if Q.refuelActive and Q.refuelActive(ctx)then pick=true end
+        if class=='Pickaxe' and (ctx.questDepthMine and ctx.questDepthMine.class==(s.classData and s.classData.SelectedClass)
+            or ctx.questMining or loadedPickaxeThreat(ctx))then pick=true end
+        local threat=ctx.questThreat
+        if threat and threat.Parent and (not api.enemyAlive or api.enemyAlive(threat))
+            and (api.isFuelLeech and api.isFuelLeech(threat) or not api.swordTargetAllowed(threat))then pick=true end
+        if class=='Pickaxe' and pick then
+            local best=api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe')
+            return not best or sameTool(best,tool) or not owned(ctx,tool) and api.useful(ctx,tool)
+        end
+        if class=='Sword' and sword then
+            local best=api.findOwned(ctx,'Sword_Void') or api.findTool(ctx,'Sword')
+            return not best or sameTool(best,tool) or not owned(ctx,tool) and api.useful(ctx,tool)
+        end
+        if guns[class]then
+            local best=api.findTool(ctx,class);return not best or sameTool(best,tool) or not owned(ctx,tool) and api.useful(ctx,tool)
+        end
+        if (id=='RPG' or id=='Cannon') and unmet.ExplosiveDamage then return true end
+        return false
+    end
+    function I.needed(ctx,tool,plan)
+        if not cfg.classQuest then return false end
+        plan=currentPlan(plan);return not plan or neededTool(ctx,tool,plan)
+    end
+    local function classOnly(tool)
+        local _,ids=I.catalog();if not ids or not tool then return false end
+        local id=api.id(tool)
+        if not ids[id] or shared[id] or tostring(id):lower():find('void',1,true)
+            or api.attr(tool,'Class')=='ItemBag' then return false end
+        -- The same native medkit ID is used by Healer starters and purchased supplies.
+        -- No exported provenance distinguishes them, so useful medicine is retained.
+        if Q.healing and Q.healing.isMedical(tool) or api.attr(tool,'Class')=='ReviveKit' or id=='ReviveKit'then return false end
+        return true
+    end
+    function I.allowPickup(ctx,item)
+        if not ctx or not classOnly(item)then return true end
+        return I.needed(ctx,item)
+    end
+    function I.candidate(ctx,tool,plan)
+        if not owned(ctx,tool) or not classOnly(tool)then return false end
+        local placement=ctx.questPlacement or s.questFurnacePlacement
+        if placement and placement.processingPlacement and placement.tool==tool
+            and placement.token and Q.calls.place==placement.token then return false end
+        local count=api.stackCount(tool)
+        if blocked[tool] and count>=blocked[tool]then return false end
+        return not I.needed(ctx,tool,plan)
+    end
+    local function ready(ctx)
+        local player=api.Players.LocalPlayer
+        local placement=ctx and ctx.questPlacement
+        local passivePlacement=placement and placement.processingPlacement and placement.background and placement.localPreviewStopped
+        local hotbar=api.controller('HotbarController');local nativePlacement=api.controller('PlaceablePlacementController')
+        local equipping=false
+        for _,record in pairs(s.equipRecords or {})do if record.pending then equipping=true;break end end
+        return api.owned() and ctx and ctx.active and s.farm==ctx and player.Character==ctx.character
+            and ctx.humanoid.Health>0 and not s.teleporting and not s.request and not s.awaiting and not s.departureAt
+            and not player.GameplayPaused and not workspace:GetAttribute('InCutScene') and not workspace:GetAttribute('InfiniteRebasing')
+            and not api.extractionReady() and not Q.manual() and not (hotbar and hotbar.IsDraggingHotbarItem)
+            and not(nativePlacement and nativePlacement.Active) and not(placement and not passivePlacement)
+            and not ctx.questPreviewCancel and not ctx.questPotionUsing and not ctx.questHealAttempt
+            and not ctx.questStartup and not ctx.questRecovering and not ctx.questRecoveryDue
+            and not ctx.currentChest and not ctx.featureHold and not ctx.questMineEntry and not ctx.nativeGateMotion
+            and not ctx.questDriving and not ctx.questSeating and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
+            and not equipping and not ctx.bringEquipmentLock and not s.bringDelivery and not s.questDelivery and not s.lootRequest and not s.equipmentRequest
+            and not s.rareShardDrop and not s.questMedicalDrop and not Q.calls.medicalDrop
+    end
+    function I.observe(ctx)
+        local job=s.questInventoryDrop;if not job then return false end
+        local sameLife=api.Players.LocalPlayer.Character==job.character and job.ctx.humanoid.Health>0
+        local remains=job.tool.Parent and (job.tool.Parent==job.character or job.tool.Parent==job.backpack)
+        local count=remains and api.stackCount(job.tool) or 0
+        if sameLife and job.token and job.token.called and (not remains or count<job.count)then
+            if Q.retireConfirmedCall('inventoryDrop',job.token)then
+                s.questInventoryDrop=nil;status('Class item inventory loss confirmed: '..job.id);return false
+            end
+            status('Class item dropped; waiting for its exact request waiter to stop');return false
+        end
+        if job.notSent then s.questInventoryDrop=nil;return false end
+        if job.settled and (not sameLife or now()-job.started>=5 and now()-(job.settledAt or job.started)>=1.5)then
+            blocked[job.tool]=job.count;s.questInventoryDrop=nil
+            status('Class item drop unconfirmed; this item is not dropped again');return false
+        end
+        if now()-job.started>=1.5 then status('Class item drop pending; exact request reserved while other work continues');return false end
+        return job.ctx==ctx and sameLife
+    end
+    function I.step(ctx,plan)
+        local held=I.observe(ctx)
+        if s.questInventoryDrop or Q.calls.inventoryDrop then return held end
+        if not ready(ctx) or not I.catalog()then return false end
+        if cfg.classQuest and not currentPlan(plan)then return false end
+        local target
+        for _,tool in ipairs(api.ownedTools(ctx))do if I.candidate(ctx,tool,plan)then target=tool;break end end
+        if not target then return false end
+        local job={ctx=ctx,tool=target,id=api.id(target),count=api.stackCount(target),started=now(),character=ctx.character,
+            backpack=api.Players.LocalPlayer:FindFirstChild('Backpack')}
+        s.questInventoryDrop=job
+        local issued,token=Q.call('inventoryDrop','ToolService','DropSpecificItem',{target},function(ok,value,_,dispatch)
+            job.settled=true;job.settledAt=now();job.notSent=dispatch=='not-sent'
+        end,function()return s.questInventoryDrop==job and ready(ctx) and api.stackCount(target)==job.count
+            and I.candidate(ctx,target,plan)end)
+        job.token=token
+        if not issued then s.questInventoryDrop=nil;return false end
+        status('Dropping unused class item: '..job.id..'; awaiting native inventory receipt')
+        return I.observe(ctx)
+    end
+    return I
+end
+
+end)()
     local unpackValues = table.unpack or unpack
     local packValues = table.pack or function(...)return {n=select('#',...),...}end
     local calls = s.questCalls or {}; s.questCalls = calls
@@ -4324,6 +4638,28 @@ end)()
     local stock
     Q.capabilities={weapons=weapons,melee=melee,guns=guns,mining=mining,sales=sales,potions=potions,upgrades=upgradeGoals,special=specialGoals}
     local function finite(v) return type(v)=='number' and v==v and math.abs(v)<math.huge end
+    Q.medicalReserve=1000
+    function Q.coinSpendable(wallet)return finite(wallet) and math.max(0,wallet-Q.medicalReserve) or 0 end
+    function Q.coinTarget(price,medical)
+        return math.max(0,finite(price) and price or 0)+(medical and 0 or Q.medicalReserve)
+    end
+    function Q.canSpend(wallet,price,medical)
+        return finite(wallet) and finite(price) and price>=0 and wallet>=price
+            and (medical or price==0 or wallet-price>=Q.medicalReserve)
+    end
+    function Q.observeCoins(balance,readVersion)
+        if not finite(balance) or balance<0 then return end
+        if readVersion==nil or readVersion==(s.questWalletVersion or 0)then
+            s.questWallet,s.questWalletAt=balance,now()
+            s.questWalletVersion=(s.questWalletVersion or 0)+1
+        end
+        return s.questWallet,s.questWalletAt,s.questWalletVersion
+    end
+    function Q.coinBalance(fallback,quotedAt,version)
+        if (s.questWalletVersion or 0)~=(version or 0)then
+            if finite(s.questWallet) and now()-(s.questWalletAt or -math.huge)<3 then return s.questWallet end
+        elseif finite(fallback) and now()-(quotedAt or -math.huge)<3 then return fallback end
+    end
     local function setStatus(text) s.questStatus = text end
     function Q.ownedClass(data, name)
         if type(data)~='table' then return false end
@@ -4802,6 +5138,7 @@ end)()
             or api.tag(item,'Ore') and item:FindFirstChild('Health')~=nil
             or api.tag(item,'Ore') and not (allowFuelOre and (api.id(item)=='Ore_Coal' or api.id(item)=='Ore_VoidCoal') and (tonumber(api.attr(item,'Fuel')) or 0)>0
                 or allowFuelOre=='sale' and not item:FindFirstChild('Health') and (api.id(item)=='Ore_Iron' or api.id(item)=='Ore_Gold'
+                    or api.id(item)=='IronBar' or api.id(item)=='GoldBar'
                     or s.itemCategories and s.itemCategories.Gems and s.itemCategories.Gems[api.id(item)]==true)) then return false end
         local owner=tonumber(item:GetAttribute('OwnerUserId'))
         return not owner or owner==0 or owner==api.Players.LocalPlayer.UserId
@@ -4889,6 +5226,7 @@ end)()
     end
     local function objective(plan,key) return tonumber(plan.counts and plan.counts[key]) or 0 end
     local function place(job)
+        if job.kind=='smelt' and Q.drillSupport.processing.contactComplete(job)then return true end
         local p,target=api.part(job.item),api.part(job.target)
         if not p or not target or not job.owns then return false end
         local cf,size
@@ -4907,9 +5245,20 @@ end)()
         if job.kind=='smelt'then
             goal=Q.drillSupport.processing.goal(job)
             if not goal then return false end
+            -- Conversion may destroy the ore or rename it during this contact.
+            -- Finish input-only work first and never constrain the resulting bar.
+            p.AssemblyLinearVelocity,p.AssemblyAngularVelocity=Vector3.zero,Vector3.zero
+            local before=job.processingContact
+            job.processingContact=true
+            local moved,why=pcall(job.item.PivotTo,job.item,goal)
+            if not moved then
+                if Q.drillSupport.processing.contactComplete(job)then return true end
+                job.processingContact=before;error(why,0)
+            end
+            Q.drillSupport.processing.contactComplete(job)
+            return true
         end
         job.item:PivotTo(goal)
-        if job.kind=='smelt'then job.processingContact=true end
         p.AssemblyLinearVelocity,p.AssemblyAngularVelocity=Vector3.zero,Vector3.zero
         if not job.constraints then
             job.constraints={}
@@ -4935,7 +5284,7 @@ end)()
                 and (kind~='shred' or Q.special.scrapEligible(item,ctx))
                 and (not plan.processingFunding or Q.drillSupport.processing.fundingEligible(item,ctx))
                 and (kind~='smelt' or Q.drillSupport.processing.inputEligible(item,ctx)
-                    and Q.drillSupport.processing.machine(target,ctx))
+                    and Q.drillSupport.processing.processor(target,ctx))
         end
         if not eligible()then return false end
         local job={ctx=ctx,item=item,target=target,kind=kind,started=now(),stage='request',objective=plan.objective,
@@ -4963,7 +5312,7 @@ end)()
                 or kind=='shred' and not Q.special.scrapEligible(item,ctx)
                 or job.processingFunding and not Q.drillSupport.processing.fundingEligible(item,ctx)
                 or kind=='smelt' and (not Q.drillSupport.processing.inputEligible(item,ctx)
-                    or not Q.drillSupport.processing.machine(target,ctx))then release(job); return end
+                    or not Q.drillSupport.processing.processor(target,ctx))then release(job); return end
             local moved,result=pcall(place,job)
             if not moved or not result then release(job); return end
             job.stage,job.readyAt='placed',now()+.55
@@ -5571,6 +5920,7 @@ end)()
         local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         local threat=ctx.questThreat
         local liveThreat=threat and threat.Parent and (not api.enemyAlive or api.enemyAlive(threat))
+            and (not api.isFuelLeech(threat) or Q.drillSupport.leechReady(ctx,threat))
         -- A native deflecting urgent enemy cannot be damaged by the quest's
         -- sword. Use a compatible owned tool for this threat only; the
         -- unfinished class requirement resumes when the threat clears.
@@ -5706,8 +6056,10 @@ end)()
             Q.drillSupport.processing.observePlacement(ctx)
             Q.drillSupport.processing.observeCraft(ctx)
         end
+        if Q.inventory then Q.inventory.observe(ctx)end
         if not cfg.classQuest then
             if ctx.questOwns or ctx.questDriving or ctx.questSeating or ctx.questDriveInput or ctx.questRecoveryDue or ctx.questRecovering or ctx.questPreviewCancel or s.questDelivery or s.questCashJob then Q.cleanup(ctx) end
+            if Q.inventory and Q.inventory.step(ctx)then return true end
             return false
         end
         Q.drillSupport.observeDoors(ctx)
@@ -5785,6 +6137,7 @@ end)()
             end
             return true
         end
+        if Q.inventory and Q.inventory.step(ctx,plan)then return true end
         if Q.special.bound(ctx) and not Q.drillSupport.activeMine() or plan.kind=='dungeon' and (ctx.questCampaign or Q.drillSupport.inDungeon(ctx) and not ctx.questCampaignExit)then
             if Q.healing.step(ctx,plan)then return true end
             Q.drillSupport.upgrades(ctx,plan)
@@ -6040,7 +6393,7 @@ end)()
         if not need or need.ctx~=ctx or need.class~=plan.name or need.objective~=plan.objective
             or now()>=need.expires or supplyCount(ctx,need.id)>need.before
             or Q.healing.isMedical(need.item) and not ctx.questHealing then return 0 end
-        return need.price
+        return Q.coinTarget(need.price,Q.healing.isMedical(need.item))
     end
     function Q.supplyReceipt(job) return supplyCount(job.ctx,job.id)>job.inventoryBefore end
     function Q.purchaseReceipt(job)
@@ -6179,10 +6532,12 @@ end)()
                 else fail('Quest supply coin quote unavailable') end
             end,guarded)
         elseif job.stage=='wallet' then
+            local readVersion=s.questWalletVersion or 0
             call('wallet','CurrencyService','GetCurrency',{},function(ok,coins)
                 if not guarded() then release(job); return end
-                if ok and finite(coins) and coins>=job.price then
-                    job.balanceAt=now();job.stage='recheck';s.questSupplyFunding=nil
+                if ok then coins,job.balanceAt,job.walletVersion=Q.observeCoins(coins,readVersion)end
+                if ok and Q.canSpend(coins,job.price,Q.healing.isMedical(job.item))then
+                    job.balance=coins;job.stage='recheck';s.questSupplyFunding=nil
                 else
                     if ok and finite(coins)then
                         s.questSupplyFunding={ctx=ctx,class=job.class,objective=job.objective,id=job.id,item=job.item,
@@ -6198,6 +6553,9 @@ end)()
                 else fail('Checkout changed; no quest purchase') end
             end,guarded)
         elseif job.stage=='buy' then
+            if not Q.canSpend(Q.coinBalance(job.balance,job.balanceAt,job.walletVersion),job.price,Q.healing.isMedical(job.item))then
+                job.stage='wallet';return true
+            end
             if job.id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,job.item)then
                 if Q.healing.isMedical(job.item)then Q.healing.makeRoom(ctx,job.item)else fail('Toolbar filled before purchase; no purchase')end
                 return true
@@ -6217,7 +6575,11 @@ end)()
                 if job.purchaseConfirmed then job.stage='purchase-confirm';job.confirmUntil=now()+5
                 elseif not ok or value==false then fail('Quest purchase rejected or unknown; no repeat Buy')
                 else job.stage='purchase-confirm'; job.confirmUntil=now()+5 end
-            end,guarded)then job.buyToken=calls.shop
+            end,function()
+                return guarded() and stock(job.item) and not obstructed(job)
+                    and Q.canSpend(Q.coinBalance(job.balance,job.balanceAt,job.walletVersion),job.price,Q.healing.isMedical(job.item))
+                    and (job.id:sub(-5)=='_Ammo' or api.hasRoom(ctx,job.item))
+            end)then job.buyToken=calls.shop
             else
                 job.buySent=nil;if purchases[job.item]==job then purchases[job.item]=nil end
                 retries[job.item]=now()+15;release(job)
@@ -6243,6 +6605,7 @@ end)()
     Q.healing=buildQuestHealing(api,Q)
     Q.drillSupport=buildQuestDrill(api,Q)
     Q.rewards=buildQuestRewards(api,Q)
+    Q.inventory=buildQuestInventory(api,Q)
     function Q.lobby()
         if not cfg.classQuest or game.PlaceId~=101906032112547 and not workspace:FindFirstChild('Lobby')then return false end
         Q.poll()
@@ -6271,6 +6634,7 @@ end)()
         local target=ctx.combatTarget
         local fuelFight=cfg.classQuest and ctx.questFuelThreat and target and api.isFuelLeech and api.isFuelLeech(target)
             and api.enemyAlive(target) and (not api.extractionReady() or exitFight)
+            and Q.drillSupport.leechReady(ctx,target)
             and (not api.questTargetAllowed or api.questTargetAllowed(ctx,target))
         if fuelFight then
             -- A draining native leech must die before driving/healing continues.
@@ -6667,7 +7031,7 @@ end)()
         if data.lootExtract == nil then enabled = data.smartLoot == true or data.extraction == true end
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
-            driveDepth = data.driveDepth ~= false, schema = 37 }
+            driveDepth = data.driveDepth ~= false, schema = 38 }
     end
     local previousConfig,previousAccountId=s.config,s.configAccountId
     local loaded=saveStore:get('settings')
@@ -7051,9 +7415,9 @@ end)()
             if mine and not quest.drillSupport.mineEnemy(npc,mine)
                 or root and not quest.special.belongs(npc,root) or not mine and not root then return false end
         end
-        -- A draining leech remains urgent through a buried/reveal phase. Its
-        -- actual native health, rather than a target retry, releases defense.
-        if F.isFuelLeech(npc)then return true end
+        if F.isFuelLeech(npc)then
+            return quest and quest.drillSupport.leechReady(ctx,npc) or false
+        end
         local retry=ctx.questTargetRetry and ctx.questTargetRetry[npc]
         if not retry then return true end
         local h=npc:FindFirstChildOfClass('Humanoid')
@@ -7248,7 +7612,7 @@ end)()
             end
             item = item.Parent
         end
-        return true
+        return not (quest and quest.inventory) or quest.inventory.allowPickup(s.farm, root)
     end
     function F.chestLootWindow(ctx, point)
         if cfg.lootExtract and bring and bring.available() then
@@ -9059,8 +9423,6 @@ end)()
     return F
 end
 ]=====]
-    local features
-
     local function startCombat(ctx, player, model, humanoid, root)
         if ctx.combatThread then return end
         s.equipRecords = s.equipRecords or setmetatable({}, { __mode = "k" })
