@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 48: preserve ready driving defense, drop unused class items and read private shared reports.
+-- Revision 49: restore smart-map reader yield budget; remove unused code and guard vanished sale targets.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 48
-    local BUILD = "r48-driving-defense-class-cleanup-shared-reports"
+    local REVISION = 49
+    local BUILD = "r49-smart-reader-budget-unused-code-sale-lifetime"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -51,7 +51,7 @@ return function(source)
     s.signalsBound = false
     s.teleportSignalsBound, s.departureBound = false, false
     s.currencyBound, s.classBound = false, false
-    s.achievementsLoading, s.itemCategoriesLoading, s.itemDatabaseLoading = false, false, false
+    s.achievementsLoading, s.itemCategoriesLoading = false, false
     env[KEY] = s
     local owner = s.owner
     local Players = game:GetService("Players")
@@ -3701,7 +3701,9 @@ end)()
         end
         local gem=item and s.itemCategories and s.itemCategories.Gems and s.itemCategories.Gems[api.id(item)]==true
         if not gem and D.processing and D.processing.step(ctx,plan)then return true end
-        local pad=item and Q.bestSeller(ctx,api.part(item).Position)
+        local itemPart=item and api.part(item)
+        if item and (not itemPart or not itemPart.Parent or not validPoint(itemPart.Position))then return false end
+        local pad=itemPart and Q.bestSeller(ctx,itemPart.Position)
         local reader=api.worldSnapshot or ctx.readWorld
         if item and not pad and not ctx.worldReading and reader then
             -- Quest mining parks the base route before its bounded map reader
@@ -3716,7 +3718,12 @@ end)()
                         ctx.worldPending=ctx.worldPending or {};ctx.worldPending[object]=true
                     end
                 end
-                ctx.questPadsAt=0;pad=Q.bestSeller(ctx,api.part(item).Position)
+                -- Reading the map can yield while another worker picks up the
+                -- item or its geometry streams out. Do not use the old pose.
+                itemPart=api.part(item)
+                if not itemPart or not itemPart.Parent or not validPoint(itemPart.Position)
+                    or not Q.free(item,'sale')then return false end
+                ctx.questPadsAt=0;pad=Q.bestSeller(ctx,itemPart.Position)
             end
         end
         if not pad then return false end
@@ -4922,7 +4929,7 @@ return function(api,Q)
         ctx.questCraftReadAt=now()+3
         Q.call('craftState','CraftingService','GetState',{},function(ok,value)
             if ok and type(value)=='table' and finite(tonumber(value.ScrapCount))then
-                s.questCraftState=value;s.questCraftObservedAt=now()
+                s.questCraftState=value
                 local c=api.controller('CraftingController')
                 if c and type(c.ApplyState)=='function'then pcall(c.ApplyState,c,value)end
             end
@@ -5539,7 +5546,6 @@ return function(api,Q)
         BlessTeammates='Staff_Priest',ConsumeCorpses='VampirePendant',MeleeLifestealHealing='VampirePendant'}
     local turrets={BasicSentry=true,AdvancedSentry=true,Flamethrower=true,Frostthrower=true}
     local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
-    local function status(text)s.questInventoryStatus=text end
     function I.catalog()
         local catalog=s.questCatalog or api.sharedModule and api.sharedModule('ClassCatalog')
         if type(catalog)~='table'then return end
@@ -5742,23 +5748,21 @@ return function(api,Q)
         local count=remains and api.stackCount(job.tool) or 0
         if sameLife and job.token and job.token.called and (not remains or count<job.count)then
             if Q.retireConfirmedCall('inventoryDrop',job.token)then
-                s.questInventoryDrop=nil;status('Class item inventory loss confirmed: '..job.id);return false
+                s.questInventoryDrop=nil;return false
             end
-            status('Class item dropped; waiting for its exact request waiter to stop');return false
+            return false
         end
         if job.notSent then s.questInventoryDrop=nil;return false end
         if job.settled and (not sameLife or now()-job.started>=5 and now()-(job.settledAt or job.started)>=1.5)then
             if sameLife and job.passiveDriving and job.rejected then
                 blocked[job.tool]={count=job.count,character=job.character,drill=job.drill,
                     started=job.started,settledAt=job.settledAt,standingRetry=true}
-                status('Class item drop was explicitly rejected while driving; one standing retry awaits native unseat')
             else
                 blocked[job.tool]=job.count
-                status('Class item drop unconfirmed; this item is not dropped again')
             end
             s.questInventoryDrop=nil;return false
         end
-        if now()-job.started>=1.5 then status('Class item drop pending; exact request reserved while other work continues');return false end
+        if now()-job.started>=1.5 then return false end
         -- Item-specific Backpack cleanup owns no driver, movement or active
         -- handler lease. A pending reply must not defer forward input/defense.
         return not job.passiveDriving and job.ctx==ctx and sameLife
@@ -5787,7 +5791,6 @@ return function(api,Q)
         end)
         job.token=token
         if not issued then s.questInventoryDrop=nil;return false end
-        status('Dropping unused class item: '..job.id..'; awaiting native inventory receipt')
         return I.observe(ctx)
     end
     return I
@@ -8487,13 +8490,10 @@ return function(api)
                 ctx.itemReloadAt, api.state.itemReloadAt = now() + 8, now() + 8
                 token.called = true
             end
-            local ok, why = pcall(method, api.Players.LocalPlayer, position,
+            local ok = pcall(method, api.Players.LocalPlayer, position,
                 token.purpose == 'remembered-item' and 0.75 or 3)
             token.done, token.ok = true, ok
             if api.state.itemReloadFlight == token then api.state.itemReloadFlight = nil end
-            if ctx.active and ctx.streamRequest == token and not ok then
-                ctx.streamError = tostring(why)
-            end
         end)
     end
     function M.prefetchAt(ctx, position) streamAhead(ctx, position) end
@@ -8731,7 +8731,6 @@ end)()
     function F.extractionReady()
         return s.questChurchExit ~= nil or F.extractionEnabled() and s.lootStarted ~= nil and now() - s.lootStarted >= cfg.minutes * 60
     end
-    function F.smartLootEnabled() return cfg.lootExtract end
     local buildGui = (function()
 return function(api)
     local s, cfg = api.state, api.state.config
@@ -10202,8 +10201,6 @@ end)()
     function F.questKeepsRun() return cfg.classQuest and not s.questStalled and not s.questIdle and s.questPlan
         and quest.activePlan(s.questPlan) end
     function F.questPreventsExit() return s.questChurchExit ~= nil or cfg.classQuest end
-    function F.bringStep(ctx, allowNew) return bring.step(ctx, allowNew) end
-    function F.rememberItem(ctx, item) bring.observe(ctx, item) end
     local function upgradeGear(ctx)
         if not cfg.lootExtract then return false end
         F.smartLootPending(ctx)
@@ -12098,7 +12095,7 @@ end
                     scan={list={},queue={workspace},cursor=1,seen=setmetatable({[workspace]=true}, {__mode='k'}),published=0};ctx.worldScan=scan
                 end
                 local ok, complete = pcall(function()
-                    local visited,started=0,now()
+                    local visited,steps,nextYield,started=0,0,100,now()
                     while scan.children or scan.cursor<=#scan.queue do
                         if not scan.children then
                             local parent=scan.queue[scan.cursor];scan.cursor=scan.cursor+1
@@ -12106,19 +12103,25 @@ end
                         else
                             local child=scan.children[scan.childCursor]
                             if child then
+                                visited=visited+1
                                 scan.childCursor=scan.childCursor+1
                                 if live(child) and not scan.seen[child]then
                                     scan.seen[child]=true;scan.list[#scan.list+1]=child;scan.queue[#scan.queue+1]=child
                                 end
                             else scan.children=nil end
                         end
-                        visited=visited+1
-                        if visited%100==0 then
+                        steps=steps+1
+                        -- Yield per inspected child, as the earlier loot reader
+                        -- did. Queue entry/exit bookkeeping is not another item.
+                        if visited>=nextYield then
+                            nextYield=visited+100
                             ctx.worldReadPulse=now();ctx.check();task.wait(0.03)
                             -- Publish a partial snapshot and resume this same queue
                             -- next time. Large maps cannot monopolize a quest pulse
                             -- or lose all scan progress to the worker watchdog.
                             if visited>=1000 or now()-started>=.75 then return false end
+                        elseif steps%100==0 and now()-started>=.75 then
+                            ctx.worldReadPulse=now();ctx.check();return false
                         end
                     end
                     return true
@@ -12714,7 +12717,6 @@ end
             restoreZoneOrigin()
             restoreZoneTouches()
             -- Do not assume membership changed until ExitedZone/controller state confirms it.
-            s.zoneExitAt = now()
             waitTransition("exit-zone", zone, 12)
         end)
     end
@@ -12911,7 +12913,6 @@ end
     end
     local function tick()
         loadFresh()
-        s.heartbeat = now()
         local player, model, humanoid, root = character()
         if not game:IsLoaded() or not player or not child(player, "PlayerGui") then
             status("Waiting for game, LocalPlayer, and PlayerGui"); return
