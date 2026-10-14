@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 42: preserve observed outdoor returns across streaming; reports require a private opt-in setting.
+-- Revision 43: select the real owned tool over stale equipped representations; preserve native equip receipts.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 42
-    local BUILD = "r42-private-reports-streamed-return"
+    local REVISION = 43
+    local BUILD = "r43-native-equipment-proxy-selection"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -4207,6 +4207,7 @@ end)()
         local matching=active and active.Tool and (active.Tool==pickaxe or api.id(active.Tool)==name
             or active.Tool.Name==name or active.Tool.Name==name..tostring(api.Players.LocalPlayer.UserId))
         if owned and active and not active._Destroyed and active.Tool and active.Tool.Parent==ctx.character
+            and (controller.ServerEquipId==nil or active.Tool:GetAttribute('ServerToolEquipId')==controller.ServerEquipId)
             and pickClass and matching and type(active.Swing)=='function'then
             if waits then waits[pickaxe]=nil end
             return active,nil,false
@@ -7205,30 +7206,52 @@ end)()
         local active=controller and controller.ActiveTool
         local display=active and active.DisplayTool
         local backpack=api.Players.LocalPlayer:FindFirstChild('Backpack')
+        local function wanted(tool)
+            local name=api.id(tool);local class=api.attr(tool,'Class')
+            return required and (name==required or tool.Name==required..tostring(api.Players.LocalPlayer.UserId))
+                or not required and (class==requiredClass or requiredClass=='Gun'
+                    and (class=='Revolver' or class=='Rifle' or class=='Shotgun'))
+        end
         if active and not active._Destroyed and active.Tool and active.Tool.Parent==ctx.character
-            and display and (display.Parent==ctx.character or display.Parent==backpack)then
-            local name=api.id(display);local class=api.attr(display,'Class')
-            local matching=api.id(active.Tool)==name or active.Tool.Name==name
-                or active.Tool.Name==name..tostring(api.Players.LocalPlayer.UserId)
-            if matching and (required and name==required or not required and (class==requiredClass
-                or requiredClass=='Gun' and (class=='Revolver' or class=='Rifle' or class=='Shotgun')))then
-                -- The native equipped model can omit definition stats. Return
-                -- its owned display Tool, which identifies the same active handler.
-                return display,true
+            and (controller.ServerEquipId==nil or active.Tool:GetAttribute('ServerToolEquipId')==controller.ServerEquipId)then
+            local function matches(tool)
+                local name=api.id(tool)
+                return active.Tool==tool or api.id(active.Tool)==name or active.Tool.Name==name
+                    or active.Tool.Name==name..tostring(api.Players.LocalPlayer.UserId)
             end
+            if display and display:IsA('Tool') and (display.Parent==ctx.character or display.Parent==backpack)
+                and wanted(display) and matches(display)then return display,true end
+            -- Sword/Pickaxe do not populate DisplayTool. Resolve their real
+            -- inventory Tool before returning the already active native model.
+            for _,container in ipairs({backpack,ctx.character})do
+                if container then for _,tool in ipairs(container:GetChildren())do
+                    if tool.Parent==container and tool:IsA('Tool') and wanted(tool) and matches(tool)then return tool,true end
+                end end
+            end
+            if wanted(active.Tool)then return active.Tool,true end
         end
         -- Changing tools cancels native drag ownership. An unresolved request
         -- permits only the already active compatible handler above.
         if calls.drag then return nil,true end
-        for _,container in ipairs({ctx.character,api.Players.LocalPlayer:FindFirstChild('Backpack')}) do
+        for _,container in ipairs({backpack,ctx.character}) do
             if container then for _,tool in ipairs(container:GetChildren()) do
-                if tool.Parent==container and required and (api.id(tool)==required or tool.Name==required..tostring(api.Players.LocalPlayer.UserId)) then return tool,true end
+                if tool.Parent==container and tool:IsA('Tool') and required and wanted(tool) then return tool,true end
             end end
+        end
+        -- A model can await its native handler, but cannot be an inventory
+        -- EquipTool argument. Exclude only a proven old server representation.
+        if required then
+            for _,tool in ipairs(ctx.character:GetChildren())do
+                if tool.Parent==ctx.character and tool:IsA('Model') and api.attr(tool,'Tool')==true and wanted(tool)
+                    and (not api.canSelectEquipment or api.canSelectEquipment(ctx,tool))then return tool,true end
+            end
         end
         if required then return nil,true end
         if requiredClass=='Sword' then
-            for _,container in ipairs({ctx.character,api.Players.LocalPlayer:FindFirstChild('Backpack')}) do
-                if container then for _,tool in ipairs(container:GetChildren()) do if api.id(tool)=='Sword_Void' then return tool,true end end end
+            for _,container in ipairs({backpack,ctx.character}) do
+                if container then for _,tool in ipairs(container:GetChildren()) do
+                    if api.id(tool)=='Sword_Void' and (not api.canSelectEquipment or api.canSelectEquipment(ctx,tool))then return tool,true end
+                end end
             end
         end
         if requiredClass=='Gun' then
@@ -8991,6 +9014,15 @@ end)()
         return tool and tool.Parent and (tool.Parent==ctx.character or tool.Parent==backpack)
             and (tool:IsA('Tool') or tool:IsA('Model') and attr(tool,'Tool')==true)
     end
+    function F.canSelectEquipment(ctx,tool)
+        if not ownedTool(ctx,tool)then return false end
+        if tool:IsA('Tool')then return true end
+        local native=controller('ToolController')
+        local equipId=tool:GetAttribute('ServerToolEquipId')
+        -- Missing IDs remain uncertain. Only two explicit unequal native IDs
+        -- prove that a leftover character representation is no longer selected.
+        return not(native and native.ServerEquipId~=nil and equipId~=nil and equipId~=native.ServerEquipId)
+    end
     local function tools(ctx)
         local list, seen, instances = {}, {}, {}
         for _, container in ipairs({ ctx.character, api.Players.LocalPlayer:FindFirstChild('Backpack') }) do
@@ -9077,7 +9109,7 @@ end)()
             local candidate = attr(tool, 'Class')
             if name == 'Champions_Hammer' then candidate = 'Pickaxe' end
             if name == 'Sword_Executioner' then candidate = 'Sword' end
-            if ownedTool(ctx,tool) and (candidate == class or class == 'ItemBag' and (name == 'Large_Sack' or name == 'ItemBag')) then
+            if F.canSelectEquipment(ctx,tool) and (candidate == class or class == 'ItemBag' and (name == 'Large_Sack' or name == 'ItemBag')) then
                 local value = class == 'ItemBag' and (tonumber(attr(tool, 'MaxSize')) or (name == 'Large_Sack' and 20 or 10))
                     or weaponValue(tool)
                 local tier = rarityRank(tool)
@@ -9092,7 +9124,8 @@ end)()
     local function activeFor(ctx, tool)
         local c = controller('ToolController')
         local active = c and c.ActiveTool
-        if active and not active._Destroyed and active.Tool and active.Tool.Parent == ctx.character then
+        if active and not active._Destroyed and active.Tool and active.Tool.Parent == ctx.character
+            and (c.ServerEquipId==nil or active.Tool:GetAttribute('ServerToolEquipId')==c.ServerEquipId)then
             local name = id(tool)
             if active.Tool == tool or active.Tool.Name == name
                 or active.Tool.Name == name .. tostring(api.Players.LocalPlayer.UserId) then return active end
@@ -9124,6 +9157,9 @@ end)()
         if record.attempted or now()-record.started<10 then return true end
         local own=s.equipRecords[tool];local calls=quest and quest.calls or {}
         local scene=controller('CutSceneController');local native=c.ActiveTool
+        local nativeId=native and native.Tool and native.Tool:GetAttribute('ServerToolEquipId')
+        local otherCurrent=native and not native._Destroyed and native.Tool and native.Tool.Parent==ctx.character
+            and (nativeId==nil or nativeId==c.ServerEquipId)
         if not ctx.active or not api.owned() or ctx.character~=api.Players.LocalPlayer.Character or ctx.humanoid.Health<=0
             or tool.Parent~=ctx.character and tool.Parent~=api.Players.LocalPlayer:FindFirstChild('Backpack')
             or own and (own.pending or own.uncertain) or s.equipmentRequest or s.lootRequest or s.bringDelivery
@@ -9134,7 +9170,7 @@ end)()
             or s.request or s.awaiting or s.teleporting or s.departureAt or ctx.currentChest or ctx.featureHold or ctx.defenseMoving
             or now()<(ctx.dodgeUntil or 0) or ctx.questPlacement or ctx.questPreviewCancel or ctx.questPotionUsing
             or ctx.questHealAttempt or s.questMedicalDrop or ctx.swingEdit
-            or native and not native._Destroyed and native.Tool and native.Tool.Parent==ctx.character then return true end
+            or otherCurrent then return true end
         -- Set before native dispatch; a failed constructor or our own version
         -- increment cannot create a reconstruction loop or a server mutation.
         record.attempted=true
@@ -9145,6 +9181,7 @@ end)()
     local function equip(ctx, tool)
         if ctx.bringEquipmentLock then return nil end
         if not tool or not tool.Parent then return nil end
+        if not F.canSelectEquipment(ctx,tool)then return nil end
         local class=attr(tool,'Class')
         if cfg.classQuest and quest and not ctx.questMining and not ctx.questHealing
             and (class=='Sword' or class=='Pickaxe' or class=='Champions_Hammer' or GUNS[class]) then
@@ -9169,17 +9206,26 @@ end)()
             and now() >= (record.retryAt or 0) then
             local c = controller('ToolController')
             local other = c and c.ActiveTool
+            local serverId=c and c.ServerEquipId
+            local current=other and not other._Destroyed and other.Tool and other.Tool.Parent==ctx.character
+                and (serverId==nil or other.Tool:GetAttribute('ServerToolEquipId')==serverId)
+            local changed=serverId~=nil and record.previousServerEquipId~=nil and serverId~=record.previousServerEquipId
             local represented = false
             for _, piece in ipairs(children(ctx.character)) do
-                if id(piece) == id(tool) or piece.Name == id(tool) .. tostring(api.Players.LocalPlayer.UserId) then represented = true end
+                if id(piece) == id(tool) or piece.Name == id(tool) .. tostring(api.Players.LocalPlayer.UserId) then
+                    local equipId=piece:GetAttribute('ServerToolEquipId')
+                    -- Only a different confirmed native server equip outcome
+                    -- can prove this older character model is no longer current.
+                    if not(current and changed and equipId~=nil and equipId~=serverId)then represented=true end
+                end
             end
-            if not represented and other and not other._Destroyed and other.Tool
-                and other.Tool.Parent == ctx.character and other~=record.previousActive then record.accepted = nil end
+            if not represented and current and other~=record.previousActive and (serverId==nil or changed)then record.accepted = nil end
         end
         if record and (record.pending or record.uncertain or record.accepted or now() < (record.retryAt or 0)) then return nil end
         record = record or {}; s.equipRecords[tool] = record
         local nativeController=controller('ToolController')
         record.previousActive=nativeController and nativeController.ActiveTool
+        record.previousServerEquipId=nativeController and nativeController.ServerEquipId
         record.pending = true; record.notDispatched = nil; record.rejected = nil
         local issued = api.request('equip-weapon', 'ToolService', 'EquipTool', api.pack(tool), function(result)
             record.pending = nil
@@ -9678,7 +9724,7 @@ end)()
             local module=shared and shared:FindFirstChild(name)
             if module then local ok,value=pcall(require,module);if ok then s.questNativeModules[name]=value;return value end end
         end,
-        findTool=findTool, hasRoom=hasRoom, ownedTools=tools, enemies=F.enemies, enemyAlive=F.enemyAlive, questTargetAllowed=F.questTargetAllowed,
+        findTool=findTool, canSelectEquipment=F.canSelectEquipment, hasRoom=hasRoom, ownedTools=tools, enemies=F.enemies, enemyAlive=F.enemyAlive, questTargetAllowed=F.questTargetAllowed,
         swordTargetAllowed=F.swordTargetAllowed, weaponClass=function(ctx,target)return F.weaponClass(ctx,target)end,
         attack=function(ctx,active)return F.swing(ctx,active)end,
         isFuelLeech=F.isFuelLeech, persist=persist, hover=movement.hover,
@@ -11259,6 +11305,7 @@ end
         end
         local function weapon(tool)
             if not tool:IsA("Tool") and not (tool:IsA("Model") and attribute(tool, "Tool") == true) then return nil end
+            if features and features.canSelectEquipment and not features.canSelectEquipment(ctx,tool)then return nil end
             local id
             if s.itemDatabase and type(s.itemDatabase.GetId) == "function" then
                 local ok, value = pcall(s.itemDatabase.GetId, tool)
@@ -11384,10 +11431,12 @@ end
             local c = controller("ToolController")
             if not c then notice("Waiting for the native ToolController"); return end
             local active = c.ActiveTool
-            local ready = active and not active._Destroyed and active.Tool and active.Tool.Parent == model
+            local currentActive=active and not active._Destroyed and active.Tool and active.Tool.Parent==model
+                and (c.ServerEquipId==nil or active.Tool:GetAttribute('ServerToolEquipId')==c.ServerEquipId)
+            local ready = currentActive
                 and (active.Tool == selected.tool or (active.DisplayTool == selected.tool))
             -- The native equipped representation can be a separate model named item+UserId.
-            if not ready and active and not active._Destroyed and active.Tool and active.Tool.Parent == model then
+            if not ready and currentActive then
                 ready = active.Tool.Name == selected.id or active.Tool.Name == selected.id .. tostring(player.UserId)
             end
             if not ready then
