@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 39: native armor and attached-worm defense, bounded mine return/sales and wall-aware driving.
+-- Revision 40: early low-health retreat, active medical shop search and scoped stale-mine recovery.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 39
-    local BUILD = "r39-combat-mine-driving"
+    local REVISION = 40
+    local BUILD = "r40-healing-search-retreat"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -700,11 +700,19 @@ end
         s.pendingChestProgress = nil
     end
     local function updateMetrics(player)
+        if s.farm and s.farm.pruneConnections then s.farm.pruneConnections()end
         for _, record in pairs(s.chests) do
             if record.attempted and record.model and not record.model.Parent and not record.removalRecorded then
                 record.removalRecorded, record.retired = true, true
                 s.stats.lootObserved, s.lastLootAt = s.stats.lootObserved + 1, now()
                 print('[ChestFarm] Observed chest removal: ' .. record.model.Name)
+            end
+            local current=s.farm and s.farm.currentChest
+            if record.model and not record.model:IsDescendantOf(workspace)
+                and not(current and current.model==record.model)then
+                -- Keep retry/removal accounting, without retaining an unloaded
+                -- model, all its descendants and a dead prompt through the run.
+                record.model,record.prompt,record.entry=nil,nil,nil
             end
         end
         local earned = tonumber(player:GetAttribute("CoresEarned"))
@@ -1867,6 +1875,30 @@ end)()
 return function(api,Q)
     local H,s,cfg,now={},api.state,api.state.config,api.now
     local known={Advanced_Medkit=.6,Basic_Medkit=.3,Bandages=.1,Golden_Medkit=1}
+    local function finite(value)return type(value)=='number' and value==value and math.abs(value)<math.huge end
+    local function scope(ctx)
+        local inside=Q.drillSupport.inDungeon(ctx)
+        local room=inside and (Q.drillSupport.activeMine(ctx) or Q.special and Q.special.bound(ctx)) or nil
+        return inside,room,room and room:GetAttribute('SessionDungeonId'),workspace:GetAttribute('InfiniteDepthOffsetMeters')
+    end
+    function H.itemAccessible(ctx,item)
+        if not item or not item.Parent or not item:IsDescendantOf(workspace)then return false end
+        local inside,room,session=scope(ctx)
+        if inside then
+            if not room then return false end
+            if Q.drillSupport.activeMine(ctx)then return Q.drillSupport.accessible(item) end
+            return item:IsDescendantOf(room) or session~=nil and item:GetAttribute('SessionDungeonId')==session
+        end
+        if Q.drillSupport.mineshaft(item) or item:GetAttribute('SessionDungeonId')~=nil
+            or item:GetAttribute('DungeonWaveNpc')==true then return false end
+        local ancestor=item
+        while ancestor and ancestor~=workspace do
+            if ancestor.Name=='Goblin_Ring' or ancestor.Name=='GoblinRing' or ancestor.Name=='VampireMansion'
+                or api.tag(ancestor,'VampireMansion')then return false end
+            ancestor=ancestor.Parent
+        end
+        return true
+    end
     function H.isMedical(item)
         if not item or Q.protectedRelic(item) or api.attr(item,'Category')=='Explosive'
             or (tonumber(api.attr(item,'Damage')) or 0)>0 then return false end
@@ -1885,7 +1917,7 @@ return function(api,Q)
         local ids,seen={},{}
         for _,item in ipairs(Q.looseItems())do
             local id=api.id(item)
-            if H.isMedical(item) and not seen[id]then ids[#ids+1]={id=id,score=score(ctx,item)};seen[id]=true end
+            if H.isMedical(item) and H.itemAccessible(ctx,item) and not seen[id]then ids[#ids+1]={id=id,score=score(ctx,item)};seen[id]=true end
         end
         table.sort(ids,function(a,b)return a.score>b.score or a.score==b.score and a.id<b.id end)
         local out={};for _,entry in ipairs(ids)do out[#out+1]=entry.id end;return out
@@ -1945,16 +1977,120 @@ return function(api,Q)
         if not issued then s.questMedicalDrop=nil end
         s.questStatus='Medical room: dropping '..api.id(tool)..'; awaiting a real free slot';return false
     end
+    function H.observe(ctx)
+        local attempt=ctx.questHealAttempt
+        if not attempt then return false end
+        local sameLife=(attempt.character or ctx.character)==ctx.character and ctx.character==api.Players.LocalPlayer.Character
+            and (not attempt.humanoid or attempt.humanoid==ctx.humanoid) and ctx.humanoid.Health>0
+        if not sameLife then ctx.questHealAttempt=nil;ctx.questHealTried=nil;return true end
+        if ctx.humanoid.Health>attempt.health or not attempt.tool.Parent or api.stackCount(attempt.tool)<attempt.count then
+            ctx.questHealAttempt=nil
+        elseif now()-attempt.started>=3 then
+            ctx.questHealTried=ctx.questHealTried or setmetatable({}, {__mode='k'});ctx.questHealTried[attempt.tool]=true
+            ctx.questHealAttempt=nil;s.questStatus='Medical use unconfirmed; no repeated consume for that item'
+        end
+        return true
+    end
     function H.cleanup(ctx)
         local job=s.questDelivery
         if job and job.healingSupply and not job.buySent then Q.release(job)end
-        ctx.questHealing,ctx.questHealAttempt,ctx.questHealPoint=nil,nil,nil
+        H.observe(ctx)
+        local attempt=ctx.questHealAttempt
+        if attempt and not cfg.classQuest then
+            -- Explicit OFF may retire local observation, but never authorizes
+            -- this same living tool's uncertain Consume to be repeated on ON.
+            ctx.questHealTried=ctx.questHealTried or setmetatable({}, {__mode='k'});ctx.questHealTried[attempt.tool]=true
+            ctx.questHealAttempt=nil;attempt=nil
+        end
+        local sameLife=ctx.character==api.Players.LocalPlayer.Character and ctx.humanoid.Health>0
+        local temporary=cfg.classQuest and sameLife and not Q.enabled(ctx)
+        local keep=cfg.classQuest and sameLife and (attempt~=nil or temporary and ctx.questHealing==true)
+            and ctx.humanoid.MaxHealth>0 and ctx.humanoid.Health/ctx.humanoid.MaxHealth<.7
+        ctx.questHealing=keep and true or nil
+        local search=ctx.questMedicalSearch
+        if api.clearMedicalSearch and (search or not keep)then api.clearMedicalSearch(ctx,search)end
+        ctx.questMedicalSearch,ctx.questMedicalSearchRetryAt,ctx.questMedicalLowWalletAt,ctx.questHealReadiness=nil,nil,nil,nil
+        ctx.questHealPoint=nil
+    end
+    local function searchWallet(ctx)
+        if Q.calls.healingWallet or Q.calls.wallet or Q.calls.upgradeWallet or now()<(ctx.questHealWalletAt or 0)then return end
+        if finite(s.questWallet) and now()-(s.questWalletAt or -math.huge)<3 then return end
+        ctx.questHealWalletAt=now()+3
+        local character,drill=ctx.character,ctx.drill
+        local readVersion=s.questWalletVersion or 0
+        Q.call('healingWallet','CurrencyService','GetCurrency',{},function(ok,value)
+            if ok and ctx.character==character and ctx.drill==drill and api.Players.LocalPlayer.Character==character
+                and cfg.classQuest and ctx.questHealing and ctx.humanoid.Health>0 and not Q.manual()then Q.observeCoins(value,readVersion)end
+        end,function()return Q.enabled(ctx) and ctx.questHealing and ctx.character==character and ctx.drill==drill
+            and api.Players.LocalPlayer.Character==character and not Q.manual() and not api.extractionReady()end)
+    end
+    function H.search(ctx)
+        if not api.medicalSearch or Q.manual() or api.extractionReady() or s.questDelivery or s.bringDelivery
+            or s.lootRequest or ctx.bringEquipmentLock or ctx.questHealAttempt or s.questMedicalDrop
+            or ctx.questMineEntry or ctx.nativeGateMotion or ctx.humanoid.SeatPart or ctx.humanoid.Sit then return false end
+        searchWallet(ctx)
+        local inside,room,session,band=scope(ctx)
+        local job=ctx.questMedicalSearch
+        if job and (job.character~=ctx.character or job.drill~=ctx.drill or job.inside~=inside or job.room~=room
+            or job.session~=session or job.band~=band)then
+            if api.clearMedicalSearch then api.clearMedicalSearch(ctx,job)end
+            ctx.questMedicalSearch=nil;ctx.questMedicalSearchRetryAt=nil;ctx.questMedicalLowWalletAt=nil;job=nil
+        end
+        -- Native Bandages Cost=10 is only a scheduling hint. Scarce coins
+        -- give funding the first five seconds, then still allow discovery of
+        -- genuinely discounted stock or free medicine. Quotes decide spending.
+        if finite(s.questWallet) and s.questWallet<10 and not job then
+            ctx.questMedicalLowWalletAt=ctx.questMedicalLowWalletAt or now()+5
+            if now()<ctx.questMedicalLowWalletAt then return false,'scarce Coins; funding before the next bounded medical search' end
+        end
+        if job and now()-job.started>=15 then
+            if api.clearMedicalSearch then api.clearMedicalSearch(ctx,job)end
+            ctx.questMedicalSearch=nil;ctx.questMedicalSearchRetryAt=now()+5;ctx.questMedicalLowWalletAt=now()+5
+            return false,'bounded medical shop search exhausted'
+        end
+        if now()<(ctx.questMedicalSearchRetryAt or 0)then return false,'medical shop search retry cooling down' end
+        if not job then
+            job={character=ctx.character,drill=ctx.drill,inside=inside,room=room,session=session,band=band,started=now()}
+            ctx.questMedicalSearch=job
+        end
+        local busy,reason,progressed=api.medicalSearch(ctx,job)
+        if progressed then job.progressAt=now()end -- Does not reset the burst deadline.
+        if busy then s.questStatus='Quest healing: '..tostring(reason or 'actively searching loaded native shops for medical supplies');return true end
+        return false,reason
+    end
+    local function usableHandler(ctx,tool,active)
+        local c=api.controller('ToolController')
+        local name=api.id(tool)
+        if not c or c.ActiveTool~=active or not active or active._Destroyed or not active.Tool
+            or active.Tool.Parent~=ctx.character or not (active.Tool==tool or active.Tool.Name==name
+                or active.Tool.Name==name..tostring(api.Players.LocalPlayer.UserId))
+            or type(active.Consume)~='function' or now()<(tonumber(active.NextMedicalUseAt) or 0)then return false end
+        local ok,ready=pcall(api.readyAction,active)
+        if not ok or not ready then return false end
+        local seen,visible=pcall(api.watcherReady,ctx)
+        return seen and visible==true
+    end
+    local function readiness(ctx,tool)
+        local ledger=ctx.questHealReadiness or setmetatable({}, {__mode='k'});ctx.questHealReadiness=ledger
+        local wait=ledger[tool]
+        if wait and wait.character~=ctx.character then ledger[tool]=nil;wait=nil end
+        return ledger,wait
     end
     function H.step(ctx,plan)
         local h=ctx.humanoid;local maximum=tonumber(h.MaxHealth)
         if not cfg.classQuest or not maximum or maximum<=0 or h.Health<=0 then H.cleanup(ctx);return false end
         local ratio=h.Health/maximum
         H.settleRoom()
+        if Q.prepareHealing then
+            local wasHealing=ctx.questHealing
+            local needs,blocked,reason=Q.prepareHealing(ctx)
+            if not needs then
+                H.cleanup(ctx)
+                if wasHealing and h.Health/maximum>=.7 then ctx.questOwns=nil;s.questStatus='Quest healing complete; resuming at 70% HP' end
+                return false
+            end
+            if blocked then s.questStatus=reason or 'Quest healing: waiting for native safety handoff';return true end
+        end
         if not ctx.questHealing and ratio>.3 then return false end
         if ratio>=.7 then
             H.cleanup(ctx);ctx.questOwns=nil;s.questStatus='Quest healing complete; resuming at 70% HP';return false
@@ -1967,16 +2103,16 @@ return function(api,Q)
         ctx.questCombat=nil -- Waiting for healing is not quest counter progress.
         Q.stopDrive(ctx)
         if h.SeatPart or h.Sit then local _,holding=Q.unseat(ctx);api.watch(ctx);return holding end
-        local job=s.questDelivery
-        if job then
-            if job.healingFunding or job.kind=='supply' and H.isMedical(job.item) then Q.deliveryStep(ctx,plan)
-            else Q.release(job)end
-        end
         if not Q.holdRoute(ctx)then return true end
         api.watch(ctx)
         if not h.SeatPart and now()>=(ctx.questHealRetreatAt or 0)
             and (not api.healingPointSafe or not api.healingPointSafe(ctx,ctx.root.Position)) then
             ctx.questHealRetreatAt=now()+3;api.retreat(ctx);api.watch(ctx)
+        end
+        local job=s.questDelivery
+        if job then
+            if job.healingFunding or job.kind=='supply' and H.isMedical(job.item) then Q.deliveryStep(ctx,plan)
+            else Q.release(job)end
         end
         if Q.cashStep(ctx)then return true end
         local reserved=s.questDelivery
@@ -1984,36 +2120,35 @@ return function(api,Q)
         if Q.manual() or reserved and not detached or s.bringDelivery or s.lootRequest or ctx.bringEquipmentLock then
             s.questStatus='Quest healing: waiting for owned item action to release';return true
         end
-        local attempt=ctx.questHealAttempt
-        if attempt then
-            if h.Health>attempt.health or not attempt.tool.Parent or api.stackCount(attempt.tool)<attempt.count then
-                ctx.questHealAttempt=nil
-            elseif now()-attempt.started>=3 then
-                ctx.questHealTried=ctx.questHealTried or setmetatable({}, {__mode='k'});ctx.questHealTried[attempt.tool]=true
-                ctx.questHealAttempt=nil
-                s.questStatus='Medical use unconfirmed; no repeated consume for that item'
-            end
-            return true
-        end
+        if H.observe(ctx)then return true end
         local tool,best
         for _,found in ipairs(api.ownedTools(ctx))do
             if H.isMedical(found) and not (ctx.questHealTried or {})[found]then
-                local value=score(ctx,found)
-                if not best or value>best then tool,best=found,value end
+                local _,wait=readiness(ctx,found)
+                local c=api.controller('ToolController');local active=c and c.ActiveTool
+                local ready=usableHandler(ctx,found,active)
+                if ready or not wait or now()>=(wait.retryAt or 0)then
+                    local value=score(ctx,found)
+                    if not best or value>best then tool,best=found,value end
+                end
             end
         end
         if tool then
+            local ledger,wait=readiness(ctx,tool)
+            if not wait or wait.retryAt then wait={started=now(),character=ctx.character};ledger[tool]=wait end
             local active=api.equip(ctx,tool)
-            if active and type(active.Consume)=='function' and now()>=(tonumber(active.NextMedicalUseAt) or 0)
-                and api.readyAction(active) and api.watcherReady(ctx)then
-                local attempt={tool=tool,health=h.Health,count=api.stackCount(tool),started=now()}
+            if usableHandler(ctx,tool,active)then
+                local attempt={tool=tool,health=h.Health,count=api.stackCount(tool),started=now(),character=ctx.character,humanoid=h}
                 local sent,reason=api.consume(ctx,active)
                 if sent then
+                    ledger[tool]=nil
                     ctx.questHealAttempt=attempt
                     s.questStatus='Quest healing: using '..api.id(tool)..'; awaiting actual HP recovery'
                 else s.questStatus='Quest healing: '..tostring(reason or 'native Consume dispatch unavailable')end
             else s.questStatus='Quest healing: waiting for native medical handler / Watcher attention'end
-            return true
+            if ctx.questHealAttempt or now()-wait.started<8 then return true end
+            wait.retryAt=now()+5
+            s.questStatus='Medical handler readiness unconfirmed after 8s; seeking other real supplies without repeating Consume'
         end
         if detached then
             if Q.chestTurn(ctx,plan)then return true end
@@ -2030,6 +2165,9 @@ return function(api,Q)
                 or Q.calls.upgrade and 'upgrade purchase request still pending'
                 or Q.calls.upgradeWallet and 'currency read still pending' or problem
         end
+        local searching,searchReason=H.search(ctx)
+        if searching then return true end
+        problem=searchReason or problem
         if Q.collectMoney(ctx)then
             s.questStatus='Quest healing: collecting available Coins for medical supplies';return true
         end
@@ -2717,11 +2855,33 @@ end)()
             and returned.band==workspace:GetAttribute('InfiniteDepthOffsetMeters') and returned.mine and returned.mine.Parent
             and returned.session==returned.mine:GetAttribute('SessionDungeonId') and returned or nil
     end
+    local function outsideMineState(ctx)
+        local lease=ctx and ctx.questOutsideMine
+        if not lease then return end
+        local player=api.Players.LocalPlayer;local controller=api.controller('DungeonUIController')
+        local valid=lease.character==ctx.character and ctx.character==player.Character and ctx.humanoid.Health>0
+            and lease.drill==ctx.drill and ctx.drill==workspace:FindFirstChild('Drill') and ctx.drill.Parent
+            and lease.band==workspace:GetAttribute('InfiniteDepthOffsetMeters') and lease.mine.Parent
+            and lease.mine:IsDescendantOf(workspace) and controller and controller._BoundDungeon==lease.mine
+            and lease.session==lease.mine:GetAttribute('SessionDungeonId')
+            and lease.bounds==lease.mine:FindFirstChild('MineshaftBounds',true)
+            and player:GetAttribute('InDungeon')==true and player:GetAttribute('ActiveDungeonQueueId')==nil
+            and player:GetAttribute('DungeonRunLocked')~=true
+        local inside=valid and D.contains(lease.mine,ctx.root.Position,0)
+        if not valid or inside~=false then
+            ctx.questOutsideMine=nil;ctx.questOutsideMineAt=nil;ctx.questOutsideMineCandidate=nil
+            if ctx.questMineTransition and ctx.questMineTransition.mode=='Outside'
+                and ctx.questMineTransition.mine==lease.mine then ctx.questMineTransition=nil end
+            return
+        end
+        return lease
+    end
     function D.returnSuspended(ctx,item)
         ctx=ctx or s.farm
         local returned=returnState(ctx);local c=api.controller('DungeonUIController')
         if not returned or not returned.suspended or returned.nativeCleared or not c or c._BoundDungeon~=returned.mine
-            or api.Players.LocalPlayer:GetAttribute('InDungeon')~=true then return end
+            or api.Players.LocalPlayer:GetAttribute('InDungeon')~=true then returned=outsideMineState(ctx)end
+        if not returned then return end
         if not item then return returned end
         if item==returned.mine or item:IsDescendantOf(returned.mine) or D.mineshaft(item)==returned.mine then return returned end
         local session=item:GetAttribute('SessionDungeonId')
@@ -2732,15 +2892,18 @@ end)()
         if D.returnSuspended(ctx)then return false end
         local transition=ctx and ctx.questMineTransition
         local c=api.controller('DungeonUIController')
-        if transition and (transition.mode=='Exit' or transition.mode=='Outside') and (not c or not c._BoundDungeon or c._BoundDungeon==transition.mine)then return false end
+        if transition and transition.mode=='Exit' and (not c or not c._BoundDungeon or c._BoundDungeon==transition.mine)then return false end
         return api.Players.LocalPlayer:GetAttribute('InDungeon')==true
     end
     function D.contains(mine,point,padding)
         local bounds=mine and mine:FindFirstChild('MineshaftBounds',true)
-        if not bounds or not bounds:IsA('BasePart')then return nil end
+        if not bounds or not bounds.Parent or not bounds:IsA('BasePart') or not bounds:IsDescendantOf(mine)then return nil end
         local ok,inside=pcall(function()
             local localPoint=bounds.CFrame:PointToObjectSpace(point);local half=bounds.Size*.5
             local extra=padding or 0
+            if not finite(localPoint.X) or not finite(localPoint.Y) or not finite(localPoint.Z)
+                or not finite(half.X) or not finite(half.Y) or not finite(half.Z)
+                or half.X<=0 or half.Y<=0 or half.Z<=0 or not finite(extra)then return nil end
             return math.abs(localPoint.X)<=half.X+extra and math.abs(localPoint.Y)<=half.Y+extra and math.abs(localPoint.Z)<=half.Z+extra
         end)
         if ok then return inside end
@@ -2757,6 +2920,7 @@ end)()
         local bound=c and c._BoundDungeon
         local function exited(mine)
             ctx.questMineTransition={mode='Exit',mine=mine}
+            ctx.questOutsideMine=nil;ctx.questOutsideMineCandidate=nil;ctx.questOutsideMineAt=nil
             D.stopGate(ctx)
             D.stopMine(ctx);ctx.questMineEntry=nil;ctx.questMineReadyAt=nil;ctx.questFundingMine=nil
             ctx.questOwns=nil;ctx.questThreat=nil;ctx.questCombat=nil;ctx.questExitCombat=nil;ctx.combatTarget=nil
@@ -2770,17 +2934,43 @@ end)()
         end
         ctx.questLastBoundMine=bound and D.mineshaft(bound) or nil
         local player=api.Players.LocalPlayer
-        local inside=bound and D.contains(bound,ctx.root.Position,16)
-        if ctx.questMineTransition and ctx.questMineTransition.mode=='Outside' and inside==true then ctx.questMineTransition=nil end
-        if inside==false and (not ctx.questMineEntry or ctx.questMineEntry.direct) and player:GetAttribute('ActiveDungeonQueueId')==nil
+        local outside=outsideMineState(ctx)
+        local inside=bound and D.mineshaft(bound)==bound and D.contains(bound,ctx.root.Position,0)
+        if not outside and inside==false and player:GetAttribute('InDungeon')==true
+            and ctx.character==player.Character and ctx.humanoid.Health>0 and ctx.drill==workspace:FindFirstChild('Drill') and ctx.drill.Parent
+            and (not ctx.questMineEntry or ctx.questMineEntry.direct) and player:GetAttribute('ActiveDungeonQueueId')==nil
             and player:GetAttribute('DungeonRunLocked')~=true and not player.GameplayPaused
             and not workspace:GetAttribute('InfiniteRebasing') and not workspace:GetAttribute('InCutScene')then
-            ctx.questOutsideMineAt=ctx.questOutsideMineAt or now()
-            if now()-ctx.questOutsideMineAt>=2 and not(ctx.questMineTransition and ctx.questMineTransition.mode=='Exit')then
-                exited(bound);ctx.questMineTransition.mode='Outside'
+            local bounds=bound:FindFirstChild('MineshaftBounds',true)
+            local candidate=ctx.questOutsideMineCandidate
+            local band=workspace:GetAttribute('InfiniteDepthOffsetMeters');local session=bound:GetAttribute('SessionDungeonId')
+            if not candidate or candidate.character~=ctx.character or candidate.drill~=ctx.drill or candidate.mine~=bound
+                or candidate.band~=band or candidate.session~=session or candidate.bounds~=bounds then
+                candidate={character=ctx.character,drill=ctx.drill,mine=bound,session=session,band=band,bounds=bounds,
+                    started=now(),suspended=true}
+                ctx.questOutsideMineCandidate=candidate;ctx.questOutsideMineAt=candidate.started
+            end
+            if now()-candidate.started>=2 and not(ctx.questMineTransition and ctx.questMineTransition.mode=='Exit')then
+                -- This is physical outside proof, never a native Exit receipt.
+                -- Retire the old mine route once; subsequent pulses must not
+                -- erase a new outdoor chest, driving or combat lease.
+                ctx.questOutsideMine=candidate;ctx.questOutsideMineCandidate=nil
+                ctx.questMineTransition={mode='Outside',mine=bound}
+                if ctx.questMineEntry and ctx.questMineEntry.mine==bound then D.cancelDoor(ctx,false)end
+                local owned=ctx.questMining or ctx.questFundingMine or ctx.questDepthMine and ctx.questDepthMine.mine==bound
+                D.stopMine(ctx);ctx.questMineReadyAt=nil;ctx.questFundingMine=nil
+                if ctx.questThreat and D.mineEnemy(ctx.questThreat,bound)then
+                    ctx.questThreat=nil;ctx.questMineExitPickaxe=nil;ctx.questFuelThreat=nil
+                end
+                if ctx.combatTarget and D.mineEnemy(ctx.combatTarget,bound)then
+                    ctx.combatTarget=nil;ctx.questCombat=nil;ctx.questExitCombat=nil;owned=true
+                end
+                if owned and not(ctx.questDriving or ctx.questSeating or ctx.currentChest or ctx.featureHold
+                    or ctx.bringEquipmentLock)then ctx.questOwns=nil end
+                ctx.questBindMineAt=nil;ctx.questMineExit=nil;ctx.questMineChurchFallback=nil
                 status('Outside loaded mineshaft bounds; releasing stale local mine route')
             end
-        else ctx.questOutsideMineAt=nil end
+        elseif not outside then ctx.questOutsideMineAt=nil;ctx.questOutsideMineCandidate=nil end
         if now()<(ctx.questDoorScanAt or 0)then return end
         ctx.questDoorScanAt=now()+1
         if not ctx.connect then return end
@@ -3152,6 +3342,7 @@ end)()
             return true
         end
         if not active and D.inDungeon(ctx)then return false end
+        if not active and outsideMineState(ctx)then return false end -- Old native binding is still unconfirmed.
         if not active and returned and not returned.nativeCleared
             and controller and controller._BoundDungeon==returned.mine
             and api.Players.LocalPlayer:GetAttribute('InDungeon')==true then return false end
@@ -3495,33 +3686,65 @@ end)()
         if seat and not seat:IsDescendantOf(drill)then return false end
         return scripted and (ctx.questDriving or seat and seat:IsDescendantOf(drill)) or false
     end
+    local drivingHealth,drivingEnemy
     function D.observeDrivingHealth(ctx)
-        local hp=tonumber(ctx.humanoid.Health);local watch=ctx.questDrivingHealth
+        local hp=tonumber(ctx.humanoid.Health);local maximum=tonumber(ctx.humanoid.MaxHealth)
+        local watch=ctx.questDrivingHealth or s.questDrivingHealth
         if not finite(hp)then return end
         local owned=ownedDriving(ctx);local selected=s.classData and s.classData.SelectedClass
-        if not watch or watch.character~=ctx.character or watch.humanoid~=ctx.humanoid or watch.drill~=ctx.drill or watch.class~=selected then
-            ctx.questDrivingHealth={character=ctx.character,humanoid=ctx.humanoid,drill=ctx.drill,class=selected,health=hp}
-            return
+        local band=workspace:GetAttribute('InfiniteDepthOffsetMeters')
+        if not watch or watch.character~=ctx.character or watch.humanoid~=ctx.humanoid or watch.drill~=ctx.drill
+            or watch.class~=selected or watch.band~=band then
+            watch={character=ctx.character,humanoid=ctx.humanoid,drill=ctx.drill,class=selected,band=band,health=hp,maximum=maximum}
         end
-        if hp>0 and hp<watch.health and owned then
+        ctx.questDrivingHealth=watch;s.questDrivingHealth=watch
+        if watch.boundCtx~=ctx and ctx.connect and ctx.humanoid.HealthChanged then
+            watch.boundCtx=ctx
+            ctx.connect(ctx.humanoid.HealthChanged,function()
+                if ctx.active and s.farm==ctx and ctx.character==api.Players.LocalPlayer.Character then D.observeDrivingHealth(ctx)end
+            end)
+        end
+        -- A reduced MaxHealth can clamp current HP without an enemy attack.
+        -- Any decrease below that real clamped baseline is still damage.
+        local previous=watch.health
+        if finite(maximum) and maximum>0 and finite(watch.maximum) and maximum<watch.maximum then previous=math.min(previous,maximum)end
+        if hp>0 and hp<previous and owned then
             watch.damageAt=now();watch.damagePoint=ctx.root.CFrame.Position or ctx.root.Position
+            local target,distance
+            local seen={}
+            for _,group in ipairs({api.enemies(),api.tagged('Watcher'),api.tagged('FuelLeech')})do
+                for _,npc in ipairs(group)do if not seen[npc]then
+                    seen[npc]=true
+                    local health,d=drivingEnemy(ctx,npc,watch.damagePoint)
+                    if health and (not target or d<distance)then target,distance=npc,d end
+                end end
+            end
+            if target then
+                watch.intent={target=target,origin=watch.damagePoint,started=now(),lease=s.questDriveLease}
+                ctx.questDrivingDefenseUntil=nil -- A fresh real hit is not an old retry signal.
+            end
         end
-        watch.health=hp
-        if not cfg.classQuest or hp<=0 or watch.damageAt and now()-watch.damageAt>3 then watch.damageAt=nil;watch.damagePoint=nil end
+        watch.health,watch.maximum=hp,maximum
+        if not cfg.classQuest or hp<=0 then watch.intent=nil;watch.damageAt=nil;watch.damagePoint=nil
+        elseif not watch.intent and watch.damageAt and now()-watch.damageAt>3 then watch.damageAt=nil;watch.damagePoint=nil end
     end
-    function D.stopDrivingDefense(ctx)
-        local job=ctx.questDrivingDefense;if not job then return end
-        if ctx.combatTarget==job.target then ctx.combatTarget=nil;ctx.questCombat=nil end
-        if ctx.questThreat==job.target then ctx.questThreat=nil end
-        if job.owns and not ctx.questHealing and not ctx.bringEquipmentLock then ctx.questOwns=nil end
+    function D.stopDrivingDefense(ctx,preserveIntent)
+        local job=ctx.questDrivingDefense
+        if job then
+            if ctx.combatTarget==job.target then ctx.combatTarget=nil;ctx.questCombat=nil end
+            if ctx.questThreat==job.target then ctx.questThreat=nil end
+            if job.owns and not ctx.questHealing and not ctx.bringEquipmentLock then ctx.questOwns=nil end
+        end
         ctx.questDrivingDefense=nil
+        local watch=ctx.questDrivingHealth
+        if not preserveIntent and watch then watch.intent=nil;watch.damageAt=nil;watch.damagePoint=nil end
     end
-    local function drivingHealth(npc)
+    drivingHealth=function(npc)
         local hum=npc:FindFirstChildOfClass('Humanoid')
         return api.isFuelLeech and api.isFuelLeech(npc) and tonumber(npc:GetAttribute('FuelLeechHealth'))
             or hum and tonumber(hum.Health)
     end
-    local function drivingEnemy(ctx,npc,origin)
+    drivingEnemy=function(ctx,npc,origin)
         local p=api.part(npc)
         local leech=api.isFuelLeech and api.isFuelLeech(npc)
         local hp=drivingHealth(npc)
@@ -3529,7 +3752,9 @@ end)()
             or npc:GetAttribute('Category')=='Corpse' or npc:GetAttribute('NpcFaction')=='FriendlyCompanion'
             or api.enemyAlive and not api.enemyAlive(npc)then return end
         local point=ctx.root.CFrame.Position or ctx.root.Position
-        if (p.Position-origin).Magnitude>45 or (p.Position-point).Magnitude>60 then return end
+        local seat=ctx.drill:FindFirstChild('DrillPhysicsSeat') or ctx.drill:FindFirstChild('VehicleSeat')
+        local nearDrill=seat and seat.Parent and seat:IsDescendantOf(ctx.drill) and (p.Position-seat.Position).Magnitude<=45
+        if not nearDrill and (p.Position-origin).Magnitude>45 or (p.Position-point).Magnitude>60 then return end
         local mine=D.activeMine(ctx)
         if D.inDungeon(ctx)then
             local bound=not mine and Q.special.bound(ctx)
@@ -3555,22 +3780,43 @@ end)()
         local health=tonumber(ctx.humanoid.Health);local max=tonumber(ctx.humanoid.MaxHealth)
         local driver=ctx.drill and ctx.drill:GetAttribute('DriverUserId')
         local foreign=driver~=nil and driver~=0 and driver~=api.Players.LocalPlayer.UserId
+        local attached=ctx.humanoid.SeatPart
         if not cfg.driveDepth or not Q.enabled(ctx) or Q.manual() or api.extractionReady() or foreign
+            or ctx.drill~=workspace:FindFirstChild('Drill') or not ctx.drill.Parent
+            or attached and not attached:IsDescendantOf(ctx.drill)
             or not finite(health) or health<=0 or finite(max) and max>0 and health/max<=.3
             or ctx.questHealing or Q.refuelActive and Q.refuelActive(ctx)
             or ctx.questStartup or ctx.questRecovering then
             D.stopDrivingDefense(ctx);return false
         end
+        if ctx.nativeGateMotion or ctx.questMineEntry then D.stopDrivingDefense(ctx,true);return false end
         if job and (job.character~=ctx.character or job.drill~=ctx.drill or ctx.drill~=workspace:FindFirstChild('Drill')
             or job.band~=workspace:GetAttribute('InfiniteDepthOffsetMeters') or job.class~=(s.classData and s.classData.SelectedClass))then
             D.stopDrivingDefense(ctx);job=nil
         end
-        local watch=ctx.questDrivingHealth
+        local watch=ctx.questDrivingHealth;local intent=watch and watch.intent
+        if intent and (watch.character~=ctx.character or watch.humanoid~=ctx.humanoid or watch.drill~=ctx.drill
+            or watch.band~=workspace:GetAttribute('InfiniteDepthOffsetMeters') or watch.class~=(s.classData and s.classData.SelectedClass))then
+            watch.intent=nil;intent=nil
+        end
         if not job then
-            if not ownedDriving(ctx) or not watch or not watch.damageAt or now()-watch.damageAt>3
-                or now()<(ctx.questDrivingDefenseUntil or 0)then return false end
+            local own=ownedDriving(ctx)
+            if not watch or not own and not intent or not intent and (not watch.damageAt or now()-watch.damageAt>3)then return false end
+            -- An old script receipt cannot stop a later manually occupied seat.
+            if not own and driver==api.Players.LocalPlayer.UserId
+                and not(intent and intent.lease and s.questDriveLease==intent.lease and intent.lease.ctx==ctx and intent.lease.abandoned)then return false end
+            if intent and intent.retryAt then
+                local released=intent.waiting=='seat' and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
+                    or intent.waiting=='action' and not(s.bringDelivery or s.lootRequest or s.equipmentRequest or ctx.bringEquipmentLock)
+                    or intent.waiting=='route' and ctx.routeParked==true and not(ctx.currentChest or ctx.featureHold or ctx.defenseMoving
+                        or s.bringDelivery or s.lootRequest or s.equipmentRequest or ctx.bringEquipmentLock)
+                if released then intent.retryAt=nil;intent.waiting=nil;ctx.questDrivingDefenseUntil=nil
+                elseif now()<intent.retryAt then return false end
+            end
+            if now()<(ctx.questDrivingDefenseUntil or 0)then return false end
             job={character=ctx.character,drill=ctx.drill,band=workspace:GetAttribute('InfiniteDepthOffsetMeters'),
-                class=s.classData and s.classData.SelectedClass,origin=watch.damagePoint,started=now(),owns=ctx.questOwns==true}
+                class=s.classData and s.classData.SelectedClass,origin=intent and intent.origin or watch.damagePoint,
+                started=now(),owns=ctx.questOwns==true,intent=intent}
         end
         if job.target then
             local current=drivingHealth(job.target)
@@ -3583,9 +3829,13 @@ end)()
         local npc,hp,distance
         for _,candidate in ipairs(candidates)do
             local value,d=drivingEnemy(ctx,candidate,job.origin)
-            if value and (not npc or candidate==job.target or npc~=job.target and d<distance)then npc,hp,distance=candidate,value,d end
+            if value and (ctx.questDrivingDefense or not intent or candidate==intent.target)
+                and (not npc or candidate==job.target or npc~=job.target and d<distance)then npc,hp,distance=candidate,value,d end
         end
         if not npc then
+            if not ctx.questDrivingDefense and intent and watch.intent==intent then
+                watch.intent=nil;watch.damageAt=nil;watch.damagePoint=nil
+            end
             if ctx.questDrivingDefense and job.target and ctx.questTargetRetry and ctx.questTargetRetry[job.target]then
                 ctx.questDrivingDefenseUntil=now()+10
             end
@@ -3594,6 +3844,11 @@ end)()
         if not ctx.questDrivingDefense then
             ctx.questDrivingDefense=job;watch.damageAt=nil;watch.damagePoint=nil
         end
+        local attack=ctx.questDamageWatch and ctx.questDamageWatch[npc]
+        if job.attackStartedAt and attack and attack.lastAttempt and attack.lastAttempt>=job.attackStartedAt then
+            if watch and watch.intent==job.intent then watch.intent=nil end
+            job.intent=nil -- Actual permitted-target packet; never a kill or HP receipt.
+        end
         if job.target~=npc then
             if ctx.combatTarget==job.target then ctx.combatTarget=nil;ctx.questCombat=nil end
             if ctx.questThreat==job.target then ctx.questThreat=nil end
@@ -3601,9 +3856,13 @@ end)()
             job.progressAt=job.progressAt or now()
         elseif hp<job.health then job.health,job.progressAt,job.unarmedAt=hp,now(),nil end
         Q.abortResources(ctx);Q.stopDrive(ctx)
+        local function yieldHandoff(reason)
+            if job.intent then job.intent.retryAt=now()+10;job.intent.waiting=reason end
+            ctx.questDrivingDefenseUntil=now()+10;D.stopDrivingDefense(ctx,true);return false
+        end
         if s.bringDelivery or s.lootRequest or s.equipmentRequest or ctx.bringEquipmentLock then
             if now()-job.started>=8 then
-                ctx.questDrivingDefenseUntil=now()+10;D.stopDrivingDefense(ctx);return false
+                return yieldHandoff('action')
             end
             status('Driving damage observed; own input stopped while another native action remains reserved')
             return true
@@ -3611,7 +3870,7 @@ end)()
         if not Q.holdRoute(ctx)then
             job.owns=ctx.questOwns==true
             if now()-job.started>=8 then
-                ctx.questDrivingDefenseUntil=now()+10;D.stopDrivingDefense(ctx);return false
+                return yieldHandoff('route')
             end
             return true
         end
@@ -3620,7 +3879,7 @@ end)()
             if ctx.combatTarget==npc then ctx.combatTarget=nil;ctx.questCombat=nil end
             local _,holding=Q.unseat(ctx);api.watch(ctx)
             if now()-job.started>=8 then
-                ctx.questDrivingDefenseUntil=now()+10;D.stopDrivingDefense(ctx);return false
+                return yieldHandoff('seat')
             end
             status('Driving damage observed; waiting for actual seat exit before clearing nearby enemies')
             return holding or now()-job.started<8
@@ -3639,7 +3898,7 @@ end)()
         ctx.combatTarget=npc;Q.armTarget(ctx,npc);api.watch(ctx)
         if not tool then status('Driving defense: waiting for an owned compatible weapon');return true end
         api.hover(ctx)
-        if not ctx.defenseMoving and now()>=(ctx.dodgeUntil or 0) and distance>8 then
+        if not calls.drag and not calls.cash and not ctx.defenseMoving and now()>=(ctx.dodgeUntil or 0) and distance>8 then
             ctx.root.CFrame=CFrame.new(api.part(npc).Position+Vector3.new(0,2,6))
         end
         status(Q.attackStatus(ctx,'Driving paused after native damage; clearing nearby enemies before continuing'))
@@ -5954,6 +6213,8 @@ end)()
         if job.kind=='smelt' and Q.drillSupport.processing.contactComplete(job)then return true end
         local p,target=api.part(job.item),api.part(job.target)
         if not p or not target or not job.owns then return false end
+        if job.healingSupply and (not Q.healing.itemAccessible(job.ctx,job.item)
+            or job.shop and api.medicalLocationAllowed and not api.medicalLocationAllowed(job.ctx,job.target))then return false end
         local cf,size
         if job.item:IsA('BasePart') then cf,size=job.item.CFrame,job.item.Size else cf,size=job.item:GetBoundingBox() end
         local offset
@@ -6010,11 +6271,13 @@ end)()
                 and (not plan.processingFunding or Q.drillSupport.processing.fundingEligible(item,ctx))
                 and (kind~='smelt' or Q.drillSupport.processing.inputEligible(item,ctx)
                     and Q.drillSupport.processing.processor(target,ctx))
+                and (kind~='supply' or not Q.healing.isMedical(item) or Q.healing.itemAccessible(ctx,item))
         end
         if not eligible()then return false end
         local job={ctx=ctx,item=item,target=target,kind=kind,started=now(),stage='request',objective=plan.objective,
             before=kind=='fuel' and tonumber(ctx.drill:GetAttribute('Fuel')) or objective(plan,plan.objective or 'SellGoldItems'),class=plan.name,
             questBefore=objective(plan,plan.objective or 'SellGoldItems'),coinBefore=s.stats.coinEarned or 0,moneyBefore={}}
+        job.healingSupply=kind=='supply' and ctx.questHealing and Q.healing.isMedical(item) or nil
         if kind=='fuel'then job.fuelLow=job.before end
         job.processingFunding=plan.processingFunding==true
         if kind=='smelt'then
@@ -6090,7 +6353,8 @@ end)()
         end
         if job.kind=='fuel' and (plan.kind~='fuel' and (plan.kind~='depth' or not cfg.driveDepth))
             and not Q.refuelActive(ctx)then release(job);return true end
-        if job.ctx~=ctx or not enabled(ctx) or manual() or now()-job.started>(job.shop and 25 or 12) then release(job); return true end
+        if job.ctx~=ctx or not enabled(ctx) or manual() or now()-job.started>(job.shop and 25 or 12)
+            or job.healingSupply and not Q.healing.itemAccessible(ctx,job.item)then release(job); return true end
         if job.cancelled then release(job); return true end
         if job.pending or calls.shop or calls.wallet then return true end
         if job.shop then return Q.shopStep(job,plan) end
@@ -6847,6 +7111,38 @@ end)()
         -- Moving or attempting a chest does not fabricate quest progress.
         return true
     end
+    function Q.prepareHealing(ctx)
+        if not enabled(ctx)then return false,false end
+        local h=ctx.humanoid;local maximum=tonumber(h.MaxHealth)
+        if not finite(maximum) or maximum<=0 or h.Health<=0 then return false,false end
+        local ratio=h.Health/maximum
+        if ratio>=.7 or not ctx.questHealing and ratio>.3 then return false,false end
+        ctx.questHealing=true
+        Q.drillSupport.stopMine(ctx);Q.stopDrive(ctx)
+        local worm=Q.parasite and Q.parasite.target(ctx)
+        if ctx.combatTarget~=worm then ctx.combatTarget=nil;ctx.questCombat=nil end
+        if ctx.questThreat~=worm then ctx.questThreat=nil;ctx.questFuelThreat=nil end
+        if manual()then return true,true,'waiting for manual item movement' end
+        if ctx.nativeGateMotion or ctx.questMineEntry then return true,true,'waiting for the actual dungeon transition' end
+        if h.SeatPart or h.Sit then
+            local ready=Q.unseat(ctx);api.watch(ctx)
+            if not ready then return true,true,'waiting for actual seat detachment' end
+        end
+        local point=ctx.root.CFrame.Position or ctx.root.Position
+        if api.healingPointSafe and not api.healingPointSafe(ctx,point)then
+            -- Release a danger-bound funding or medicine transport before it
+            -- can pose another item at this unsafe position. Its exact native
+            -- mutation remains reserved until its real reply/receipt settles.
+            local job=s.questDelivery
+            if job and job.ctx==ctx then release(job)end
+            local cash=s.questCashJob
+            if cash and cash.ctx==ctx then cash.cancelled=true;Q.cashStep(ctx)end
+            local moved,reason=api.retreat(ctx)
+            if reason then return true,true,reason end
+            if moved then ctx.questHealRetreatAt=now()+3 end
+        end
+        return true,false
+    end
     function Q.step(ctx)
         if Q.drillSupport.observeDrivingHealth then Q.drillSupport.observeDrivingHealth(ctx)end
         if Q.drillSupport.observeReturn then Q.drillSupport.observeReturn(ctx)end
@@ -6856,13 +7152,17 @@ end)()
             Q.drillSupport.processing.observeCraft(ctx)
         end
         if Q.inventory then Q.inventory.observe(ctx)end
+        if cfg.classQuest then
+            Q.drillSupport.observeDoors(ctx)
+            local healing,blocked,reason=Q.prepareHealing(ctx)
+            if healing and blocked then setStatus('Quest healing retreat: '..tostring(reason));return true end
+        end
         if Q.parasite and Q.parasite.step(ctx)then return true end
         if not cfg.classQuest then
             if ctx.questOwns or ctx.questDriving or ctx.questSeating or ctx.questDriveInput or ctx.questRecoveryDue or ctx.questRecovering or ctx.questPreviewCancel or s.questDelivery or s.questCashJob then Q.cleanup(ctx) end
             if Q.inventory and Q.inventory.step(ctx)then return true end
             return false
         end
-        Q.drillSupport.observeDoors(ctx)
         Q.poll()
         local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if not enabled(ctx) then ctx.questProgressAt=now(); Q.cleanup(ctx); return false end
@@ -6925,6 +7225,12 @@ end)()
                 return Q.drillSupport.leaveMine(ctx,plan)
             end
             Q.cleanup(ctx); return false
+        end
+        -- Survival takes precedence over a death-crate trip or chasing a leech.
+        -- Attached face-Worm removal above remains native in-range defense.
+        if ctx.questHealing then
+            if Q.inventory and Q.inventory.step(ctx,plan)then return true end
+            if Q.healing.step(ctx,plan)then return true end
         end
         if Q.loadout.recover(ctx,plan)then return true end
         if ctx.questPotion then Q.potionStep(ctx,plan)end -- Settle only a previously dispatched consume before urgent work.
@@ -7242,22 +7548,26 @@ end)()
             and not item:GetAttribute('Robux') and not item:GetAttribute('ProductId') and not item:GetAttribute('RobuxProductId')
     end
     local function checkout(item) return item and item.Parent and item:IsA('BasePart') and api.tag(item,'BuyPart') and item:IsDescendantOf(workspace) end
+    local function supplyAccessible(ctx,item,target)
+        return not Q.healing.isMedical(item) or Q.healing.itemAccessible(ctx,item)
+            and (not target or not api.medicalLocationAllowed or api.medicalLocationAllowed(ctx,target))
+    end
     function Q.supplyReady(ctx,id)
         if not supplyAllowed(id) then return false,'medical item is not eligible for coin purchase' end
         local item=nearest(looseItems(),ctx.root.Position,function(item)
-            return api.id(item)==id and supplyRetryReady(item) and (free(item) or stock(item))
+            return api.id(item)==id and supplyAccessible(ctx,item) and supplyRetryReady(item) and (free(item) or stock(item))
                 and (id:sub(-5)=='_Ammo' or api.hasRoom(ctx,item) or Q.healing.canMakeRoom(ctx,item))
         end)
         if not item then
             for _,found in ipairs(looseItems())do
-                if api.id(found)==id and (free(found) or stock(found))then
+                if api.id(found)==id and supplyAccessible(ctx,found) and (free(found) or stock(found))then
                     if not supplyRetryReady(found)then return false,'medical item is waiting for its retry / receipt' end
                     return false,'toolbar is full; no authorized shard slot is available'
                 end
             end
             return false,'no eligible medical stock loaded'
         end
-        if free(item) or nearest(api.tagged('BuyPart'),api.part(item).Position,checkout)then return true end
+        if free(item) or nearest(api.tagged('BuyPart'),api.part(item).Position,function(pad)return checkout(pad) and supplyAccessible(ctx,item,pad)end)then return true end
         return false,'medical stock has no loaded BuyPart checkout'
     end
     local function obstructed(job)
@@ -7270,7 +7580,7 @@ end)()
     end
     function Q.supply(ctx,plan,id)
         if not supplyAllowed(id) or s.questDelivery or s.bringDelivery or calls.drag or manual() then ctx.questOwns=nil; return false end
-        local loose=nearest(looseItems(),ctx.root.Position,function(item)return free(item) and api.id(item)==id and supplyRetryReady(item)end)
+        local loose=nearest(looseItems(),ctx.root.Position,function(item)return free(item) and api.id(item)==id and supplyAccessible(ctx,item) and supplyRetryReady(item)end)
         if loose then
             if id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,loose) then
                 if Q.healing.canMakeRoom(ctx,loose)then Q.healing.makeRoom(ctx,loose);return true end
@@ -7290,8 +7600,8 @@ end)()
         if s.questUpgradeJob or calls.upgrade or calls.upgradeWallet then return false end
         if now()<(ctx.questSupplyAt or 0) then ctx.questOwns=nil; return false end
         ctx.questSupplyAt=now()+3
-        local item=nearest(looseItems(),ctx.root.Position,function(item)return stock(item) and api.id(item)==id and supplyRetryReady(item)end)
-        local pad=item and nearest(api.tagged('BuyPart'),api.part(item).Position,checkout)
+        local item=nearest(looseItems(),ctx.root.Position,function(item)return stock(item) and api.id(item)==id and supplyAccessible(ctx,item) and supplyRetryReady(item)end)
+        local pad=item and nearest(api.tagged('BuyPart'),api.part(item).Position,function(pad)return checkout(pad) and supplyAccessible(ctx,item,pad)end)
         if not item or not pad then ctx.questOwns=nil; setStatus('No free or coin-shop quest supply loaded: '..id); return false end
         if id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,item) and not Q.healing.canMakeRoom(ctx,item) then ctx.questOwns=nil; setStatus('Quest tool needs a free toolbar slot; no purchase'); return false end
         local job={ctx=ctx,item=item,target=pad,kind='supply',shop=true,id=id,class=plan.name,
@@ -7311,7 +7621,7 @@ end)()
         if job.pending or calls.drag or calls.shop or calls.wallet or now()<(job.nextAt or 0) then return true end
         job.nextAt=now()+.25
         local function guarded() return enabled(ctx) and s.questDelivery==job and not job.cancelled and not manual()
-            and (not job.healingSupply or ctx.questHealing or job.buySent)end
+            and (not job.healingSupply or (ctx.questHealing or job.buySent) and supplyAccessible(ctx,job.item,job.target))end
         local function fail(text) retries[job.item]=job.buySent and math.huge or now()+120; setStatus(text); release(job)end
         if job.stage=='empty' then
             call('shop','ShopService','GetBuyQuote',{job.target},function(ok,price)
@@ -7850,7 +8160,7 @@ end)()
         if data.lootExtract == nil then enabled = data.smartLoot == true or data.extraction == true end
         return { chest = true, lootExtract = enabled,
             minutes = clamp(data.minutes, 0, 180, DEFAULTS.minutes), classQuest = data.classQuest == true,
-            driveDepth = data.driveDepth ~= false, schema = 39 }
+            driveDepth = data.driveDepth ~= false, schema = 40 }
     end
     local previousConfig,previousAccountId=s.config,s.configAccountId
     local loaded=saveStore:get('settings')
@@ -8345,7 +8655,7 @@ end)()
     function F.healingPointSafe(ctx,point)
         if not point or not finite(point.X) or not finite(point.Y) or not finite(point.Z) then return false end
         local player=api.Players.LocalPlayer
-        local inside=player and player:GetAttribute('InDungeon')==true
+        local inside=quest and quest.drillSupport.inDungeon(ctx) or not quest and player and player:GetAttribute('InDungeon')==true
         local mine=inside and quest and quest.drillSupport.activeMine(ctx)
         local room=inside and not mine and quest and quest.special.bound(ctx)
         for _,npc in ipairs(F.enemies())do
@@ -8354,10 +8664,10 @@ end)()
             -- Quest retry suppression is not protection from a living enemy.
             -- Dungeon session ownership, however, keeps another native room's
             -- loaded wave from blocking a chest that it cannot reach.
-            local belongs=not inside or not mine and not room or mine and quest.drillSupport.mineEnemy(npc,mine)
+            local belongs=not inside and outdoorEnemyAllowed(npc) or inside and not mine and not room or mine and quest.drillSupport.mineEnemy(npc,mine)
                 or room and quest.special.belongs(npc,room)
             local p=position(npc)
-            if not isPlayer and belongs and p and finite(p.X) and finite(p.Y) and finite(p.Z)
+            if not isPlayer and not ownFaceWorm(ctx,npc) and belongs and p and finite(p.X) and finite(p.Y) and finite(p.Z)
                 and (p-point).Magnitude<80 then return false end
         end
         return true
@@ -9133,6 +9443,9 @@ end)()
         collectMineLoot=function(ctx)return F.upgradeGear(ctx)end,
         openChest=function(ctx,entry)return ctx.helpers[16361397](entry)end,
         healingChestSafe=F.healingChestSafe,healingPointSafe=F.healingPointSafe,
+        medicalLocationAllowed=function(ctx,item)return F.medicalLocationAllowed(ctx,item)end,
+        medicalSearch=function(ctx,search)return F.medicalSearch(ctx,search)end,
+        clearMedicalSearch=function(ctx,search)return F.clearMedicalSearch(ctx,search)end,
         miningSurface=function(ctx,node)
             local best,distance
             local parts=node:GetDescendants();if node:IsA('BasePart')then parts[#parts+1]=node end
@@ -9766,37 +10079,71 @@ end)()
         return outdoorEnemyAllowed(npc) or suspendedMeleeDefense(ctx,npc)
     end
     local function currentWatchers(ctx)
+        local native=controller('WatcherController')
+        local folder=workspace:FindFirstChild('Npc')
+        local cache=ctx.watcherDiscovery
+        if not cache or cache.folder~=folder or cache.native~=native then
+            cache={folder=folder,native=native,at=0,list={}};ctx.watcherDiscovery=cache
+        end
+        if not ctx.watcherTagSignals and ctx.connect and type(api.CollectionService.GetInstanceAddedSignal)=='function'then
+            ctx.watcherTagSignals=true
+            for _,method in ipairs({'GetInstanceAddedSignal','GetInstanceRemovedSignal'})do
+                if type(api.CollectionService[method])=='function'then
+                    local ok,signal=pcall(api.CollectionService[method],api.CollectionService,'Watcher')
+                    if ok and signal then ctx.connect(signal,function()ctx.watcherDiscoveryDirty=true end)end
+                end
+            end
+        end
+        if now()>=cache.at or ctx.watcherDiscoveryDirty then
+            local discovered,seen={},{}
+            local function discover(npc)
+                if npc and npc.Parent and not seen[npc]then seen[npc]=true;discovered[#discovered+1]=npc end
+            end
+            for _,npc in ipairs(tagged('Watcher'))do discover(npc)end
+            -- Native identity covers the short interval before a Watcher tag
+            -- streams in; ordinary enemy enumeration is structural, not per-frame.
+            for _,npc in ipairs(F.enemies())do
+                if tostring(npc:GetAttribute('RealName') or npc.Name):find('Watcher',1,true)==1 then discover(npc)end
+            end
+            cache.list,cache.at=discovered,now()+.2;ctx.watcherDiscoveryDirty=nil
+        end
         local result,seen={},{}
         local function add(npc)
             if npc and not seen[npc] and relevantWatcher(ctx,npc)then seen[npc]=true;result[#result+1]=npc end
         end
-        for _,npc in ipairs(tagged('Watcher'))do add(npc)end
-        -- A living replicated Watcher can arrive before its tag/controller
-        -- entry. Its native identity already requires attention and pickaxe.
-        for _,npc in ipairs(F.enemies())do
-            if tostring(npc:GetAttribute('RealName') or npc.Name):find('Watcher',1,true)==1 then add(npc)end
-        end
-        local native=controller('WatcherController')
+        for _,npc in ipairs(cache.list)do add(npc)end
+        -- These are small authoritative/urgent sets. Recheck them immediately,
+        -- together with every cached candidate's live health, range and session.
         for npc in pairs(native and native.TrackedWatchers or {})do add(npc)end
+        for _,npc in pairs({ctx.questThreat,ctx.combatTarget})do
+            if npc and (tag(npc,'Watcher') or tostring(npc:GetAttribute('RealName') or npc.Name):find('Watcher',1,true)==1)then add(npc)end
+        end
         table.sort(result,function(a,b)return (position(a)-ctx.root.Position).Magnitude<(position(b)-ctx.root.Position).Magnitude end)
         return result
     end
     function F.watcher(ctx)
         local targets=currentWatchers(ctx);local closest=targets[1]
-        ctx.watcherSearchAt=now()+.15;ctx.watcher=closest
+        ctx.watcherSearchAt=ctx.watcherDiscovery.at;ctx.watcher=closest
         if closest and workspace.CurrentCamera then
             local eyes = closest:FindFirstChild('Head', true) or closest:FindFirstChild('Eyes', true) or part(closest)
             if eyes then
                 local camera = workspace.CurrentCamera
+                if ctx.watcherCamera and ctx.watcherCamera~=camera then
+                    if ctx.cameraBeforeWatcher and ctx.watcherCamera.CFrame==ctx.watcherFrame then
+                        ctx.watcherCamera.CFrame=ctx.cameraBeforeWatcher
+                    end
+                    ctx.cameraBeforeWatcher,ctx.watcherFrame=nil,nil
+                end
                 ctx.watcherCamera = camera
                 ctx.cameraBeforeWatcher = ctx.cameraBeforeWatcher or camera.CFrame
                 camera.CFrame = CFrame.lookAt(camera.CFrame.Position, eyes.Position)
                 ctx.watcherFrame = camera.CFrame
-                if cfg.classQuest and not F.watcherVisible(ctx) and now()>=(ctx.watcherViewTryAt or 0) then
+                if cfg.classQuest and now()>=(ctx.watcherViewTryAt or 0) then
+                    ctx.watcherViewTryAt=now()+.15
+                    if not F.watcherVisible(ctx)then
                     -- Each actual current-room Watcher must pass the native ray
                     -- and viewport test. Real cluster viewpoints can cover more
                     -- than one; an occluded member remains unobserved.
-                    ctx.watcherViewTryAt=now()+.15
                     local point,count=Vector3.zero,0
                     for _,npc in ipairs(targets)do
                         local target=npc:FindFirstChild('Head',true) or npc:FindFirstChild('Eyes',true) or part(npc)
@@ -9825,6 +10172,7 @@ end)()
                             camera.CFrame=CFrame.lookAt(origin,target.Position);ctx.watcherFrame=camera.CFrame
                         end
                     end
+                    end
                 end
             end
         elseif ctx.cameraBeforeWatcher then
@@ -9850,18 +10198,59 @@ end)()
         -- Missing native controller is not proof of a clear line of sight.
         return false
     end
+    function F.healingMovementBlocked(ctx)
+        if not cfg.classQuest or not ctx.questHealing or not quest.enabled(ctx)then return 'native scene or character is not ready' end
+        if quest.manual()then return 'manual item movement is active' end
+        if ctx.humanoid.SeatPart or ctx.humanoid.Sit then return 'actual seat detachment is pending' end
+        if ctx.questDriveInput or ctx.questDriving or ctx.questSeating then return 'owned driving input has not released' end
+        if ctx.nativeGateMotion or ctx.questMineEntry then return 'actual dungeon transition is pending' end
+        if ctx.questPlacement or ctx.questPreviewCancel then return 'native placement cancellation is pending' end
+        if s.bringDelivery or ctx.bringEquipmentLock or quest.calls.drag then return 'native item transport is still reserved' end
+        local job=s.questDelivery
+        if job and job.ctx==ctx and (job.owns or job.pending or not job.movementReleased)then return 'native delivery release is pending' end
+        if s.questCashJob and s.questCashJob.ctx==ctx and quest.calls.cash then return 'native coin interaction is pending' end
+        if ctx.featureHold or ctx.defenseMoving then return 'another movement owner is active' end
+        if ctx.currentChest then
+            ctx.defenseAbort=true;movement.cancel(ctx)
+            return 'waiting for the chest route to acknowledge retreat'
+        end
+    end
+    function F.medicalLocationAllowed(ctx,item)
+        if not item or not item.Parent or not item:IsDescendantOf(workspace)then return false end
+        if quest.drillSupport.inDungeon(ctx)then return F.chestAreaAllowed(ctx,item)end
+        local ancestor=item
+        while ancestor and ancestor~=workspace do
+            if quest.drillSupport.mineshaft(ancestor) or ancestor:GetAttribute('SessionDungeonId')~=nil
+                or ancestor.Name=='Goblin_Ring' or ancestor.Name=='GoblinRing' or ancestor.Name=='VampireMansion'
+                or tag(ancestor,'VampireMansion')then return false end
+            ancestor=ancestor.Parent
+        end
+        return true
+    end
+    local function healingFloor(ctx,origin,height)
+        if not RaycastParams or type(workspace.Raycast)~='function'then return end
+        local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude;params.RespectCanCollide=true
+        params.FilterDescendantsInstances={ctx.character,ctx.drill,workspace:FindFirstChild('Npc'),workspace:FindFirstChild('Items')}
+        local ok,hit=pcall(workspace.Raycast,workspace,origin+Vector3.new(0,150,0),Vector3.new(0,-500,0),params)
+        if not ok or not hit or not hit.Instance or not hit.Instance.Parent or not hit.Instance:IsA('BasePart')
+            or hit.Instance.CanCollide~=true or not hit.Position or not hit.Normal or not finite(hit.Normal.Y) or hit.Normal.Y<.65
+            or not F.medicalLocationAllowed(ctx,hit.Instance)then return end
+        local inside=quest.drillSupport.inDungeon(ctx)
+        local point=hit.Position+Vector3.new(0,height or (inside and 3 or 100),0)
+        local mine=inside and quest.drillSupport.activeMine(ctx)
+        if mine and quest.drillSupport.contains(mine,point,0)~=true then return end
+        if F.healingPointSafe(ctx,point)then return point end
+    end
     function F.questRetreat(ctx)
-        if not cfg.classQuest or not ctx.questHealing or ctx.humanoid.SeatPart then return false end
+        local blocked=F.healingMovementBlocked(ctx)
+        if blocked then return false,blocked end
         local current=ctx.root.CFrame.Position or ctx.root.Position
         if F.healingPointSafe(ctx,current)then ctx.questHealPoint=current;return false end
-        local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances={ctx.character,workspace:FindFirstChild('Npc'),workspace:FindFirstChild('Items')}
         local best,score
         for _,direction in ipairs({Vector3.new(1,0,0),Vector3.new(-1,0,0),Vector3.new(0,0,1),Vector3.new(0,0,-1)})do
-            local origin=ctx.root.Position+direction*80+Vector3.new(0,150,0)
-            local ok,hit=pcall(workspace.Raycast,workspace,origin,Vector3.new(0,-400,0),params)
-            if ok and hit and hit.Position then
-                local point=hit.Position+Vector3.new(0,100,0);local distance=1000
+            local point=healingFloor(ctx,current+direction*80)
+            if point then
+                local distance=1000
                 for _,npc in ipairs(F.enemies())do
                     local hp=npc:FindFirstChildOfClass('Humanoid');local p=part(npc)
                     if hp and hp.Health>0 and p and npc:GetAttribute('NpcFaction')~='FriendlyCompanion'then distance=math.min(distance,(point-p.Position).Magnitude)end
@@ -9870,7 +10259,101 @@ end)()
             end
         end
         if not best then return false end
-        movement.hover(ctx);ctx.root.CFrame=CFrame.new(best);ctx.questHealPoint=best;return true
+        movement.cancel(ctx);movement.hover(ctx);ctx.root.CFrame=CFrame.new(best);ctx.questHealPoint=best;return true
+    end
+    function F.clearMedicalSearch(ctx,search)
+        if search and search.streamToken then movement.cancelItemReload(ctx,search.streamToken);search.streamToken=nil end
+        if not ctx.questHealing then ctx.medicalSearchScan=nil end
+    end
+    function F.medicalSearch(ctx,search)
+        if not cfg.classQuest or not ctx.questHealing or not quest.enabled(ctx) or F.extractionReady()then return false,'medical search is paused',false end
+        local band=workspace:GetAttribute('InfiniteDepthOffsetMeters')
+        local native=controller('DungeonUIController');local room=native and native._BoundDungeon
+        local cache=ctx.medicalSearchScan
+        if not cache or cache.character~=ctx.character or cache.drill~=ctx.drill or cache.band~=band or cache.room~=room
+            or cache.session~=(room and room:GetAttribute('SessionDungeonId'))then
+            cache={character=ctx.character,drill=ctx.drill,band=band,room=room,session=room and room:GetAttribute('SessionDungeonId'),
+                cursor=1,candidates=setmetatable({}, {__mode='k'}),tried=setmetatable({}, {__mode='k'}),origin=ctx.root.CFrame.Position or ctx.root.Position,survey=0}
+            ctx.medicalSearchScan=cache;ctx.worldRefreshAt=0
+        end
+        local progressed=false
+        if now()>=(cache.readAt or 0) and type(ctx.readWorld)=='function'then
+            cache.readAt=now()+1
+            local reader=ctx.worldReader
+            if not ctx.worldReading or reader and coroutine.status(reader)=='dead'then
+                local before=ctx.worldScan;local cursor=before and before.cursor;local child=before and before.childCursor
+                local ok,why=pcall(ctx.readWorld)
+                if not ok then
+                    local text=tostring(why)
+                    if text:find('__CHESTFARM_CANCELLED',1,true) or text:find('__EARTH_',1,true)then error(why,0)end
+                else
+                    progressed=ctx.worldScan~=before or before and (before.cursor~=cursor or before.childCursor~=child) or false
+                end
+            end
+        end
+        if now()>=(cache.tagsAt or 0)then
+            cache.tagsAt=now()+1
+            for _,pad in ipairs(tagged('BuyPart'))do
+                if pad:IsA('BasePart') and F.medicalLocationAllowed(ctx,pad)then cache.candidates[pad]=true end
+            end
+        end
+        local source=ctx.worldObjects or ctx.worldScan and ctx.worldScan.list or {}
+        local ending=math.min(#source,cache.cursor+199)
+        for i=cache.cursor,ending do
+            local item=source[i]
+            if item and item.Parent
+                and (item:IsA('BasePart') and tag(item,'BuyPart') or item:IsA('Model') and (item.Name=='Shop' or item.Name=='TradingPost'))
+                and F.medicalLocationAllowed(ctx,item)then
+                cache.candidates[item]=true
+            end
+        end
+        if ending>=cache.cursor then progressed=true end
+        cache.cursor=ending+1
+        if cache.cursor>#source and not ctx.worldScan then cache.cursor=1 end
+        if cache.target then
+            if not cache.target.Parent or not F.medicalLocationAllowed(ctx,cache.target)then cache.target=nil
+            elseif now()<(cache.targetUntil or 0)then
+                movement.prefetchAt(ctx,position(cache.target));return true,'streaming medical stock at a verified shop',progressed
+            else cache.tried[cache.target]=now()+30;cache.target=nil end
+        end
+        local blocked=F.healingMovementBlocked(ctx)
+        if blocked then return false,'medical search waits: '..blocked,progressed end
+        local target,distance,pose
+        for candidate in pairs(cache.candidates)do
+            local p=position(candidate)
+            local inside=quest.drillSupport.inDungeon(ctx)
+            local point=p and p+Vector3.new(0,inside and 3 or 100,0)
+            local mine=inside and quest.drillSupport.activeMine(ctx)
+            if mine and point and quest.drillSupport.contains(mine,point,0)~=true then point=nil end
+            if point and F.medicalLocationAllowed(ctx,candidate) and now()>=(cache.tried[candidate] or 0)
+                and F.healingPointSafe(ctx,point)then
+                local d=(p-(ctx.root.CFrame.Position or ctx.root.Position)).Magnitude
+                if not distance or d<distance then target,distance,pose=candidate,d,point end
+            end
+        end
+        if target then
+            movement.cancel(ctx);movement.hover(ctx);ctx.root.CFrame=CFrame.new(pose);ctx.questHealPoint=pose
+            cache.target,cache.targetUntil=target,now()+3;movement.prefetchAt(ctx,position(target))
+            ctx.worldRefreshAt=0;return true,'searching medical stock at a verified shop',true
+        end
+        -- No shop is loaded yet. Survey only positions with actual collidable
+        -- current-scope floor, retaining the origin across bounded search bursts.
+        if not quest.drillSupport.inDungeon(ctx) and now()>=(cache.surveyAt or 0)then
+            cache.surveyAt=now()+3;cache.survey=(cache.survey%8)+1
+            local direction=cache.survey%2==1 and 1 or -1
+            local offset=math.ceil(cache.survey/2)*160*direction
+            local surveyOrigin=cache.origin+Vector3.new(offset,0,0)
+            -- Streaming is read-only. Ask for the candidate area before its
+            -- floor is visible, but never move there without actual geometry.
+            movement.prefetchAt(ctx,surveyOrigin)
+            local point=healingFloor(ctx,surveyOrigin)
+            if point then
+                movement.cancel(ctx);movement.hover(ctx);ctx.root.CFrame=CFrame.new(point);ctx.questHealPoint=point
+                movement.prefetchAt(ctx,point-Vector3.new(0,100,0));ctx.worldRefreshAt=0
+                return true,'surveying loaded safe tunnel for a medical shop',true
+            end
+        end
+        return progressed,'searching the actual streamed map for a medical shop',progressed
     end
     local function bossAt(origin, source)
         for _, manager in ipairs(tagged('NpcManager')) do
@@ -9937,48 +10420,90 @@ end)()
             ctx.connect(charge, function(...) F.bossCharge(ctx, ...) end)
         end
     end
+    local function cueNpc(manager)
+        local npc=manager and manager.Parent
+        if not npc or not manager:IsDescendantOf(workspace) or not F.enemyAlive(npc)
+            or npc:GetAttribute('NpcFaction')=='FriendlyCompanion'then return end
+        local name=npc:GetAttribute('RealName') or npc.Name
+        if name=='Blinker' or manager:GetAttribute('IsBoss')==true then return npc,name end
+    end
+    local function disconnectCue(ctx,manager)
+        local record=ctx.cueConnections and ctx.cueConnections[manager]
+        if type(record)=='table'then
+            for _,connection in ipairs(record)do pcall(function()connection:Disconnect()end)end
+        end
+        if ctx.cueConnections then ctx.cueConnections[manager]=nil end
+    end
+    local function observeCue(ctx,manager,npc,name)
+        -- Room ownership is safety; a quest retry is not protection from a
+        -- living ranged enemy. The same live/session predicate used by the
+        -- camera applies here without suppressing retry-held native attacks.
+        if not ctx.active or not api.owned() or not safeToWork(ctx) or not relevantWatcher(ctx,npc)then return end
+        local animation,nonce=manager:GetAttribute('ForceAnimation'),manager:GetAttribute('ForceAnimationNonce')
+        local point=position(npc);local token=tostring(animation)..':'..tostring(nonce)
+        local ranged=type(animation)=='string' and (animation:lower():match('shoot')
+            or animation:lower():match('projectile') or animation:lower():match('cast'))
+        if ((name=='Blinker' and animation=='Attack') or (manager:GetAttribute('IsBoss')==true and ranged))
+            and point and (point-ctx.root.Position).Magnitude<=120 and ctx.attackCues[manager]~=token then
+            ctx.pendingThreat={npc=npc,origin=point,kind=name=='Blinker' and 'Blinker cast' or 'boss ranged cast',
+                source=manager,token=token,expires=now()+.6}
+            if ctx.currentChest then ctx.defenseAbort=true end
+            return ctx.pendingThreat
+        end
+    end
+    local function bindCue(ctx,manager)
+        if ctx.cueConnections[manager] or not ctx.connect or type(manager.GetAttributeChangedSignal)~='function'then return end
+        local record={};ctx.cueConnections[manager]=record
+        local function changed()
+            local npc,name=cueNpc(manager)
+            if not npc or not ctx.active then disconnectCue(ctx,manager);return end
+            -- Attribute events inspect their exact eligible manager;
+            -- ordinary NPC animation bursts cannot rescan the registry.
+            pcall(observeCue,ctx,manager,npc,name)
+        end
+        record[1]=ctx.connect(manager:GetAttributeChangedSignal('ForceAnimation'),changed)
+        record[2]=ctx.connect(manager:GetAttributeChangedSignal('ForceAnimationNonce'),changed)
+    end
     function F.observeThreat(ctx)
         if not F.enabled() or not safeToWork(ctx) then return nil end
         F.bindShots(ctx)
-        ctx.attackCues = ctx.attackCues or setmetatable({}, {__mode = 'k'})
-        if ctx.pendingThreat and now() >= ctx.pendingThreat.expires then
-            ctx.pendingThreat, ctx.defenseAbort = nil, nil
-        end
+        ctx.attackCues=ctx.attackCues or setmetatable({}, {__mode='k'})
+        ctx.cueConnections=ctx.cueConnections or setmetatable({}, {__mode='k'})
+        for manager in pairs(ctx.cueConnections)do if not cueNpc(manager)then disconnectCue(ctx,manager)end end
+        if ctx.pendingThreat and now()>=ctx.pendingThreat.expires then ctx.pendingThreat,ctx.defenseAbort=nil,nil end
         if ctx.pendingThreat then return ctx.pendingThreat end
-        if now() < (ctx.blinkerObserveAt or 0) then return nil end
-        ctx.blinkerObserveAt = now() + 0.1
-        for _, manager in ipairs(tagged('NpcManager')) do
-            ctx.cueConnections = ctx.cueConnections or setmetatable({}, {__mode = 'k'})
-            if not ctx.cueConnections[manager] and type(manager.GetAttributeChangedSignal) == 'function' then
-                ctx.cueConnections[manager] = true
-                local function changed()
-                    ctx.blinkerObserveAt = 0
-                    -- Queue the cue synchronously; movement belongs to the defense worker.
-                    pcall(F.observeThreat, ctx)
-                end
-                ctx.connect(manager:GetAttributeChangedSignal('ForceAnimation'), changed)
-                ctx.connect(manager:GetAttributeChangedSignal('ForceAnimationNonce'), changed)
-            end
-            local npc = manager.Parent
-            local name = npc and (npc:GetAttribute('RealName') or npc.Name)
-            if (name == 'Blinker' or manager:GetAttribute('IsBoss') == true) and npcHealth(npc) > 0
-                and npc:GetAttribute('NpcFaction') ~= 'FriendlyCompanion' then
-                local animation, nonce = manager:GetAttribute('ForceAnimation'), manager:GetAttribute('ForceAnimationNonce')
-                local point = position(npc)
-                local token = tostring(animation) .. ':' .. tostring(nonce)
-                local ranged = type(animation) == 'string' and animation:lower():match('shoot')
-                    or type(animation) == 'string' and animation:lower():match('projectile')
-                    or type(animation) == 'string' and animation:lower():match('cast')
-                if ((name == 'Blinker' and animation == 'Attack') or (manager:GetAttribute('IsBoss') == true and ranged))
-                    and point and (point - ctx.root.Position).Magnitude <= 120
-                    and ctx.attackCues[manager] ~= token then
-                    -- NpcManagerComponent uses Blinker Attack as its launch cue.
-                    ctx.pendingThreat = {npc = npc, origin = point, kind = name == 'Blinker' and 'Blinker cast' or 'boss ranged cast',
-                        source = manager, token = token, expires = now() + 0.6}
-                    if ctx.currentChest then ctx.defenseAbort = true end
-                    return ctx.pendingThreat
+        if now()<(ctx.blinkerObserveAt or 0)then return nil end
+        ctx.blinkerObserveAt=now()+.1
+        if not ctx.cueTagSignals and ctx.connect and type(api.CollectionService.GetInstanceAddedSignal)=='function'then
+            ctx.cueTagSignals=true
+            for _,method in ipairs({'GetInstanceAddedSignal','GetInstanceRemovedSignal'})do
+                if type(api.CollectionService[method])=='function'then
+                    local removed=method=='GetInstanceRemovedSignal'
+                    local ok,signal=pcall(api.CollectionService[method],api.CollectionService,'NpcManager')
+                    if ok and signal then ctx.connect(signal,function(manager)
+                        if removed then disconnectCue(ctx,manager);ctx.cueDiscoveryAt=0;return end
+                        local npc,name=cueNpc(manager)
+                        if npc then bindCue(ctx,manager);pcall(observeCue,ctx,manager,npc,name)end
+                    end)end
                 end
             end
+        end
+        if now()>=(ctx.cueDiscoveryAt or 0)then
+            ctx.cueDiscoveryAt=now()+.2
+            local managers,seen={},{}
+            for _,manager in ipairs(tagged('NpcManager'))do
+                if not seen[manager] and cueNpc(manager)then seen[manager]=true;managers[#managers+1]=manager end
+            end
+            for manager in pairs(ctx.cueConnections)do if not seen[manager]then disconnectCue(ctx,manager)end end
+            ctx.cueManagers=managers
+        end
+        for _,manager in ipairs(ctx.cueManagers or {})do
+            local npc,name=cueNpc(manager)
+            if npc then
+                bindCue(ctx,manager)
+                local threat=observeCue(ctx,manager,npc,name)
+                if threat then return threat end
+            else disconnectCue(ctx,manager)end
         end
         return nil
     end
@@ -10011,7 +10536,7 @@ end)()
                 elseif origin.Y - floor.Position.Y <= 12 then candidate = floor.Position + Vector3.new(0, 3, 0) end
                 if clear and workspace:Raycast(candidate, Vector3.new(0, 4, 0), rayParams) then clear = false end
             end
-            if clear then
+            if clear and (not ctx.questHealing or F.healingPointSafe(ctx,candidate))then
                 local offset = candidate - point
                 local lateral = threat.radius and offset.Magnitude or math.abs(offset:Dot(side))
                 if not best or lateral > score then best, score = candidate, lateral end
@@ -10023,6 +10548,7 @@ end)()
     function F.dodge(ctx)
         local threat = F.observeThreat(ctx)
         if not threat or not safeToWork(ctx) then return false end
+        if ctx.questHealing and F.healingMovementBlocked(ctx)then return false end
         local thread = coroutine.running()
         if (thread ~= ctx.defenseThread and thread ~= ctx.featureThread) or now() < (ctx.dodgeAt or 0) then return false end
         local destination = escapePosition(ctx, threat)
@@ -10297,6 +10823,10 @@ end)()
         release(ctx); return true
     end
     function F.cleanup(ctx)
+        if not ctx.active then
+            for manager in pairs(ctx.cueConnections or {})do disconnectCue(ctx,manager)end
+            ctx.cueManagers,ctx.watcherDiscovery=nil,nil
+        end
         ctx.churchReload=nil
         if quest then pcall(quest.cleanup,ctx) end
         pcall(bring.cleanup,ctx)
@@ -10353,7 +10883,8 @@ end)()
         s.equipRecords = s.equipRecords or setmetatable({}, { __mode = 'k' })
         s.lootStarted = s.lootStarted or now()
         s.sackSize, s.sackCapacity = nil, nil
-        ctx.itemRetry, ctx.damageChecks, ctx.pickaxeTargets = {}, {}, {}
+        ctx.itemRetry,ctx.damageChecks,ctx.pickaxeTargets=setmetatable({}, {__mode='k'}),
+            setmetatable({}, {__mode='k'}),setmetatable({}, {__mode='k'})
         ctx.sackDrop = s.pendingSackDrop
         if type(workspace.GetAttributeChangedSignal) == 'function' then
             ctx.connect(workspace:GetAttributeChangedSignal('InfiniteRebasing'), function()
@@ -10698,12 +11229,13 @@ end
             factory = chunk()
         end
         local ctx = { active = true, character = model, humanoid = humanoid, root = root, drill = drill,
-            flags = {}, threads = {}, connections = {}, savedParts = {}, started = now() }
+            flags = {}, threads = {}, connections = {}, savedParts = setmetatable({}, {__mode='k'}), started = now() }
         features.initializeRoute(ctx)
         s.farm = ctx
         ctx.helpers = {}
         local taskApi = {}
         local function readWorld()
+            local function live(item)return item==workspace or item and item.Parent and item:IsDescendantOf(workspace)end
             -- This lock protects a READ-ONLY snapshot, not character movement.
             -- Parking its producer for quest movement makes a quest consumer
             -- wait forever for the very producer it has parked.
@@ -10719,19 +11251,19 @@ end
                 local reader=coroutine.running();ctx.worldReader=reader;ctx.worldReadPulse=now()
                 local scan=ctx.worldScan
                 if not scan then
-                    scan={list={},queue={workspace},cursor=1,seen={[workspace]=true}};ctx.worldScan=scan
+                    scan={list={},queue={workspace},cursor=1,seen=setmetatable({[workspace]=true}, {__mode='k'}),published=0};ctx.worldScan=scan
                 end
                 local ok, complete = pcall(function()
                     local visited,started=0,now()
                     while scan.children or scan.cursor<=#scan.queue do
                         if not scan.children then
                             local parent=scan.queue[scan.cursor];scan.cursor=scan.cursor+1
-                            scan.children,scan.childCursor=parent:GetChildren(),1
+                            scan.children,scan.childCursor=live(parent) and parent:GetChildren() or {},1
                         else
                             local child=scan.children[scan.childCursor]
                             if child then
                                 scan.childCursor=scan.childCursor+1
-                                if not scan.seen[child]then
+                                if live(child) and not scan.seen[child]then
                                     scan.seen[child]=true;scan.list[#scan.list+1]=child;scan.queue[#scan.queue+1]=child
                                 end
                             else scan.children=nil end
@@ -10751,30 +11283,48 @@ end
                 if not ok then error(complete, 0) end
                 if complete then
                     ctx.worldObjects,ctx.worldScan,ctx.worldRefreshAt=scan.list,nil,now()+(workspace.DescendantAdded and 30 or 2)
+                    ctx.worldSeen=setmetatable({}, {__mode='k'});ctx.worldPruneAt=0
+                    for _,item in ipairs(ctx.worldObjects)do ctx.worldSeen[item]=true end
                 else
-                    -- Keep previously discovered live chests while a refresh is
-                    -- incomplete; newly discovered descendants are usable now.
-                    local merged,seen={},{}
-                    for _,group in ipairs({ctx.worldObjects or {},scan.list})do
-                        for _,item in ipairs(group)do
-                            if item.Parent and not seen[item]then merged[#merged+1]=item;seen[item]=true end
+                    -- Publish only this slice's new identities. Recopying the
+                    -- cumulative scan at every slice makes large maps quadratic.
+                    ctx.worldObjects=ctx.worldObjects or {}
+                    if not ctx.worldSeen then
+                        ctx.worldSeen=setmetatable({}, {__mode='k'})
+                        for _,item in ipairs(ctx.worldObjects)do ctx.worldSeen[item]=true end
+                    end
+                    for i=(scan.published or 0)+1,#scan.list do
+                        local item=scan.list[i]
+                        if live(item) and not ctx.worldSeen[item]then
+                            ctx.worldObjects[#ctx.worldObjects+1]=item;ctx.worldSeen[item]=true
                         end
                     end
-                    ctx.worldObjects=merged
+                    scan.published=#scan.list
                 end
             end
-            local list, seen = {}, {}
-            for _, item in ipairs(ctx.worldObjects) do
-                if item.Parent then list[#list + 1] = item; seen[item] = true end
+            local list=ctx.worldObjects or {};ctx.worldObjects=list
+            if not ctx.worldSeen then
+                ctx.worldSeen=setmetatable({}, {__mode='k'})
+                for _,item in ipairs(list)do ctx.worldSeen[item]=true end
             end
+            local seen=ctx.worldSeen
             for item in pairs(ctx.worldPending or {}) do
-                if item.Parent and not seen[item] then list[#list + 1] = item end
+                if live(item) and not seen[item] then list[#list + 1] = item;seen[item]=true end
                 local scan=ctx.worldScan
-                if scan and item.Parent and not scan.seen[item]then
+                if scan and live(item) and not scan.seen[item]then
                     scan.seen[item]=true;scan.list[#scan.list+1]=item;scan.queue[#scan.queue+1]=item
                 end
             end
-            ctx.worldPending, ctx.worldObjects = {}, list
+            ctx.worldPending={}
+            if now()>=(ctx.worldPruneAt or 0)then
+                local write=1
+                for i=1,#list do
+                    local item=list[i]
+                    if live(item)then list[write]=item;write=write+1 else seen[item]=nil end
+                end
+                for i=#list,write,-1 do list[i]=nil end
+                ctx.worldPruneAt=now()+1
+            end
             return list
         end
         ctx.readWorld=readWorld
@@ -10964,6 +11514,15 @@ end
             end
             return unpackValues(result, 2, result.n)
         end
+        function ctx.pruneConnections()
+            if now()<(ctx.connectionsPruneAt or 0)then return end
+            local kept={}
+            for _,existing in ipairs(ctx.connections)do
+                local ok,connected=pcall(function()return existing.Connected end)
+                if not ok or connected~=false then kept[#kept+1]=existing end
+            end
+            ctx.connections=kept;ctx.connectionsPruneAt=now()+1
+        end
         function ctx.connect(signal, fn)
             local connection
             if type(signal) == "table" and signal.__headless then
@@ -10980,6 +11539,8 @@ end
                     end
                 end)
             end
+            if #ctx.connections>=128 then ctx.connectionsPruneAt=0 end
+            ctx.pruneConnections()
             table.insert(ctx.connections, connection)
             return connection
         end
