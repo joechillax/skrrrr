@@ -1,11 +1,11 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 40: early low-health retreat, active medical shop search and scoped stale-mine recovery.
+-- Revision 42: preserve observed outdoor returns across streaming; reports require a private opt-in setting.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
 -- Hides the default Gameplay Paused popup after readiness; streaming pauses still apply.
--- Includes Discord ending reports, cached discovery, and Blinker / identified boss ranged dodging.
+-- Includes local ending reports, optional privately configured Discord delivery, cached discovery, and ranged dodging.
 -- Optional class quests: native combat, mining, sales, shredding, turrets, dungeons, fuel, potions and upgrades.
 -- Quest mode OFF preserves chest-only travel; no healing, mining or team purchases.
 -- Every execution waits seven seconds first; this script never queues itself for teleport.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 40
-    local BUILD = "r40-healing-search-retreat"
+    local REVISION = 42
+    local BUILD = "r42-private-reports-streamed-return"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -44,6 +44,7 @@ return function(source)
     s.questInputRelease=s.questInputRelease or previous and previous.questInputRelease
     if s.revision ~= REVISION or s.build ~= BUILD then s.freshChecked=nil end
     s.revision, s.build = REVISION, BUILD
+    print("[DTEC JoeJoe Automation] Revision "..REVISION.." active ("..BUILD..")")
     s.pauseNoticeHidden, s.pauseNoticeRetryAt, s.pauseNoticeWarned = nil, nil, nil
     s.job, s.owner, s.connections = job, {}, {}
     s.farm, s.teleporting, s.status = nil, false, nil
@@ -302,8 +303,35 @@ end)()
     local REPORT_SOURCE = [=====[return function(api)
     local s, env, now = api.state, api.env, api.now
     local R = {}
-    local URL = 'https://discord.com/api/webhooks/1551830162650435584/V_EItPsWyCQDQgEvZlAGjaH4XoKXchAD6UbPwEiiJ6mPUmiU-2cOlioFzvPW79KlZGgu?wait=true'
     local saveStore=assert(api.saveStore,'DTEC account store is required')
+    local function currentAccount()
+        local ok,player=pcall(function()return (api.Players or game:GetService('Players')).LocalPlayer end)
+        local id=ok and player and tonumber(player.UserId)
+        return id and id==id and id>0 and id<math.huge and id%1==0 and tostring(id) or nil
+    end
+    local function endpoint(value)
+        if type(value)~='string' then return end
+        local base,suffix=value:match('^(https://discord%.com/api/webhooks/%d+/[%w_-]+)(.*)$')
+        if base and (suffix=='' or suffix=='?wait=true')then return base..'?wait=true' end
+    end
+    local function privateConfiguration()
+        local account=currentAccount()
+        if not account or account~=saveStore.accountId then return end
+        -- Explicit environment preferences take precedence over saved opt-in.
+        -- Endpoints stay private and never enter the public source or run ledger.
+        if env.DTECReportingEnabled~=nil or env.DTECWebhookURL~=nil then
+            if env.DTECReportingEnabled==true then
+                local url=endpoint(env.DTECWebhookURL)
+                if url then return account,url,'environment' end
+            end
+            return
+        end
+        local preference=saveStore:get('reporting')
+        if type(preference)=='table' and preference.enabled==true then
+            local url=endpoint(preference.webhook)
+            if url then return account,url,'account' end
+        end
+    end
     local function notice(message)
         if s.reportNotice~=message then s.reportNotice=message;warn('[DTEC JoeJoe Automation Results] '..message)end
     end
@@ -322,7 +350,7 @@ end)()
     local function readyLedger()
         local saved=saveStore:get('reports')
         local account=saveStore.accountId
-        if not account then return false end
+        if not account or currentAccount()~=account then return false end
         if ledgerAccount~=account then
             ledger=type(saved)=='table' and saved or {}
             ledger.records=type(ledger.records)=='table' and ledger.records or {}
@@ -506,7 +534,7 @@ end)()
         if s.config and s.config.classQuest then
             fields[#fields+1]={name='Quest progress (observed)',value=questText(run),inline=false}
         end
-        return {id = run.id, status = 'queued', attempts = 0, created = clock(), body = {
+        return {id = run.id, status = 'queued', attempts = 0, created = clock(), revision=s.revision, build=s.build, body = {
             username = 'DTEC JoeJoe Automation',
             embeds = {{title = 'Earth run - ' .. outcome, color = outcome == 'LOSS' and 15158332
                 or (outcome == 'EXTRACTED' and 3066993 or 15844367), description = clean(reason, 250), fields = fields,
@@ -547,6 +575,8 @@ end)()
     end
     function R.pump()
         if not readyLedger()then return end
+        local account,url,configuration=privateConfiguration()
+        if not account then return end -- Local end-run observations remain available without external reporting.
         local waiting = false
         for _, record in ipairs(ledger.records) do if record.status == 'queued' then waiting = true; break end end
         if not waiting then return end
@@ -559,16 +589,34 @@ end)()
         end
         for _, record in ipairs(ledger.records) do
             if record.status == 'queued' and clock() >= (record.retryAt or 0) then
+                local scheduledLedger,scheduledAccount=ledger,ledgerAccount
+                local previousAttempts=record.attempts or 0
+                local function allowed()
+                    local current,currentURL,source=privateConfiguration()
+                    return current==account and currentURL==url and source==configuration
+                        and ledger==scheduledLedger and ledgerAccount==scheduledAccount
+                        and saveStore.accountId==scheduledAccount and currentAccount()==scheduledAccount
+                end
+                local function persistOwn()
+                    if currentAccount()==scheduledAccount and saveStore.accountId==scheduledAccount
+                        and ledger==scheduledLedger and ledgerAccount==scheduledAccount then persist()end
+                end
+                local function unsent()
+                    record.status,record.sentAt,record.attempts='queued',nil,previousAttempts
+                    persistOwn()
+                end
                 -- Persist before dispatch. An uncertain send is never blindly repeated after teleport/re-execution.
                 record.status, record.sentAt = 'sending', clock()
                 record.attempts = (record.attempts or 0) + 1
                 persist()
                 task.spawn(function()
+                    if not allowed()then unsent();return end
                     local encoded, body = pcall(function() return http:JSONEncode(record.body) end)
-                    if not encoded then record.status = 'failed'; persist(); notice('Result encoding failed.'); return end
+                    if not encoded then record.status = 'failed'; persistOwn(); notice('Result encoding failed.'); return end
                     -- Empty Lua tables encode ambiguously; use an explicit empty JSON array for mentions.
                     body = '{"allowed_mentions":{"parse":[]},' .. body:sub(2)
-                    local sent, response = pcall(send, {Url = URL, Method = 'POST',
+                    if not allowed()then unsent();return end
+                    local sent, response = pcall(send, {Url = url, Method = 'POST',
                         Headers = {['Content-Type'] = 'application/json'}, Body = body})
                     local code = sent and type(response) == 'table' and tonumber(response.StatusCode or response.Status)
                     if code and code >= 200 and code < 300 then
@@ -583,7 +631,7 @@ end)()
                         notice('Discord report ' .. record.status .. (code and (' (HTTP ' .. code .. ')') or '')
                             .. '; farming continues. Uncertain sends are not duplicated.')
                     end
-                    persist()
+                    persistOwn()
                 end)
                 return
             end
@@ -1977,16 +2025,44 @@ return function(api,Q)
         if not issued then s.questMedicalDrop=nil end
         s.questStatus='Medical room: dropping '..api.id(tool)..'; awaiting a real free slot';return false
     end
+    local function quarantine(ctx,attempt)
+        ctx.questHealTried=ctx.questHealTried or setmetatable({}, {__mode='k'})
+        ctx.questHealTried[attempt.tool]={character=attempt.character or ctx.character,
+            humanoid=attempt.humanoid or ctx.humanoid,nativeCount=attempt.nativeCount}
+    end
+    local function nativeCount(value)
+        return finite(value) and value>=1 and value%1==0
+    end
     function H.observe(ctx)
+        -- A late exact stack loss proves that the earlier unit was consumed.
+        -- Re-arm only its remaining unit; HP changes or stale/missing count
+        -- metadata cannot authorize replaying an uncertain Consume.
+        local backpack=api.Players.LocalPlayer:FindFirstChild('Backpack')
+        for tool,record in pairs(ctx.questHealTried or {})do
+            if type(record)=='table' and record.character==ctx.character and record.humanoid==ctx.humanoid
+                and ctx.character==api.Players.LocalPlayer.Character and ctx.humanoid.Health>0
+                and tool.Parent and (tool.Parent==ctx.character or tool.Parent==backpack) and H.isMedical(tool)then
+                local count=tool:GetAttribute('MedicalStackCount')
+                if nativeCount(record.nativeCount) and nativeCount(count) and count<record.nativeCount then
+                    ctx.questHealTried[tool]=nil
+                end
+            end
+        end
         local attempt=ctx.questHealAttempt
         if not attempt then return false end
         local sameLife=(attempt.character or ctx.character)==ctx.character and ctx.character==api.Players.LocalPlayer.Character
             and (not attempt.humanoid or attempt.humanoid==ctx.humanoid) and ctx.humanoid.Health>0
         if not sameLife then ctx.questHealAttempt=nil;ctx.questHealTried=nil;return true end
-        if ctx.humanoid.Health>attempt.health or not attempt.tool.Parent or api.stackCount(attempt.tool)<attempt.count then
+        local count=attempt.tool:GetAttribute('MedicalStackCount')
+        local consumed=not attempt.tool.Parent or nativeCount(attempt.nativeCount) and nativeCount(count) and count<attempt.nativeCount
+        if consumed then
             ctx.questHealAttempt=nil
+        elseif ctx.humanoid.Health>attempt.health then
+            -- Passive or teammate healing can raise HP without consuming this
+            -- unit. Recovery may continue, but its unknown packet is not replayed.
+            quarantine(ctx,attempt);ctx.questHealAttempt=nil
         elseif now()-attempt.started>=3 then
-            ctx.questHealTried=ctx.questHealTried or setmetatable({}, {__mode='k'});ctx.questHealTried[attempt.tool]=true
+            quarantine(ctx,attempt)
             ctx.questHealAttempt=nil;s.questStatus='Medical use unconfirmed; no repeated consume for that item'
         end
         return true
@@ -1999,7 +2075,7 @@ return function(api,Q)
         if attempt and not cfg.classQuest then
             -- Explicit OFF may retire local observation, but never authorizes
             -- this same living tool's uncertain Consume to be repeated on ON.
-            ctx.questHealTried=ctx.questHealTried or setmetatable({}, {__mode='k'});ctx.questHealTried[attempt.tool]=true
+            quarantine(ctx,attempt)
             ctx.questHealAttempt=nil;attempt=nil
         end
         local sameLife=ctx.character==api.Players.LocalPlayer.Character and ctx.humanoid.Health>0
@@ -2138,7 +2214,8 @@ return function(api,Q)
             if not wait or wait.retryAt then wait={started=now(),character=ctx.character};ledger[tool]=wait end
             local active=api.equip(ctx,tool)
             if usableHandler(ctx,tool,active)then
-                local attempt={tool=tool,health=h.Health,count=api.stackCount(tool),started=now(),character=ctx.character,humanoid=h}
+                local attempt={tool=tool,health=h.Health,count=api.stackCount(tool),nativeCount=tool:GetAttribute('MedicalStackCount'),
+                    started=now(),character=ctx.character,humanoid=h}
                 local sent,reason=api.consume(ctx,active)
                 if sent then
                     ledger[tool]=nil
@@ -2848,17 +2925,52 @@ end)()
         return not kind:find('coal',1,true) and (kind:find('diamond',1,true) or kind:find('emerald',1,true)
             or kind:find('ruby',1,true) or kind:find('gold',1,true) or kind:find('iron',1,true))~=nil
     end
+    local function capturedMineInside(snapshot,point)
+        if not snapshot or not snapshot.frame or not snapshot.size or not point then return end
+        local ok,inside=pcall(function()
+            local p=snapshot.frame:PointToObjectSpace(point);local half=snapshot.size*.5
+            if not finite(p.X) or not finite(p.Y) or not finite(p.Z) or not finite(half.X) or not finite(half.Y) or not finite(half.Z)
+                or half.X<=0 or half.Y<=0 or half.Z<=0 then return end
+            return math.abs(p.X)<=half.X and math.abs(p.Y)<=half.Y and math.abs(p.Z)<=half.Z
+        end)
+        if ok then return inside end
+    end
+    local function returnedInside(ctx,returned)
+        local loaded=returned.mine.Parent and returned.mine:IsDescendantOf(workspace)
+        local inside
+        if loaded then inside=D.contains(returned.mine,ctx.root.Position,0)end
+        if inside~=nil then return inside end
+        return capturedMineInside(returned.boundsSnapshot,ctx.root.Position)
+    end
     local function returnState(ctx)
         local returned=ctx and ctx.questMineReturn
-        return returned and returned.character==ctx.character and ctx.character==api.Players.LocalPlayer.Character
+        local player=api.Players.LocalPlayer
+        local valid=returned and returned.character==ctx.character and ctx.character==player.Character and ctx.humanoid.Health>0
             and returned.drill==ctx.drill and ctx.drill==workspace:FindFirstChild('Drill') and ctx.drill.Parent
-            and returned.band==workspace:GetAttribute('InfiniteDepthOffsetMeters') and returned.mine and returned.mine.Parent
-            and returned.session==returned.mine:GetAttribute('SessionDungeonId') and returned or nil
+            and returned.band==workspace:GetAttribute('InfiniteDepthOffsetMeters') and returned.mine
+            and returned.session==returned.mine:GetAttribute('SessionDungeonId')
+            and player:GetAttribute('ActiveDungeonQueueId')==nil and player:GetAttribute('DungeonRunLocked')~=true
+        if not valid then return end
+        local c=api.controller('DungeonUIController')
+        if c and c._BoundDungeon and c._BoundDungeon~=returned.mine then return end
+        if returned.mine.Parent and returned.mine:IsDescendantOf(workspace)then return returned end
+        local transition=ctx.questMineTransition
+        local entered=transition and transition~=returned.transition and transition.mode=='Enter' and transition.mine==returned.mine
+        local exited=transition and transition.mode=='Exit' and transition.mine==returned.mine
+        -- An unloaded room cannot erase an already observed outdoor return.
+        -- Preserve only actual outside position evidence in the same native
+        -- room/session; neither the old binding nor completion is rewritten.
+        if returned.arrivalObserved and not entered and not returned.reentered
+            and (exited or player:GetAttribute('InDungeon')==false or c and c._BoundDungeon==nil
+                or c and c._BoundDungeon==returned.mine and player:GetAttribute('InDungeon')==true
+                    and returnedInside(ctx,returned)==false)then return returned end
     end
     local function outsideMineState(ctx)
         local lease=ctx and ctx.questOutsideMine
         if not lease then return end
         local player=api.Players.LocalPlayer;local controller=api.controller('DungeonUIController')
+        local transition=ctx.questMineTransition
+        local entered=transition and transition~=lease.transition and transition.mode=='Enter' and transition.mine==lease.mine
         local valid=lease.character==ctx.character and ctx.character==player.Character and ctx.humanoid.Health>0
             and lease.drill==ctx.drill and ctx.drill==workspace:FindFirstChild('Drill') and ctx.drill.Parent
             and lease.band==workspace:GetAttribute('InfiniteDepthOffsetMeters') and lease.mine.Parent
@@ -2866,7 +2978,7 @@ end)()
             and lease.session==lease.mine:GetAttribute('SessionDungeonId')
             and lease.bounds==lease.mine:FindFirstChild('MineshaftBounds',true)
             and player:GetAttribute('InDungeon')==true and player:GetAttribute('ActiveDungeonQueueId')==nil
-            and player:GetAttribute('DungeonRunLocked')~=true
+            and player:GetAttribute('DungeonRunLocked')~=true and not entered
         local inside=valid and D.contains(lease.mine,ctx.root.Position,0)
         if not valid or inside~=false then
             ctx.questOutsideMine=nil;ctx.questOutsideMineAt=nil;ctx.questOutsideMineCandidate=nil
@@ -2880,7 +2992,11 @@ end)()
         ctx=ctx or s.farm
         local returned=returnState(ctx);local c=api.controller('DungeonUIController')
         if not returned or not returned.suspended or returned.nativeCleared or not c or c._BoundDungeon~=returned.mine
-            or api.Players.LocalPlayer:GetAttribute('InDungeon')~=true then returned=outsideMineState(ctx)end
+            or api.Players.LocalPlayer:GetAttribute('InDungeon')~=true
+            or api.Players.LocalPlayer:GetAttribute('ActiveDungeonQueueId')~=nil or api.Players.LocalPlayer:GetAttribute('DungeonRunLocked')==true
+            or returned.reentered or ctx and returnedInside(ctx,returned)==true
+            or ctx and ctx.questMineTransition and ctx.questMineTransition~=returned.transition
+                and ctx.questMineTransition.mode=='Enter' and ctx.questMineTransition.mine==returned.mine then returned=outsideMineState(ctx)end
         if not returned then return end
         if not item then return returned end
         if item==returned.mine or item:IsDescendantOf(returned.mine) or D.mineshaft(item)==returned.mine then return returned end
@@ -2915,6 +3031,24 @@ end)()
         return root and root.Parent and root:IsDescendantOf(workspace)
             and D.inDungeon(ctx) and D.mineshaft(root) or nil
     end
+    function D.pruneDoorObservers(ctx)
+        if not ctx.questDoorRemotes or now()<(ctx.questDoorListenerPruneAt or 0)then return end
+        ctx.questDoorListenerPruneAt=now()+1
+        local native=api.controller('DungeonUIController');local bound=native and native._BoundDungeon
+        for item,record in pairs(ctx.questDoorRemotes)do
+            if type(record)=='table'then
+                local mine=record.mine
+                local entry,visit=ctx.questMineEntry,ctx.questDepthMine
+                local keep=mine==bound or not native and mine==ctx.questLastBoundMine or ctx.nativeGateMotion
+                    or entry and (entry.mine==mine or entry.gate and entry.gate:IsDescendantOf(mine)
+                        or entry.prompt and entry.prompt:IsDescendantOf(mine))
+                    or visit and (visit.mine==mine or visit.source==mine)
+                if not keep and not(mine.Parent and mine:IsDescendantOf(workspace))then
+                    pcall(function()record.connection:Disconnect()end);ctx.questDoorRemotes[item]=nil
+                end
+            end
+        end
+    end
     function D.observeDoors(ctx)
         local c=api.controller('DungeonUIController')
         local bound=c and c._BoundDungeon
@@ -2946,7 +3080,7 @@ end)()
             local band=workspace:GetAttribute('InfiniteDepthOffsetMeters');local session=bound:GetAttribute('SessionDungeonId')
             if not candidate or candidate.character~=ctx.character or candidate.drill~=ctx.drill or candidate.mine~=bound
                 or candidate.band~=band or candidate.session~=session or candidate.bounds~=bounds then
-                candidate={character=ctx.character,drill=ctx.drill,mine=bound,session=session,band=band,bounds=bounds,
+                candidate={character=ctx.character,drill=ctx.drill,mine=bound,session=session,band=band,bounds=bounds,transition=ctx.questMineTransition,
                     started=now(),suspended=true}
                 ctx.questOutsideMineCandidate=candidate;ctx.questOutsideMineAt=candidate.started
             end
@@ -2971,14 +3105,18 @@ end)()
                 status('Outside loaded mineshaft bounds; releasing stale local mine route')
             end
         elseif not outside then ctx.questOutsideMineAt=nil;ctx.questOutsideMineCandidate=nil end
+        D.pruneDoorObservers(ctx)
         if now()<(ctx.questDoorScanAt or 0)then return end
         ctx.questDoorScanAt=now()+1
         if not ctx.connect then return end
+        if Q.special and Q.special.observe then Q.special.observe(ctx,nil)end
         ctx.questDoorRemotes=ctx.questDoorRemotes or setmetatable({}, {__mode='k'})
         local roots,seen={},{}
         local function add(item)
             local mine=D.mineshaft(item)
-            if mine and not seen[mine]then seen[mine]=true;roots[#roots+1]=mine end
+            if mine and not seen[mine] and (mine==bound or mine.Parent and mine:IsDescendantOf(workspace))then
+                seen[mine]=true;roots[#roots+1]=mine
+            end
         end
         add(bound)
         for _,door in ipairs(api.tagged('DungeonDoor'))do add(door)end
@@ -2987,9 +3125,10 @@ end)()
         for _,mine in ipairs(roots)do
             for _,item in ipairs(mine:GetDescendants())do
                 if item.Name=='DungeonDoorTransition' and item:IsA('RemoteEvent') and item.OnClientEvent and not ctx.questDoorRemotes[item]then
-                    ctx.questDoorRemotes[item]=true
-                    ctx.connect(item.OnClientEvent,function(mode)
-                        if not ctx.active then return end
+                    local record={mine=mine}
+                    ctx.questDoorRemotes[item]=record
+                    record.connection=ctx.connect(item.OnClientEvent,function(mode)
+                        if not ctx.active or ctx.questDoorRemotes[item]~=record then return end
                         if mode=='Enter'then
                             if not item:IsDescendantOf(workspace)then return end
                             ctx.questMineTransition={mode='Enter',mine=mine};ctx.questMineReadyAt=now()+3
@@ -3197,7 +3336,7 @@ end)()
             return
         end
         local point=ctx.root.Position
-        local inside=validPoint(point) and D.contains(returned.mine,point,0)
+        local inside=validPoint(point) and returnedInside(ctx,returned)
         local entered=transition and transition~=returned.transition and transition.mode=='Enter' and transition.mine==returned.mine
         if entered then
             if ownJob then D.cancelDoor(ctx,false)end
@@ -3217,7 +3356,12 @@ end)()
                 -- Position was observed after the return, not merely requested.
                 -- Suspend travel back into this stale bound room without claiming
                 -- a native exit, a completed visit, or any quest credit.
-                returned.suspended=true;returned.unconfirmedAt=now()
+                returned.suspended=true;returned.unconfirmedAt=now();returned.arrivalObserved=true
+                local bounds=returned.mine:FindFirstChild('MineshaftBounds',true)
+                if inside==false and bounds and bounds.Parent and bounds:IsA('BasePart') and bounds:IsDescendantOf(returned.mine)then
+                    local snapshot={frame=bounds.CFrame,size=bounds.Size}
+                    if capturedMineInside(snapshot,point)==false then returned.boundsSnapshot=snapshot end
+                end
                 D.stopMine(ctx)
                 if D.returnSuspended(ctx,ctx.questThreat)then ctx.questThreat=nil;ctx.questMineExitPickaxe=nil end
                 if D.returnSuspended(ctx,ctx.combatTarget)then ctx.combatTarget=nil;ctx.questCombat=nil end
@@ -4246,7 +4390,20 @@ end)()
         local pending=ctx.questMineEntry
         local returned=D.returnSuspended(ctx)
         if returned and visit and visit.mine==returned.mine then
-            D.stopMine(ctx);ctx.questOwns=nil;return false
+            local job=ctx.questMineJob
+            if job and job.node and D.returnSuspended(ctx,job.node)==returned then
+                local owns=ctx.questMining==true and ctx.questOwns==true
+                D.stopMine(ctx)
+                -- This unfinished visit retains only its old room's scope.
+                -- Once that mine job is gone, a later outdoor coal/chest/driver
+                -- lease must survive every subsequent suspended-room pulse.
+                if owns and not(ctx.questDriving or ctx.questSeating or ctx.currentChest or ctx.featureHold
+                    or ctx.defenseMoving or ctx.nativeGateMotion or ctx.bringEquipmentLock or ctx.questCombat
+                    or s.bringDelivery or s.lootRequest or s.equipmentRequest or s.questDelivery or s.questCashJob)then
+                    ctx.questOwns=nil
+                end
+            end
+            return false
         end
         if visit and visit.mine and active~=visit.mine then
             local transition=ctx.questMineTransition
@@ -4932,14 +5089,42 @@ return function(api,Q)
         return npc:IsDescendantOf(root)
     end
     function S.observe(ctx,root)
-        if not ctx.connect or not root then return end
+        if not ctx.connect then return end
         ctx.questCampaignRemotes=ctx.questCampaignRemotes or setmetatable({}, {__mode='k'})
+        ctx.questCampaignScans=ctx.questCampaignScans or setmetatable({}, {__mode='k'})
+        local nativeController=api.controller('DungeonUIController')
+        local function protected(watched)
+            if nativeController and nativeController._BoundDungeon==watched or ctx.nativeGateMotion then return true end
+            for _,job in pairs({ctx.questCampaign,ctx.questCampaignDoor,ctx.questMineEntry,ctx.questDepthMine})do
+                if job.root==watched or job.mine==watched or job.source==watched
+                    or job.prompt and job.prompt:IsDescendantOf(watched)
+                    or job.gate and job.gate:IsDescendantOf(watched)then return true end
+            end
+            return false
+        end
+        if now()>=(ctx.questCampaignListenerPruneAt or 0)then
+            ctx.questCampaignListenerPruneAt=now()+1
+            for watched,record in pairs(ctx.questCampaignScans)do
+                if not live(watched) and not protected(watched)then
+                    if record.added then pcall(function()record.added:Disconnect()end)end
+                    for item,connection in pairs(record.connections or {})do
+                        pcall(function()connection:Disconnect()end)
+                        if ctx.questCampaignRemotes[item]==connection then ctx.questCampaignRemotes[item]=nil end
+                    end
+                    ctx.questCampaignScans[watched]=nil
+                end
+            end
+        end
+        if not root or not live(root) and not protected(root)then return end
+        local scan=ctx.questCampaignScans[root]
+        if not scan then scan={connections={}};ctx.questCampaignScans[root]=scan end
         local function bind(item)
+            if ctx.questCampaignScans[root]~=scan then return end
             if item.Name=='DungeonDoorTransition' and item:IsA('RemoteEvent') and item.OnClientEvent
                 and not ctx.questCampaignRemotes[item]then
-                ctx.questCampaignRemotes[item]=true
-                ctx.connect(item.OnClientEvent,function(mode)
-                    if not ctx.active then return end
+                local connection
+                connection=ctx.connect(item.OnClientEvent,function(mode)
+                    if not ctx.active or ctx.questCampaignRemotes[item]~=connection then return end
                     if mode=='Enter'then ctx.questCampaignExit=nil
                     elseif mode=='Exit' and (S.bound(ctx)==root or ctx.questCampaign and ctx.questCampaign.root==root)then
                         local controller=api.controller('DungeonUIController')
@@ -4949,14 +5134,10 @@ return function(api,Q)
                         ctx.questCombat=nil;ctx.questExitCombat=nil;ctx.combatTarget=nil
                     end
                 end)
+                ctx.questCampaignRemotes[item]=connection;scan.connections[item]=connection
             end
         end
-        ctx.questCampaignScans=ctx.questCampaignScans or setmetatable({}, {__mode='k'})
-        local scan=ctx.questCampaignScans[root]
-        if not scan then
-            scan={};ctx.questCampaignScans[root]=scan
-            if root.DescendantAdded then ctx.connect(root.DescendantAdded,bind)end
-        end
+        if not scan.added and root.DescendantAdded then scan.added=ctx.connect(root.DescendantAdded,bind)end
         if now()<(scan.nextAt or 0)then return end
         scan.nextAt=now()+2
         for _,item in ipairs(root:GetDescendants())do bind(item)end
@@ -6167,9 +6348,10 @@ end)()
     local function sellers(ctx)
         if now()<(ctx.questPadsAt or 0) then return ctx.questPads or {} end
         ctx.questPadsAt=now()+5; ctx.questPads={}
-        local seen={}; ctx.questPosts=ctx.questPosts or {}
+        local seen={}; ctx.questPosts=setmetatable(ctx.questPosts or {},{__mode='k'})
+        local function loaded(item)return item and item.Parent and item:IsDescendantOf(workspace)end
         local function add(item)
-            if not item or not item.Parent then return end
+            if not loaded(item) then return end
             if Q.sellPad(item) and not seen[item] then seen[item]=true;ctx.questPads[#ctx.questPads+1]=item end
             if item.Name=='TradingPost' then ctx.questPosts[item]=true end
         end
@@ -6179,7 +6361,7 @@ end)()
         -- Model events can precede replication of their sell parts while the route
         -- is parked in a driving quest. Revisit only known posts, not all Workspace.
         for post in pairs(ctx.questPosts) do
-            if not post.Parent then ctx.questPosts[post]=nil
+            if not loaded(post) then ctx.questPosts[post]=nil
             else local parts=post:FindFirstChild('SellParts'); if parts then for _,item in ipairs(parts:GetChildren()) do add(item) end end end
         end
         return ctx.questPads
@@ -8916,6 +9098,50 @@ end)()
                 or active.Tool.Name == name .. tostring(api.Players.LocalPlayer.UserId) then return active end
         end
     end
+    local function rebindHandler(ctx,tool)
+        local c=controller('ToolController');local name=id(tool)
+        if not c or type(c.Equip)~='function' or not name or c.ServerEquipId==nil
+            or not finite(c.EquipVersion) then return false end
+        local proxy
+        for _,piece in ipairs(children(ctx.character))do
+            if piece.Parent==ctx.character and attr(piece,'Tool')==true
+                and (piece.Name==name or piece.Name==name..tostring(api.Players.LocalPlayer.UserId))
+                and piece:GetAttribute('ServerToolEquipId')~=nil
+                and piece:GetAttribute('ServerToolEquipId')==c.ServerEquipId then proxy=piece;break end
+        end
+        if not proxy then return false end
+        -- The actual server-selected representation forbids another EquipTool
+        -- toggle, even while its local class is missing. Rebuild only the
+        -- original native handler after its own ten-second replication budget.
+        s.equipRebindRecords=s.equipRebindRecords or setmetatable({}, {__mode='k'})
+        local record=s.equipRebindRecords[proxy]
+        local version=c.EquipVersion
+        if not record or record.character~=ctx.character or record.controller~=c or record.serverId~=c.ServerEquipId
+            or version~=record.version and version~=record.resultVersion then
+            record={character=ctx.character,controller=c,serverId=c.ServerEquipId,version=version,started=now()}
+            s.equipRebindRecords[proxy]=record
+        end
+        if record.attempted or now()-record.started<10 then return true end
+        local own=s.equipRecords[tool];local calls=quest and quest.calls or {}
+        local scene=controller('CutSceneController');local native=c.ActiveTool
+        if not ctx.active or not api.owned() or ctx.character~=api.Players.LocalPlayer.Character or ctx.humanoid.Health<=0
+            or tool.Parent~=ctx.character and tool.Parent~=api.Players.LocalPlayer:FindFirstChild('Backpack')
+            or own and (own.pending or own.uncertain) or s.equipmentRequest or s.lootRequest or s.bringDelivery
+            or calls.drag or calls.cash or ctx.bringEquipmentLock or quest and quest.manual()
+            or ctx.questDriving or ctx.questSeating or ctx.humanoid.SeatPart or ctx.humanoid.Sit
+            or ctx.questMineEntry or ctx.nativeGateMotion or workspace:GetAttribute('InCutScene') or workspace:GetAttribute('InfiniteRebasing')
+            or scene and (scene.CurrentCutScene or scene.AbortingCutScene)
+            or s.request or s.awaiting or s.teleporting or s.departureAt or ctx.currentChest or ctx.featureHold or ctx.defenseMoving
+            or now()<(ctx.dodgeUntil or 0) or ctx.questPlacement or ctx.questPreviewCancel or ctx.questPotionUsing
+            or ctx.questHealAttempt or s.questMedicalDrop or ctx.swingEdit
+            or native and not native._Destroyed and native.Tool and native.Tool.Parent==ctx.character then return true end
+        -- Set before native dispatch; a failed constructor or our own version
+        -- increment cannot create a reconstruction loop or a server mutation.
+        record.attempted=true
+        record.accepted=pcall(c.Equip,c,name,proxy,record.serverId)
+        record.resultVersion=c.EquipVersion
+        return true
+    end
     local function equip(ctx, tool)
         if ctx.bringEquipmentLock then return nil end
         if not tool or not tool.Parent then return nil end
@@ -8929,6 +9155,11 @@ end)()
         end
         local active = activeFor(ctx, tool)
         if active then s.equipRecords[tool] = nil; return active end
+        if rebindHandler(ctx,tool)then
+            active=activeFor(ctx,tool)
+            if active then s.equipRecords[tool]=nil;return active end
+            return nil
+        end
         if tool.Parent == ctx.character then return nil end
         local record = s.equipRecords[tool]
         -- An accepted request can be superseded by another confirmed tool before
@@ -9036,6 +9267,12 @@ end)()
         if not (cfg.lootExtract or cfg.classQuest or s.questChurchExit) or workspace:GetAttribute('InfiniteRebasing')
             or now() < (ctx.churchObserveAt or 0) then return end
         ctx.churchObserveAt = now() + 1
+        if ctx.indexPending then
+            setmetatable(ctx.indexPending,{__mode='k'})
+            for item in pairs(ctx.indexPending)do
+                if not item.Parent or not descendant(item,workspace)then ctx.indexPending[item]=nil end
+            end
+        end
         -- Read-only collection before the timer prevents streaming-out churches
         -- from being forgotten. Movement and SaveGear still require the timer.
         for _, item in ipairs(tagged('FramePrompt')) do
@@ -9049,12 +9286,17 @@ end)()
     end
     local function index(ctx)
         F.observeChurch(ctx)
+        local retained=ctx.featureIndex and ctx.featureIndex.church
+        for i=#(retained or {}),1,-1 do
+            local item=retained[i]
+            if not item.Parent or not descendant(item,workspace)then table.remove(retained,i)end
+        end
         if ctx.featureIndex and not ctx.worldScan and now() < (ctx.indexAt or 0)
             and now() < (ctx.fullIndexAt or 0) and not next(ctx.indexPending or {}) then return ctx.featureIndex end
         local refresh = ctx.worldScan or not ctx.featureIndex or now() >= (ctx.fullIndexAt or 0)
         local data, seen = { church = {} }, {}
         local function classify(item)
-            if not item or not item.Parent or not item:IsA('ProximityPrompt') or seen[item] or F.skipLootArea(item) then return end
+            if not item or not item.Parent or not descendant(item,workspace) or not item:IsA('ProximityPrompt') or seen[item] or F.skipLootArea(item) then return end
             local action = (tostring(item.ActionText or '') .. ' ' .. item.Name):lower()
             if F.isChurchSavePrompt(item) or (ancestry(item, 'church') or ancestry(item, 'altar')) and F.chestFallbackAllowed(item)
                 and (action:find('lobby', 1, true) or action:find('extract', 1, true) or action:find('return', 1, true)) then
@@ -9066,14 +9308,30 @@ end)()
         if refresh then
             -- Reuse the chest route's bounded reader. Extraction must not start
             -- a second full-map walk or lose a discovered altar to a partial scan.
-            for _,item in ipairs(api.worldSnapshot(ctx))do classify(item)end
-            ctx.fullIndexAt = ctx.worldScan and 0 or now() + 30
+            local snapshot=api.worldSnapshot(ctx)
+            local scan=ctx.worldScan
+            if scan then
+                -- The reader's live snapshot can be pruned in place. Consume
+                -- its append-only scan list by exact scan identity instead of
+                -- revisiting the cumulative snapshot after every small slice.
+                local progress=ctx.featureIndexScan
+                if not progress or progress.scan~=scan then
+                    progress=setmetatable({scan=scan,cursor=1},{__mode='v'});ctx.featureIndexScan=progress
+                end
+                for i=progress.cursor,#scan.list do classify(scan.list[i])end
+                progress.cursor=#scan.list+1;ctx.fullIndexAt=0
+            else
+                -- One finalized pass also catches old live entries and any
+                -- shifts caused by membership pruning during the scan.
+                for _,item in ipairs(snapshot)do classify(item)end
+                ctx.featureIndexScan=nil;ctx.fullIndexAt=now()+30
+            end
         end
         for item in pairs(ctx.indexPending or {}) do classify(item) end
         -- Tags can arrive after DescendantAdded. Query the small native registry
         -- independently of a full workspace refresh.
         for _, item in ipairs(tagged('FramePrompt')) do classify(item) end
-        ctx.indexPending = {}
+        ctx.indexPending = setmetatable({}, {__mode='k'})
         ctx.featureIndex, ctx.indexAt = data, now() + 2
         return data
     end
@@ -10851,6 +11109,10 @@ end)()
     end
     function F.watchdog(ctx)
         F.checkQuestExit(ctx)
+        if ctx.active and quest then
+            if quest.special and quest.special.observe then pcall(quest.special.observe,ctx,nil)end
+            if quest.drillSupport and quest.drillSupport.pruneDoorObservers then pcall(quest.drillSupport.pruneDoorObservers,ctx)end
+        end
         if ctx.active then F.bindOreBreaks(ctx) end
         if ctx.active then F.startDefense(ctx) end
         if not ctx.active or not ctx.initialized or not ctx.featureThread then return end
@@ -10895,7 +11157,7 @@ end)()
             ctx.connect(workspace.DescendantAdded, function(item)
                 if cfg.lootExtract then bring.observe(ctx, item) end
                 if item:IsA('ProximityPrompt') and (cfg.lootExtract or cfg.classQuest or s.questChurchExit) then
-                    ctx.indexPending = ctx.indexPending or {}; ctx.indexPending[item] = true
+                    ctx.indexPending = ctx.indexPending or setmetatable({}, {__mode='k'}); ctx.indexPending[item] = true
                     if F.isChurchSavePrompt(item) then rememberChurch(ctx, item) end
                 end
             end)
@@ -11130,6 +11392,24 @@ end
             end
             if not ready then
                 if ctx.bringEquipmentLock then return end -- Native tool changes cancel drag ownership.
+                -- A weapon change destroys the current native handler. Do not
+                -- take medical/mining equipment merely to prepare idle combat.
+                -- Inspect actual permitted hit geometry before requesting equip.
+                if ctx.questHealing or ctx.questMining then
+                    local nearby
+                    if selected.melee then
+                        local range=features.weaponRange(nil,selected.tool)
+                        nearby=features.auraTargets(ctx,{Tool=selected.tool,DisplayTool=selected.tool,Range=range})
+                    else
+                        local npc=nearestHostile(80,selected.class)
+                        nearby=npc and {npc} or {}
+                    end
+                    if not nearby or #nearby==0 then
+                        notice("No permitted hostile inside the native weapon range")
+                        combat.holdUntil,combat.burstUntil,combat.target=nil,nil,nil
+                        return
+                    end
+                end
                 -- Share the receipt-aware equip path with mining and healing.
                 -- It can recover a superseded accepted request only after a
                 -- different native tool is confirmed and this one is absent.
