@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 45: bounded anonymous local snapshots capture stalled native equipment and healing state.
+-- Revision 46: reserve bounded local snapshots for real equipment, healing and health pressure.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 45
-    local BUILD = "r45-bounded-local-runtime-snapshots"
+    local REVISION = 46
+    local BUILD = "r46-pressure-gated-local-runtime-snapshots"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -11275,6 +11275,14 @@ end)()
         if ledger.busy or ledger.count>=3 or ledger.lastAt~=nil and not finite(ledger.lastAt)then return false end
         local health,maximum=ctx.humanoid.Health,ctx.humanoid.MaxHealth
         local critical=finite(health) and finite(maximum) and maximum>0 and health/maximum<.3
+        if finite(health) and finite(maximum) and maximum>0 and finite(ledger.lastHealth)
+            and health<math.min(ledger.lastHealth,maximum)then ledger.lastDamageAt=at end
+        local injured=finite(health) and finite(maximum) and maximum>0 and health/maximum<.7
+        local recentDamage=finite(ledger.lastDamageAt) and at>=ledger.lastDamageAt and at-ledger.lastDamageAt<=30
+        local waitTarget=ctx.questCombatWait and ctx.questCombatWait.target
+        local combatNeed=F.enemyAlive(waitTarget) or F.enemyAlive(ctx.combatTarget)
+        local equipmentNeeded=not ctx.questDriving and not ctx.questSeating and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
+            and (ctx.questMining or combatNeed or injured or recentDamage)
         local native=controller('ToolController');local active=native and native.ActiveTool
         local nativeCurrent=active and not active._Destroyed and active.Tool and active.Tool.Parent==ctx.character
             and (native.ServerEquipId==nil or active.Tool:GetAttribute('ServerToolEquipId')==native.ServerEquipId)
@@ -11283,9 +11291,13 @@ end)()
         local backpack=player:FindFirstChild('Backpack');local inspected=0
         for tool,receipt in pairs(s.equipRecords or {})do
             inspected=inspected+1;if inspected>16 then break end
+            local class=attr(tool,'Class')
+            local relevant=ctx.questHealing and class=='Medkit' or not ctx.questHealing
+                and (not ctx.questMining or class=='Pickaxe' or class=='Champions_Hammer')
             if tool.Parent and (tool.Parent==ctx.character or tool.Parent==backpack) and type(receipt)=='table'
-                and (receipt.pending or receipt.uncertain or receipt.accepted) and not activeFor(ctx,tool)then equipmentWait=true;break end
+                and relevant and (receipt.pending or receipt.uncertain or receipt.accepted) and not activeFor(ctx,tool)then equipmentWait=true;break end
         end
+        equipmentWait=equipmentWait and equipmentNeeded
         if equipmentWait then
             if not finite(ledger.equipmentSince) or ledger.equipmentSince>at then ledger.equipmentSince=at end
         else ledger.equipmentSince=nil end
