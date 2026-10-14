@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 49: restore smart-map reader yield budget; remove unused code and guard vanished sale targets.
+-- Revision 50: include the native generic Blueprint in unused-item cleanup; retain needed quest blueprints.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 49
-    local BUILD = "r49-smart-reader-budget-unused-code-sale-lifetime"
+    local REVISION = 50
+    local BUILD = "r50-generic-blueprint-cleanup"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -5604,7 +5604,7 @@ return function(api,Q)
         local id=api.id(tool);local unmet={}
         for _,goal in ipairs(plan.unmet or {})do unmet[goal.key]=true end
         for key,wanted in pairs(exact)do if unmet[key] and id==wanted then return true end end
-        if turrets[id] and (unmet.PlaceTurrets or unmet.TurretKills)then return true end
+        if (turrets[id] or id=='Blueprint') and (unmet.PlaceTurrets or unmet.TurretKills)then return true end
         local placement=ctx.questPlacement or s.questFurnacePlacement
         if placement and placement.processingPlacement and placement.tool==tool
             and (now()-(placement.started or now())<12 or placement.token and Q.calls.place==placement.token)then return true end
@@ -5650,7 +5650,7 @@ return function(api,Q)
     local function classOnly(tool)
         local _,ids=I.catalog();if not ids or not tool then return false end
         local id=api.id(tool)
-        if not ids[id] or shared[id] or tostring(id):lower():find('void',1,true)
+        if not(ids[id] or id=='Blueprint') or shared[id] or tostring(id):lower():find('void',1,true)
             or api.attr(tool,'Class')=='ItemBag' then return false end
         -- The same native medkit ID is used by Healer starters and purchased supplies.
         -- No exported provenance distinguishes them, so useful medicine is retained.
