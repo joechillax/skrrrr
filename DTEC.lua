@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 51: recover persistently empty native equipment with bounded retries; expand medical survey coverage.
+-- Revision 52: observe exact medical delivery stage and route handoff locally; gameplay unchanged.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 51
-    local BUILD = "r51-empty-equipment-retries-expanding-medical-search"
+    local REVISION = 52
+    local BUILD = "r52-local-medical-handoff-observation"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -11672,6 +11672,21 @@ end)()
                 preview_cancel=boolean(ctx.questPreviewCancel),potion=boolean(ctx.questPotionUsing),swing_edit=boolean(ctx.swingEdit),
                 current_chest=boolean(ctx.currentChest),defense_moving=boolean(ctx.defenseMoving),dodge=at<(ctx.dodgeUntil or 0)})
             output('requests',requestSlots);output('calls',callSlots)
+            local delivery=type(s.questDelivery)=='table' and s.questDelivery or nil
+            local stages={request=true,placed=true,pickup=true,receipt=true,empty=true,['shop-request']=true,
+                ['shop-drop']=true,quote=true,wallet=true,recheck=true,buy=true,['purchase-confirm']=true}
+            local kinds={supply=true,fuel=true,sale=true,gold=true,smelt=true,shred=true}
+            output('delivery',{route_parked=ctx.routeParked==true,quest_owns=boolean(ctx.questOwns),present=delivery~=nil,
+                current_context=delivery and delivery.ctx==ctx or false,age=delivery and age(delivery.started) or nil,
+                kind=delivery and kinds[delivery.kind] and delivery.kind or nil,
+                stage=delivery and stages[delivery.stage] and delivery.stage or nil,
+                pending=delivery and boolean(delivery.pending) or false,owns=delivery and boolean(delivery.owns) or false,
+                shop=delivery and boolean(delivery.shop) or false,stock_placed=delivery and boolean(delivery.stockPlaced) or false,
+                buy_sent=delivery and boolean(delivery.buySent) or false,healing_supply=delivery and boolean(delivery.healingSupply) or false,
+                cancelled=delivery and boolean(delivery.cancelled) or false,movement_released=delivery and boolean(delivery.movementReleased) or false,
+                release_failed=delivery and boolean(delivery.releaseFailed) or false,
+                drag_reserved=boolean(calls.drag),shop_reserved=boolean(calls.shop),wallet_reserved=boolean(calls.wallet),
+                healing_wallet_reserved=boolean(calls.healingWallet),wallet=number(s.questWallet)})
             for index,entry in ipairs(inventory)do output('inventory-'..index,entry)end
         end)
         ledger.busy=nil
