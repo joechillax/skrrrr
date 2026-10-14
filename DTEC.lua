@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 47: release expired unowned healing supply leases before waiting for route parking.
+-- Revision 48: preserve ready driving defense, drop unused class items and read private shared reports.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 47
-    local BUILD = "r47-expired-unowned-healing-supply-lease"
+    local REVISION = 48
+    local BUILD = "r48-driving-defense-class-cleanup-shared-reports"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -304,6 +304,8 @@ end)()
     local s, env, now = api.state, api.env, api.now
     local R = {}
     local saveStore=assert(api.saveStore,'DTEC account store is required')
+    local http
+    local SHARED_CONFIGURATION='DTEC-private-reporting.json'
     local function currentAccount()
         local ok,player=pcall(function()return (api.Players or game:GetService('Players')).LocalPlayer end)
         local id=ok and player and tonumber(player.UserId)
@@ -313,6 +315,20 @@ end)()
         if type(value)~='string' then return end
         local base,suffix=value:match('^(https://discord%.com/api/webhooks/%d+/[%w_-]+)(.*)$')
         if base and (suffix=='' or suffix=='?wait=true')then return base..'?wait=true' end
+    end
+    local function sharedConfiguration()
+        local reader=env.readfile or readfile
+        if type(reader)~='function' then return nil,false end
+        local found,body=pcall(reader,SHARED_CONFIGURATION)
+        if not found then return nil,false end
+        -- A present but disabled/invalid shared preference never falls through
+        -- to a stale per-account endpoint. No contents or URLs are logged.
+        if not http or type(body)~='string' or #body>4096 then return nil,true end
+        local decoded,value=pcall(http.JSONDecode,http,body)
+        if decoded and type(value)=='table' and value.schema==1 and value.accountScope=='all' then
+            return value,true
+        end
+        return nil,true
     end
     local function privateConfiguration()
         local account=currentAccount()
@@ -326,6 +342,14 @@ end)()
             end
             return
         end
+        local shared,present=sharedConfiguration()
+        if present then
+            if shared and shared.enabled==true then
+                local url=endpoint(shared.webhook)
+                if url then return account,url,'shared-file' end
+            end
+            return
+        end
         local preference=saveStore:get('reporting')
         if type(preference)=='table' and preference.enabled==true then
             local url=endpoint(preference.webhook)
@@ -336,7 +360,8 @@ end)()
         if s.reportNotice~=message then s.reportNotice=message;warn('[DTEC JoeJoe Automation Results] '..message)end
     end
     local function clock()return os.time()end
-    local ok,http=pcall(function()return game:GetService('HttpService')end)
+    local ok
+    ok,http=pcall(function()return game:GetService('HttpService')end)
     if not ok then http=nil end
     local ledger=saveStore:get('reports')
     local migrate=saveStore.accountId and s.reportLedger and s.reportAccountId==nil
@@ -575,11 +600,11 @@ end)()
     end
     function R.pump()
         if not readyLedger()then return end
-        local account,url,configuration=privateConfiguration()
-        if not account then return end -- Local end-run observations remain available without external reporting.
         local waiting = false
         for _, record in ipairs(ledger.records) do if record.status == 'queued' then waiting = true; break end end
         if not waiting then return end
+        local account,url,configuration=privateConfiguration()
+        if not account then return end -- Local end-run observations remain available without external reporting.
         if not http then notice('HttpService unavailable; farming continues without Discord reports.'); return end
         local send = env.request or env.http_request or http_request or request
             or (env.syn and env.syn.request) or (syn and syn.request)
@@ -3972,6 +3997,7 @@ end)()
             if intent and intent.retryAt then
                 local released=intent.waiting=='seat' and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
                     or intent.waiting=='action' and not(s.bringDelivery or s.lootRequest or s.equipmentRequest or ctx.bringEquipmentLock)
+                        and not Q.driveHandoff(ctx)
                     or intent.waiting=='route' and ctx.routeParked==true and not(ctx.currentChest or ctx.featureHold or ctx.defenseMoving
                         or s.bringDelivery or s.lootRequest or s.equipmentRequest or ctx.bringEquipmentLock)
                 if released then intent.retryAt=nil;intent.waiting=nil;ctx.questDrivingDefenseUntil=nil
@@ -3980,7 +4006,7 @@ end)()
             if now()<(ctx.questDrivingDefenseUntil or 0)then return false end
             job={character=ctx.character,drill=ctx.drill,band=workspace:GetAttribute('InfiniteDepthOffsetMeters'),
                 class=s.classData and s.classData.SelectedClass,origin=intent and intent.origin or watch.damagePoint,
-                started=now(),owns=ctx.questOwns==true,intent=intent}
+                started=now(),owns=ctx.questOwns==true,intent=intent,driveLease=intent and intent.lease or s.questDriveLease}
         end
         if job.target then
             local current=drivingHealth(job.target)
@@ -4024,11 +4050,12 @@ end)()
             if job.intent then job.intent.retryAt=now()+10;job.intent.waiting=reason end
             ctx.questDrivingDefenseUntil=now()+10;D.stopDrivingDefense(ctx,true);return false
         end
-        if s.bringDelivery or s.lootRequest or s.equipmentRequest or ctx.bringEquipmentLock then
+        if s.bringDelivery or s.lootRequest or s.equipmentRequest or ctx.bringEquipmentLock or Q.driveHandoff(ctx)then
+            if ctx.combatTarget==npc then ctx.combatTarget=nil;ctx.questCombat=nil end
             if now()-job.started>=8 then
                 return yieldHandoff('action')
             end
-            status('Driving damage observed; own input stopped while another native action remains reserved')
+            status('Driving damage observed; waiting for native driving, input or item ownership to release')
             return true
         end
         if not Q.holdRoute(ctx)then
@@ -4050,6 +4077,36 @@ end)()
         end
         if not job.attackStartedAt then job.attackStartedAt=now();job.progressAt=now()end
         ctx.questThreat=npc;ctx.questCombat=true;ctx.questWeapon,ctx.questWeaponClass=plan.weapon,plan.weaponClass or 'Sword'
+        ctx.combatTarget=npc;Q.armTarget(ctx,npc)
+        local seat=ctx.drill:FindFirstChild('DrillPhysicsSeat') or ctx.drill:FindFirstChild('VehicleSeat')
+        local function movementFree()
+            local currentMax=tonumber(ctx.humanoid.MaxHealth)
+            return cfg.driveDepth and Q.enabled(ctx) and not Q.manual() and not api.extractionReady()
+                and ctx.questDrivingDefense==job and job.character==ctx.character
+                and ctx.character==api.Players.LocalPlayer.Character and job.drill==ctx.drill
+                and ctx.drill==workspace:FindFirstChild('Drill') and job.band==workspace:GetAttribute('InfiniteDepthOffsetMeters')
+                and job.class==(s.classData and s.classData.SelectedClass)
+                and not ctx.questHealing and not ctx.questMineEntry and not ctx.nativeGateMotion
+                and not(finite(currentMax) and currentMax>0 and ctx.humanoid.Health/currentMax<=.3)
+                and Q.driveStopped(ctx,job.driveLease)
+                and not(calls.drag or calls.cash or calls.shop or s.questDelivery or s.questCashJob
+                    or s.bringDelivery or s.lootRequest or s.equipmentRequest or ctx.bringEquipmentLock
+                    or ctx.currentChest or ctx.featureHold or ctx.defenseMoving or now()<(ctx.dodgeUntil or 0))
+        end
+        local escaped=false
+        if movementFree() and seat and seat.Parent and seat:IsA('BasePart') and seat:IsDescendantOf(ctx.drill)
+            and validPoint(seat.Position) and validPoint(ctx.root.Position) and (ctx.root.Position-seat.Position).Magnitude<=3 then
+            -- Native TrainComponent checks this radius every0.1s. Waiting for
+            -- equipment here can re-seat us and hide/unequip the weapon again.
+            local read,frame=pcall(function()return seat.CFrame*CFrame.new(0,2,6)end)
+            if read and frame and validPoint(frame.Position) and (frame.Position-seat.Position).Magnitude>3 then
+                api.hover(ctx)
+                if movementFree()then
+                    ctx.root.CFrame=frame;escaped=true
+                    if ctx.root.AssemblyLinearVelocity then ctx.root.AssemblyLinearVelocity=Vector3.zero end
+                end
+            end
+        end
         local tool=Q.preferred(ctx)
         if tool then job.unarmedAt=nil else job.unarmedAt=job.unarmedAt or now()end
         if now()-job.progressAt>=12 or job.unarmedAt and now()-job.unarmedAt>=8 then
@@ -4059,11 +4116,15 @@ end)()
             status('Nearby driving defense made no native damage progress; resuming other work with a bounded retry')
             return false
         end
-        ctx.combatTarget=npc;Q.armTarget(ctx,npc);api.watch(ctx)
+        api.watch(ctx)
         if not tool then status('Driving defense: waiting for an owned compatible weapon');return true end
         api.hover(ctx)
-        if not calls.drag and not calls.cash and not ctx.defenseMoving and now()>=(ctx.dodgeUntil or 0) and distance>8 then
-            ctx.root.CFrame=CFrame.new(api.part(npc).Position+Vector3.new(0,2,6))
+        distance=(api.part(npc).Position-ctx.root.Position).Magnitude
+        if movementFree() and not escaped and distance>8 then
+            local destination=api.part(npc).Position+Vector3.new(0,2,6)
+            if not seat or not seat.Parent or validPoint(seat.Position) and (destination-seat.Position).Magnitude>3 then
+                ctx.root.CFrame=CFrame.new(destination)
+            end
         end
         status(Q.attackStatus(ctx,'Driving paused after native damage; clearing nearby enemies before continuing'))
         return true
@@ -5499,12 +5560,18 @@ return function(api,Q)
     local function sameTool(a,b)return a==b or a and b and api.id(a)==api.id(b)end
     local function currentPlan(plan)
         if not cfg.classQuest then return plan end
-        local catalog=I.catalog();local data=s.classData;local name=data and data.SelectedClass
-        local progress=data and data.ClassProgress and data.ClassProgress[name]
-        if not catalog or not name or type(progress)~='table' or not finite(progress.Level)
-            or progress.Level<1 or progress.Level%1~=0 or progress.Objectives~=nil and type(progress.Objectives)~='table'
+        local catalog=I.catalog();local data=s.classData
+        if type(data)~='table'then return end
+        local name=data.SelectedClass
+        local progress=type(data.ClassProgress)=='table' and data.ClassProgress[name]
+        if not catalog or not name or type(data.ClassProgress)~='table'
             or type(catalog[name])~='table' or type(catalog[name].Requirements)~='table'then return end
-        return Q.plan(data,catalog,cfg.driveDepth)
+        if progress~=nil and (type(progress)~='table' or not finite(progress.Level)
+            or progress.Level<1 or progress.Level%1~=0 or progress.Objectives~=nil and type(progress.Objectives)~='table')then return end
+        -- Q.plan owns the native initial Level1 rule and requires explicit
+        -- OwnedClasses membership before a missing first progress entry is valid.
+        local current=Q.plan(data,catalog,cfg.driveDepth)
+        return current.name==name and current.kind~='waiting' and current or nil
     end
     local function loadedPickaxeThreat(ctx)
         local mine=Q.drillSupport.activeMine(ctx);local campaign=not mine and Q.special.bound(ctx)
@@ -5588,16 +5655,67 @@ return function(api,Q)
         if not ctx or not classOnly(item)then return true end
         return I.needed(ctx,item)
     end
+    local function standingRejectedReady(ctx,record)
+        local at=now();local player=api.Players.LocalPlayer
+        local drill=record.drill
+        local driver=drill and drill:GetAttribute('DriverUserId')
+        return record.standingRetry==true and record.character==ctx.character and finite(record.count)
+            and record.count>=1 and record.count%1==0 and finite(record.started) and finite(record.settledAt)
+            and finite(at) and at>=record.started and at>=record.settledAt
+            and not ctx.questDriving and not ctx.questSeating and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
+            and drill and drill.Parent and drill==ctx.drill and drill==workspace:FindFirstChild('Drill')
+            and (driver==nil or finite(driver) and driver>=0 and driver%1==0) and driver~=player.UserId
+    end
     function I.candidate(ctx,tool,plan)
         if not owned(ctx,tool) or not classOnly(tool)then return false end
         local placement=ctx.questPlacement or s.questFurnacePlacement
         if placement and placement.processingPlacement and placement.tool==tool
             and placement.token and Q.calls.place==placement.token then return false end
         local count=api.stackCount(tool)
-        if blocked[tool] and count>=blocked[tool]then return false end
+        local record=blocked[tool];local limit=type(record)=='table' and record.count or record
+        if record and (not finite(limit) or limit<1 or limit%1~=0)then return false end
+        if limit and count>=limit and (type(record)~='table' or count~=limit or not standingRejectedReady(ctx,record))then return false end
         return not I.needed(ctx,tool,plan)
     end
-    local function ready(ctx)
+    local function passiveDriving(ctx,tool)
+        local player=api.Players.LocalPlayer;local drill=ctx.drill
+        local seat=ctx.humanoid.SeatPart
+        local lease=s.questDriveLease;local seating=ctx.questSeating
+        local drop=Q.calls.inventoryDrop;local job=s.questInventoryDrop
+        local hotbar=api.controller('HotbarController');local ui=hotbar and hotbar.BackpackUI
+        local visible=ui and ui.Parent and ui.Visible==true
+        -- TrainComponent hides the toolbar for its native Drill presentation.
+        -- This item-specific Backpack drop does not select equipment; accept
+        -- only that exact hidden reason, never a frame/manual/cutscene hide.
+        if not visible and ui and ui.Parent and ui.Visible==false
+            and type(hotbar.HiddenReasons)=='table' and rawget(hotbar.HiddenReasons,'Drill')==true then
+            visible=true
+            for reason in pairs(hotbar.HiddenReasons)do if reason~='Drill'then visible=false;break end end
+        end
+        -- Q.drive retains its finite seating start time after native driving is
+        -- confirmed. Only that exact confirmed lease is a passive driver, not
+        -- a new or unresolved seating/start-stop handoff.
+        if not ctx.questDriving or not lease or lease.ctx~=ctx or lease.drill~=drill
+            or lease.confirmed~=true or lease.abandoned
+            or seating~=nil and (not finite(seating) or seating>now()) or not drill or not drill.Parent
+            or drill~=workspace:FindFirstChild('Drill') or drill:GetAttribute('DriverUserId')~=player.UserId
+            or not visible
+            or seat and not seat:IsDescendantOf(drill) or Q.calls.drive
+            or Q.calls.drag or Q.calls.shop or Q.calls.place or Q.calls.placementCancel
+            or Q.calls.medicalDrop or drop and (not tool or not job or job.ctx~=ctx or job.tool~=tool
+                or not drop.args or drop.args[1]~=tool)then return false end
+        if not tool then return true end -- Read-only candidate selection follows.
+        if not tool:IsA('Tool') or tool.Parent~=player:FindFirstChild('Backpack')then return false end
+        local receipt=s.equipRecords and s.equipRecords[tool]
+        if receipt and (receipt.pending or receipt.uncertain or receipt.accepted)then return false end
+        local native=api.controller('ToolController');local active=native and native.ActiveTool
+        local name=api.id(tool)
+        if active and not active._Destroyed and (active.DisplayTool==tool or active.Tool==tool
+            or active.Tool and (api.id(active.Tool)==name or active.Tool.Name==name
+                or active.Tool.Name==name..tostring(player.UserId)))then return false end
+        return true
+    end
+    local function ready(ctx,tool)
         local player=api.Players.LocalPlayer
         local placement=ctx and ctx.questPlacement
         local passivePlacement=placement and placement.processingPlacement and placement.background and placement.localPreviewStopped
@@ -5612,7 +5730,8 @@ return function(api,Q)
             and not ctx.questPreviewCancel and not ctx.questPotionUsing and not ctx.questHealAttempt
             and not ctx.questStartup and not ctx.questRecovering and not ctx.questRecoveryDue
             and not ctx.currentChest and not ctx.featureHold and not ctx.questMineEntry and not ctx.nativeGateMotion
-            and not ctx.questDriving and not ctx.questSeating and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
+            and (not ctx.questDriving and not ctx.questSeating and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
+                or passiveDriving(ctx,tool)) and not Q.calls.drive
             and not equipping and not ctx.bringEquipmentLock and not s.bringDelivery and not s.questDelivery and not s.lootRequest and not s.equipmentRequest
             and not s.rareShardDrop and not s.questMedicalDrop and not Q.calls.medicalDrop
     end
@@ -5629,11 +5748,20 @@ return function(api,Q)
         end
         if job.notSent then s.questInventoryDrop=nil;return false end
         if job.settled and (not sameLife or now()-job.started>=5 and now()-(job.settledAt or job.started)>=1.5)then
-            blocked[job.tool]=job.count;s.questInventoryDrop=nil
-            status('Class item drop unconfirmed; this item is not dropped again');return false
+            if sameLife and job.passiveDriving and job.rejected then
+                blocked[job.tool]={count=job.count,character=job.character,drill=job.drill,
+                    started=job.started,settledAt=job.settledAt,standingRetry=true}
+                status('Class item drop was explicitly rejected while driving; one standing retry awaits native unseat')
+            else
+                blocked[job.tool]=job.count
+                status('Class item drop unconfirmed; this item is not dropped again')
+            end
+            s.questInventoryDrop=nil;return false
         end
         if now()-job.started>=1.5 then status('Class item drop pending; exact request reserved while other work continues');return false end
-        return job.ctx==ctx and sameLife
+        -- Item-specific Backpack cleanup owns no driver, movement or active
+        -- handler lease. A pending reply must not defer forward input/defense.
+        return not job.passiveDriving and job.ctx==ctx and sameLife
     end
     function I.step(ctx,plan)
         local held=I.observe(ctx)
@@ -5641,15 +5769,22 @@ return function(api,Q)
         if not ready(ctx) or not I.catalog()then return false end
         if cfg.classQuest and not currentPlan(plan)then return false end
         local target
-        for _,tool in ipairs(api.ownedTools(ctx))do if I.candidate(ctx,tool,plan)then target=tool;break end end
+        for _,tool in ipairs(api.ownedTools(ctx))do if I.candidate(ctx,tool,plan) and ready(ctx,tool)then target=tool;break end end
         if not target then return false end
         local job={ctx=ctx,tool=target,id=api.id(target),count=api.stackCount(target),started=now(),character=ctx.character,
-            backpack=api.Players.LocalPlayer:FindFirstChild('Backpack')}
+            backpack=api.Players.LocalPlayer:FindFirstChild('Backpack'),drill=ctx.drill,
+            passiveDriving=ctx.questDriving and passiveDriving(ctx,target) or false}
         s.questInventoryDrop=job
         local issued,token=Q.call('inventoryDrop','ToolService','DropSpecificItem',{target},function(ok,value,_,dispatch)
             job.settled=true;job.settledAt=now();job.notSent=dispatch=='not-sent'
-        end,function()return s.questInventoryDrop==job and ready(ctx) and api.stackCount(target)==job.count
-            and I.candidate(ctx,target,plan)end)
+            job.rejected=ok==true and value==false and not job.notSent
+        end,function()
+            local allowed=s.questInventoryDrop==job and ready(ctx,target) and api.stackCount(target)==job.count
+                and I.candidate(ctx,target,plan)
+            local record=blocked[target]
+            if allowed and type(record)=='table' and record.standingRetry then record.standingRetry=nil end
+            return allowed
+        end)
         job.token=token
         if not issued then s.questInventoryDrop=nil;return false end
         status('Dropping unused class item: '..job.id..'; awaiting native inventory receipt')
@@ -6155,7 +6290,7 @@ end)()
             -- remain reserved; only a completed explicit rejection may rearm.
             -- Set before dispatch because an executor/mock may settle immediately.
             lease.stopIssued=true
-            if not call('drive','DrillService','StopDriving',{},function(ok,value,_,dispatch)
+            local issued,token=call('drive','DrillService','StopDriving',{},function(ok,value,_,dispatch)
                 lease.stopSettled=true;lease.stopAccepted=ok and value~=false
                 if dispatch=='not-sent' or ok and value==false then
                     lease.stopIssued=nil
@@ -6164,7 +6299,8 @@ end)()
                 end
             end,function()return api.owned() and s.questDriveLease==lease and lease.abandoned and not lease.retired
                 and workspace:FindFirstChild('Drill')==lease.drill
-                and driverId(lease.drill)==api.Players.LocalPlayer.UserId end)then lease.stopIssued=nil end
+                and driverId(lease.drill)==api.Players.LocalPlayer.UserId end)
+            if issued then lease.stopToken=token else lease.stopIssued=nil end
         end
     end
     local function humanDrivingInput(ctx)
@@ -6244,6 +6380,27 @@ end)()
         setStatus(holding and 'Leaving the actual seat; waiting for SeatPart to clear'
             or 'Seat exit unconfirmed; native jump retries continue without claiming escape')
         return false,holding
+    end
+    function Q.driveStopped(ctx,lease)
+        local current=workspace:FindFirstChild('Drill');local token=lease and lease.stopToken
+        local owner=current and current:GetAttribute('DriverUserId')
+        local stopped=owner==nil or finite(owner) and owner>=0 and owner~=api.Players.LocalPlayer.UserId
+        return token and token.called==true and token.service=='DrillService' and token.method=='StopDriving'
+            and lease.ctx==ctx and lease.drill==current and ctx.drill==current and current and current.Parent
+            and lease.confirmed and lease.abandoned and stopped
+            and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
+            and not ctx.questDriveInput and not s.questInputRelease and not humanDrivingInput(ctx)
+    end
+    function Q.driveHandoff(ctx)
+        local lease=s.questDriveLease;local current=workspace:FindFirstChild('Drill')
+        if ctx.questDriveInput or s.questInputRelease then return true end
+        local token=calls.drive
+        -- A real effect receipt permits only local standing work. The exact
+        -- unknown RPC remains reserved; no reply or cancellation is invented.
+        if token and not(lease and lease.stopToken==token and Q.driveStopped(ctx,lease))then return true end
+        return lease and lease.ctx==ctx and lease.drill==current and lease.abandoned
+                and lease.stopIssued and lease.stopAccepted~=true
+                and driverId(current)==api.Players.LocalPlayer.UserId
     end
     local function release(job)
         if job.kind=='smelt' and Q.drillSupport and Q.drillSupport.processing then
@@ -7165,6 +7322,66 @@ end)()
         return ready,reason or 'No loaded quest target or supply'
     end
     Q.combatWork=combatWork
+    local function drivingWeapon(ctx,plan,target)
+        local job=ctx.questDrivingDefense
+        local c=api.controller('ToolController');local active=c and c.ActiveTool
+        local scene=api.controller('CutSceneController')
+        if not job or job.target~=target or ctx.questThreat~=target or ctx.combatTarget~=target
+            or not target or not target.Parent or not target:IsDescendantOf(workspace)
+            or target:GetAttribute('NpcFaction')=='FriendlyCompanion'
+            or not api.enemyAlive(target) or not api.questTargetAllowed(ctx,target)
+            or job.character~=ctx.character or ctx.character~=api.Players.LocalPlayer.Character
+            or job.drill~=ctx.drill or ctx.drill~=workspace:FindFirstChild('Drill')
+            or job.band~=workspace:GetAttribute('InfiniteDepthOffsetMeters')
+            or job.class~=(s.classData and s.classData.SelectedClass)
+            or plan.kind=='combat' or plan.kind=='waiting' or not cfg.driveDepth or not enabled(ctx) or manual()
+            or ctx.humanoid.MaxHealth>0 and ctx.humanoid.Health/ctx.humanoid.MaxHealth<=.3
+            or ctx.questDriving or ctx.questSeating or ctx.humanoid.SeatPart or ctx.humanoid.Sit
+            or ctx.questMining or ctx.questHealing or ctx.questStartup or ctx.questRecovering
+            or ctx.questMineEntry or ctx.nativeGateMotion or ctx.bringEquipmentLock
+            or s.bringDelivery or s.lootRequest or s.equipmentRequest or ctx.featureHold or ctx.currentChest
+            or ctx.questHealAttempt or s.questMedicalDrop or ctx.questPotionUsing or ctx.questPreviewCancel
+            or ctx.questPlacement or ctx.swingEdit or ctx.defenseMoving or now()<(ctx.dodgeUntil or 0)
+            or Q.driveHandoff(ctx)
+            or scene and (scene.CurrentCutScene or scene.AbortingCutScene)
+            or not active or active._Destroyed or not active.Tool or active.Tool.Parent~=ctx.character
+            or api.attr(active.Tool,'Tool')~=true or c.ServerEquipId==nil
+            or active.Tool:GetAttribute('ServerToolEquipId')~=c.ServerEquipId
+            or type(active.Swing)~='function' or type(active.CanUseAction)~='function'
+            or type(active.RecordUseCooldown)~='function' or not active.Execute
+            or type(active.Execute.Fire)~='function' then return end
+        local backpack=api.Players.LocalPlayer:FindFirstChild('Backpack')
+        local tool=active.DisplayTool
+        local function matches(candidate)
+            if not candidate or not candidate:IsA('Tool')
+                or candidate.Parent~=ctx.character and candidate.Parent~=backpack then return false end
+            local name=api.id(candidate)
+            return active.Tool==candidate or active.Tool.Name==name
+                or active.Tool.Name==name..tostring(api.Players.LocalPlayer.UserId)
+        end
+        if not matches(tool)then
+            tool=nil
+            for _,candidate in ipairs(api.ownedTools(ctx))do if matches(candidate)then tool=candidate;break end end
+        end
+        if not tool then return end
+        local class=api.attr(tool,'Class')
+        local compatible=api.weaponClass and api.weaponClass(ctx,target)
+        if api.attr(active.Tool,'Class')~=class or class~='Sword' and class~='Pickaxe' or compatible and compatible~=class
+            or class=='Sword' and not api.swordTargetAllowed(target)then return end
+        local range=active.Range
+        local bounds=api.sharedModule('MeleeSwingBounds')
+        if not finite(range) or range<=0 or not bounds or type(bounds.GetModelHitPosition)~='function'then return end
+        local ok,point=pcall(bounds.GetModelHitPosition,target,{Position=ctx.root.Position})
+        if not ok or not point or (point-ctx.root.Position).Magnitude>math.min(range,45)then return end
+        if job.weaponHandler~=active or job.weaponTool~=tool or job.weaponServerId~=c.ServerEquipId then
+            local ready,value=pcall(api.readyAction,active)
+            if not ready or not value then return end
+            job.weaponHandler,job.weaponTool,job.weaponServerId=active,tool,c.ServerEquipId
+        end
+        -- Keep this proven current handler through its native swing cooldown.
+        -- Replacing it immediately would recreate the unnecessary equip wait.
+        return api.id(tool),class
+    end
     function Q.required(ctx)
         if Q.parasite then
             local tool,class,strict=Q.parasite.required(ctx)
@@ -7207,6 +7424,8 @@ end)()
         if plan.name=='Pirate' and plan.kind~='combat' and not ctx.questThreat then return 'Sword_Void','Sword',true end
         if plan.kind=='waiting'then return nil,nil,true end
         if liveThreat then
+            local held,class=drivingWeapon(ctx,plan,threat)
+            if held then return held,class,true end
             if api.findOwned(ctx,'Sword_Void')then return 'Sword_Void','Sword',true end
             return nil,'Sword',true
         end
@@ -7987,6 +8206,7 @@ end)()
             -- only after the actual seat/transition and manual work have cleared.
             local pickaxe=api.findOwned(ctx,'Pickaxe_Void') or api.findTool(ctx,'Pickaxe')
             return ctx.questDriving or ctx.questSeating or ctx.humanoid.SeatPart~=nil or ctx.humanoid.Sit
+                or Q.driveHandoff(ctx)
                 or ctx.questMineEntry or ctx.nativeGateMotion or manual() or ctx.questStartup and not pickaxe or ctx.questRecovering
                 or placementBusy or ctx.questPreviewCancel or ctx.questPotionUsing or ctx.questHealAttempt or s.questMedicalDrop
                 or ctx.swingEdit and not(ctx.swingEdit==ownedEdit and ownedEdit.thread==coroutine.running())
@@ -7994,6 +8214,7 @@ end)()
         -- Standing beside loot, preparing a pickaxe or waiting for extraction
         -- does not disable native in-range retaliation. Actual handoffs do.
         local handoff=ctx.questDriving or ctx.questSeating or ctx.humanoid.SeatPart~=nil or ctx.humanoid.Sit
+            or Q.driveHandoff(ctx)
             or ctx.questMineEntry or ctx.nativeGateMotion or manual() or ctx.bringEquipmentLock
             or s.bringDelivery or s.lootRequest or s.equipmentRequest
             or ctx.swingEdit and not(ctx.swingEdit==ownedEdit and ownedEdit.thread==coroutine.running())
@@ -9242,6 +9463,17 @@ end)()
         end
         return true
     end
+    local function equipmentSelectionReady()
+        local hotbar=controller('HotbarController')
+        local ui=hotbar and hotbar.BackpackUI
+        local scene=controller('CutSceneController')
+        -- The native hotbar refuses new selection while hidden or dragging.
+        -- Driver presentation hides it and requests UnequipTool independently
+        -- of the physical seat; wait for the actual loaded UI to be ready.
+        return ui~=nil and ui.Visible==true and not hotbar.IsDraggingHotbarItem
+            and not workspace:GetAttribute('InCutScene')
+            and not(scene and (scene.CurrentCutScene or scene.AbortingCutScene))
+    end
     local function equip(ctx, tool)
         local record=tool and s.equipRecords[tool]
         if ctx.bringEquipmentLock or not tool or not tool.Parent or not F.canSelectEquipment(ctx,tool)then
@@ -9262,6 +9494,10 @@ end)()
             return nil
         end
         if tool.Parent == ctx.character then if record then record.emptyRecovery=nil end;return nil end
+        if not equipmentSelectionReady()then
+            if record then record.emptyRecovery=nil end
+            return nil
+        end
         -- An accepted request can be superseded by another confirmed tool before
         -- its next observation. Recover every tool family, not just the sack.
         -- EquipTool toggles: never resend while this tool is represented on the character.
@@ -9313,9 +9549,15 @@ end)()
         local acceptedBefore=record.accepted
         record.pending = true; record.notDispatched = nil; record.rejected = nil
         record.issuedAt=now();record.settledAt=nil
-        local dispatchGuard
-        if recovery then
-            dispatchGuard=function(token)
+        local dispatchGuard=function(token)
+            if not equipmentSelectionReady() or not ctx.active or not api.owned() or s.farm~=ctx
+                or ctx.character~=api.Players.LocalPlayer.Character or ctx.humanoid.Health<=0
+                or ctx.bringEquipmentLock or not F.canSelectEquipment(ctx,tool)
+                or tool.Parent~=api.Players.LocalPlayer:FindFirstChild('Backpack')
+                or not equipmentRequirementAllowed(ctx,tool,attr(tool,'Class'))then
+                record.emptyRecovery=nil;return false
+            end
+            if recovery then
                 local required=equipmentRequirementAllowed(ctx,tool,attr(tool,'Class'))
                 local c,version
                 if required then c,version=emptyEquipmentState(ctx,tool,token)end
@@ -9328,8 +9570,8 @@ end)()
                 record.previousActive=c.ActiveTool;record.previousServerEquipId=c.ServerEquipId
                 record.issuedAt=now()
                 print('[DTEC Equipment] Empty native equipment remained clear for 10 seconds; one recovery selection dispatched')
-                return true
             end
+            return true
         end
         local issued = api.request('equip-weapon', 'ToolService', 'EquipTool', api.pack(tool), function(result)
             record.pending = nil
