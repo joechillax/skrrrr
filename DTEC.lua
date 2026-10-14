@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 52: observe exact medical delivery stage and route handoff locally; gameplay unchanged.
+-- Revision 53: recover acknowledged selection stuck behind a stable confirmed other melee tool.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 52
-    local BUILD = "r52-local-medical-handoff-observation"
+    local REVISION = 53
+    local BUILD = "r53-stable-other-native-equipment-recovery"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -9430,17 +9430,17 @@ end)()
         if use then times[#times+1]=at end
         return true
     end
-    local function emptyEquipmentState(ctx,tool,ownRequest)
+    local function selectionRecoveryState(ctx,tool,ownRequest)
         local player=api.Players.LocalPlayer
         local c=controller('ToolController');local calls=quest and quest.calls or {}
         local scene=controller('CutSceneController')
         local placement=controller('PlaceablePlacementController')
         local class=attr(tool,'Class')
         -- A completed transport reply is not an equipped-tool receipt. Only an
-        -- entirely empty, stable native state permits one fresh selection.
+        -- stable native state with the target absent permits a guarded selection.
         if not ctx.active or not api.owned() or s.farm~=ctx or ctx.character~=player.Character
             or ctx.humanoid.Health<=0 or not tool:IsA('Tool') or tool.Parent~=player:FindFirstChild('Backpack')
-            or not c or c.ActiveTool~=nil or c.ServerEquipId~=nil or not finite(c.EquipVersion)
+            or not c or not finite(c.EquipVersion)
             or c.EquipVersion<0 or c.EquipVersion%1~=0
             or s.equipmentRequest and s.equipmentRequest~=ownRequest or s.lootRequest or s.upgradeRequest or s.bringDelivery
             or calls.drag or calls.cash or calls.drive or calls.shop or calls.place or calls.placementCancel
@@ -9457,12 +9457,26 @@ end)()
             or ctx.questHealAttempt or s.questMedicalDrop or ctx.swingEdit
             or ctx.questHealing and class~='Medkit'
             or ctx.questMining and class~='Pickaxe' and class~='Champions_Hammer' then return nil end
+        local other,ownedOther=c.ActiveTool
+        if other~=nil or c.ServerEquipId~=nil then
+            local proxy=other and other.Tool
+            local otherClass=proxy and attr(proxy,'Class')
+            if not other or other._Destroyed or not proxy or proxy.Parent~=ctx.character
+                or not proxy:IsA('Model') or attr(proxy,'Tool')~=true or c.ServerEquipId==nil
+                or proxy:GetAttribute('ServerToolEquipId')~=c.ServerEquipId
+                or (otherClass~='Sword' and otherClass~='Pickaxe') or id(proxy)==id(tool)then return nil end
+            for _,found in ipairs(tools(ctx))do
+                if found~=tool and found:IsA('Tool') and ownedTool(ctx,found) and activeFor(ctx,found)==other then ownedOther=found;break end
+            end
+            if not ownedOther then return nil end
+        end
         local name=id(tool);local qualified=name..tostring(player.UserId)
         for _,piece in ipairs(children(ctx.character))do
-            if piece.Parent==ctx.character and (piece:IsA('Tool') or attr(piece,'Tool')==true
+            if piece.Parent==ctx.character and piece~=ownedOther and (not other or piece~=other.Tool)
+                and (piece:IsA('Tool') or attr(piece,'Tool')==true
                 or piece:IsA('Model') and attr(piece,'Tool')==nil and (id(piece)==name or piece.Name==qualified))then return nil end
         end
-        return c,c.EquipVersion
+        return c,c.EquipVersion,other,c.ServerEquipId
     end
     local function equipmentRequirementAllowed(ctx,tool,class)
         if cfg.classQuest and quest and not ctx.questMining and not ctx.questHealing
@@ -9542,11 +9556,11 @@ end)()
         end
         if record and record.accepted and not record.pending and not record.uncertain
             and finite(record.settledAt)then
-            local c,version=emptyEquipmentState(ctx,tool)
+            local c,version,other,serverId=selectionRecoveryState(ctx,tool)
             local observation=record.emptyRecovery
             if not c then record.emptyRecovery=nil
-            elseif not observation or observation.character~=ctx.character or observation.controller~=c or observation.version~=version then
-                record.emptyRecovery={character=ctx.character,controller=c,version=version,started=now()}
+            elseif not observation or observation.character~=ctx.character or observation.controller~=c or observation.version~=version or observation.other~=other or observation.serverId~=serverId then
+                record.emptyRecovery={character=ctx.character,controller=c,version=version,other=other,serverId=serverId,started=now()}
             elseif now()-observation.started>=10 and now()>=(record.retryAt or 0) and emptyRecoveryBudget(record,false)then recovery=observation end
         elseif record then record.emptyRecovery=nil end
         if record and (record.pending or record.uncertain or record.accepted and not recovery
@@ -9570,17 +9584,17 @@ end)()
             end
             if recovery then
                 local required=equipmentRequirementAllowed(ctx,tool,attr(tool,'Class'))
-                local c,version
-                if required then c,version=emptyEquipmentState(ctx,tool,token)end
+                local c,version,other,serverId
+                if required then c,version,other,serverId=selectionRecoveryState(ctx,tool,token)end
                 if s.equipRecords[tool]~=record or not record.pending or record.uncertain or not emptyRecoveryBudget(record,false)
                     or not required or record.emptyRecovery~=recovery or not c or c~=recovery.controller
-                    or ctx.character~=recovery.character or version~=recovery.version or now()-recovery.started<10 then
+                    or ctx.character~=recovery.character or version~=recovery.version or other~=recovery.other or serverId~=recovery.serverId or now()-recovery.started<10 then
                     record.emptyRecovery=nil;return false
                 end
                 record.emptyRecoveryUsed=true;emptyRecoveryBudget(record,true);record.emptyRecovery=nil
                 record.previousActive=c.ActiveTool;record.previousServerEquipId=c.ServerEquipId
                 record.issuedAt=now()
-                print('[DTEC Equipment] Empty native equipment remained clear for 10 seconds; one recovery selection dispatched')
+                print('[DTEC Equipment] Requested tool absent from stable native equipment for 10 seconds; one recovery selection dispatched')
             end
             return true
         end
