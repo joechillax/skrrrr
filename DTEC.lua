@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 44: recover once from a settled equip reply followed by ten seconds of verified empty native equipment.
+-- Revision 45: bounded anonymous local snapshots capture stalled native equipment and healing state.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 44
-    local BUILD = "r44-bounded-empty-equipment-recovery"
+    local REVISION = 45
+    local BUILD = "r45-bounded-local-runtime-snapshots"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -11259,6 +11259,152 @@ end)()
         ctx.bagObserver = nil
         s.pendingSackDrop = ctx.sackDrop
     end
+    function F.snapshotPulse(ctx)
+        local player=api.Players.LocalPlayer
+        local function current()
+            return api.owned() and ctx and ctx.active and s.farm==ctx and player and player.Character==ctx.character
+                and ctx.humanoid and ctx.humanoid.Parent==ctx.character and ctx.humanoid.Health>0
+        end
+        if not current()then return false end
+        local at=now();if not finite(at)then return false end
+        local ledger=s.runtimeSnapshots
+        if type(ledger)~='table' or ledger.character~=ctx.character or ledger.job~=game.JobId then
+            ledger={character=ctx.character,job=game.JobId,count=0};s.runtimeSnapshots=ledger
+        end
+        if not finite(ledger.count) or ledger.count<0 or ledger.count>3 or ledger.count%1~=0 then ledger.count=3 end
+        if ledger.busy or ledger.count>=3 or ledger.lastAt~=nil and not finite(ledger.lastAt)then return false end
+        local health,maximum=ctx.humanoid.Health,ctx.humanoid.MaxHealth
+        local critical=finite(health) and finite(maximum) and maximum>0 and health/maximum<.3
+        local native=controller('ToolController');local active=native and native.ActiveTool
+        local nativeCurrent=active and not active._Destroyed and active.Tool and active.Tool.Parent==ctx.character
+            and (native.ServerEquipId==nil or active.Tool:GetAttribute('ServerToolEquipId')==native.ServerEquipId)
+        local equipmentWait=ctx.questMining and not(nativeCurrent and type(active.Swing)=='function'
+            and (attr(active.Tool,'Class')=='Pickaxe' or attr(active.Tool,'Class')=='Champions_Hammer')) or false
+        local backpack=player:FindFirstChild('Backpack');local inspected=0
+        for tool,receipt in pairs(s.equipRecords or {})do
+            inspected=inspected+1;if inspected>16 then break end
+            if tool.Parent and (tool.Parent==ctx.character or tool.Parent==backpack) and type(receipt)=='table'
+                and (receipt.pending or receipt.uncertain or receipt.accepted) and not activeFor(ctx,tool)then equipmentWait=true;break end
+        end
+        if equipmentWait then
+            if not finite(ledger.equipmentSince) or ledger.equipmentSince>at then ledger.equipmentSince=at end
+        else ledger.equipmentSince=nil end
+        if ctx.questHealing then
+            if not finite(ledger.healingSince) or finite(health) and finite(ledger.lastHealth) and health>ledger.lastHealth then ledger.healingSince=at end
+        else ledger.healingSince=nil end
+        ledger.lastHealth=finite(health) and health or nil
+        local function age(value)return finite(value) and at>=value and at-value or nil end
+        local reason=critical and 'critical-health'
+            or equipmentWait and (age(ledger.equipmentSince) or 0)>=15 and 'equipment-wait'
+            or ctx.questHealing and (age(ledger.healingSince) or 0)>=15 and 'healing-stall'
+        if not reason or finite(ledger.lastAt) and at-ledger.lastAt<60 then return false end
+        -- Reserve before collecting/printing. A failed or re-entrant diagnostic
+        -- must neither spam nor change any gameplay ownership or request lane.
+        ledger.count=ledger.count+1;ledger.lastAt=at;ledger.busy=true
+        local ok=pcall(function()
+            local json=getService('HttpService');if not json or type(json.JSONEncode)~='function'then return end
+            local classes={Sword=true,Pickaxe=true,Champions_Hammer=true,Medkit=true,Blueprint=true,
+                Revolver=true,Rifle=true,Shotgun=true,BlackholeGun=true,ItemBag=true}
+            local replyTypes={['nil']=true,boolean=true,number=true,string=true,table=true,['function']=true,
+                thread=true,userdata=true,Instance=true,Vector3=true,CFrame=true}
+            local function boolean(value)return not not value end
+            local function number(value)return finite(value) and value or nil end
+            local function scope(instance)
+                if typeof(instance)~='Instance'then return 'absent' end
+                if instance.Parent==ctx.character then return 'character' end
+                if instance.Parent==backpack then return 'backpack' end
+                if instance.Parent==nil then return 'detached' end
+                if instance:IsDescendantOf(ctx.character)then return 'inside-character' end
+                if workspace.CurrentCamera and instance:IsDescendantOf(workspace.CurrentCamera)then return 'camera' end
+                return 'other'
+            end
+            local function proof(instance)
+                local valid=typeof(instance)=='Instance'
+                local proxyId;if valid then proxyId=instance:GetAttribute('ServerToolEquipId')end
+                local currentId=native and native.ServerEquipId
+                local class=valid and attr(instance,'Class') or nil
+                return {scope=scope(instance),class=classes[class] and class or 'other',has_proxy_id=proxyId~=nil,
+                    has_controller_id=currentId~=nil,ids_both_known=proxyId~=nil and currentId~=nil,
+                    ids_match=proxyId~=nil and currentId~=nil and proxyId==currentId,
+                    native_tool_attribute=valid and attr(instance,'Tool')==true or false}
+            end
+            local inventory,truncated={},false
+            local characterTruncated,backpackTruncated=false,false
+            local anyCharacterTool,anyCharacterProxy=false,false
+            for _,container in ipairs({ctx.character,backpack})do
+                local scanned=0
+                for _,item in ipairs(children(container))do
+                    scanned=scanned+1
+                    if scanned>64 then
+                        truncated=true
+                        if container==ctx.character then characterTruncated=true else backpackTruncated=true end
+                        break
+                    end
+                    if item.Parent==container then
+                        local isTool=item:IsA('Tool');local isProxy=item:IsA('Model') and attr(item,'Tool')==true
+                        if container==ctx.character then anyCharacterTool=anyCharacterTool or isTool;anyCharacterProxy=anyCharacterProxy or isProxy end
+                        if isTool or isProxy then
+                            if #inventory>=16 then truncated=true
+                            else
+                                local entry=proof(item)
+                                entry.is_active_tool=active and active.Tool==item or false
+                                entry.is_display_tool=active and active.DisplayTool==item or false
+                                local receipt=s.equipRecords and s.equipRecords[item]
+                                if type(receipt)=='table'then
+                                    entry.request={pending=receipt.pending==true,uncertain=receipt.uncertain==true,
+                                        accepted=receipt.accepted==true,rejected=receipt.rejected==true,not_dispatched=receipt.notDispatched==true,
+                                        recovery_used=receipt.emptyRecoveryUsed==true,issued_age=age(receipt.issuedAt),settled_age=age(receipt.settledAt),
+                                        empty_age=type(receipt.emptyRecovery)=='table' and age(receipt.emptyRecovery.started) or nil,
+                                        reply_type=replyTypes[receipt.replyType] and receipt.replyType or nil,
+                                        reply_arity=number(receipt.replyArity),previous_server_id_known=receipt.previousServerEquipId~=nil,
+                                        server_id_changed=receipt.previousServerEquipId~=nil and native~=nil and native.ServerEquipId~=nil
+                                            and receipt.previousServerEquipId~=native.ServerEquipId}
+                                end
+                                inventory[#inventory+1]=entry
+                            end
+                        end
+                    end
+                end
+            end
+            local calls=quest and quest.calls or s.questCalls or {}
+            local requestSlots,callSlots={},{}
+            for _,key in ipairs({'request','equipmentRequest','lootRequest','lootQuery','upgradeRequest','awaiting','teleporting','departureAt'})do requestSlots[key]=boolean(s[key])end
+            for _,key in ipairs({'drag','cash','drive','shop','place','placementCancel','craft','upgrade','medicalDrop','inventoryDrop'})do callSlots[key]=boolean(calls[key])end
+            local scene=controller('CutSceneController');local placement=controller('PlaceablePlacementController');local drag=controller('DragController')
+            local function output(section,value)
+                if not current()then return end
+                local prefix='[DTEC Runtime Snapshot] '..section..' '
+                local encoded=json:JSONEncode(value)
+                if type(encoded)~='string' or #prefix+#encoded>=900 then encoded='{"truncated":true}'end
+                if not current()then return end
+                print(prefix..encoded)
+            end
+            output('core',{revision=number(s.revision),trigger=reason,snapshot=ledger.count,health=number(health),max_health=number(maximum),
+                tool_controller_present=native~=nil,native_handler_present=active~=nil,native_handler_destroyed=active and active._Destroyed==true or false,
+                native_handler_current=boolean(nativeCurrent),native_equip_version=number(native and native.EquipVersion),
+                active_swing=active and type(active.Swing)=='function' or false,active_consume=active and type(active.Consume)=='function' or false,
+                equipment_wait_age=age(ledger.equipmentSince),healing_wait_age=age(ledger.healingSince)})
+            output('identity',{active_tool=proof(active and active.Tool),display_scope=scope(active and active.DisplayTool),inventory_truncated=truncated,
+                character_scan_truncated=characterTruncated,backpack_scan_truncated=backpackTruncated,
+                any_character_tool=anyCharacterTool,any_character_proxy=anyCharacterProxy})
+            output('phase',{healing=boolean(ctx.questHealing),mining=boolean(ctx.questMining),driving=boolean(ctx.questDriving),seating=boolean(ctx.questSeating),
+                seated=boolean(ctx.humanoid.SeatPart or ctx.humanoid.Sit),feature_hold=boolean(ctx.featureHold),equipment_lock=boolean(ctx.bringEquipmentLock),
+                equipment_lock_matches_bring_delivery=boolean(ctx.bringEquipmentLock and s.bringDelivery and ctx.bringEquipmentLock==s.bringDelivery),
+                equipment_lock_matches_quest_delivery=boolean(ctx.bringEquipmentLock and s.questDelivery and ctx.bringEquipmentLock==s.questDelivery),
+                consume_observation=boolean(ctx.questHealAttempt),medical_drop_reserved=boolean(s.questMedicalDrop),native_gate_motion=boolean(ctx.nativeGateMotion),
+                native_mine_entry=boolean(ctx.questMineEntry),delivery_reserved=boolean(s.questDelivery),cash_reserved=boolean(s.questCashJob),bring_delivery_reserved=boolean(s.bringDelivery)})
+            output('guards',{manual_drag=drag and boolean(drag.LockedTarget) or false,native_placement=placement and boolean(placement.Active) or false,
+                player_placing=player:GetAttribute('PlacingCraftedPlaceable')==true,cutscene=boolean(workspace:GetAttribute('InCutScene')
+                    or scene and (scene.CurrentCutScene or scene.AbortingCutScene)),rebasing=boolean(workspace:GetAttribute('InfiniteRebasing')),
+                gameplay_paused=player.GameplayPaused==true,recovering=boolean(ctx.questRecovering),placement=boolean(ctx.questPlacement),
+                preview_cancel=boolean(ctx.questPreviewCancel),potion=boolean(ctx.questPotionUsing),swing_edit=boolean(ctx.swingEdit),
+                current_chest=boolean(ctx.currentChest),defense_moving=boolean(ctx.defenseMoving),dodge=at<(ctx.dodgeUntil or 0)})
+            output('requests',requestSlots);output('calls',callSlots)
+            for index,entry in ipairs(inventory)do output('inventory-'..index,entry)end
+        end)
+        ledger.busy=nil
+        return ok
+    end
     function F.watchdog(ctx)
         F.checkQuestExit(ctx)
         if ctx.active and quest then
@@ -12667,7 +12813,10 @@ end
             ctx.failed = 'Chest interaction exceeded 15 seconds; holding its retry while recovering the worker'
             print('[ChestFarm] ' .. ctx.failed)
         end
-        if ctx then features.watchdog(ctx) end
+        if ctx then
+            if type(features.snapshotPulse)=='function'then pcall(features.snapshotPulse,ctx)end
+            features.watchdog(ctx)
+        end
         if ctx and ctx.active and ctx.combatThread and now()>=(ctx.combatRestartAt or 0)then
             local thread,combat=ctx.combatThread,ctx.combat
             if coroutine.status(thread)=='dead' or combat and now()-(combat.pulse or now())>=20 then
