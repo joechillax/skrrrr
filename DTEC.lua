@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 46: reserve bounded local snapshots for real equipment, healing and health pressure.
+-- Revision 47: release expired unowned healing supply leases before waiting for route parking.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 46
-    local BUILD = "r46-pressure-gated-local-runtime-snapshots"
+    local REVISION = 47
+    local BUILD = "r47-expired-unowned-healing-supply-lease"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2190,6 +2190,15 @@ return function(api,Q)
         ctx.questCombat=nil -- Waiting for healing is not quest counter progress.
         Q.stopDrive(ctx)
         if h.SeatPart or h.Sit then local _,holding=Q.unseat(ctx);api.watch(ctx);return holding end
+        local expired=s.questDelivery
+        if expired and expired.ctx==ctx and expired.kind=='supply' and finite(expired.started)
+            and now()-expired.started>(expired.shop and 25 or 12)
+            and not expired.pending and not expired.owns and not expired.stockPlaced
+            and not Q.calls.drag and not Q.calls.shop and not Q.calls.wallet then
+            -- An unacknowledged route must not retain this expired local lease.
+            -- These guards exclude every native release/stock-return branch.
+            Q.release(expired)
+        end
         if not Q.holdRoute(ctx)then return true end
         api.watch(ctx)
         if not h.SeatPart and now()>=(ctx.questHealRetreatAt or 0)
