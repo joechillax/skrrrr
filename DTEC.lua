@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 50: include the native generic Blueprint in unused-item cleanup; retain needed quest blueprints.
+-- Revision 51: recover persistently empty native equipment with bounded retries; expand medical survey coverage.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 50
-    local BUILD = "r50-generic-blueprint-cleanup"
+    local REVISION = 51
+    local BUILD = "r51-empty-equipment-retries-expanding-medical-search"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -9418,6 +9418,18 @@ end)()
         record.resultVersion=c.EquipVersion
         return true
     end
+    local function emptyRecoveryBudget(record,use)
+        local at=now();local times=record.emptyRecoveryTimes
+        if type(times)~='table'then
+            times={};record.emptyRecoveryTimes=times
+            if record.emptyRecoveryUsed then times[1]=finite(record.settledAt) and math.min(at,record.settledAt) or at end
+        end
+        for _,time in ipairs(times)do if not finite(time) or time>at then return false end end
+        while times[1] and at-times[1]>=60 do table.remove(times,1)end
+        if #times>=3 then return false end
+        if use then times[#times+1]=at end
+        return true
+    end
     local function emptyEquipmentState(ctx,tool,ownRequest)
         local player=api.Players.LocalPlayer
         local c=controller('ToolController');local calls=quest and quest.calls or {}
@@ -9528,17 +9540,17 @@ end)()
             and not s.equipmentRequest and not finite(record.settledAt)then
             record.settledAt=now();record.emptyRecovery=nil
         end
-        if record and record.accepted and not record.pending and not record.uncertain and not record.emptyRecoveryUsed
+        if record and record.accepted and not record.pending and not record.uncertain
             and finite(record.settledAt)then
             local c,version=emptyEquipmentState(ctx,tool)
             local observation=record.emptyRecovery
             if not c then record.emptyRecovery=nil
             elseif not observation or observation.character~=ctx.character or observation.controller~=c or observation.version~=version then
                 record.emptyRecovery={character=ctx.character,controller=c,version=version,started=now()}
-            elseif now()-observation.started>=10 and now()>=(record.retryAt or 0)then recovery=observation end
+            elseif now()-observation.started>=10 and now()>=(record.retryAt or 0) and emptyRecoveryBudget(record,false)then recovery=observation end
         elseif record then record.emptyRecovery=nil end
         if record and (record.pending or record.uncertain or record.accepted and not recovery
-            or record.emptyRecoveryUsed or now() < (record.retryAt or 0)) then return nil end
+            or now() < (record.retryAt or 0)) then return nil end
         record = record or {}; s.equipRecords[tool] = record
         local nativeController=controller('ToolController')
         if not recovery then
@@ -9560,12 +9572,12 @@ end)()
                 local required=equipmentRequirementAllowed(ctx,tool,attr(tool,'Class'))
                 local c,version
                 if required then c,version=emptyEquipmentState(ctx,tool,token)end
-                if s.equipRecords[tool]~=record or not record.pending or record.uncertain or record.emptyRecoveryUsed
+                if s.equipRecords[tool]~=record or not record.pending or record.uncertain or not emptyRecoveryBudget(record,false)
                     or not required or record.emptyRecovery~=recovery or not c or c~=recovery.controller
                     or ctx.character~=recovery.character or version~=recovery.version or now()-recovery.started<10 then
                     record.emptyRecovery=nil;return false
                 end
-                record.emptyRecoveryUsed=true
+                record.emptyRecoveryUsed=true;emptyRecoveryBudget(record,true);record.emptyRecovery=nil
                 record.previousActive=c.ActiveTool;record.previousServerEquipId=c.ServerEquipId
                 record.issuedAt=now()
                 print('[DTEC Equipment] Empty native equipment remained clear for 10 seconds; one recovery selection dispatched')
@@ -10997,7 +11009,7 @@ end)()
         -- No shop is loaded yet. Survey only positions with actual collidable
         -- current-scope floor, retaining the origin across bounded search bursts.
         if not quest.drillSupport.inDungeon(ctx) and now()>=(cache.surveyAt or 0)then
-            cache.surveyAt=now()+3;cache.survey=(cache.survey%8)+1
+            cache.surveyAt=now()+3;cache.survey=cache.survey+1
             local direction=cache.survey%2==1 and 1 or -1
             local offset=math.ceil(cache.survey/2)*160*direction
             local surveyOrigin=cache.origin+Vector3.new(offset,0,0)
