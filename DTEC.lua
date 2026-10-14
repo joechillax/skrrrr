@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 43: select the real owned tool over stale equipped representations; preserve native equip receipts.
+-- Revision 44: recover once from a settled equip reply followed by ten seconds of verified empty native equipment.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 43
-    local BUILD = "r43-native-equipment-proxy-selection"
+    local REVISION = 44
+    local BUILD = "r44-bounded-empty-equipment-recovery"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -694,7 +694,7 @@ end
     end
     -- Transition calls remain serialized. Independent read/reward/skip calls have
     -- bounded slots so a stuck optional feature cannot lock the gameplay loop.
-    local function request(kind, service, method, args, finished)
+    local function request(kind, service, method, args, finished, dispatchGuard)
         local slot = requestSlot(kind)
         if s[slot] or now() < (s.requestBackoff[service .. "." .. method] or 0) then return false end
         if slot == "request" and (s.awaiting or now() < (s.nextAction or 0)) then return false end
@@ -707,6 +707,17 @@ end
         if slot == "request" then stopFarm() end
         status("Requesting " .. method)
         task.spawn(function()
+            -- Recovery selections must still be permitted when their queued
+            -- task actually runs. A skipped guard proves no RPC was sent.
+            if dispatchGuard then
+                local ok, allowed = pcall(dispatchGuard, token)
+                if not ok or allowed ~= true then
+                    token.result = pack(true, false)
+                    token.result.notDispatched = true
+                    token.settled = true
+                    return
+                end
+            end
             token.result = pack(pcall(function() return rf:InvokeServer(unpackValues(args, 1, args.n or #args)) end))
             token.settled = true
         end)
@@ -9178,31 +9189,74 @@ end)()
         record.resultVersion=c.EquipVersion
         return true
     end
-    local function equip(ctx, tool)
-        if ctx.bringEquipmentLock then return nil end
-        if not tool or not tool.Parent then return nil end
-        if not F.canSelectEquipment(ctx,tool)then return nil end
+    local function emptyEquipmentState(ctx,tool,ownRequest)
+        local player=api.Players.LocalPlayer
+        local c=controller('ToolController');local calls=quest and quest.calls or {}
+        local scene=controller('CutSceneController')
+        local placement=controller('PlaceablePlacementController')
         local class=attr(tool,'Class')
+        -- A completed transport reply is not an equipped-tool receipt. Only an
+        -- entirely empty, stable native state permits one fresh selection.
+        if not ctx.active or not api.owned() or s.farm~=ctx or ctx.character~=player.Character
+            or ctx.humanoid.Health<=0 or not tool:IsA('Tool') or tool.Parent~=player:FindFirstChild('Backpack')
+            or not c or c.ActiveTool~=nil or c.ServerEquipId~=nil or not finite(c.EquipVersion)
+            or c.EquipVersion<0 or c.EquipVersion%1~=0
+            or s.equipmentRequest and s.equipmentRequest~=ownRequest or s.lootRequest or s.upgradeRequest or s.bringDelivery
+            or calls.drag or calls.cash or calls.drive or calls.shop or calls.place or calls.placementCancel
+            or calls.craft or calls.upgrade or calls.medicalDrop or calls.inventoryDrop
+            or s.questDelivery or s.questCashJob or ctx.bringEquipmentLock or quest and quest.manual()
+            or ctx.questDriving or ctx.questSeating or ctx.humanoid.SeatPart or ctx.humanoid.Sit
+            or ctx.questMineEntry or ctx.nativeGateMotion or workspace:GetAttribute('InCutScene')
+            or workspace:GetAttribute('InfiniteRebasing') or player.GameplayPaused==true
+            or scene and (scene.CurrentCutScene or scene.AbortingCutScene)
+            or player:GetAttribute('PlacingCraftedPlaceable')==true or placement and placement.Active
+            or s.request or s.awaiting or s.teleporting or s.departureAt
+            or ctx.currentChest or ctx.featureHold or ctx.defenseMoving or now()<(ctx.dodgeUntil or 0)
+            or ctx.questPlacement or ctx.questPreviewCancel or ctx.questPotionUsing or ctx.questRecovering
+            or ctx.questHealAttempt or s.questMedicalDrop or ctx.swingEdit
+            or ctx.questHealing and class~='Medkit'
+            or ctx.questMining and class~='Pickaxe' and class~='Champions_Hammer' then return nil end
+        local name=id(tool);local qualified=name..tostring(player.UserId)
+        for _,piece in ipairs(children(ctx.character))do
+            if piece.Parent==ctx.character and (piece:IsA('Tool') or attr(piece,'Tool')==true
+                or piece:IsA('Model') and attr(piece,'Tool')==nil and (id(piece)==name or piece.Name==qualified))then return nil end
+        end
+        return c,c.EquipVersion
+    end
+    local function equipmentRequirementAllowed(ctx,tool,class)
         if cfg.classQuest and quest and not ctx.questMining and not ctx.questHealing
-            and (class=='Sword' or class=='Pickaxe' or class=='Champions_Hammer' or GUNS[class]) then
+            and (class=='Sword' or class=='Pickaxe' or class=='Champions_Hammer' or GUNS[class])then
             local required,requiredClass,strict=quest.required(ctx)
             if required and id(tool)~=required or strict and not required and not requiredClass
                 or requiredClass=='Gun' and not GUNS[class]
-                or requiredClass and requiredClass~='Gun' and class~=requiredClass then return nil end
+                or requiredClass and requiredClass~='Gun' and class~=requiredClass then return false end
+        end
+        return true
+    end
+    local function equip(ctx, tool)
+        local record=tool and s.equipRecords[tool]
+        if ctx.bringEquipmentLock or not tool or not tool.Parent or not F.canSelectEquipment(ctx,tool)then
+            if record then record.emptyRecovery=nil end
+            return nil
+        end
+        local class=attr(tool,'Class')
+        if not equipmentRequirementAllowed(ctx,tool,class)then
+            if record then record.emptyRecovery=nil end
+            return nil
         end
         local active = activeFor(ctx, tool)
         if active then s.equipRecords[tool] = nil; return active end
         if rebindHandler(ctx,tool)then
+            if record then record.emptyRecovery=nil end
             active=activeFor(ctx,tool)
             if active then s.equipRecords[tool]=nil;return active end
             return nil
         end
-        if tool.Parent == ctx.character then return nil end
-        local record = s.equipRecords[tool]
+        if tool.Parent == ctx.character then if record then record.emptyRecovery=nil end;return nil end
         -- An accepted request can be superseded by another confirmed tool before
         -- its next observation. Recover every tool family, not just the sack.
         -- EquipTool toggles: never resend while this tool is represented on the character.
-        if record and record.accepted
+        if record and (record.accepted or record.emptyRecoveryUsed)
             and now() >= (record.retryAt or 0) then
             local c = controller('ToolController')
             local other = c and c.ActiveTool
@@ -9219,22 +9273,74 @@ end)()
                     if not(current and changed and equipId~=nil and equipId~=serverId)then represented=true end
                 end
             end
-            if not represented and current and other~=record.previousActive and (serverId==nil or changed)then record.accepted = nil end
+            if not represented and current and other~=record.previousActive and (serverId==nil or changed)then
+                record.accepted=nil;record.emptyRecovery=nil;record.emptyRecoveryUsed=nil
+            end
         end
-        if record and (record.pending or record.uncertain or record.accepted or now() < (record.retryAt or 0)) then return nil end
+        local recovery
+        -- Hot replacement can retain a settled pre-44 record without these
+        -- diagnostics. Start a new observation now; never credit earlier time.
+        if record and record.accepted==true and not record.pending and not record.uncertain
+            and not s.equipmentRequest and not finite(record.settledAt)then
+            record.settledAt=now();record.emptyRecovery=nil
+        end
+        if record and record.accepted and not record.pending and not record.uncertain and not record.emptyRecoveryUsed
+            and finite(record.settledAt)then
+            local c,version=emptyEquipmentState(ctx,tool)
+            local observation=record.emptyRecovery
+            if not c then record.emptyRecovery=nil
+            elseif not observation or observation.character~=ctx.character or observation.controller~=c or observation.version~=version then
+                record.emptyRecovery={character=ctx.character,controller=c,version=version,started=now()}
+            elseif now()-observation.started>=10 and now()>=(record.retryAt or 0)then recovery=observation end
+        elseif record then record.emptyRecovery=nil end
+        if record and (record.pending or record.uncertain or record.accepted and not recovery
+            or record.emptyRecoveryUsed or now() < (record.retryAt or 0)) then return nil end
         record = record or {}; s.equipRecords[tool] = record
         local nativeController=controller('ToolController')
-        record.previousActive=nativeController and nativeController.ActiveTool
-        record.previousServerEquipId=nativeController and nativeController.ServerEquipId
+        if not recovery then
+            record.previousActive=nativeController and nativeController.ActiveTool
+            record.previousServerEquipId=nativeController and nativeController.ServerEquipId
+        end
+        local acceptedBefore=record.accepted
         record.pending = true; record.notDispatched = nil; record.rejected = nil
+        record.issuedAt=now();record.settledAt=nil
+        local dispatchGuard
+        if recovery then
+            dispatchGuard=function(token)
+                local required=equipmentRequirementAllowed(ctx,tool,attr(tool,'Class'))
+                local c,version
+                if required then c,version=emptyEquipmentState(ctx,tool,token)end
+                if s.equipRecords[tool]~=record or not record.pending or record.uncertain or record.emptyRecoveryUsed
+                    or not required or record.emptyRecovery~=recovery or not c or c~=recovery.controller
+                    or ctx.character~=recovery.character or version~=recovery.version or now()-recovery.started<10 then
+                    record.emptyRecovery=nil;return false
+                end
+                record.emptyRecoveryUsed=true
+                record.previousActive=c.ActiveTool;record.previousServerEquipId=c.ServerEquipId
+                record.issuedAt=now()
+                print('[DTEC Equipment] Empty native equipment remained clear for 10 seconds; one recovery selection dispatched')
+                return true
+            end
+        end
         local issued = api.request('equip-weapon', 'ToolService', 'EquipTool', api.pack(tool), function(result)
             record.pending = nil
+            record.settledAt=now()
+            record.replyType=type(result[2])
+            record.replyArity=math.max(0,(result.n or #result)-1)
+            if result.notDispatched then
+                record.notDispatched=true;record.rejected=nil;record.uncertain=nil
+                record.accepted=acceptedBefore;record.emptyRecovery=nil;record.retryAt=now()+3
+                return
+            end
             record.notDispatched = nil
             record.rejected = result[1] == true and result[2] == false
             record.uncertain = result[1] ~= true
             record.accepted, record.retryAt = api.accepted(result), now() + 3
-        end)
-        if not issued then record.pending = nil; record.notDispatched = true end
+        end,dispatchGuard)
+        if not issued then
+            record.pending=nil;record.notDispatched=true
+            if recovery then record.accepted=acceptedBefore;record.emptyRecovery=nil;record.settledAt=now() end
+        end
     end
     local function wait(ctx, seconds)
         ctx.featurePulse = now()
