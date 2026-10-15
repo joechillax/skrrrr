@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.60: collect sale proceeds before more sales and await delayed native cash receipts safely.
+-- Version 0.61: ignore Common and Mimic chests in every farming and quest mode.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 60
+    local REVISION = 61
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.60-cash-collection-priority"
+    local BUILD = "v0.61-ignore-common-and-mimic-chests"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -7786,6 +7786,7 @@ end)()
         ctx.questChestTaking=true;ctx.questChestLease=coroutine.running()
         setStatus('Checking loaded chests alongside class quests')
         local function eligible(entry)
+            if not entry or not entry.Model or api.chestAllowed and not api.chestAllowed(entry.Model)then return false end
             if ctx.questHealing and api.healingChestSafe and not api.healingChestSafe(ctx,entry)then return false end
             if not Q.drillSupport.inDungeon(ctx)then return true end
             local root=Q.special.bound(ctx)
@@ -9504,6 +9505,8 @@ end)()
             local real=tostring(item:GetAttribute('RealName') or ''):lower():gsub('[%s_%-]','')
             if name=='mimic' or name=='mimicchest' or name=='chestmimic'
                 or real=='mimic' or real=='mimicchest' or real=='chestmimic' then return false end
+            if name=='commonchest' or name=='chestcommon' or real=='commonchest' or real=='chestcommon'
+                or item:GetAttribute('RuntimeChestModel') and (name=='common' or real=='common') then return false end
             if tag(item, 'ShopItem') or (tonumber(item:GetAttribute('Cost')) or 0) > 0
                 or item:GetAttribute('Robux') == true or item:GetAttribute('ProductId') ~= nil
                 or item:GetAttribute('RobuxProductId') ~= nil then return false end
@@ -10449,6 +10452,7 @@ end)()
         end,
         miningNodeAllowed=function(node)return not F.skipLootArea(node) and F.liveOre(node)end,
         chestCandidate=function(ctx,radius,predicate)return ctx.questChestCandidate and ctx.questChestCandidate(radius,predicate)end,
+        chestAllowed=F.chestFallbackAllowed,
         collectMineLoot=function(ctx)return F.upgradeGear(ctx)end,
         openChest=function(ctx,entry)return ctx.helpers[16361397](entry)end,
         healingChestSafe=F.healingChestSafe,healingPointSafe=F.healingPointSafe,
