@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.61: ignore Common and Mimic chests in every farming and quest mode.
+-- Version 0.62: spend available upgrades and drive when initial funding stops progressing.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 61
+    local REVISION = 62
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.61-ignore-common-and-mimic-chests"
+    local BUILD = "v0.62-funding-idle-handoff"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2746,6 +2746,7 @@ end)()
     -- Later rounds are timed loot breaks, not coin quotas: one valuable gem
     -- must not cut a break short, and missing mines must not extend it forever.
     D.depthFundingCoins,D.depthDriveSeconds,D.depthLootSeconds=10000,150,60
+    D.depthFundingIdleSeconds=60
     function D.depthEconomy(ctx,plan)
         if plan.kind~='depth' or not cfg.driveDepth or not Q.enabled(ctx) then return end
         local cycle=ctx.questDepthEconomy
@@ -2754,8 +2755,22 @@ end)()
             ctx.questDepthEconomy=cycle
         end
         local wallet=Q.coinBalance(s.questWallet,s.questWalletAt,s.questWalletVersion)
-        if cycle.phase=='funding' and wallet and wallet>=D.depthFundingCoins then
-            cycle.phase,cycle.upgradeAt='upgrades',now()
+        if cycle.phase=='funding' then
+            -- Aim for 10k while real funding progresses. An exhausted loaded
+            -- route must not wait below the target until the 90s save exit.
+            -- The existing activity watch counts native income, chest removal,
+            -- observed loot and objective changes; requests cannot reset it.
+            local activity=s.questActivity
+            local dry=activity and now()-math.max(cycle.started,activity.at)>=D.depthFundingIdleSeconds
+            local idleReady=dry and not Q.manual() and not api.extractionReady() and not D.inDungeon(ctx)
+                and not ctx.currentChest and not ctx.questChestLease and not ctx.questChestTaking and not ctx.questHealing
+                and not s.equipmentRequest
+                and not s.questDelivery and not s.questCashJob and not s.questUpgradeJob
+                and not calls.cash and not calls.drag and not calls.shop and not calls.wallet and not calls.upgrade
+            if wallet and (wallet>=D.depthFundingCoins or idleReady)then
+                cycle.fundingLimited=wallet<D.depthFundingCoins or nil
+                cycle.phase,cycle.upgradeAt='upgrades',now()
+            end
         elseif cycle.phase=='drive' then
             if ctx.questDriving then cycle.driveAt=cycle.driveAt or now() end
             if cycle.driveAt and now()-cycle.driveAt>=D.depthDriveSeconds then
@@ -2790,7 +2805,10 @@ end)()
             return string.format('Before driving: chest loot and sales for upgrades, %.0f / 10000 Coins',s.questWallet or 0)
         elseif cycle.phase=='loot' then
             return string.format('Driving funding break: %.0fs of chest loot and sales remaining',math.max(0,D.depthLootSeconds-(now()-cycle.lootAt)))
-        elseif cycle.phase=='upgrades' then return 'Spending the upgrade budget before driving: drill, sword, pickaxe, health' end
+        elseif cycle.phase=='upgrades' then
+            return cycle.fundingLimited and 'No funding progress for 60s; spending available upgrades before driving'
+                or 'Spending the upgrade budget before driving: drill, sword, pickaxe, health'
+        end
     end
     function D.cost(offer)
         local cost=tonumber(offer and offer.Cost)
