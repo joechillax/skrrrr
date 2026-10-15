@@ -1,11 +1,11 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.57: fund depth upgrades first, alternate driving/loot, prioritize sales and recover distant mines.
+-- Version 0.58: seven-minute run default and built-in personal reporting on every device.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
 -- Hides the default Gameplay Paused popup after readiness; streaming pauses still apply.
--- Includes local ending reports, optional privately configured Discord delivery, cached discovery, and ranged dodging.
+-- Includes local ending reports, personal Discord delivery, cached discovery, and ranged dodging.
 -- Optional class quests: native combat, mining, sales, shredding, turrets, dungeons, fuel, potions and upgrades.
 -- Quest mode OFF preserves chest-only travel; no healing, mining or team purchases.
 -- Every execution waits seven seconds first; this script never queues itself for teleport.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 57
+    local REVISION = 58
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.57-depth-funding-and-mine-recovery"
+    local BUILD = "v0.58-personal-defaults"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -306,7 +306,8 @@ end)()
     local R = {}
     local saveStore=assert(api.saveStore,'DTEC account store is required')
     local http
-    local SHARED_CONFIGURATION='DTEC-private-reporting.json'
+    -- User-authorized personal default, shared across devices and accounts.
+    local DEFAULT_WEBHOOK="https://discord.com/api/webhooks/1551830162650435584/V_EItPsWyCQDQgEvZlAGjaH4XoKXchAD6UbPwEiiJ6mPUmiU-2cOlioFzvPW79KlZGgu"
     local function currentAccount()
         local ok,player=pcall(function()return (api.Players or game:GetService('Players')).LocalPlayer end)
         local id=ok and player and tonumber(player.UserId)
@@ -317,45 +318,18 @@ end)()
         local base,suffix=value:match('^(https://discord%.com/api/webhooks/%d+/[%w_-]+)(.*)$')
         if base and (suffix=='' or suffix=='?wait=true')then return base..'?wait=true' end
     end
-    local function sharedConfiguration()
-        local reader=env.readfile or readfile
-        if type(reader)~='function' then return nil,false end
-        local found,body=pcall(reader,SHARED_CONFIGURATION)
-        if not found then return nil,false end
-        -- A present but disabled/invalid shared preference never falls through
-        -- to a stale per-account endpoint. No contents or URLs are logged.
-        if not http or type(body)~='string' or #body>4096 then return nil,true end
-        local decoded,value=pcall(http.JSONDecode,http,body)
-        if decoded and type(value)=='table' and value.schema==1 and value.accountScope=='all' then
-            return value,true
-        end
-        return nil,true
-    end
-    local function privateConfiguration()
+    local function reportingConfiguration()
         local account=currentAccount()
-        if not account or account~=saveStore.accountId then return end
-        -- Explicit environment preferences take precedence over saved opt-in.
-        -- Endpoints stay private and never enter the public source or run ledger.
-        if env.DTECReportingEnabled~=nil or env.DTECWebhookURL~=nil then
-            if env.DTECReportingEnabled==true then
-                local url=endpoint(env.DTECWebhookURL)
-                if url then return account,url,'environment' end
-            end
+        if not account or account~=saveStore.accountId or env.DTECReportingEnabled==false then return end
+        -- An explicit override is rechecked before dispatch; no separate file
+        -- or per-account opt-in is needed for the personal built-in default.
+        if env.DTECWebhookURL~=nil then
+            local url=endpoint(env.DTECWebhookURL)
+            if url then return account,url,'environment' end
             return
         end
-        local shared,present=sharedConfiguration()
-        if present then
-            if shared and shared.enabled==true then
-                local url=endpoint(shared.webhook)
-                if url then return account,url,'shared-file' end
-            end
-            return
-        end
-        local preference=saveStore:get('reporting')
-        if type(preference)=='table' and preference.enabled==true then
-            local url=endpoint(preference.webhook)
-            if url then return account,url,'account' end
-        end
+        local url=endpoint(DEFAULT_WEBHOOK)
+        if url then return account,url,'default' end
     end
     local function notice(message)
         if s.reportNotice~=message then s.reportNotice=message;warn('[DTEC JoeJoe Automation Results] '..message)end
@@ -650,7 +624,7 @@ end)()
         local waiting = false
         for _, record in ipairs(ledger.records) do if record.status == 'queued' then waiting = true; break end end
         if not waiting then return end
-        local account,url,configuration=privateConfiguration()
+        local account,url,configuration=reportingConfiguration()
         if not account then return end -- Local end-run observations remain available without external reporting.
         if not http then notice('HttpService unavailable; farming continues without Discord reports.'); return end
         local send = env.request or env.http_request or http_request or request
@@ -664,7 +638,7 @@ end)()
                 local scheduledLedger,scheduledAccount=ledger,ledgerAccount
                 local previousAttempts=record.attempts or 0
                 local function allowed()
-                    local current,currentURL,source=privateConfiguration()
+                    local current,currentURL,source=reportingConfiguration()
                     return current==account and currentURL==url and source==configuration
                         and ledger==scheduledLedger and ledgerAccount==scheduledAccount
                         and saveStore.accountId==scheduledAccount and currentAccount()==scheduledAccount
@@ -8776,7 +8750,7 @@ end)()
     F.travelDepth, F.cancelTravel = movement.travel, movement.cancel
     F.syncRoute, F.initializeRoute, F.travelRoute = movement.syncRoute, movement.initializeRoute, movement.travelRoute
     F.hover = movement.hover
-    local DEFAULTS = { lootExtract = false, minutes = 10, classQuest = false, driveDepth = true }
+    local DEFAULTS = { lootExtract = false, minutes = 7, classQuest = false, driveDepth = true }
     local saveStore=assert(api.saveStore,'DTEC account store is required')
     local function clamp(value, low, high, fallback)
         value = tonumber(value)
