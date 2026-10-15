@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.67: start delivery receipt checks after confirmed native drop replies.
+-- Version 0.68: choose the cheapest card only when all three Coin cards are blacklisted.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 67
+    local REVISION = 68
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.67-post-drop-delivery-receipts"
+    local BUILD = "v0.68-cheapest-blacklisted-roll-fallback"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2762,7 +2762,7 @@ end)()
         DriveSpeed=140,PowerDrive=100,EngineOverdrive=90,FuelStorage=45,MoneyDrill=60,
         TeamMeleeDamage=100,TeamPickaxeDamage=100,TeamGunDamage=100,TeamExplosiveDamage=100,TeamHealth=70,SackStorage=6,PowerBurst=120}
     local blocked={CartExtension=true,MountedGunner=true,SackStorage=true,LifeSteal=true,HealthRegen=true,MoneyDrill=true}
-    local lastResort={} -- No regeneration/lifesteal fallback, including free class cards.
+    local lastResort={} -- Ordinary ranking keeps the blacklist; complete blocked rolls use the scoped exception below.
     local damage={TeamMeleeDamage=true,TeamPickaxeDamage=true,TeamGunDamage=true,TeamExplosiveDamage=true}
     local ores={Ore_Iron=true,Ore_Gold=true,Ore_Diamond=true,Ore_Emerald=true,Ore_Ruby=true,Ore_Coal=true,Ore_VoidCoal=true,IronBar=true,GoldBar=true}
     local rarity={Common=1,Rare=2,Epic=3,Legendary=4,Mythic=5}
@@ -2971,6 +2971,29 @@ end)()
             or name=='TeamHealth' and amount>=2 and hp<.7
         return strong and value or nil
     end
+    function D.blacklistFallback(ctx,c)
+        local reward=c.ActiveClassReward
+        local options=reward and reward.Options or c.Options
+        if type(options)~='table' or #options<3 or #options>(reward and 3 or 4)then return end
+        local count,premium,entries,seen,best,price,bestIndex=0,0,0,{}
+        for index,offer in pairs(options)do
+            if not finite(index) or index%1~=0 or index<1 or index>#options or type(offer)~='table'then return end
+            entries=entries+1
+            if offer.Type==(reward and 'ClassReward' or 'Coins')then
+                local name=offer.UpgradeName
+                local amount=offer.UpgradeAmount==nil and 1 or tonumber(offer.UpgradeAmount)
+                local cost=reward and 0 or D.cost(offer)
+                if not blocked[name] or seen[name] or not finite(amount) or amount<=0 or amount%1~=0
+                    or not finite(cost) or cost<0 or not D.capAllowed(ctx,offer,c)then return end
+                count=count+1;seen[name]=true
+                if price==nil or cost<price or cost==price and index<bestIndex then best,price,bestIndex=offer,cost,index end
+            elseif not reward and offer.Type=='Robux'then premium=premium+1
+            else return end
+        end
+        -- Native paid rolls have three Coin cards and a separate Robux card.
+        -- Only the three Coin choices authorize this exception; no paid product.
+        if entries==#options and count==3 and premium<=1 then return best,price end
+    end
     function D.choose(ctx,plan,c,wallet,reservedKey)
         wallet=Q.coinSpendable(wallet)
         local reward=c.ActiveClassReward
@@ -2978,7 +3001,9 @@ end)()
         local version=reward and reward.Id or c.OptionsVersion
         if type(options)~='table' or not finite(version) or version<=0 then return end
         local key=tostring(game.JobId or '')..':'..(reward and 'reward:' or 'coins:')..version
-        if ledger[key]==true and key~=reservedKey or type(ledger[key])=='number' and now()<ledger[key]then return end
+        if ledger[key]==true and key~=reservedKey then return nil,nil,nil,nil,nil,'reserved' end
+        if type(ledger[key])=='number' and now()<ledger[key]then return nil,nil,nil,nil,nil,'retry' end
+        local blockedChoice,blockedCost=D.blacklistFallback(ctx,c)
         local best,score,fallback,fallbackCost,desperate,desperateCost,saving,savingScore
         for _,offer in ipairs(options)do
             local free=reward and offer.Type=='ClassReward'
@@ -3001,11 +3026,13 @@ end)()
             end
         end
         local choice=best or fallback or desperate
+            or blockedChoice and (reward or wallet>=blockedCost) and blockedChoice
         if plan.kind=='depth' and cfg.driveDepth then saving=nil end -- Spend this round; no legendary-card saving loop.
         local choiceScore=choice and D.score(ctx,plan,choice) or 0
         if saving and choice and (math.floor(choiceScore/1000000)>math.floor(savingScore/1000000)
             or (rarity[choice.Rarity] or 0)>=(rarity[saving.Rarity] or 0) and choiceScore>=savingScore)then saving=nil end
-        return not saving and choice or nil,key,version,reward~=nil,saving
+        return not saving and choice or nil,key,version,reward~=nil,saving,
+            choice and blocked[choice.UpgradeName] and 'blacklist_fallback' or not choice and not saving and 'no_eligible' or nil
     end
     function D.fundingTarget(ctx,plan)
         local cycle=D.depthEconomy(ctx,plan)
@@ -3016,6 +3043,8 @@ end)()
         if c then chosen,key,_,_,saving=D.choose(ctx,plan,c,wallet)end
         if saving or chosen then return math.max(Q.coinTarget(D.cost(saving or chosen) or 0,false),Q.supplyFundingTarget(ctx,plan))end
         if not key then return math.max(Q.medicalReserve,Q.supplyFundingTarget(ctx,plan))end
+        local blockedChoice,blockedCost=D.blacklistFallback(ctx,c)
+        if blockedChoice then return math.max(Q.coinTarget(blockedCost,false),Q.supplyFundingTarget(ctx,plan))end
         for _,offer in ipairs(c and c.Options or {})do
             local price=D.cost(offer)
             local value=D.score(ctx,plan,offer)
@@ -3075,16 +3104,19 @@ end)()
             end,function()return Q.enabled(ctx) and not api.extractionReady()end)
         end
         if not c or type(c.Options)~='table' then info('waiting for native upgrade cards');readWallet();return end
+        local function refreshCards()
+            if type(c.FetchUpgradeOptions)=='function' and not c.OptionsFetchPending and not c.OptionsRetryPending
+                and now()>=(ctx.questCardFetchAt or 0)then
+                ctx.questCardFetchAt=now()+5;task.spawn(function()pcall(c.FetchUpgradeOptions,c)end)
+            end
+        end
         if D.settleUpgrade(ctx)then
             if not c.ActiveClassReward then readWallet()end
             return
         end
         if not c.ActiveClassReward and (#c.Options==0 or (tonumber(c.OptionsVersion) or 0)<=0)then
             info('waiting for native upgrade cards')
-            if type(c.FetchUpgradeOptions)=='function' and not c.OptionsFetchPending and not c.OptionsRetryPending
-                and now()>=(ctx.questCardFetchAt or 0)then
-                ctx.questCardFetchAt=now()+5;task.spawn(function()pcall(c.FetchUpgradeOptions,c)end)
-            end
+            refreshCards()
             readWallet();return
         end
         local function dispatch(wallet,walletAt,walletVersion)
@@ -3099,13 +3131,22 @@ end)()
                 info(D.depthFundingStatus(ctx,current) or 'Initial head-start funding or manual input; purchases paused')
                 return
             end
-            local offer,key,version,reward,saving=D.choose(ctx,current,c,wallet)
+            local offer,key,version,reward,saving,reason=D.choose(ctx,current,c,wallet)
             if not offer then
                 if saving then info(string.format('Saving for %s %s: %.0f / %.0f Coins (1000 held for medkits)',saving.Rarity,saving.UpgradeName,wallet,Q.coinTarget(D.cost(saving),false)))
+                elseif reason=='reserved' then
+                    info('current roll already requested; waiting for native refreshed cards')
+                    if not c.ActiveClassReward then refreshCards()end
+                elseif reason=='retry' then info('server-rejected roll cooling down before its bounded retry')
                 elseif c.ActiveClassReward then info('no eligible free card')
                 else
+                    local blockedChoice,blockedCost=D.blacklistFallback(ctx,c)
                     local target=D.fundingTarget(ctx,current)
-                    info(string.format('%.0f Coins; funding target %.0f',wallet,target))
+                    if blockedChoice then
+                        info(string.format('all three Coin cards blacklisted; cheapest %s needs %.0f Coins (1000 held for medkits)',blockedChoice.UpgradeName,Q.coinTarget(blockedCost,false)))
+                    elseif target<=math.max(Q.medicalReserve,Q.supplyFundingTarget(ctx,current))then
+                        info('no eligible card on this roll: capped, irrelevant or incomplete; Coins retained')
+                    else info(string.format('%.0f Coins; funding target %.0f',wallet,target))end
                 end
                 return
             end
@@ -3113,7 +3154,7 @@ end)()
             local method=reward and 'ChooseClassReward' or 'UpgradeDrill'
             local args=reward and {version,name} or {name,version}
             local job={ctx=ctx,name=name,key=key,started=now(),before=tonumber(ctx.drill:GetAttribute(name)) or 0,
-                controller=c,version=version,reward=reward==true,rollToken=c.RollToken}
+                controller=c,version=version,reward=reward==true,rollToken=c.RollToken,blacklistFallback=reason=='blacklist_fallback'}
             if Q.call('upgrade','DrillService',method,args,function(ok,value,_,dispatchState)
                 -- An explicit native rejection permits a bounded retry. A lost
                 -- response cannot prove the purchase failed and stays quarantined.
@@ -3145,7 +3186,7 @@ end)()
                     local held=pcall(c.SetPurchasePending,c,true)
                     job.uiPendingOwned=held and c.PurchasePending==true or nil
                 end
-                info('requested '..name..'; awaiting server receipt')
+                info((job.blacklistFallback and 'all three cards blacklisted; cheapest fallback requested: ' or 'requested ')..name..'; awaiting server receipt')
             end
         end
         local reward=c.ActiveClassReward
