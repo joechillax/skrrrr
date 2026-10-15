@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.55: remove unused bookkeeping and retain guarded equipment recovery.
+-- Version 0.56: report loaded version, quest mode and observed chest/prompt counts per run.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 55
+    local REVISION = 56
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.55-version-and-dead-code-cleanup"
+    local BUILD = "v0.56-run-throughput-diagnostics"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -458,6 +458,35 @@ end)()
         end
         quest.currentName,quest.currentLevel=name,level
     end
+    local function observeFarm(run)
+        local progress=run.farmProgress
+        if not progress then
+            progress={baseline={},latest={},invalid={},partial=now()>run.started+.001}
+            run.farmProgress=progress
+        end
+        local revision=finite(s.revision)
+        local version=revision and revision%1==0 and string.format('%.2f',revision/100) or nil
+        if version then
+            progress.firstVersion=progress.firstVersion or version
+            if version~=progress.firstVersion then progress.changedVersion=true end
+            progress.latestVersion=version
+        end
+        local mode=s.config and s.config.classQuest
+        if mode==true then progress.questsOn=true elseif mode==false then progress.questsOff=true end
+        -- Scalar counters only. Observations never inspect the map, yield,
+        -- request an action or reset an existing diagnostic/scheduler budget.
+        for _,key in ipairs({'lootObserved','promptFires'})do
+            local value=finite((s.stats or {})[key])
+            if value then
+                if progress.baseline[key]==nil then
+                    progress.baseline[key]=value
+                    if now()>run.started+.001 then progress.partial=true end
+                end
+                if progress.latest[key] and value<progress.latest[key]then progress.invalid[key]=true end
+                progress.latest[key]=value
+            end
+        end
+    end
     function R.observe(player, isPlanet, live)
         if not readyLedger()then return end
         if not isPlanet then return end
@@ -469,6 +498,7 @@ end)()
         if run.ended then return end
         run.account = run.account or player.Name
         run.cores = finite(player:GetAttribute('CoresEarned')) or run.cores
+        observeFarm(run)
         observeQuest(run)
         -- Retain the last living inventory when death removes the character/tools.
         if live and s.itemDatabase then
@@ -541,6 +571,21 @@ end)()
         end
         return text
     end
+    local function farmText(run)
+        observeFarm(run)
+        local progress=run.farmProgress
+        local version=progress.firstVersion or 'unavailable'
+        if progress.changedVersion then version=version..' → '..progress.latestVersion..' (changed)' end
+        local mode=progress.questsOn and progress.questsOff and 'CHANGED'
+            or progress.questsOn and 'ON' or progress.questsOff and 'OFF' or 'unknown'
+        local function delta(key)
+            local before,after=progress.baseline[key],progress.latest[key]
+            return before and after and not progress.invalid[key] and tostring(math.floor(after-before)) or 'unavailable'
+        end
+        return 'Version '..version..' | Quests '..mode
+            ..'\nChest removals observed: '..delta('lootObserved')..' | Prompt calls: '..delta('promptFires')
+            ..(progress.partial and '\nCounts cover only the observed part of this run.' or '')
+    end
     local function payload(outcome, reason)
         local run = s.reportRun
         if not run or run.ended then return nil end
@@ -560,7 +605,8 @@ end)()
         if s.config and s.config.classQuest then
             fields[#fields+1]={name='Quest progress (observed)',value=questText(run),inline=false}
         end
-        return {id = run.id, status = 'queued', attempts = 0, created = clock(), revision=s.revision, build=s.build, body = {
+        fields[#fields+1]={name='Farm diagnostics',value=farmText(run),inline=false}
+        return {id = run.id, status = 'queued', attempts = 0, created = clock(), revision=s.revision, version=s.version, build=s.build, body = {
             username = 'DTEC JoeJoe Automation',
             embeds = {{title = 'Earth run - ' .. outcome, color = outcome == 'LOSS' and 15158332
                 or (outcome == 'EXTRACTED' and 3066993 or 15844367), description = clean(reason, 250), fields = fields,
