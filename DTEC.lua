@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.59: sell carried resources from 100 Coins, sustain mobile throttle and report driving/funding observations.
+-- Version 0.60: collect sale proceeds before more sales and await delayed native cash receipts safely.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 59
+    local REVISION = 60
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.59-carried-sales-and-mobile-throttle"
+    local BUILD = "v0.60-cash-collection-priority"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -184,6 +184,9 @@ end)()
     local function now() return os.clock() end
     s.stats = s.stats or { started = now(), coreEarned = 0, coinEarned = 0, gems = 0,
         promptFires = 0, lootObserved = 0, badgeClaims = 0, chestProgress = 0 }
+    for _,key in ipairs({'questCashRequests','questCashConfirmed','questCashRejected'})do
+        if s.stats[key]==nil then s.stats[key]=0 end
+    end
     s.chests = s.chests or {}
     s.stats.chestStarts = s.stats.chestStarts or 0
     s.claims = s.claims or {}
@@ -465,7 +468,7 @@ end)()
         end
         -- Scalar counters only. Observations never inspect the map, yield,
         -- request an action or reset an existing diagnostic/scheduler budget.
-        for _,key in ipairs({'lootObserved','promptFires'})do
+        for _,key in ipairs({'lootObserved','promptFires','questCashRequests','questCashConfirmed','questCashRejected'})do
             local value=finite((s.stats or {})[key])
             if value then
                 if progress.baseline[key]==nil then
@@ -578,6 +581,7 @@ end)()
             ..' | Native driver observed: '..(progress.driveSeen==true and 'YES' or progress.driveSeen==false and 'NO' or 'unavailable')
             ..'\nLast drive phase: '..(progress.lastDrivePhase or 'unavailable')
             ..' | Last observed Coins: '..(progress.lastCoins and string.format('%.0f',progress.lastCoins) or 'unavailable')
+            ..'\nCash pickups: '..delta('questCashRequests')..' requests | '..delta('questCashConfirmed')..' verified | '..delta('questCashRejected')..' rejected'
             ..(progress.mobileFramesSeen and ' | Mobile frame input observed' or '')
             ..(progress.partial and '\nCounts cover only the observed part of this run.' or '')
     end
@@ -3830,6 +3834,7 @@ end)()
     end
     function D.sellLoose(ctx,plan,immediate)
         if not Q.activePlan(plan) or ctx.questPotionUsing or s.questDelivery or calls.drag or s.bringDelivery or s.lootRequest or Q.manual()
+            or s.questCashJob and s.questCashJob.movementHeld
             or ctx.questMineEntry or ctx.nativeGateMotion
             or not immediate and now()<(ctx.questValueSaleAt or 0)then return false end
         ctx.questValueSaleAt=now()+1
@@ -5818,6 +5823,7 @@ return function(api,Q)
     local function saleCandidate(ctx,tool)
         local D=Q.drillSupport
         if not cfg.classQuest or ctx.questHealing or ctx.questDriving or ctx.questSeating
+            or s.questCashJob and s.questCashJob.movementHeld or Q.moneyTarget(ctx)
             or ctx.humanoid.SeatPart or ctx.humanoid.Sit or not D.carriedSaleEligible(tool,ctx)then return false end
         local seller=Q.bestSeller(ctx,ctx.root.Position)
         return seller and D.accessible(seller) or false
@@ -6277,6 +6283,9 @@ end)()
                 end
             end
             token.called=true
+            if key=='cash' and service=='InteractionService' and method=='Interact'then
+                s.stats.questCashRequests=(s.stats.questCashRequests or 0)+1
+            end
             local results=packValues(pcall(function()return rf:InvokeServer(unpackValues(args,1,#args))end))
             local ok,value=results[1],results[2]
             if calls[key]~=token then return end
@@ -7954,6 +7963,14 @@ end)()
         Q.drillSupport.upgrades(ctx,plan)
         if Q.drillSupport.drivingDefense and Q.drillSupport.drivingDefense(ctx,plan)then return true end
         if Q.drillSupport.threat(ctx,plan)then return true end
+        -- Collect native sale proceeds before another sale can monopolize the
+        -- item-delivery lane. A slow cash reply retains its exact observer.
+        local cashCycle=ctx.questDepthEconomy
+        local drivingDue=plan.kind=='depth' and cfg.driveDepth and cashCycle and cashCycle.phase=='drive'
+        if not ctx.questDriving and not ctx.questSeating and not drivingDue then
+            if Q.cashStep(ctx)then return true end
+            if Q.activePlan(plan) and not Q.refuelActive(ctx,plan) and Q.collectMoney(ctx)then return true end
+        end
         -- New disposable drops get the next safe sale turn, before optional
         -- mining/readiness waits or another chest. Never steal a driver or a
         -- pending native prompt/ownership lane to satisfy the sale preference.
@@ -8156,6 +8173,15 @@ end)()
                 and (not creator or creator=='' or creator==api.Players.LocalPlayer.Name) and now()>=(retries[item] or 0)
         end)
     end
+    local cashRejected=s.questCashRejected or setmetatable({}, {__mode='k'});s.questCashRejected=cashRejected
+    local function rejectCash(job)
+        local record=cashRejected[job.item]
+        local count=record and record.character==job.character and record.count or 0
+        count=count+1;cashRejected[job.item]={character=job.character,count=count}
+        -- Only an explicit native false permits a fresh attempt. Accepted,
+        -- thrown or still-pending mutations never enter this bounded retry.
+        retries[job.item]=count<=2 and now()+(count==1 and 2 or 8) or math.huge
+    end
     function Q.cashStep(ctx)
         local job=s.questCashJob;if not job then return false end
         local function releaseMovement()
@@ -8164,6 +8190,7 @@ end)()
         if job.ctx==ctx and api.Players.LocalPlayer.Character==ctx.character and (job.sent or job.token and job.token.called)
             and (s.stats.coinEarned or 0)>job.before and (not job.item.Parent or not api.tag(job.item,'Interactive'))then
             Q.retireConfirmedCall('cash',job.token)
+            s.stats.questCashConfirmed=(s.stats.questCashConfirmed or 0)+1
             retries[job.item]=math.huge;job.cancelled=true;s.questCashJob=nil;releaseMovement()
             setStatus('Money bag coin increase confirmed');return false
         end
@@ -8181,24 +8208,37 @@ end)()
             end
         end
         if job.stage=='approach' and now()>=job.readyAt then
-            job.stage='receipt';job.receiptUntil=now()+5
+            job.stage='receipt'
             -- DragController collects Money_Sack through Interact(item), not ItemBag.
-            if call('cash','InteractionService','Interact',{job.item},function(ok,value)
-                if job.cancelled then if s.questCashJob==job then s.questCashJob=nil end;return end
+            local issued,token=call('cash','InteractionService','Interact',{job.item},function(ok,value,_,dispatch)
+                job.knownRejected=ok==true and value==false and dispatch~='not-sent'
                 job.rejected=not ok or value==false
-                job.sent=true;releaseMovement()
+                job.sent=dispatch~='not-sent';job.receiptUntil=now()+8
+                if job.knownRejected then s.stats.questCashRejected=(s.stats.questCashRejected or 0)+1 end
+                if job.cancelled then
+                    if job.knownRejected then rejectCash(job)
+                    elseif job.sent then retries[job.item]=math.huge end
+                    if s.questCashJob==job then s.questCashJob=nil end;return
+                end
+                releaseMovement()
             end,function()return enabled(ctx) and not job.cancelled and free(job.item) and api.tag(job.item,'Interactive')
                 and (not ctx.questHealing or not api.healingPointSafe or api.healingPointSafe(ctx,api.part(job.item).Position))
-                and (api.part(job.item).Position-ctx.root.Position).Magnitude<=10 and not manual()end)then job.token=calls.cash
-            else
+                and (api.part(job.item).Position-ctx.root.Position).Magnitude<=10 and not manual()end)
+            if issued then job.token=token else
                 retries[job.item]=now()+15;s.questCashJob=nil;releaseMovement()
             end
         elseif job.stage=='receipt' then
-            if job.rejected or now()>=job.receiptUntil then
-                retries[job.item]=job.sent and math.huge or now()+30
+            if job.token and calls.cash==job.token then
+                if now()-job.started>=1.5 then releaseMovement()end
+                return ctx.questOwns==true
+            end
+            if job.rejected or job.receiptUntil and now()>=job.receiptUntil then
+                if job.knownRejected then rejectCash(job)
+                else retries[job.item]=job.sent and math.huge or now()+30 end
                 job.cancelled=true;releaseMovement()
                 if not calls.cash then s.questCashJob=nil end
-                setStatus('Money bag pickup unconfirmed; farming continues without a duplicate request')
+                setStatus(job.knownRejected and 'Money bag pickup rejected; bounded reapproach retry scheduled'
+                    or 'Money bag pickup unconfirmed; farming continues without a duplicate request')
             end
         end
         return ctx.questOwns==true
@@ -8206,7 +8246,7 @@ end)()
     function Q.collectMoney(ctx)
         if ctx.questPotionUsing then return false end
         local mine=ctx.questMineJob
-        if mine and Q.drillSupport.nodeAllowed(mine.node,mine.coal)then return false end
+        if mine and mine.coal and Q.drillSupport.nodeAllowed(mine.node,true) and Q.fuelNeeded()then return false end
         local item=Q.moneyTarget(ctx)
         if not item then return false end
         if not holdRoute(ctx)then return ctx.questOwns==true end
@@ -8217,7 +8257,7 @@ end)()
         if ctx.questHealing and api.healingPointSafe and not api.healingPointSafe(ctx,api.part(item).Position)then ctx.questOwns=nil;return false end
         Q.drillSupport.stopMine(ctx);api.hover(ctx)
         ctx.root.CFrame=CFrame.new(api.part(item).Position+Vector3.new(0,1,2))
-        s.questCashJob={ctx=ctx,item=item,started=now(),readyAt=now()+.2,stage='approach',before=s.stats.coinEarned or 0,movementHeld=true}
+        s.questCashJob={ctx=ctx,character=ctx.character,item=item,started=now(),readyAt=now()+.2,stage='approach',before=s.stats.coinEarned or 0,movementHeld=true}
         setStatus('Collecting a free money bag for quest supplies and upgrades');return true
     end
     local function supplyCount(ctx,id)
