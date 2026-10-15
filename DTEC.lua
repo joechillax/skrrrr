@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.63: buy upgrades during loot breaks and resume driving when loaded work is exhausted.
+-- Version 0.64: upgrade independently after head-start funding, use mines and advance the map for ore processing.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 63
+    local REVISION = 64
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.63-productive-loot-breaks"
+    local BUILD = "v0.64-independent-upgrades-and-mine-funding"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2386,6 +2386,18 @@ return function(api,Q,D)
         local plan=Q.plan(s.classData,s.questCatalog,s.config.driveDepth)
         return plan.kind~='shred' and not ctx.questNeedScrap and D.accessible(item)
     end
+    function M.carriedOre(item,ctx)
+        local player=api.Players.LocalPlayer
+        return item and item:IsA('Tool') and recipes[api.id(item)]~=nil and not failed[item]
+            and player.Character==ctx.character and (item.Parent==ctx.character or item.Parent==player:FindFirstChild('Backpack'))
+            and not protected(item,ctx) and not item:FindFirstChild('Health') and not api.tag(item,'CraftedPlaceable')
+            and Q.plan(s.classData,s.questCatalog,s.config.driveDepth).kind~='shred' and not ctx.questNeedScrap
+    end
+    function M.hasOre(ctx)
+        for _,item in ipairs(Q.looseItems())do if M.inputEligible(item,ctx)then return true end end
+        for _,item in ipairs(api.ownedTools(ctx))do if M.carriedOre(item,ctx)then return true end end
+        return false
+    end
     function M.machine(item,ctx)
         local catalog=api.sharedModule('CraftingCatalog');local entry=catalog and catalog.Furnace
         return entry and entry.UseType=='Placeable' and live(item) and api.id(item)=='Furnace'
@@ -2720,7 +2732,22 @@ return function(api,Q,D)
         end
         if not item then return false end
         local machine=M.findProcessor(ctx,api.part(item).Position)
-        if not machine then Q.special.readCraft(ctx);return M.placement(ctx,plan)end
+        if not machine then
+            Q.special.readCraft(ctx)
+            if M.placement(ctx,plan)then return true end
+            if plan.kind~='depth' or s.config.driveDepth~=true then return false end
+            if not api.hasRoom(ctx,item) or not M.inputEligible(item,ctx)then return false end
+            local name,before=api.id(item),0
+            for _,tool in ipairs(api.ownedTools(ctx))do if api.id(tool)==name then before=before+1 end end
+            local carry={name=plan.name,counts=plan.counts,objective=plan.objective,processingCarry=true}
+            if Q.startDelivery(ctx,item,ctx.root,'supply',carry)then
+                local job=s.questDelivery
+                if job then job.id,job.inventoryBefore=name,before end
+                status('Collecting ore for a later Furnace; retaining it while advancing the map')
+                return true
+            end
+            return false
+        end
         if Q.startDelivery(ctx,item,machine,'smelt',plan)then
             status('Delivering ore to the confirmed native Furnace intake; awaiting a real bar output');return true
         end
@@ -2742,7 +2769,7 @@ end)()
     local ledger=s.questUpgradeLedger or {};s.questUpgradeLedger=ledger
     local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
     local function status(text)s.questStatus=text end
-    -- A depth run funds its first upgrade round before taking the driver seat.
+    -- A depth run funds its initial budget before taking the driver seat.
     -- Later rounds allow up to one minute of loot, sales and upgrade work.
     -- A gem value is not a finish signal; confirmed empty loaded work may yield early.
     D.depthFundingCoins,D.depthDriveSeconds,D.depthLootSeconds=10000,150,60
@@ -2750,10 +2777,21 @@ end)()
     function D.depthEconomy(ctx,plan)
         if plan.kind~='depth' or not cfg.driveDepth or not Q.enabled(ctx) then return end
         local cycle=ctx.questDepthEconomy
-        if not cycle or cycle.character~=ctx.character or cycle.drill~=ctx.drill then
-            cycle={character=ctx.character,drill=ctx.drill,phase='funding',started=now()}
-            ctx.questDepthEconomy=cycle
+        local function sameLife(record)
+            return record and record.character==ctx.character and record.humanoid==ctx.humanoid and record.drill==ctx.drill
+                and record.job==game.JobId and record.runStarted==s.lootStarted
         end
+        -- A supervisor rebuild replaces ctx while the same living character,
+        -- humanoid, drill and run remain. Its initial budget must not restart.
+        local localCycle=cycle and cycle.character==ctx.character and cycle.drill==ctx.drill
+            and (cycle.humanoid==nil or sameLife(cycle))
+        if not localCycle then
+            local retained=s.questDepthEconomy
+            cycle=sameLife(retained) and retained or {character=ctx.character,drill=ctx.drill,phase='funding',started=now()}
+            cycle.emptyAt=nil -- A new worker must independently confirm an empty break.
+        end
+        cycle.humanoid,cycle.job,cycle.runStarted=ctx.humanoid,game.JobId,s.lootStarted
+        ctx.questDepthEconomy,s.questDepthEconomy=cycle,cycle
         local wallet=Q.coinBalance(s.questWallet,s.questWalletAt,s.questWalletVersion)
         if cycle.phase=='funding' then
             -- Aim for 10k while real funding progresses. An exhausted loaded
@@ -2769,32 +2807,26 @@ end)()
                 and not calls.cash and not calls.drag and not calls.shop and not calls.wallet and not calls.upgrade
             if wallet and (wallet>=D.depthFundingCoins or idleReady)then
                 cycle.fundingLimited=wallet<D.depthFundingCoins or nil
-                cycle.phase,cycle.upgradeAt='upgrades',now()
+                cycle.phase,cycle.driveAt='drive',nil
             end
         elseif cycle.phase=='drive' then
+            if cycle.fundingExplore and now()>=(cycle.exploreProbeAt or 0)then
+                cycle.exploreProbeAt=now()+3
+                if wallet and wallet>=D.depthFundingCoins then
+                    cycle.fundingExplore=nil
+                elseif D.processing and D.processing.hasOre(ctx) and D.processing.findProcessor(ctx,ctx.root.Position)then
+                    cycle.phase,cycle.fundingExplore,cycle.emptyAt='funding',nil,nil
+                end
+            end
             if ctx.questDriving then cycle.driveAt=cycle.driveAt or now() end
-            if cycle.driveAt and now()-cycle.driveAt>=D.depthDriveSeconds then
-                cycle.phase,cycle.lootAt,cycle.driveAt='loot',now(),nil
+            if cycle.phase=='drive' and cycle.driveAt and now()-cycle.driveAt>=D.depthDriveSeconds then
+                cycle.phase,cycle.lootAt,cycle.driveAt=cycle.fundingExplore and 'funding' or 'loot',now(),nil
+                cycle.fundingExplore,cycle.emptyAt=nil,nil
             end
-        elseif cycle.phase=='loot' and now()-cycle.lootAt>=D.depthLootSeconds then
-            cycle.phase,cycle.upgradeAt='upgrades',now()
-        end
-        if cycle.phase=='upgrades' and not s.questUpgradeJob and not calls.upgrade and not calls.upgradeWallet then
-            local c=api.controller('DrillUpgradeController')
-            local ready=c and type(c.Options)=='table' and (tonumber(c.OptionsVersion) or 0)>0
-                and not c.ActiveClassReward and not c.PurchasePending and not c.RerollPending and not c.CardsLocked
-            local offer,key
-            if wallet and ready then
-                offer,key=D.choose(ctx,plan,c,wallet)
-                if not offer and key then cycle.phase,cycle.driveAt='drive',nil end
-            end
-            if cycle.phase=='upgrades' and not offer and not key and wallet
-                and now()-(cycle.upgradeAt or now())>=15 and not s.questDelivery and not calls.shop and not calls.wallet then
-                -- Missing cards cannot strand a funded run. Keep the money;
-                -- retry the real cards at the next round without inventing a buy.
-                cycle.phase,cycle.driveAt='drive',nil
-                s.questUpgradeStatus='Upgrades: native cards unavailable; retaining Coins for the next funding break'
-            end
+        elseif cycle.phase=='upgrades' or cycle.phase=='loot' and now()-cycle.lootAt>=D.depthLootSeconds then
+            -- Upgrades have their own passive pulse. Neither unavailable cards
+            -- nor an unknown purchase owns the movement/loot schedule.
+            cycle.phase,cycle.driveAt='drive',nil
         end
         return cycle
     end
@@ -2802,39 +2834,57 @@ end)()
         local cycle=D.depthEconomy(ctx,plan)
         if not cycle then return end
         if cycle.phase=='funding' then
-            return string.format('Before driving: chest loot and sales for upgrades, %.0f / 10000 Coins',s.questWallet or 0)
+            return string.format('Head start: chests, mines, ore processing and sales, %.0f / 10000 Coins',s.questWallet or 0)
         elseif cycle.phase=='loot' then
             return string.format('Chest loot, sales and upgrade checks: up to %.0fs remaining',math.max(0,D.depthLootSeconds-(now()-cycle.lootAt)))
-        elseif cycle.phase=='upgrades' then
-            return cycle.fundingLimited and 'No funding progress for 60s; spending available upgrades before driving'
-                or 'Spending the upgrade budget before driving: drill, sword, pickaxe, health'
         end
     end
     function D.finishEmptyLoot(ctx,plan,empty)
         local cycle=ctx.questDepthEconomy
-        if not cycle or cycle.phase~='loot' then return false end
+        if not cycle or cycle.phase~='loot' and cycle.phase~='funding' then return false end
+        local funding=cycle.phase=='funding'
+        local pending=false
+        for key in pairs(calls)do
+            if key~='upgrade' and key~='upgradeWallet'then pending=true;break end
+        end
         local clear=empty==true and Q.enabled(ctx) and not Q.manual() and not api.extractionReady() and not D.inDungeon(ctx)
             and not ctx.currentChest and not ctx.questChestLease and not ctx.questChestTaking and not ctx.questHealing
             and not ctx.featureHold and not ctx.smartLootWindow and not ctx.questMineJob and not ctx.questMineEntry
             and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
-            and not s.questDelivery and not s.questCashJob and not s.questUpgradeJob and not s.questInventoryDrop
+            and not s.questDelivery and not s.questCashJob and not s.questInventoryDrop
             and not s.bringDelivery and not s.lootRequest and not s.equipmentRequest and not s.rareShardDrop
-            and not next(calls) and Q.coinBalance(s.questWallet,s.questWalletAt,s.questWalletVersion)~=nil
+            and not pending and Q.coinBalance(s.questWallet,s.questWalletAt,s.questWalletVersion)~=nil
         if not clear then cycle.emptyAt=nil;return false end
         local activity=s.questActivity
-        local last=math.max(cycle.lootAt,activity and activity.at or cycle.lootAt)
+        local started=funding and cycle.started or cycle.lootAt
+        local last=math.max(started,activity and activity.at or started)
         if not cycle.emptyAt or last>cycle.emptyAt then cycle.emptyAt=now();return false end
         -- A complete loaded candidate pass and eight quiet seconds allow late
         -- drops/receipts to arrive. No request or phase change invents progress.
         if now()-cycle.emptyAt<8 then return false end
-        cycle.phase,cycle.upgradeAt,cycle.emptyEnded='upgrades',now(),true
-        D.depthEconomy(ctx,plan)
+        if funding then
+            cycle.phase,cycle.fundingExplore,cycle.driveAt,cycle.emptyAt='drive',true,nil,nil
+            cycle.exploreProbeAt=now()+3
+            s.questUpgradeStatus='Head start: advancing for more loaded mines, loot and a native Furnace'
+        else
+            cycle.phase,cycle.driveAt,cycle.emptyEnded='drive',nil,true
+        end
         return true
     end
     function D.paidUpgradeWindow(ctx,cycle)
-        return not cycle or cycle.phase=='upgrades' or cycle.phase=='loot'
-            and not ctx.questDriving and not ctx.questSeating and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
-            and not Q.manual() and not Q.driveHandoff(ctx)
+        return not Q.manual() and (not cycle or cycle.phase~='funding' and not cycle.fundingExplore)
+    end
+    function D.upgradePulse(ctx)
+        if not Q.enabled(ctx) or ctx.character~=api.Players.LocalPlayer.Character
+            or ctx.drill~=workspace:FindFirstChild('Drill') or api.extractionReady()
+            then return end
+        if s.questUpgradeJob and s.questUpgradeJob.ctx==ctx then D.settleUpgrade(ctx)end
+        if now()<(ctx.questUpgradePulseAt or 0)then return end
+        ctx.questUpgradePulseAt=now()+.5
+        -- The supervisor also pulses this while optional movement/chest work
+        -- yields. Native wallet/purchase calls already run asynchronously.
+        Q.poll() -- Retire timed-out reads even while the optional worker yields.
+        D.upgrades(ctx,Q.plan(s.classData,s.questCatalog,cfg.driveDepth))
     end
     function D.cost(offer)
         local cost=tonumber(offer and offer.Cost)
@@ -3035,7 +3085,7 @@ end)()
             local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
             local cycle=D.depthEconomy(ctx,current)
             if not c.ActiveClassReward and not D.paidUpgradeWindow(ctx,cycle)then
-                info(D.depthFundingStatus(ctx,current) or 'Driving interval; paid upgrades resume at the next funding break')
+                info(D.depthFundingStatus(ctx,current) or 'Initial head-start funding or manual input; purchases paused')
                 return
             end
             local offer,key,version,reward,saving=D.choose(ctx,current,c,wallet)
@@ -3794,6 +3844,7 @@ end)()
         local id=api.id(item);local class=api.attr(item,'Class');local category=api.attr(item,'Category')
         local value=tonumber(api.attr(item,'Value'))
         local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+        if current.kind=='depth' and cfg.driveDepth and (id=='Ore_Iron' or id=='Ore_Gold')then return false end
         if category=='Scrap' and (current.kind=='shred' or ctx.questNeedScrap)then return false end
         local fuelValue=tonumber(api.attr(item,'Fuel')) or 0
         if not finite(value) or value<100 or Q.protectedRelic(item)
@@ -5872,8 +5923,14 @@ return function(api,Q)
         local seller=Q.bestSeller(ctx,ctx.root.Position)
         return seller and D.accessible(seller) or false
     end
+    local function processingCandidate(ctx,tool)
+        local M=Q.drillSupport.processing
+        return cfg.classQuest and not ctx.questHealing and not ctx.questDriving and not ctx.questSeating
+            and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit and M and M.carriedOre(tool,ctx)
+            and M.findProcessor(ctx,ctx.root.Position)~=nil
+    end
     function I.candidate(ctx,tool,plan)
-        if not owned(ctx,tool) or not (classOnly(tool) or saleCandidate(ctx,tool))then return false end
+        if not owned(ctx,tool) or not (classOnly(tool) or saleCandidate(ctx,tool) or processingCandidate(ctx,tool))then return false end
         local placement=ctx.questPlacement or s.questFurnacePlacement
         if placement and placement.processingPlacement and placement.tool==tool
             and placement.token and Q.calls.place==placement.token then return false end
@@ -6926,11 +6983,13 @@ end)()
     local function startDelivery(ctx,item,target,kind,plan)
         if s.questDelivery or calls.drag or s.bringDelivery or s.lootRequest or s.equipmentRequest or manual() then return false end
         local function eligible()
-            return free(item,(kind=='gold' or kind=='sale' or kind=='smelt') and 'sale' or kind=='fuel')
+            return free(item,(kind=='gold' or kind=='sale' or kind=='smelt' or kind=='supply' and plan.processingCarry) and 'sale' or kind=='fuel')
                 and (kind~='gold' or Q.gold(item,ctx))
                 and (kind~='sale' or Q.drillSupport.saleEligible(item,ctx,nil,plan.objective))
                 and (kind~='shred' or Q.special.scrapEligible(item,ctx))
                 and (not plan.processingFunding or Q.drillSupport.processing.fundingEligible(item,ctx))
+                and (not plan.processingCarry or kind=='supply' and target==ctx.root and api.hasRoom(ctx,item)
+                    and Q.drillSupport.processing.inputEligible(item,ctx))
                 and (kind~='smelt' or Q.drillSupport.processing.inputEligible(item,ctx)
                     and Q.drillSupport.processing.processor(target,ctx))
                 and (kind~='supply' or not Q.healing.isMedical(item) or Q.healing.itemAccessible(ctx,item))
@@ -6942,6 +7001,7 @@ end)()
         job.healingSupply=kind=='supply' and ctx.questHealing and Q.healing.isMedical(item) or nil
         if kind=='fuel'then job.fuelLow=job.before end
         job.processingFunding=plan.processingFunding==true
+        job.processingCarry=plan.processingCarry==true
         if kind=='smelt'then
             job.processing=Q.drillSupport.processing.capture(ctx,item,target)
             if not job.processing then return false end
@@ -6957,10 +7017,11 @@ end)()
             job.pending=nil; job.owns=dispatch~='not-sent' and (not ok or value==true);job.ownershipConfirmed=ok and value==true
             if not job.owns then retries[item]=now()+15 end
             if not ok or not job.owns or job.cancelled or not enabled(ctx) then release(job); return end
-            if not free(item,(kind=='gold' or kind=='sale' or kind=='smelt') and 'sale' or kind=='fuel') or kind=='gold' and not Q.gold(item,ctx)
+            if not free(item,(kind=='gold' or kind=='sale' or kind=='smelt' or job.processingCarry) and 'sale' or kind=='fuel') or kind=='gold' and not Q.gold(item,ctx)
                 or kind=='sale' and not Q.drillSupport.saleEligible(item,ctx,nil,job.objective)
                 or kind=='shred' and not Q.special.scrapEligible(item,ctx)
                 or job.processingFunding and not Q.drillSupport.processing.fundingEligible(item,ctx)
+                or job.processingCarry and (not Q.drillSupport.processing.inputEligible(item,ctx) or not api.hasRoom(ctx,item))
                 or kind=='smelt' and (not Q.drillSupport.processing.inputEligible(item,ctx)
                     or not Q.drillSupport.processing.processor(target,ctx))then release(job); return end
             local moved,result=pcall(place,job)
@@ -7028,7 +7089,8 @@ end)()
             job.pending=true
             if call('drag','InteractionService','Interact',{job.item},function()
                 job.pending=nil; job.stage='receipt'
-            end,function()return enabled(ctx) and free(job.item) and job.owns end)then job.pickupToken=calls.drag
+            end,function()return enabled(ctx) and free(job.item,job.processingCarry and 'sale') and job.owns
+                and (not job.processingCarry or Q.drillSupport.processing.inputEligible(job.item,ctx) and api.hasRoom(ctx,job.item))end)then job.pickupToken=calls.drag
             else job.pending=nil end
         end
         if job.kind=='supply' then
@@ -7455,9 +7517,16 @@ end)()
             and Q.drillSupport.depthMine(ctx,plan)then return true end
         local refilling=refuelWork(ctx,plan)
         if refilling~=nil then return refilling end
+        local economy=ctx.questDepthEconomy
+        local explore=economy and economy.fundingExplore and now()>=(ctx.questFundingMineProbeAt or 0)
+        if explore then ctx.questFundingMineProbeAt=now()+3 end
+        if explore and Q.drillSupport.depthMine and Q.drillSupport.depthMine(ctx,plan)then
+            economy.phase,economy.fundingExplore,economy.emptyAt='funding',nil,nil
+            return true
+        end
         local working,holding,quick=wallWork(ctx)
         if working and not quick then return holding and true or nil end
-        if not quick and not ctx.questDepthEconomy and Q.drillSupport.depthMine and Q.drillSupport.depthMine(ctx,plan)then return true end
+        if not quick and not economy and Q.drillSupport.depthMine and Q.drillSupport.depthMine(ctx,plan)then return true end
         if Q.drillSupport.inDungeon(ctx) or now()<(ctx.questDriveDetourUntil or 0)then return nil end
         local ready,reason=driveReady(ctx)
         if not ready then Q.stopDrive(ctx);ctx.questOwns=nil;setStatus(reason..'; other work continues');return false end
@@ -7892,6 +7961,7 @@ end)()
         return true,false
     end
     function Q.step(ctx)
+        Q.drillSupport.upgradePulse(ctx)
         if Q.drillSupport.observeDrivingHealth then Q.drillSupport.observeDrivingHealth(ctx)end
         if Q.drillSupport.observeReturn then Q.drillSupport.observeReturn(ctx)end
         Q.recoverDrive()
@@ -7994,7 +8064,6 @@ end)()
         if Q.inventory and Q.inventory.step(ctx,plan)then return true end
         if Q.special.bound(ctx) and not Q.drillSupport.activeMine() or plan.kind=='dungeon' and (ctx.questCampaign or Q.drillSupport.inDungeon(ctx) and not ctx.questCampaignExit)then
             if Q.healing.step(ctx,plan)then return true end
-            Q.drillSupport.upgrades(ctx,plan)
             return Q.special.dungeon(ctx,plan,false)
         end
         if Q.drillSupport.inDungeon(ctx) and not Q.drillSupport.activeMine() and not ctx.questCampaignExit then
@@ -8008,7 +8077,6 @@ end)()
             if Q.special.quickReturn(ctx)then ctx.questOwns=true;return true end
             return Q.special.placement(ctx,plan)
         end
-        Q.drillSupport.upgrades(ctx,plan)
         if Q.drillSupport.drivingDefense and Q.drillSupport.drivingDefense(ctx,plan)then return true end
         if Q.drillSupport.threat(ctx,plan)then return true end
         -- Collect native sale proceeds before another sale can monopolize the
@@ -8054,6 +8122,9 @@ end)()
                 ctx.questChestDue=math.min(ctx.questChestDue or now(),now())
                 local chestBusy,empty=Q.chestTurn(ctx,plan)
                 if chestBusy then return true end
+                if cycle.phase=='funding' then
+                    if Q.drillSupport.step(ctx,plan) or Q.drillSupport.depthMine(ctx,plan)then return true end
+                end
                 Q.drillSupport.finishEmptyLoot(ctx,plan,empty)
             end
             ctx.questOwns=nil
@@ -12087,6 +12158,7 @@ end)()
     function F.watchdog(ctx)
         F.checkQuestExit(ctx)
         if ctx.active and quest then
+            pcall(quest.drillSupport.upgradePulse,ctx)
             if quest.special and quest.special.observe then pcall(quest.special.observe,ctx,nil)end
             if quest.drillSupport and quest.drillSupport.pruneDoorObservers then pcall(quest.drillSupport.pruneDoorObservers,ctx)end
         end
@@ -13254,6 +13326,7 @@ end
         end)
     end
     local function recoverDeath(player, model)
+        s.questDepthEconomy=nil
         stopFarm()
         if not s.deadSince then s.deadSince = now() end
         if now() - s.deadSince < 8 then status("Waiting for death/respawn state to settle"); return end
@@ -13404,6 +13477,7 @@ end
             stopFarm(); status("Waiting for outstanding " .. tostring(s.request.kind) .. " transition request"); return
         end
         if isLobby then
+            s.questDepthEconomy=nil
             s.deadSince, s.drillMissingSince, s.everReady = nil, nil, false
             s.lootStarted, s.extractionAttempt, s.extractionAttemptAt = nil, nil, nil
             s.churchSave, s.churchMemories = nil, nil
