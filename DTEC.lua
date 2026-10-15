@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.66: upgrade fuel capacity at normal priority until it reaches 250 or more.
+-- Version 0.67: start delivery receipt checks after confirmed native drop replies.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 66
+    local REVISION = 67
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.66-normal-fuel-priority-until-250"
+    local BUILD = "v0.67-post-drop-delivery-receipts"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -7087,10 +7087,14 @@ end)()
         end
         if job.kind=='fuel' and (plan.kind~='fuel' and (plan.kind~='depth' or not cfg.driveDepth))
             and not Q.refuelActive(ctx)then release(job);return true end
-        if job.ctx~=ctx or not enabled(ctx) or manual() or now()-job.started>(job.shop and 25 or 12)
+        -- A confirmed native drop ends ownership. Its replication receipt gets
+        -- a separate window; slow Request/Cancel replies cannot consume it.
+        local receiptOnly=job.stage=='receipt' and job.droppedAt and not job.owns and not job.pending
+            and job.kind~='smelt' and not job.shop
+        if job.ctx~=ctx or not enabled(ctx) or manual() or not receiptOnly and now()-job.started>(job.shop and 25 or 12)
             or job.healingSupply and not Q.healing.itemAccessible(ctx,job.item)then release(job); return true end
         if job.cancelled then release(job); return true end
-        if job.pending or calls.shop or calls.wallet then return true end
+        if job.pending or not receiptOnly and (calls.shop or calls.wallet) then return true end
         if job.shop then return Q.shopStep(job,plan) end
         if job.kind=='supply' and job.stage=='placed' and now()>=job.readyAt then
             if Q.healing.isMedical(job.item) and not api.hasRoom(ctx,job.item)then
@@ -7119,6 +7123,9 @@ end)()
                     job.owns=false
                     if ctx.bringEquipmentLock==job then ctx.bringEquipmentLock=nil;ctx.questOwns=nil end
                     job.background=true
+                    if job.kind~='smelt' and not job.cancelled then
+                        job.droppedAt=now();job.receiptUntil=job.droppedAt+8
+                    end
                 else job.releaseFailed=true; release(job) end
             end)
             if sent and job.kind=='smelt'then job.dropToken=dropToken end
@@ -7150,7 +7157,7 @@ end)()
             elseif now()>=job.receiptUntil then
                 retries[job.item]=now()+120;clearHold(job);s.questDelivery=nil
                 if ctx.bringEquipmentLock==job then ctx.bringEquipmentLock=nil;ctx.questOwns=nil end
-                setStatus('Delivery did not confirm server progress; retry held for 120s')
+                setStatus('Delivery did not confirm server progress; only this item waits 120s; other work continues')
             end
         end
         return true
