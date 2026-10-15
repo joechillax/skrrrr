@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 54: preserve stable equipment observation across chest work; dispatch only after chest release.
+-- Revision 55: cancel a queued initial selection when its native target arrives before dispatch.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 54
-    local BUILD = "r54-chest-equipment-observation-continuity"
+    local REVISION = 55
+    local BUILD = "r55-cancel-queued-arrived-equipment"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -9577,7 +9577,7 @@ end)()
         local dispatchGuard=function(token)
             if not equipmentSelectionReady() or not ctx.active or not api.owned() or s.farm~=ctx
                 or ctx.character~=api.Players.LocalPlayer.Character or ctx.humanoid.Health<=0
-                or ctx.bringEquipmentLock or not F.canSelectEquipment(ctx,tool)
+                or ctx.bringEquipmentLock or not F.canSelectEquipment(ctx,tool) or activeFor(ctx,tool)
                 or tool.Parent~=api.Players.LocalPlayer:FindFirstChild('Backpack')
                 or not equipmentRequirementAllowed(ctx,tool,attr(tool,'Class'))then
                 record.emptyRecovery=nil;return false
