@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.56: report loaded version, quest mode and observed chest/prompt counts per run.
+-- Version 0.57: fund depth upgrades first, alternate driving/loot, prioritize sales and recover distant mines.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 56
+    local REVISION = 57
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.56-run-throughput-diagnostics"
+    local BUILD = "v0.57-depth-funding-and-mine-recovery"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2735,14 +2735,64 @@ end)()
     local weights={DrillPower=120,RPMOverclock=140,UltraDrill=130,MegaDrill=110,PowerSlam=100,
         DriveSpeed=140,PowerDrive=100,EngineOverdrive=90,FuelStorage=45,MoneyDrill=60,
         TeamMeleeDamage=100,TeamPickaxeDamage=100,TeamGunDamage=100,TeamExplosiveDamage=100,TeamHealth=70,SackStorage=6,PowerBurst=120}
-    local blocked={CartExtension=true,MountedGunner=true}
-    local lastResort={LifeSteal=true,HealthRegen=true}
+    local blocked={CartExtension=true,MountedGunner=true,SackStorage=true,LifeSteal=true,HealthRegen=true}
+    local lastResort={} -- No regeneration/lifesteal fallback, including free class cards.
     local damage={TeamMeleeDamage=true,TeamPickaxeDamage=true,TeamGunDamage=true,TeamExplosiveDamage=true}
     local ores={Ore_Iron=true,Ore_Gold=true,Ore_Diamond=true,Ore_Emerald=true,Ore_Ruby=true,Ore_Coal=true,Ore_VoidCoal=true,IronBar=true,GoldBar=true}
     local rarity={Common=1,Rare=2,Epic=3,Legendary=4,Mythic=5}
     local ledger=s.questUpgradeLedger or {};s.questUpgradeLedger=ledger
     local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
     local function status(text)s.questStatus=text end
+    -- A depth run funds its first upgrade round before taking the driver seat.
+    -- Later rounds are timed loot breaks, not coin quotas: one valuable gem
+    -- must not cut a break short, and missing mines must not extend it forever.
+    D.depthFundingCoins,D.depthDriveSeconds,D.depthLootSeconds=10000,150,60
+    function D.depthEconomy(ctx,plan)
+        if plan.kind~='depth' or not cfg.driveDepth or not Q.enabled(ctx) then return end
+        local cycle=ctx.questDepthEconomy
+        if not cycle or cycle.character~=ctx.character or cycle.drill~=ctx.drill then
+            cycle={character=ctx.character,drill=ctx.drill,phase='funding',started=now()}
+            ctx.questDepthEconomy=cycle
+        end
+        local wallet=Q.coinBalance(s.questWallet,s.questWalletAt,s.questWalletVersion)
+        if cycle.phase=='funding' and wallet and wallet>=D.depthFundingCoins then
+            cycle.phase,cycle.upgradeAt='upgrades',now()
+        elseif cycle.phase=='drive' then
+            if ctx.questDriving then cycle.driveAt=cycle.driveAt or now() end
+            if cycle.driveAt and now()-cycle.driveAt>=D.depthDriveSeconds then
+                cycle.phase,cycle.lootAt,cycle.driveAt='loot',now(),nil
+            end
+        elseif cycle.phase=='loot' and now()-cycle.lootAt>=D.depthLootSeconds then
+            cycle.phase,cycle.upgradeAt='upgrades',now()
+        end
+        if cycle.phase=='upgrades' and not s.questUpgradeJob and not calls.upgrade and not calls.upgradeWallet then
+            local c=api.controller('DrillUpgradeController')
+            local ready=c and type(c.Options)=='table' and (tonumber(c.OptionsVersion) or 0)>0
+                and not c.ActiveClassReward and not c.PurchasePending and not c.RerollPending and not c.CardsLocked
+            local offer,key
+            if wallet and ready then
+                offer,key=D.choose(ctx,plan,c,wallet)
+                if not offer and key then cycle.phase,cycle.driveAt='drive',nil end
+            end
+            if cycle.phase=='upgrades' and not offer and not key and wallet
+                and now()-(cycle.upgradeAt or now())>=15 and not s.questDelivery and not calls.shop and not calls.wallet then
+                -- Missing cards cannot strand a funded run. Keep the money;
+                -- retry the real cards at the next round without inventing a buy.
+                cycle.phase,cycle.driveAt='drive',nil
+                s.questUpgradeStatus='Upgrades: native cards unavailable; retaining Coins for the next funding break'
+            end
+        end
+        return cycle
+    end
+    function D.depthFundingStatus(ctx,plan)
+        local cycle=D.depthEconomy(ctx,plan)
+        if not cycle then return end
+        if cycle.phase=='funding' then
+            return string.format('Before driving: chest loot and sales for upgrades, %.0f / 10000 Coins',s.questWallet or 0)
+        elseif cycle.phase=='loot' then
+            return string.format('Driving funding break: %.0fs of chest loot and sales remaining',math.max(0,D.depthLootSeconds-(now()-cycle.lootAt)))
+        elseif cycle.phase=='upgrades' then return 'Spending the upgrade budget before driving: drill, sword, pickaxe, health' end
+    end
     function D.cost(offer)
         local cost=tonumber(offer and offer.Cost)
         if not finite(cost) or cost<0 then return nil end
@@ -2795,7 +2845,16 @@ end)()
         local amount=tonumber(offer.UpgradeAmount) or 1
         if not finite(amount) or amount<=0 then return end
         local cost=D.cost(offer) or 0
-        return (needed and 2000000 or 1000000)+weight*amount/(1+math.max(0,level)/8)/math.max(1,cost)^.35,needed
+        local tier=needed and 2 or 1
+        if plan.kind=='depth' and cfg.driveDepth then
+            if name=='DrillPower' or name=='RPMOverclock' or name=='UltraDrill' or name=='MegaDrill'
+                or name=='PowerSlam' or name=='PowerBurst' then tier=8
+            elseif name=='DriveSpeed' or name=='PowerDrive' or name=='EngineOverdrive' or name=='FuelStorage' or name=='MoneyDrill' then tier=7
+            elseif name=='TeamMeleeDamage' then tier=6
+            elseif name=='TeamPickaxeDamage' then tier=5
+            elseif name=='TeamHealth' then tier=4 end
+        end
+        return tier*1000000+weight*amount/(1+math.max(0,level)/8)/math.max(1,cost)^.35,needed
     end
     function D.worthSaving(ctx,plan,offer)
         if offer.Type~='Coins' or (rarity[offer.Rarity] or 0)<rarity.Legendary then return end
@@ -2838,12 +2897,15 @@ end)()
             end
         end
         local choice=best or fallback or desperate
+        if plan.kind=='depth' and cfg.driveDepth then saving=nil end -- Spend this round; no legendary-card saving loop.
         local choiceScore=choice and D.score(ctx,plan,choice) or 0
         if saving and choice and (math.floor(choiceScore/1000000)>math.floor(savingScore/1000000)
             or (rarity[choice.Rarity] or 0)>=(rarity[saving.Rarity] or 0) and choiceScore>=savingScore)then saving=nil end
         return not saving and choice or nil,key,version,reward~=nil,saving
     end
     function D.fundingTarget(ctx,plan)
+        local cycle=D.depthEconomy(ctx,plan)
+        if cycle and cycle.phase=='funding' then return D.depthFundingCoins end
         local c=api.controller('DrillUpgradeController');local fallback,desperate
         local wallet=finite(s.questWallet) and s.questWallet or 0
         local chosen,key,_,_,saving
@@ -2895,7 +2957,6 @@ end)()
         if plan.kind=='waiting' or plan.kind=='advance' or plan.kind=='complete' or plan.kind=='unsupported'then return end
         local function info(text)s.questUpgradeStatus='Upgrades: '..text end
         local c=api.controller('DrillUpgradeController')
-        if not c or type(c.Options)~='table' then info('waiting for native upgrade cards');return end
         -- Reading the wallet is independent of movement/delivery ownership.
         -- Purchase dispatch below still shares the native spending reservation.
         local function readWallet(callback)
@@ -2909,6 +2970,7 @@ end)()
                 else info('wallet read unavailable; purchases paused')end
             end,function()return Q.enabled(ctx) and not api.extractionReady()end)
         end
+        if not c or type(c.Options)~='table' then info('waiting for native upgrade cards');readWallet();return end
         if D.settleUpgrade(ctx)then
             if not c.ActiveClassReward then readWallet()end
             return
@@ -2928,6 +2990,11 @@ end)()
             if c.PurchasePending or c.RerollPending or c.CardsLocked then info('native cards locked / purchase pending');return end
             if now()<(ctx.questUpgradeAt or 0)then return end
             local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+            local cycle=D.depthEconomy(ctx,current)
+            if not c.ActiveClassReward and cycle and cycle.phase~='upgrades' then
+                info(D.depthFundingStatus(ctx,current) or 'Driving interval; paid upgrades resume at the next funding break')
+                return
+            end
             local offer,key,version,reward,saving=D.choose(ctx,current,c,wallet)
             if not offer then
                 if saving then info(string.format('Saving for %s %s: %.0f / %.0f Coins (1000 held for medkits)',saving.Rarity,saving.UpgradeName,wallet,Q.coinTarget(D.cost(saving),false)))
@@ -2963,6 +3030,7 @@ end)()
                 local reservation=s.questUpgradeJob==job and not job.rejected and not job.confirmed and sameUpgradeUI(job)
                 local picked,pickedKey,pickedVersion=D.choose(ctx,Q.plan(s.classData,s.questCatalog,cfg.driveDepth),c,balance,reservation and key or nil)
                 return Q.enabled(ctx) and not api.extractionReady() and not(s.questDelivery and s.questDelivery.shop) and not calls.shop and not calls.wallet
+                    and (reward or not cycle or ctx.questDepthEconomy==cycle and cycle.phase=='upgrades')
                     and (not c.PurchasePending or reservation and job.uiPendingOwned==true) and not c.RerollPending and not c.CardsLocked
                     and (reward or Q.canSpend(balance,D.cost(offer),false))
                     and picked==offer and pickedKey==key and pickedVersion==version
@@ -3478,7 +3546,9 @@ end)()
         local seat=drill:FindFirstChild('DrillPhysicsSeat') or drill:FindFirstChild('VehicleSeat')
         if seat and seat.Parent and seat:IsA('BasePart') and seat:IsDescendantOf(drill) and seat.CFrame
             and not D.mineshaft(drill) and validPoint(seat.CFrame.Position) and validPoint(reference)
-            and (seat.CFrame.Position-reference).Magnitude<=500 then
+            and ((seat.CFrame.Position-reference).Magnitude<=500
+                or not origin and D.activeMine(ctx)==mine and D.contains(mine,ctx.root.Position,0)==true
+                    and D.contains(mine,seat.CFrame.Position,0)==false) then
             -- Use the actual train seat frame, outside its <=3-stud automatic
             -- driver-start radius; a model's authored pivot is not a safe deck.
             local frame=seat.CFrame*CFrame.new(0,5,12)
@@ -3678,8 +3748,7 @@ end)()
         local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if category=='Scrap' and (current.kind=='shred' or ctx.questNeedScrap)then return false end
         local fuelValue=tonumber(api.attr(item,'Fuel')) or 0
-        local bar=id=='IronBar' or id=='GoldBar'
-        if not finite(value) or value<=0 or value<150 and not bar or Q.protectedRelic(item)
+        if not finite(value) or value<150 or Q.protectedRelic(item)
             or class=='Medkit' or class=='ReviveKit' or category=='Ammo' or id:sub(-5)=='_Ammo'
             or id=='Money_Sack' or api.tag(item,'MoneySack') or fuelValue>0 and (Q.fuelNeeded() or category=='Fuel' and not ores[id])
             or id=='Void_Helmet' or id=='Void_Chest' or id=='Void_Legs' or id=='Pickaxe_Void' or id=='Sword_Void'
@@ -3724,10 +3793,10 @@ end)()
         if ctx.questMineRotate~=nil then ctx.humanoid.AutoRotate=ctx.questMineRotate;ctx.questMineRotate=nil end
         ctx.questMining=nil;ctx.questMineJob=nil
     end
-    function D.sellLoose(ctx,plan)
+    function D.sellLoose(ctx,plan,immediate)
         if not Q.activePlan(plan) or ctx.questPotionUsing or s.questDelivery or calls.drag or s.bringDelivery or s.lootRequest or Q.manual()
             or ctx.questMineEntry or ctx.nativeGateMotion
-            or now()<(ctx.questValueSaleAt or 0)then return false end
+            or not immediate and now()<(ctx.questValueSaleAt or 0)then return false end
         ctx.questValueSaleAt=now()+1
         local useful=api.snapshot and api.snapshot(ctx)
         local item,score,objective
@@ -3747,7 +3816,8 @@ end)()
             end
         end
         local gem=item and s.itemCategories and s.itemCategories.Gems and s.itemCategories.Gems[api.id(item)]==true
-        if not gem and D.processing and D.processing.step(ctx,plan)then return true end
+        if immediate and not item then return false end
+        if not immediate and not gem and D.processing and D.processing.step(ctx,plan)then return true end
         local itemPart=item and api.part(item)
         if item and (not itemPart or not itemPart.Parent or not validPoint(itemPart.Position))then return false end
         local pad=itemPart and Q.bestSeller(ctx,itemPart.Position)
@@ -4100,6 +4170,13 @@ end)()
             job.progressAt=job.progressAt or now()
         elseif hp<job.health then job.health,job.progressAt,job.unarmedAt=hp,now(),nil end
         Q.abortResources(ctx);Q.stopDrive(ctx)
+        local stoppedLease=job.driveLease
+        local stoppedOwner=ctx.drill:GetAttribute('DriverUserId')
+        if stoppedLease and stoppedLease.ctx==ctx and stoppedLease.drill==ctx.drill
+            and stoppedLease.confirmed and stoppedLease.abandoned and stoppedLease.stopAccepted==true
+            and (stoppedOwner==nil or finite(stoppedOwner) and stoppedOwner>=0 and stoppedOwner~=api.Players.LocalPlayer.UserId)then
+            job.driverReleased=true
+        end
         local function yieldHandoff(reason)
             if job.intent then job.intent.retryAt=now()+10;job.intent.waiting=reason end
             ctx.questDrivingDefenseUntil=now()+10;D.stopDrivingDefense(ctx,true);return false
@@ -4121,14 +4198,16 @@ end)()
         end
         job.owns=true
         if ctx.humanoid.SeatPart or ctx.humanoid.Sit then
+            job.seatWaitAt=job.seatWaitAt or now()
             if ctx.combatTarget==npc then ctx.combatTarget=nil;ctx.questCombat=nil end
             local _,holding=Q.unseat(ctx);api.watch(ctx)
-            if now()-job.started>=8 then
+            if now()-job.seatWaitAt>=8 then
                 return yieldHandoff('seat')
             end
             status('Driving damage observed; waiting for actual seat exit before clearing nearby enemies')
-            return holding or now()-job.started<8
+            return holding or now()-job.seatWaitAt<8
         end
+        job.seatWaitAt=nil
         if not job.attackStartedAt then job.attackStartedAt=now();job.progressAt=now()end
         ctx.questThreat=npc;ctx.questCombat=true;ctx.questWeapon,ctx.questWeaponClass=plan.weapon,plan.weaponClass or 'Sword'
         ctx.combatTarget=npc;Q.armTarget(ctx,npc)
@@ -6250,10 +6329,22 @@ end)()
         for seat,value in pairs(ctx.questSeats or {}) do pcall(function() if seat.Parent then seat.ThrottleFloat=value end end) end
         ctx.questSeats=nil
     end
+    local function mobileInput()
+        local controller=api.controller('InputController')
+        if controller and controller.Platform=='Mobile'then return true end
+        local ok,uis=pcall(function()return game:GetService('UserInputService')end)
+        return ok and uis and uis.TouchEnabled==true and uis.KeyboardEnabled==false
+    end
     local function forwardInput(ctx)
         if s.questInputRelease then
             clearThrottle(s.questInputRelease)
             if s.questInputRelease then return false end
+        end
+        -- Native TrainComponent accepts the owned seat throttle on Mobile.
+        -- Delta does not need desktop key injection or a virtual keyboard.
+        if mobileInput()then
+            if ctx.questDriveInput then clearThrottle(ctx)end
+            return false
         end
         if now()<(ctx.questDriveInputRetryAt or 0)then return false end
         local ok,uis=pcall(function()return game:GetService('UserInputService')end)
@@ -6373,6 +6464,25 @@ end)()
         local wall=ctx.questWallWork;local drill=ctx.drill;local attached=ctx.humanoid.SeatPart
         local localSeat=drill and drill:FindFirstChild('LocalDriverSeat')
         local pending=calls.drive or lease and lease.abandoned and lease.stopIssued and lease.stopAccepted~=true
+        local defense=ctx.questDrivingDefense
+        if cfg.classQuest and enabled(ctx) and not manual() and defense and defense.driverReleased
+            and defense.character==ctx.character and ctx.character==api.Players.LocalPlayer.Character
+            and defense.drill==drill and drill==workspace:FindFirstChild('Drill') and drill.Parent
+            and defense.band==workspace:GetAttribute('InfiniteDepthOffsetMeters')
+            and defense.class==(s.classData and s.classData.SelectedClass)
+            and defense.driveLease and defense.driveLease.ctx==ctx and defense.driveLease.drill==drill
+            and defense.driveLease.confirmed and defense.driveLease.abandoned and defense.driveLease.stopAccepted==true
+            and (not lease or lease==defense.driveLease) and attached and attached==localSeat
+            and localSeat.Occupant==ctx.humanoid and driverId(drill)==api.Players.LocalPlayer.UserId
+            and not pending and not humanDrivingInput(ctx)then
+            -- Knockback can restart the native driver after our verified stop.
+            -- Adopt only this still-active defense's actual reseated character,
+            -- and require a new observed driver release before another stop.
+            ctx.questDriving=true;wasDriving=true
+            lease={ctx=ctx,drill=drill,started=now(),confirmed=true};s.questDriveLease=lease
+            defense.driveLease=lease;defense.driverReleased=nil
+            if defense.intent then defense.intent.lease=lease end
+        end
         if cfg.classQuest and enabled(ctx) and not manual() and wall and wall.drill==drill
             and drill==workspace:FindFirstChild('Drill') and drill.Parent
             and wall.band==workspace:GetAttribute('InfiniteDepthOffsetMeters')
@@ -6541,7 +6651,7 @@ end)()
         if not free(item,'sale') then return false end
         local id=api.id(item)
         local value=tonumber(api.attr(item,'Value'))
-        if not finite(value) or value<=0 or value<150 and id~='IronBar' and id~='GoldBar' then return false end
+        if not finite(value) or value<150 then return false end
         if Q.protectedRelic(item) or (tonumber(api.attr(item,'Fuel')) or 0)>0 and Q.fuelNeeded() or api.tag(item,'MoneySack')
             or id=='Money_Sack' or id=='Flintlock' or id=='Sword_Pirate' then return false end
         local isGold=s.itemCategories and s.itemCategories.GoldenItems and s.itemCategories.GoldenItems[id]==true
@@ -7148,6 +7258,7 @@ end)()
         setStatus(drilling and (wall and finite(wall.eta) and string.format('Wall estimate %.1fs (%s); staying seated and driving',wall.eta,wall.estimateSource)
                 or 'Wall damage rate loading; staying seated with bounded progress checks')
             or nativeInput and 'Driving drill with native forward input; observing distance and TotalDepth'
+            or mobileInput() and 'Mobile native seat throttle; distance monitored'
             or 'Native forward input unavailable; seat throttle fallback, distance monitored')
         Q.drillSupport.boost(ctx)
         return true
@@ -7203,7 +7314,7 @@ end)()
         if refilling~=nil then return refilling end
         local working,holding,quick=wallWork(ctx)
         if working and not quick then return holding and true or nil end
-        if not quick and Q.drillSupport.depthMine and Q.drillSupport.depthMine(ctx,plan)then return true end
+        if not quick and not ctx.questDepthEconomy and Q.drillSupport.depthMine and Q.drillSupport.depthMine(ctx,plan)then return true end
         if Q.drillSupport.inDungeon(ctx) or now()<(ctx.questDriveDetourUntil or 0)then return nil end
         local ready,reason=driveReady(ctx)
         if not ready then Q.stopDrive(ctx);ctx.questOwns=nil;setStatus(reason..'; other work continues');return false end
@@ -7227,12 +7338,8 @@ end)()
             if ctx.questDriveSessionAt then ctx.questDriveSessionAt=ctx.questDriveSessionAt+paused end
         end
         if not holdRoute(ctx)then return ctx.questOwns==true end
-        -- Optional funding and chest turns cannot preempt every seating pulse.
-        -- A moving drive receives 30s, then nearby ordinary chests get a turn.
-        local watch=ctx.questDriveWatch
-        if watch and watch.moved and not ctx.drill:GetAttribute('IsDrilling')
-            and now()-(ctx.questDriveSessionAt or now())>=30 and not s.questDelivery
-            and Q.chestTurn(ctx,plan)then return true end
+        -- The economy scheduler owns the 150s drive / 60s loot cadence.
+        -- Nearby chest polls must not preempt the driving interval every 30s.
         Q.drillSupport.stopMine(ctx)
         local tank,capacity=tonumber(ctx.drill:GetAttribute('Fuel')),tonumber(ctx.drill:GetAttribute('MaxFuel'))
         if not s.questDelivery and finite(tank) and finite(capacity) and tank<=capacity*.2 then
@@ -7757,10 +7864,45 @@ end)()
         Q.drillSupport.upgrades(ctx,plan)
         if Q.drillSupport.drivingDefense and Q.drillSupport.drivingDefense(ctx,plan)then return true end
         if Q.drillSupport.threat(ctx,plan)then return true end
+        -- New disposable drops get the next safe sale turn, before optional
+        -- mining/readiness waits or another chest. Never steal a driver or a
+        -- pending native prompt/ownership lane to satisfy the sale preference.
+        if not ctx.questDriving and not ctx.questSeating then
+            local sale=s.questDelivery
+            if sale and sale.ctx==ctx and (sale.kind=='sale' or sale.kind=='gold') then
+                local busy=deliveryStep(ctx,plan)
+                if busy and not (sale.cancelled and sale.movementReleased) then return true end
+            end
+            if not Q.refuelActive(ctx,plan) and Q.drillSupport.sellLoose(ctx,plan,true) then return true end
+        end
         if ctx.questMineEntry and Q.drillSupport.entry(ctx,ctx.questDepthMine~=nil)then return true end
         if ctx.questDepthMine and Q.drillSupport.depthMine and Q.drillSupport.depthMine(ctx,plan)then return true end
         local refilling=refuelWork(ctx,plan)
         if refilling~=nil then return refilling end
+        local cycle=Q.drillSupport.depthEconomy(ctx,plan)
+        if cycle and cycle.phase~='drive' and not Q.manual() and not Q.drillSupport.inDungeon(ctx) then
+            Q.stopDrive(ctx)
+            if ctx.humanoid.SeatPart or ctx.humanoid.Sit then
+                local ready,holding=Q.unseat(ctx);if not ready then return holding end
+            end
+            -- Finish the existing native owner before starting another pickup,
+            -- sale, upgrade or driver session. A deadline cannot cancel an RPC.
+            if s.questDelivery then
+                local sale=s.questDelivery;local busy=deliveryStep(ctx,plan)
+                if busy and not (sale.cancelled and sale.movementReleased) then return true end
+                if s.questDelivery then ctx.questOwns=nil;return false end
+            end
+            if Q.cashStep(ctx) then return true end
+            if Q.loadout.step(ctx,plan) then return true end
+            if cycle.phase~='upgrades' then
+                if Q.collectMoney(ctx) or Q.drillSupport.sellLoose(ctx,plan) then return true end
+                ctx.questChestDue=math.min(ctx.questChestDue or now(),now())
+                if Q.chestTurn(ctx,plan) then return true end
+            end
+            ctx.questOwns=nil
+            setStatus(Q.drillSupport.depthFundingStatus(ctx,plan) or 'Settling upgrade purchases before driving')
+            return false -- The ordinary chest/gear route also gets a full turn.
+        end
         -- Optional startup gear and new mine/loot trips wait for a short wall;
         -- urgent defense, healing, native mine exits and refuelling run above.
         if plan.kind=='depth' and cfg.driveDepth and not Q.manual() and not Q.drillSupport.inDungeon(ctx)
@@ -7790,7 +7932,7 @@ end)()
         if plan.kind=='shred'then return Q.special.shred(ctx,plan)end
         if plan.kind=='turret'then return Q.special.turretKills(ctx,plan)end
         if plan.kind=='dungeon'then return Q.special.dungeon(ctx,plan,false)end
-        if plan.kind=='depth' and ctx.questWallWork and Q.drillSupport.depthMine
+        if plan.kind=='depth' and ctx.questWallWork and not ctx.questDepthEconomy and Q.drillSupport.depthMine
             and Q.drillSupport.depthMine(ctx,plan)then return true end
         if Q.drillSupport.sellLoose(ctx,plan)then return true end
         if plan.kind=='potion'then return Q.potionStep(ctx,plan)end
@@ -8884,14 +9026,16 @@ return function(api)
         local dragging, origin, initial
         bind(header.InputBegan, function(inputObject)
             if inputObject.UserInputType == Enum.UserInputType.MouseButton1 or inputObject.UserInputType == Enum.UserInputType.Touch then
-                dragging, origin, initial = true, inputObject.Position, panel.Position
+                if not dragging then dragging, origin, initial = inputObject, inputObject.Position, panel.Position end
             end
         end)
         bind(UIS.InputEnded, function(inputObject)
-            if inputObject.UserInputType == Enum.UserInputType.MouseButton1 or inputObject.UserInputType == Enum.UserInputType.Touch then dragging = false end
+            if dragging and (inputObject==dragging or dragging.UserInputType==Enum.UserInputType.MouseButton1
+                and inputObject.UserInputType==Enum.UserInputType.MouseButton1)then dragging=nil end
         end)
         bind(UIS.InputChanged, function(inputObject)
-            if dragging and (inputObject.UserInputType == Enum.UserInputType.MouseMovement or inputObject.UserInputType == Enum.UserInputType.Touch) then
+            if dragging and (inputObject==dragging or dragging.UserInputType==Enum.UserInputType.MouseButton1
+                and inputObject.UserInputType==Enum.UserInputType.MouseMovement) then
                 local delta = inputObject.Position - origin
                 panel.Position = UDim2.new(initial.X.Scale, initial.X.Offset + delta.X, initial.Y.Scale, initial.Y.Offset + delta.Y)
             end
@@ -8914,7 +9058,9 @@ return function(api)
             or cfg.lootExtract and (s.lootRequest or ctx and (ctx.featureHold or ctx.gearPickup))
             or s.featureStatusAt and api.now() - s.featureStatusAt < 3
         ui.stage.Text = optionalActive and s.featureStatus or s.status or 'Waiting for readiness…'
-        if cfg.classQuest and ctx and ctx.questOwns then ui.stage.Text = s.questStatus or ui.stage.Text end
+        if cfg.classQuest and ctx and (ctx.questOwns or ctx.questDepthEconomy and ctx.questDepthEconomy.phase~='drive') then
+            ui.stage.Text = s.questStatus or ui.stage.Text
+        end
         if ctx and ctx.questChestLease and ctx.worldReading then ui.stage.Text='Reading loaded map for a quest chest' end
         local h = api.player.Character and api.player.Character:FindFirstChildOfClass('Humanoid')
         local health = h and h.MaxHealth > 0 and math.floor(100 * h.Health / h.MaxHealth) or 0
@@ -8951,7 +9097,7 @@ return function(api)
             end
         end
         local camera = workspace.CurrentCamera
-        if camera then scale.Scale = math.min(1, math.max(0.55, math.min((camera.ViewportSize.Y - 60) / 570, (camera.ViewportSize.X - 40) / 410))) end
+        if camera then scale.Scale = math.min(1, math.max(0.25, math.min((camera.ViewportSize.Y - 60) / 570, (camera.ViewportSize.X - 40) / 410))) end
     end
     function ui.dispose()
         for _, c in ipairs(ui.connections) do pcall(function() c:Disconnect() end) end
