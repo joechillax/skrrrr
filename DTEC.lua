@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.62: spend available upgrades and drive when initial funding stops progressing.
+-- Version 0.63: buy upgrades during loot breaks and resume driving when loaded work is exhausted.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 62
+    local REVISION = 63
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.62-funding-idle-handoff"
+    local BUILD = "v0.63-productive-loot-breaks"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2743,8 +2743,8 @@ end)()
     local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
     local function status(text)s.questStatus=text end
     -- A depth run funds its first upgrade round before taking the driver seat.
-    -- Later rounds are timed loot breaks, not coin quotas: one valuable gem
-    -- must not cut a break short, and missing mines must not extend it forever.
+    -- Later rounds allow up to one minute of loot, sales and upgrade work.
+    -- A gem value is not a finish signal; confirmed empty loaded work may yield early.
     D.depthFundingCoins,D.depthDriveSeconds,D.depthLootSeconds=10000,150,60
     D.depthFundingIdleSeconds=60
     function D.depthEconomy(ctx,plan)
@@ -2804,11 +2804,37 @@ end)()
         if cycle.phase=='funding' then
             return string.format('Before driving: chest loot and sales for upgrades, %.0f / 10000 Coins',s.questWallet or 0)
         elseif cycle.phase=='loot' then
-            return string.format('Driving funding break: %.0fs of chest loot and sales remaining',math.max(0,D.depthLootSeconds-(now()-cycle.lootAt)))
+            return string.format('Chest loot, sales and upgrade checks: up to %.0fs remaining',math.max(0,D.depthLootSeconds-(now()-cycle.lootAt)))
         elseif cycle.phase=='upgrades' then
             return cycle.fundingLimited and 'No funding progress for 60s; spending available upgrades before driving'
                 or 'Spending the upgrade budget before driving: drill, sword, pickaxe, health'
         end
+    end
+    function D.finishEmptyLoot(ctx,plan,empty)
+        local cycle=ctx.questDepthEconomy
+        if not cycle or cycle.phase~='loot' then return false end
+        local clear=empty==true and Q.enabled(ctx) and not Q.manual() and not api.extractionReady() and not D.inDungeon(ctx)
+            and not ctx.currentChest and not ctx.questChestLease and not ctx.questChestTaking and not ctx.questHealing
+            and not ctx.featureHold and not ctx.smartLootWindow and not ctx.questMineJob and not ctx.questMineEntry
+            and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
+            and not s.questDelivery and not s.questCashJob and not s.questUpgradeJob and not s.questInventoryDrop
+            and not s.bringDelivery and not s.lootRequest and not s.equipmentRequest and not s.rareShardDrop
+            and not next(calls) and Q.coinBalance(s.questWallet,s.questWalletAt,s.questWalletVersion)~=nil
+        if not clear then cycle.emptyAt=nil;return false end
+        local activity=s.questActivity
+        local last=math.max(cycle.lootAt,activity and activity.at or cycle.lootAt)
+        if not cycle.emptyAt or last>cycle.emptyAt then cycle.emptyAt=now();return false end
+        -- A complete loaded candidate pass and eight quiet seconds allow late
+        -- drops/receipts to arrive. No request or phase change invents progress.
+        if now()-cycle.emptyAt<8 then return false end
+        cycle.phase,cycle.upgradeAt,cycle.emptyEnded='upgrades',now(),true
+        D.depthEconomy(ctx,plan)
+        return true
+    end
+    function D.paidUpgradeWindow(ctx,cycle)
+        return not cycle or cycle.phase=='upgrades' or cycle.phase=='loot'
+            and not ctx.questDriving and not ctx.questSeating and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit
+            and not Q.manual() and not Q.driveHandoff(ctx)
     end
     function D.cost(offer)
         local cost=tonumber(offer and offer.Cost)
@@ -3008,7 +3034,7 @@ end)()
             if now()<(ctx.questUpgradeAt or 0)then return end
             local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
             local cycle=D.depthEconomy(ctx,current)
-            if not c.ActiveClassReward and cycle and cycle.phase~='upgrades' then
+            if not c.ActiveClassReward and not D.paidUpgradeWindow(ctx,cycle)then
                 info(D.depthFundingStatus(ctx,current) or 'Driving interval; paid upgrades resume at the next funding break')
                 return
             end
@@ -3047,7 +3073,7 @@ end)()
                 local reservation=s.questUpgradeJob==job and not job.rejected and not job.confirmed and sameUpgradeUI(job)
                 local picked,pickedKey,pickedVersion=D.choose(ctx,Q.plan(s.classData,s.questCatalog,cfg.driveDepth),c,balance,reservation and key or nil)
                 return Q.enabled(ctx) and not api.extractionReady() and not(s.questDelivery and s.questDelivery.shop) and not calls.shop and not calls.wallet
-                    and (reward or not cycle or ctx.questDepthEconomy==cycle and cycle.phase=='upgrades')
+                    and (reward or not cycle or ctx.questDepthEconomy==cycle and D.paidUpgradeWindow(ctx,cycle))
                     and (not c.PurchasePending or reservation and job.uiPendingOwned==true) and not c.RerollPending and not c.CardsLocked
                     and (reward or Q.canSpend(balance,D.cost(offer),false))
                     and picked==offer and pickedKey==key and pickedVersion==version
@@ -7811,9 +7837,12 @@ end)()
             return entry and entry.Model and (root and entry.Model:IsDescendantOf(root)
                 or Q.drillSupport.accessible(entry.Model))
         end
-        local ok,entry=pcall(api.chestCandidate,ctx,ctx.questHealing and 1000 or 250,eligible)
+        local ok,entry,empty=pcall(api.chestCandidate,ctx,ctx.questHealing and 1000 or 250,eligible)
         if not ok then ctx.questChestTaking=nil;ctx.questChestLease=nil;error(entry,0)end
-        if not entry or not eligible(entry)then ctx.questChestTaking=nil;ctx.questChestLease=nil;ctx.questChestDue=now()+3;return false end
+        if not entry or not eligible(entry)then
+            ctx.questChestTaking=nil;ctx.questChestLease=nil;ctx.questChestDue=now()+3
+            return false,entry==nil and empty==true
+        end
         Q.drillSupport.stopMine(ctx);Q.stopDrive(ctx)
         if plan.kind=='depth'then ctx.questDriveDetourUntil=now()+6 end
         if ctx.humanoid.SeatPart or ctx.humanoid.Sit then
@@ -8023,11 +8052,13 @@ end)()
             if cycle.phase~='upgrades' then
                 if Q.collectMoney(ctx) or Q.drillSupport.sellLoose(ctx,plan) then return true end
                 ctx.questChestDue=math.min(ctx.questChestDue or now(),now())
-                if Q.chestTurn(ctx,plan) then return true end
+                local chestBusy,empty=Q.chestTurn(ctx,plan)
+                if chestBusy then return true end
+                Q.drillSupport.finishEmptyLoot(ctx,plan,empty)
             end
             ctx.questOwns=nil
             setStatus(Q.drillSupport.depthFundingStatus(ctx,plan) or 'Settling upgrade purchases before driving')
-            return false -- The ordinary chest/gear route also gets a full turn.
+            if cycle.phase~='drive' then return false end -- Give ordinary chest/gear work its turn until the break ends.
         end
         -- Optional startup gear and new mine/loot trips wait for a short wall;
         -- urgent defense, healing, native mine exits and refuelling run above.
@@ -10469,7 +10500,9 @@ end)()
             return cf.Position,size
         end,
         miningNodeAllowed=function(node)return not F.skipLootArea(node) and F.liveOre(node)end,
-        chestCandidate=function(ctx,radius,predicate)return ctx.questChestCandidate and ctx.questChestCandidate(radius,predicate)end,
+        chestCandidate=function(ctx,radius,predicate)
+            if ctx.questChestCandidate then return ctx.questChestCandidate(radius,predicate)end
+        end,
         chestAllowed=F.chestFallbackAllowed,
         collectMineLoot=function(ctx)return F.upgradeGear(ctx)end,
         openChest=function(ctx,entry)return ctx.helpers[16361397](entry)end,
@@ -12594,7 +12627,7 @@ end
                         ctx.candidates = fn(...)
                         ctx.cacheAt, ctx.chestsDirty = now() + (workspace.DescendantAdded and 30 or 2), false
                     end
-                    local list = {}
+                    local list, pending = {}, false
                     for _, entry in ipairs(ctx.candidates) do
                         if entry.Model.Parent and features.chestAreaAllowed(ctx,entry.Model)
                             and features.chestFallbackAllowed(entry.Model) then
@@ -12603,9 +12636,12 @@ end
                                 and not ((record.failures or 0) >= 3 and entry.Pos.X < (s.routeScanX or entry.Pos.X) - 300) then
                                 entry.Dist = (entry.Pos - root.Position).Magnitude
                                 table.insert(list, entry)
+                            elseif not record.locked and not record.retired then
+                                pending = true -- Cooling/unconfirmed chests are not an empty route.
                             end
                         end
                     end
+                    ctx.chestCandidatesPending = pending
                     table.sort(list, function(a, b) return a.Dist < b.Dist end)
                     return list
                 end
@@ -12729,9 +12765,17 @@ end
             -- the discovery route stays parked throughout the detour.
             if not s.config.classQuest or not ctx.questChestTaking
                 or coroutine.running() ~= ctx.featureThread or ctx.currentChest then return end
+            local any=false
             for _,entry in ipairs(ctx.helpers[9164528]())do
-                if entry.Dist<=radius and (not predicate or predicate(entry))then return entry end
+                if not predicate or predicate(entry)then
+                    any=true
+                    if entry.Dist<=radius then return entry,false end
+                end
             end
+            local complete=type(ctx.worldObjects)=='table' and not ctx.worldScan and not ctx.worldReading
+                and now()<(ctx.worldRefreshAt or 0) and not ctx.chestsDirty and not ctx.chestCandidatesPending
+                and not next(ctx.worldPending or {}) and not ctx.streamWaiting and player.GameplayPaused~=true
+            return nil,not any and complete
         end
         local function run(fn, ...)
             if not ctx.active then return end
