@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 53: recover acknowledged selection stuck behind a stable confirmed other melee tool.
+-- Revision 54: preserve stable equipment observation across chest work; dispatch only after chest release.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,8 +14,8 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 53
-    local BUILD = "r53-stable-other-native-equipment-recovery"
+    local REVISION = 54
+    local BUILD = "r54-chest-equipment-observation-continuity"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -9430,7 +9430,7 @@ end)()
         if use then times[#times+1]=at end
         return true
     end
-    local function selectionRecoveryState(ctx,tool,ownRequest)
+    local function selectionRecoveryState(ctx,tool,ownRequest,observeChest)
         local player=api.Players.LocalPlayer
         local c=controller('ToolController');local calls=quest and quest.calls or {}
         local scene=controller('CutSceneController')
@@ -9452,7 +9452,7 @@ end)()
             or scene and (scene.CurrentCutScene or scene.AbortingCutScene)
             or player:GetAttribute('PlacingCraftedPlaceable')==true or placement and placement.Active
             or s.request or s.awaiting or s.teleporting or s.departureAt
-            or ctx.currentChest or ctx.featureHold or ctx.defenseMoving or now()<(ctx.dodgeUntil or 0)
+            or ctx.currentChest and not observeChest or ctx.featureHold or ctx.defenseMoving or now()<(ctx.dodgeUntil or 0)
             or ctx.questPlacement or ctx.questPreviewCancel or ctx.questPotionUsing or ctx.questRecovering
             or ctx.questHealAttempt or s.questMedicalDrop or ctx.swingEdit
             or ctx.questHealing and class~='Medkit'
@@ -9556,12 +9556,12 @@ end)()
         end
         if record and record.accepted and not record.pending and not record.uncertain
             and finite(record.settledAt)then
-            local c,version,other,serverId=selectionRecoveryState(ctx,tool)
+            local c,version,other,serverId=selectionRecoveryState(ctx,tool,nil,true)
             local observation=record.emptyRecovery
             if not c then record.emptyRecovery=nil
             elseif not observation or observation.character~=ctx.character or observation.controller~=c or observation.version~=version or observation.other~=other or observation.serverId~=serverId then
                 record.emptyRecovery={character=ctx.character,controller=c,version=version,other=other,serverId=serverId,started=now()}
-            elseif now()-observation.started>=10 and now()>=(record.retryAt or 0) and emptyRecoveryBudget(record,false)then recovery=observation end
+            elseif not ctx.currentChest and now()-observation.started>=10 and now()>=(record.retryAt or 0) and emptyRecoveryBudget(record,false)then recovery=observation end
         elseif record then record.emptyRecovery=nil end
         if record and (record.pending or record.uncertain or record.accepted and not recovery
             or now() < (record.retryAt or 0)) then return nil end
