@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.58: seven-minute run default and built-in personal reporting on every device.
+-- Version 0.59: sell carried resources from 100 Coins, sustain mobile throttle and report driving/funding observations.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 58
+    local REVISION = 59
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.58-personal-defaults"
+    local BUILD = "v0.59-carried-sales-and-mobile-throttle"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -447,6 +447,22 @@ end)()
         end
         local mode=s.config and s.config.classQuest
         if mode==true then progress.questsOn=true elseif mode==false then progress.questsOff=true end
+        if s.config and type(s.config.driveDepth)=='boolean'then progress.drivingEnabled=s.config.driveDepth end
+        local wallet=finite(s.questWallet)
+        if wallet then progress.lastCoins=wallet end
+        local ctx=s.farm
+        if ctx and ctx.active then
+            local cycle=ctx.questDepthEconomy
+            local phase=cycle and cycle.phase
+            if phase=='funding' or phase=='upgrades' or phase=='drive' or phase=='loot'then progress.lastDrivePhase=phase end
+            if progress.driveSeen==nil then progress.driveSeen=false end
+            if ctx.questDriving and ctx.drill and type(ctx.drill.GetAttribute)=='function'then
+                local ok,owner=pcall(ctx.drill.GetAttribute,ctx.drill,'DriverUserId')
+                local read,player=pcall(function()return (api.Players or game:GetService('Players')).LocalPlayer end)
+                if ok and read and player and owner==player.UserId then progress.driveSeen=true end
+            end
+            if ctx.questMobileThrottle then progress.mobileFramesSeen=true end
+        end
         -- Scalar counters only. Observations never inspect the map, yield,
         -- request an action or reset an existing diagnostic/scheduler budget.
         for _,key in ipairs({'lootObserved','promptFires'})do
@@ -558,6 +574,11 @@ end)()
         end
         return 'Version '..version..' | Quests '..mode
             ..'\nChest removals observed: '..delta('lootObserved')..' | Prompt calls: '..delta('promptFires')
+            ..'\nDriving enabled: '..(progress.drivingEnabled==true and 'YES' or progress.drivingEnabled==false and 'NO' or 'unknown')
+            ..' | Native driver observed: '..(progress.driveSeen==true and 'YES' or progress.driveSeen==false and 'NO' or 'unavailable')
+            ..'\nLast drive phase: '..(progress.lastDrivePhase or 'unavailable')
+            ..' | Last observed Coins: '..(progress.lastCoins and string.format('%.0f',progress.lastCoins) or 'unavailable')
+            ..(progress.mobileFramesSeen and ' | Mobile frame input observed' or '')
             ..(progress.partial and '\nCounts cover only the observed part of this run.' or '')
     end
     local function payload(outcome, reason)
@@ -2484,7 +2505,7 @@ return function(api,Q,D)
     end
     function M.fundingEligible(item,ctx)
         local value=tonumber(api.attr(item,'Value'));local id=api.id(item)
-        return Q.free(item) and api.attr(item,'Category')=='Scrap' and finite(value) and value>0 and value<=149
+        return Q.free(item) and api.attr(item,'Category')=='Scrap' and finite(value) and value>0 and value<100
             and not recipes[id] and id~='IronBar' and id~='GoldBar' and not protected(item,ctx)
             and not item:FindFirstChild('Health') and D.accessible(item)
     end
@@ -2600,7 +2621,7 @@ return function(api,Q,D)
                 end
             end
             if pad and best and Q.startDelivery(ctx,best,pad,'shred',{name=plan.name,counts=plan.counts,objective='ShredScrap',processingFunding=true})then
-                status('Shredding disposable loot below 150 for the native unlocked Furnace quote');return true
+                status('Shredding disposable loot below 100 for the native unlocked Furnace quote');return true
             end
             return false
         end
@@ -3714,22 +3735,25 @@ end)()
         if depthVisit and not active then ctx.questDepthMine=nil end
         ctx.questOwns=nil;return false
     end
-    function D.saleEligible(item,ctx,snapshot,objective)
+    local function saleEligible(item,ctx,snapshot,objective,carried)
         ctx=ctx or s.farm
-        if not item or not ctx or not Q.free(item,'sale')then return false end
+        if not item or not ctx then return false end
+        if carried then
+            local player=api.Players.LocalPlayer
+            if not item:IsA('Tool') or player.Character~=ctx.character
+                or item.Parent~=ctx.character and item.Parent~=player:FindFirstChild('Backpack')then return false end
+        elseif not Q.free(item,'sale')then return false end
         local id=api.id(item);local class=api.attr(item,'Class');local category=api.attr(item,'Category')
         local value=tonumber(api.attr(item,'Value'))
         local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if category=='Scrap' and (current.kind=='shred' or ctx.questNeedScrap)then return false end
         local fuelValue=tonumber(api.attr(item,'Fuel')) or 0
-        if not finite(value) or value<150 or Q.protectedRelic(item)
+        if not finite(value) or value<100 or Q.protectedRelic(item)
             or class=='Medkit' or class=='ReviveKit' or category=='Ammo' or id:sub(-5)=='_Ammo'
             or id=='Money_Sack' or api.tag(item,'MoneySack') or fuelValue>0 and (Q.fuelNeeded() or category=='Fuel' and not ores[id])
             or id=='Void_Helmet' or id=='Void_Chest' or id=='Void_Legs' or id=='Pickaxe_Void' or id=='Sword_Void'
             or id=='Flintlock' or id=='Sword_Pirate' then return false end
-        -- Initializes the catalog-backed protection for every class starter item.
-        Q.gold(item,ctx,snapshot)
-        if s.questProtectedIds and s.questProtectedIds[id]then return false end
+        if Q.protectedStarter(item)then return false end
         local hum=item:FindFirstChildOfClass('Humanoid')
         if hum and hum.Health>0 and (not api.enemyAlive or api.enemyAlive(item))then return false end
         if snapshot and snapshot(item) or not snapshot and api.useful(ctx,item)then return false end
@@ -3743,6 +3767,23 @@ end)()
         return category=='Corpse' or category=='Valuable' or category=='Resource' or category=='Scrap'
             or api.attr(item,'ArmorType')~=nil or class=='Sword' or class=='Pickaxe' or class=='ItemBag'
             or class=='Revolver' or class=='Rifle' or class=='Shotgun'
+    end
+    function D.saleEligible(item,ctx,snapshot,objective)
+        return saleEligible(item,ctx,snapshot,objective,false)
+    end
+    function D.carriedSaleEligible(item,ctx)
+        if not item then return false end
+        local id=api.id(item);local category=api.attr(item,'Category')
+        local gem=s.itemCategories and s.itemCategories.Gems and s.itemCategories.Gems[id]==true
+        -- Only consumable sale resources enter the inventory drop lane. Never
+        -- expand this to carried weapons, armor, bags or class equipment.
+        return (gem or ores[id] or category=='Valuable' or category=='Resource' or category=='Scrap')
+            and api.attr(item,'Class')~='Sword' and api.attr(item,'Class')~='Pickaxe'
+            and api.attr(item,'Class')~='ItemBag' and api.attr(item,'Class')~='Revolver'
+            and api.attr(item,'Class')~='Rifle' and api.attr(item,'Class')~='Shotgun'
+            and api.attr(item,'Class')~='RPG' and api.attr(item,'Class')~='Cannon'
+            and api.attr(item,'Class')~='Blueprint' and api.attr(item,'ArmorType')==nil
+            and saleEligible(item,ctx,nil,nil,true)
     end
     function D.saleReceipt(job)
         if job.item.Parent then return false end
@@ -3766,6 +3807,26 @@ end)()
         end)end
         if ctx.questMineRotate~=nil then ctx.humanoid.AutoRotate=ctx.questMineRotate;ctx.questMineRotate=nil end
         ctx.questMining=nil;ctx.questMineJob=nil
+    end
+    function D.findSeller(ctx,origin)
+        local pad=Q.bestSeller(ctx,origin)
+        local reader=api.worldSnapshot or ctx.readWorld
+        if not pad and not ctx.worldReading and reader then
+            -- Advance the existing bounded reader for either a loose item or
+            -- carried sale resources; never start another whole-map scan.
+            local ok,objects=pcall(reader,ctx)
+            if ok and type(objects)=='table'then
+                for _,object in ipairs(objects)do
+                    if object.Parent and object.Name=='TradingPost'then
+                        ctx.questPosts=ctx.questPosts or {};ctx.questPosts[object]=true
+                    elseif Q.sellPad(object)then
+                        ctx.worldPending=ctx.worldPending or {};ctx.worldPending[object]=true
+                    end
+                end
+                ctx.questPadsAt=0;pad=Q.bestSeller(ctx,origin)
+            end
+        end
+        return pad
     end
     function D.sellLoose(ctx,plan,immediate)
         if not Q.activePlan(plan) or ctx.questPotionUsing or s.questDelivery or calls.drag or s.bringDelivery or s.lootRequest or Q.manual()
@@ -3794,29 +3855,11 @@ end)()
         if not immediate and not gem and D.processing and D.processing.step(ctx,plan)then return true end
         local itemPart=item and api.part(item)
         if item and (not itemPart or not itemPart.Parent or not validPoint(itemPart.Position))then return false end
-        local pad=itemPart and Q.bestSeller(ctx,itemPart.Position)
-        local reader=api.worldSnapshot or ctx.readWorld
-        if item and not pad and not ctx.worldReading and reader then
-            -- Quest mining parks the base route before its bounded map reader
-            -- may have reached a loaded TradingPost. Advance that same reader;
-            -- never start another whole-map walk or assume a sale destination.
-            local ok,objects=pcall(reader,ctx)
-            if ok and type(objects)=='table'then
-                for _,object in ipairs(objects)do
-                    if object.Parent and object.Name=='TradingPost'then
-                        ctx.questPosts=ctx.questPosts or {};ctx.questPosts[object]=true
-                    elseif Q.sellPad(object)then
-                        ctx.worldPending=ctx.worldPending or {};ctx.worldPending[object]=true
-                    end
-                end
-                -- Reading the map can yield while another worker picks up the
-                -- item or its geometry streams out. Do not use the old pose.
-                itemPart=api.part(item)
-                if not itemPart or not itemPart.Parent or not validPoint(itemPart.Position)
-                    or not Q.free(item,'sale')then return false end
-                ctx.questPadsAt=0;pad=Q.bestSeller(ctx,itemPart.Position)
-            end
-        end
+        local pad=itemPart and D.findSeller(ctx,itemPart.Position)
+        -- Map discovery may yield while ownership or geometry changes.
+        itemPart=item and api.part(item)
+        if item and (not itemPart or not itemPart.Parent or not validPoint(itemPart.Position)
+            or not Q.free(item,'sale'))then return false end
         if not pad then return false end
         local requestPlan={name=plan.name,counts=plan.counts,objective=objective or plan.objective}
         if Q.startDelivery(ctx,item,pad,objective=='SellGoldItems' and 'gold' or 'sale',requestPlan)then
@@ -5772,8 +5815,15 @@ return function(api,Q)
             and drill and drill.Parent and drill==ctx.drill and drill==workspace:FindFirstChild('Drill')
             and (driver==nil or finite(driver) and driver>=0 and driver%1==0) and driver~=player.UserId
     end
+    local function saleCandidate(ctx,tool)
+        local D=Q.drillSupport
+        if not cfg.classQuest or ctx.questHealing or ctx.questDriving or ctx.questSeating
+            or ctx.humanoid.SeatPart or ctx.humanoid.Sit or not D.carriedSaleEligible(tool,ctx)then return false end
+        local seller=Q.bestSeller(ctx,ctx.root.Position)
+        return seller and D.accessible(seller) or false
+    end
     function I.candidate(ctx,tool,plan)
-        if not owned(ctx,tool) or not classOnly(tool)then return false end
+        if not owned(ctx,tool) or not (classOnly(tool) or saleCandidate(ctx,tool))then return false end
         local placement=ctx.questPlacement or s.questFurnacePlacement
         if placement and placement.processingPlacement and placement.tool==tool
             and placement.token and Q.calls.place==placement.token then return false end
@@ -5872,8 +5922,17 @@ return function(api,Q)
         if s.questInventoryDrop or Q.calls.inventoryDrop then return held end
         if not ready(ctx) or not I.catalog()then return false end
         if cfg.classQuest and not currentPlan(plan)then return false end
-        local target
-        for _,tool in ipairs(api.ownedTools(ctx))do if I.candidate(ctx,tool,plan) and ready(ctx,tool)then target=tool;break end end
+        local target,score;local searched=false
+        for _,tool in ipairs(api.ownedTools(ctx))do
+            if cfg.classQuest and not ctx.questHealing and not ctx.questDriving and not ctx.questSeating
+                and not ctx.humanoid.SeatPart and not ctx.humanoid.Sit and Q.drillSupport.carriedSaleEligible(tool,ctx)then
+                if not searched then Q.drillSupport.findSeller(ctx,ctx.root.Position);searched=true end
+                if I.candidate(ctx,tool,plan) and ready(ctx,tool)then
+                    local value=tonumber(api.attr(tool,'Value')) or 0
+                    if not score or value>score then target,score=tool,value end
+                end
+            elseif not target and I.candidate(ctx,tool,plan) and ready(ctx,tool)then target=tool end
+        end
         if not target then return false end
         local job={ctx=ctx,tool=target,id=api.id(target),count=api.stackCount(target),started=now(),character=ctx.character,
             backpack=api.Players.LocalPlayer:FindFirstChild('Backpack'),drill=ctx.drill,
@@ -5891,6 +5950,7 @@ return function(api,Q)
         end)
         job.token=token
         if not issued then s.questInventoryDrop=nil;return false end
+        if score then s.questStatus='Dropping owned sale resource; waiting for its native world item before selling' end
         return I.observe(ctx)
     end
     return I
@@ -6286,6 +6346,11 @@ end)()
         return c and c.LockedTarget or api.Players.LocalPlayer:GetAttribute('PlacingCraftedPlaceable')==true and not own
     end
     local function clearThrottle(ctx)
+        local frameInput=ctx.questMobileThrottle
+        if frameInput then
+            ctx.questMobileThrottle=nil
+            pcall(api.RunService.UnbindFromRenderStep,api.RunService,frameInput.name)
+        end
         if ctx.questDriveInput then
             local input=ctx.questDriveInput
             -- Release only the key this worker injected. Cleanup must work even
@@ -6431,6 +6496,54 @@ end)()
             end
         end
         return false
+    end
+    local function mobileThrottle(ctx,seat,lease)
+        if not mobileInput()then return false end
+        local renderer=api.RunService
+        if not renderer or type(renderer.BindToRenderStep)~='function'
+            or type(renderer.UnbindFromRenderStep)~='function'then return false end
+        local previous=ctx.questMobileThrottle
+        if previous and previous.seat==seat and previous.lease==lease then return true end
+        if previous then
+            ctx.questMobileThrottle=nil;pcall(renderer.UnbindFromRenderStep,renderer,previous.name)
+        end
+        local record={name='DTECDriveThrottle_'..tostring(ctx),seat=seat,lease=lease,character=ctx.character,
+            band=workspace:GetAttribute('InfiniteDepthOffsetMeters'),class=s.classData and s.classData.SelectedClass}
+        local function release()
+            if ctx.questMobileThrottle~=record then return end
+            ctx.questMobileThrottle=nil;pcall(renderer.UnbindFromRenderStep,renderer,record.name)
+        end
+        local function update()
+            local own=ctx.questMobileThrottle==record and enabled(ctx) and cfg.driveDepth and ctx.questDriving
+                and ctx.character==record.character and ctx.character==api.Players.LocalPlayer.Character
+                and ctx.drill==workspace:FindFirstChild('Drill') and ctx.drill.Parent
+                and s.questDriveLease==lease and lease.ctx==ctx and lease.drill==ctx.drill
+                and lease.confirmed and not lease.abandoned and driverId(ctx.drill)==api.Players.LocalPlayer.UserId
+                and record.band==workspace:GetAttribute('InfiniteDepthOffsetMeters')
+                and record.class==(s.classData and s.classData.SelectedClass)
+                and seat.Parent and seat:IsDescendantOf(ctx.drill) and not manual() and not humanDrivingInput(ctx)
+                and not api.extractionReady() and not ctx.questHealing and not ctx.nativeGateMotion and not ctx.questMineEntry
+                and not(finite(ctx.humanoid.MaxHealth) and ctx.humanoid.Health<=ctx.humanoid.MaxHealth*.3)
+            local ok,uis=pcall(function()return game:GetService('UserInputService')end)
+            if own and ok and uis and type(uis.GetFocusedTextBox)=='function'then
+                local read,value=pcall(uis.GetFocusedTextBox,uis)
+                own=read and not value
+            else own=false end
+            if not own then release();return end
+            local current=ctx.drill:FindFirstChild('LocalDriverSeat')
+                or ctx.drill:FindFirstChild('DrillPhysicsSeat') or ctx.drill:FindFirstChild('VehicleSeat')
+            if current~=seat then release();return end
+            -- CoreScripts writes idle mobile throttle during Input priority.
+            -- Apply only our owned seat afterward, before native Heartbeat
+            -- samples it. No keys, touch events, remotes or progress are forged.
+            local written=pcall(function()seat.ThrottleFloat=1 end)
+            if not written then release()end
+        end
+        ctx.questMobileThrottle=record
+        local priority=Enum.RenderPriority.Input and Enum.RenderPriority.Input.Value or 200
+        local bound=pcall(renderer.BindToRenderStep,renderer,record.name,priority+1,update)
+        if not bound then release();return false end
+        return true
     end
     function Q.stopDrive(ctx)
         local wasDriving=ctx.questDriving or ctx.questSeating
@@ -6620,19 +6733,7 @@ end)()
         local owner=tonumber(item:GetAttribute('OwnerUserId'))
         return not owner or owner==0 or owner==api.Players.LocalPlayer.UserId
     end
-    function Q.gold(item,ctx,snapshot)
-        if item and ctx and ctx.questHealing and Q.healing.isMedical(item)then return false end
-        if not free(item,'sale') then return false end
-        local id=api.id(item)
-        local value=tonumber(api.attr(item,'Value'))
-        if not finite(value) or value<150 then return false end
-        if Q.protectedRelic(item) or (tonumber(api.attr(item,'Fuel')) or 0)>0 and Q.fuelNeeded() or api.tag(item,'MoneySack')
-            or id=='Money_Sack' or id=='Flintlock' or id=='Sword_Pirate' then return false end
-        local isGold=s.itemCategories and s.itemCategories.GoldenItems and s.itemCategories.GoldenItems[id]==true
-        -- User-confirmed live rule supplements the export's finite category list.
-        for _,name in ipairs({id or '',item.Name or '',api.attr(item,'DisplayName') or '',item:GetAttribute('RealName') or ''}) do
-            if type(name)=='string' and name:lower():find('gold',1,true) then isGold=true;break end
-        end
+    function Q.protectedStarter(item)
         if s.questProtectedCatalog~=s.questCatalog or not s.questProtectedIds then
             s.questProtectedCatalog=s.questCatalog; s.questProtectedIds={}
             local function collect(t)
@@ -6643,7 +6744,21 @@ end)()
                 if type(entry)=='table' then collect(entry.StarterArmor); collect(entry.StarterTools) end
             end
         end
-        if s.questProtectedIds[id] then return false end
+        return s.questProtectedIds[api.id(item)]==true
+    end
+    function Q.gold(item,ctx,snapshot)
+        if item and ctx and ctx.questHealing and Q.healing.isMedical(item)then return false end
+        if not free(item,'sale') then return false end
+        local id=api.id(item)
+        local value=tonumber(api.attr(item,'Value'))
+        if not finite(value) or value<100 then return false end
+        if Q.protectedRelic(item) or (tonumber(api.attr(item,'Fuel')) or 0)>0 and Q.fuelNeeded() or api.tag(item,'MoneySack')
+            or id=='Money_Sack' or id=='Flintlock' or id=='Sword_Pirate' or Q.protectedStarter(item)then return false end
+        local isGold=s.itemCategories and s.itemCategories.GoldenItems and s.itemCategories.GoldenItems[id]==true
+        -- User-confirmed live rule supplements the export's finite category list.
+        for _,name in ipairs({id or '',item.Name or '',api.attr(item,'DisplayName') or '',item:GetAttribute('RealName') or ''}) do
+            if type(name)=='string' and name:lower():find('gold',1,true) then isGold=true;break end
+        end
         -- Never take carried gear, or a useful loose upgrade, to sell.
         return isGold and not (snapshot and snapshot(item) or not snapshot and api.useful(ctx,item))
     end
@@ -7177,6 +7292,7 @@ end)()
             if ctx.questSeats[candidate]==nil then ctx.questSeats[candidate]=candidate.ThrottleFloat end
             candidate.ThrottleFloat=1
         end
+        mobileThrottle(ctx,presentation,lease)
         if now()>=(ctx.questThrottleAt or 0) then
             if call('throttle','DrillService','UpdateDriverThrottle',{1},function()end,
                 function()return enabled(ctx) and ctx.questDriving and driverId(ctx.drill)==user end)
@@ -10252,7 +10368,7 @@ end)()
         interact = function(ctx, item, callback) return operation(ctx, 'InteractionService', 'Interact', item, callback) end})
     local auraModule
     local questApi
-    questApi = {state=s, now=now, controller=controller, remote=api.remote, event=api.event, RS=api.RS,
+    questApi = {state=s, now=now, controller=controller, remote=api.remote, event=api.event, RS=api.RS, RunService=api.RunService,
         passives=function()
             local resolver=auraModule and auraModule('ClassResolver')
             if resolver and type(resolver.ResolvePlayerPassives)=='function'then
