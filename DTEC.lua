@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Revision 55: cancel a queued initial selection when its native target arrives before dispatch.
+-- Version 0.55: remove unused bookkeeping and retain guarded equipment recovery.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -15,7 +15,8 @@ return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
     local REVISION = 55
-    local BUILD = "r55-cancel-queued-arrived-equipment"
+    local VERSION = string.format("%.2f", REVISION / 100)
+    local BUILD = "v0.55-version-and-dead-code-cleanup"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -43,15 +44,15 @@ return function(source)
     local s = previous and previous.job == job and previous or {}
     s.questInputRelease=s.questInputRelease or previous and previous.questInputRelease
     if s.revision ~= REVISION or s.build ~= BUILD then s.freshChecked=nil end
-    s.revision, s.build = REVISION, BUILD
-    print("[DTEC JoeJoe Automation] Revision "..REVISION.." active ("..BUILD..")")
+    s.revision, s.version, s.build = REVISION, VERSION, BUILD
+    print("[DTEC JoeJoe Automation] Version "..VERSION.." active ("..BUILD..")")
     s.pauseNoticeHidden, s.pauseNoticeRetryAt, s.pauseNoticeWarned = nil, nil, nil
     s.job, s.owner, s.connections = job, {}, {}
     s.farm, s.teleporting, s.status = nil, false, nil
     s.signalsBound = false
     s.teleportSignalsBound, s.departureBound = false, false
     s.currencyBound, s.classBound = false, false
-    s.achievementsLoading, s.itemCategoriesLoading = false, false
+    s.achievementsLoading = false
     env[KEY] = s
     local owner = s.owner
     local Players = game:GetService("Players")
@@ -366,7 +367,7 @@ end)()
     local ledger=saveStore:get('reports')
     local migrate=saveStore.accountId and s.reportLedger and s.reportAccountId==nil
     if s.reportLedger and (s.reportAccountId==nil or s.reportAccountId==saveStore.accountId)then ledger=s.reportLedger end
-    if s.reportAccountId and s.reportAccountId~=saveStore.accountId then s.reportRun=nil;s.reportFlight=nil end
+    if s.reportAccountId and s.reportAccountId~=saveStore.accountId then s.reportRun=nil end
     ledger=type(ledger)=='table' and ledger or {}
     ledger.records=type(ledger.records)=='table' and ledger.records or {}
     s.reportLedger,s.reportAccountId=ledger,saveStore.accountId
@@ -1875,7 +1876,7 @@ return function(api,Q)
             return releaseRecovery(ctx,job,'Own death chest is empty; checking other gear sources')
         end
         if absent and #absent==0 then
-            job.done=true;records[job.chest]=job;s.questDeathClaim=nil;s.questDeathLocation=nil
+            job.done=true;records[job.chest]=job;s.questDeathClaim=nil
             if c and c.DeathChest==job.chest and c.Frame and c.Frame.Visible and not c.ClaimPending then
                 local ui=api.controller('UIController')
                 if ui and type(ui.ToggleFrame)=='function'then pcall(ui.ToggleFrame,ui,'Crate',false)end
@@ -4658,7 +4659,7 @@ end)()
             if not pickaxe then
                 D.stopMine(ctx);ctx.questOwns=nil;status('Mining waits for an actually owned pickaxe; other loaded work continues');return false
             end
-            local _,wait,unready,retryProof=pickaxeReadiness(ctx,pickaxe,mine.node)
+            local _,_,unready,retryProof=pickaxeReadiness(ctx,pickaxe,mine.node)
             if unready then return yieldPickaxeReadiness(ctx)end
             ctx.questMining=true
             if not miningHandoff(ctx,mine)then return ctx.questOwns==true end
@@ -4668,7 +4669,7 @@ end)()
             end
             mine.readyAt=mine.readyAt or now()
             api.equip(ctx,pickaxe)
-            local active;active,wait,unready=pickaxeReadiness(ctx,pickaxe,mine.node,true,retryProof)
+            local active;active,_,unready=pickaxeReadiness(ctx,pickaxe,mine.node,true,retryProof)
             if not active then
                 if unready then return yieldPickaxeReadiness(ctx)end
                 mine.progressAt=nil;status('Mining waits for owned pickaxe readiness; target retained');return true
@@ -8777,7 +8778,7 @@ return function(api)
     local mark = label(header, 'E', 18, 16, 32, 32, 22, color.accent, true)
     mark.TextXAlignment = Enum.TextXAlignment.Center
     label(header, 'DTEC JoeJoe Automation', 62, 13, 260, 23, 17, color.text, true)
-    label(header, 'Revision '..tostring(s.revision or '?')..' · Account settings', 62, 36, 270, 16, 11, color.muted)
+    label(header, 'Version '..tostring(s.version or '?')..' · Account settings', 62, 36, 270, 16, 11, color.muted)
     local minimize = make('TextButton', header, { Text = '−', Font = bold, TextSize = 24,
         TextColor3 = color.muted, BackgroundTransparency = 1, Position = UDim2.new(1, -46, 0, 13),
         Size = UDim2.new(0, 32, 0, 34), AutoButtonColor = false })
@@ -10172,7 +10173,7 @@ end)()
                 return false
             end)
             if not ok then return false,'native ore overlap unavailable' end
-            return hit,hit and nil or 'target ore outside native swing box'
+            return hit,not hit and 'target ore outside native swing box' or nil
         end,
         cancelTravel=movement.cancel, extractionReady=F.extractionReady,
         equip=equip,readyAction=readyAction,stackCount=stackCount,
@@ -10639,7 +10640,7 @@ end)()
         local ok,why=pcall(active.Swing,active)
         if ctx.swingEdit==edit then F.restoreWeaponSignal(ctx,edit.thread)end
         if not ok then return false,why end
-        return dispatched==true,dispatched and nil or 'native pickaxe produced no Swing packet'
+        return dispatched==true,not dispatched and 'native pickaxe produced no Swing packet' or nil
     end
     function F.gunShot(ctx,active)
         if not active or active._Destroyed or type(active.Shoot)~='function' or not safeToWork(ctx) then return false,'native gun is not ready' end
@@ -10807,7 +10808,7 @@ end)()
     end
     function F.watcher(ctx)
         local targets=currentWatchers(ctx);local closest=targets[1]
-        ctx.watcherSearchAt=ctx.watcherDiscovery.at;ctx.watcher=closest
+        ctx.watcher=closest
         if closest and workspace.CurrentCamera then
             local eyes = closest:FindFirstChild('Head', true) or closest:FindFirstChild('Eyes', true) or part(closest)
             if eyes then
@@ -12074,7 +12075,6 @@ end
             combat.target, combat.holdUntil, combat.burstUntil = target, nil, nil
         end
         ctx.combatThread = task.spawn(function()
-            combat.thread=coroutine.running()
             while ctx.active and owned() and s.farm == ctx do
                 combat.pulse=now()
                 local ok, why = pcall(step)
