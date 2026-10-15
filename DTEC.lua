@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.65: prioritize damage over health, blacklist Money Drill and cap low-priority fuel storage at 250.
+-- Version 0.66: upgrade fuel capacity at normal priority until it reaches 250 or more.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 65
+    local REVISION = 66
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.65-damage-priority-and-fuel-cap"
+    local BUILD = "v0.66-normal-fuel-priority-until-250"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2898,11 +2898,8 @@ end)()
         local name=offer.UpgradeName
         if name=='FuelStorage'then
             local capacity=tonumber(ctx.drill:GetAttribute('MaxFuel'))
-            local info=c and c.DisplayInfo and c.DisplayInfo.FuelStorage
-            local increment=tonumber(info and info.Increment) or 25 -- Native MAX FUEL increases by 25 per tier.
             local amount=tonumber(offer.UpgradeAmount) or 1
-            return finite(capacity) and capacity>0 and capacity<250 and finite(increment) and increment>0
-                and finite(amount) and amount>0 and capacity+increment*amount<=250
+            return finite(capacity) and capacity>0 and capacity<250 and finite(amount) and amount>0
         end
         if not damage[name]then return true end
         local count=math.max(tonumber(ctx.drill:GetAttribute(name)) or 0,tonumber(c and c.Owned and c.Owned[name]) or 0)
@@ -2950,11 +2947,10 @@ end)()
         if plan.kind=='depth' and cfg.driveDepth then
             if name=='DrillPower' or name=='RPMOverclock' or name=='UltraDrill' or name=='MegaDrill'
                 or name=='PowerSlam' or name=='PowerBurst' then tier=8
-            elseif name=='DriveSpeed' or name=='PowerDrive' or name=='EngineOverdrive' then tier=7
+            elseif name=='DriveSpeed' or name=='PowerDrive' or name=='EngineOverdrive' or name=='FuelStorage' then tier=7
             elseif name=='TeamMeleeDamage' then tier=6
             elseif name=='TeamPickaxeDamage' then tier=5
-            elseif name=='TeamHealth' then tier=4
-            elseif name=='FuelStorage' then tier=0 end
+            elseif name=='TeamHealth' then tier=4 end
         elseif name=='TeamMeleeDamage' or name=='TeamPickaxeDamage' then
             tier=needed and 4 or 3
         elseif name=='TeamHealth' then
@@ -2983,7 +2979,7 @@ end)()
         if type(options)~='table' or not finite(version) or version<=0 then return end
         local key=tostring(game.JobId or '')..':'..(reward and 'reward:' or 'coins:')..version
         if ledger[key]==true and key~=reservedKey or type(ledger[key])=='number' and now()<ledger[key]then return end
-        local best,score,fallback,fallbackCost,fallbackRank,desperate,desperateCost,saving,savingScore
+        local best,score,fallback,fallbackCost,desperate,desperateCost,saving,savingScore
         for _,offer in ipairs(options)do
             local free=reward and offer.Type=='ClassReward'
             local cost=D.cost(offer)
@@ -3000,17 +2996,11 @@ end)()
                 if known and not blocked[name] and D.capAllowed(ctx,offer,c)then
                     if lastResort[name]then
                         if not desperateCost or (cost or 0)<desperateCost then desperate,desperateCost=offer,cost or 0 end
-                    elseif name~='TeamGunDamage' and name~='TeamExplosiveDamage' or value then
-                        local rank=name=='FuelStorage' and 0 or 1
-                        if not fallbackCost or rank>fallbackRank or rank==fallbackRank and (cost or 0)<fallbackCost then
-                            fallback,fallbackCost,fallbackRank=offer,cost or 0,rank
-                        end
-                    end
+                    elseif (name~='TeamGunDamage' and name~='TeamExplosiveDamage' or value) and (not fallbackCost or (cost or 0)<fallbackCost)then fallback,fallbackCost=offer,cost or 0 end
                 end
             end
         end
         local choice=best or fallback or desperate
-        if choice and choice.UpgradeName=='FuelStorage' and fallback and fallback.UpgradeName~='FuelStorage'then choice=fallback end
         if plan.kind=='depth' and cfg.driveDepth then saving=nil end -- Spend this round; no legendary-card saving loop.
         local choiceScore=choice and D.score(ctx,plan,choice) or 0
         if saving and choice and (math.floor(choiceScore/1000000)>math.floor(savingScore/1000000)
@@ -3020,7 +3010,7 @@ end)()
     function D.fundingTarget(ctx,plan)
         local cycle=D.depthEconomy(ctx,plan)
         if cycle and cycle.phase=='funding' then return D.depthFundingCoins end
-        local c=api.controller('DrillUpgradeController');local fallback,fallbackRank,desperate
+        local c=api.controller('DrillUpgradeController');local fallback,desperate
         local wallet=finite(s.questWallet) and s.questWallet or 0
         local chosen,key,_,_,saving
         if c then chosen,key,_,_,saving=D.choose(ctx,plan,c,wallet)end
@@ -3034,12 +3024,7 @@ end)()
             if offer.Type=='Coins' and finite(price) and price>=0 and known and not blocked[name]
                 and D.capAllowed(ctx,offer,c) and (name~='TeamGunDamage' and name~='TeamExplosiveDamage' or value)then
                 if lastResort[name]then desperate=math.min(desperate or price,price)
-                else
-                    local rank=name=='FuelStorage' and 0 or 1
-                    if not fallback or rank>fallbackRank or rank==fallbackRank and price<fallback then
-                        fallback,fallbackRank=price,rank
-                    end
-                end
+                else fallback=math.min(fallback or price,price)end
             end
         end
         -- Preserve the user's medical balance above the actual upgrade quote.
