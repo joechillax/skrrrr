@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.76: advance due driving, retire disabled depth refuelling and fence upgrade receipts.
+-- Version 0.77: validate queued native actions, exact claim receipts and revive/placement ownership.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 76
+    local REVISION = 77
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.76-scheduler-and-lifecycle-fixes"
+    local BUILD = "v0.77-deep-native-contract-audit"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -91,7 +91,17 @@ return function(api)
         local reader=env.readfile or readfile
         if type(reader)~='function' or not http then return {schema=1,accounts={}},false end
         local found,body=pcall(reader,FILE)
-        if not found then return {schema=1,accounts={}},true end
+        if not found then
+            -- A transient read failure is not evidence that an existing shared
+            -- account document is absent. Use an optional executor probe; keep
+            -- the tagged dirty backup until this exact file becomes readable.
+            local exists=env.isfile or isfile
+            if type(exists)=='function'then
+                local checked,present=pcall(exists,FILE)
+                if not checked or present~=false then return {schema=1,accounts={}},false end
+            end
+            return {schema=1,accounts={}},true
+        end
         local decoded,data=pcall(http.JSONDecode,http,body)
         if not decoded or type(data)~='table' or data.schema~=1 or type(data.accounts)~='table'then
             return {schema=1,accounts={}},false -- Preserve corrupt/unsupported files instead of erasing other accounts.
@@ -969,14 +979,18 @@ end
         task.spawn(function()
             -- Recovery selections must still be permitted when their queued
             -- task actually runs. A skipped guard proves no RPC was sent.
-            if dispatchGuard then
-                local ok, allowed = pcall(dispatchGuard, token)
-                if not ok or allowed ~= true then
-                    token.result = pack(true, false)
-                    token.result.notDispatched = true
-                    token.settled = true
-                    return
-                end
+            local allowed=owned()
+            if allowed and dispatchGuard then
+                local checked,value=pcall(dispatchGuard,token)
+                allowed=checked and value==true
+            end
+            -- A replacement owns the native actions now. Even a guard that
+            -- yielded cannot authorize this retired runtime to send its RPC.
+            if not allowed or not owned()then
+                token.result=pack(true,false)
+                token.result.notDispatched=true
+                token.settled=true
+                return
             end
             token.result = pack(pcall(function() return rf:InvokeServer(unpackValues(args, 1, args.n or #args)) end))
             token.settled = true
@@ -1088,9 +1102,14 @@ end
                         and now() >= ((record and record.retryAt) or 0) then
                         record = record or {}; s.claims[name] = record
                         if request("claim-reward", "BadgeAwardingService", "ClaimBadgeReward", pack(name), function(result)
-                            record.sent = accepted(result)
+                            -- A thrown reply cannot prove the native claim failed.
+                            record.sent = not (result.notDispatched or result[1] and result[2] == false)
                             record.retryAt = now() + 15
-                        end) then return end
+                        end,function()
+                            return owned() and Players.LocalPlayer==player and s.claims[name]==record
+                                and hasBadge(player:GetAttribute("Badges"),badge.BadgeID)
+                                and not hasBadge(player:GetAttribute("ClaimedBadges"),badge.BadgeID)
+                        end) then record.sent=true;return end
                     end
                 end
             end
@@ -1241,7 +1260,7 @@ end
     local FEATURE_SOURCE = [=====[return function(api)
     local s, now, controller = api.state, api.now, api.controller
     local F = {}
-    local bring, quest
+    local bring, quest, pickupAllowed
     local buildBring = (function()
 -- Native Request(item) ownership and alignment holding adapted from EarthManualAssist.
 -- Interact accepts LockedTarget in the game's DragController: collect while held,
@@ -1295,11 +1314,24 @@ return function(api)
         if s.bringDelivery == job then s.bringDelivery = nil end
     end
     local cancel
-    local function call(job, method, rf, args, callback)
+    local function call(job, method, rf, args, callback, guard)
         if job.pending or not rf then return false end
         local token = {started = now(), method = method}
         job.pending = token
         task.spawn(function()
+            -- Cancel has no target argument. A manual drag that began while
+            -- this task was queued must keep its native ownership untouched.
+            if method=='Cancel' and manual()then
+                if job.pending==token then job.pending=nil;job.manualConflict=true end
+                return
+            end
+            if guard then
+                local checked,allowed=pcall(guard)
+                if not checked or allowed~=true then
+                    if job.pending==token then job.pending=nil;pcall(callback,true,false)end
+                    return -- Proven not sent; never acquire or compensate ownership.
+                end
+            end
             -- Native calls may yield indefinitely. Keep the slot quarantined until
             -- the actual reply; timeout must never authorize another ownership request.
             local ok, value = pcall(function() return rf:InvokeServer(unpackValues(args, 1, #args)) end)
@@ -1769,6 +1801,11 @@ return function(api)
                 or not api.eligible(ctx, item) then cancel(job); return end
             local held = pcall(hold, job)
             if not held then cancel(job) end
+        end,function()
+            return s.bringDelivery==job and ctx.active and s.farm==ctx and api.owned() and api.enabled()
+                and ctx.character==api.Players.LocalPlayer.Character and ctx.humanoid.Health>0
+                and api.safe(ctx) and not manual() and not job.cancelled
+                and loose(ctx,item) and api.eligible(ctx,item)
         end)
         if not issued then retire(job) end
         return true
@@ -2756,7 +2793,14 @@ return function(api,Q,D)
     end
     function M.observeCraft(ctx)
         local job=s.questFurnaceCraft;if not job then return false end
-        if job.ctx~=ctx or ctx.character~=api.Players.LocalPlayer.Character or job.drill~=ctx.drill then
+        -- A rebuilt optional worker retains this same native transaction. Its
+        -- new ctx may observe the actual blueprint/count receipt, but a new
+        -- life, drill or native controller cannot retire the old reservation.
+        local sameLife=job.ctx.character==ctx.character and job.ctx.humanoid==ctx.humanoid
+            and ctx.character==api.Players.LocalPlayer.Character and job.drill==ctx.drill
+            and ctx.drill==workspace:FindFirstChild('Drill')
+            and api.controller('CraftingController')==job.controller
+        if not sameLife then
             if s.questCalls.craft~=job.token then releaseCraft(job);s.questFurnaceCraft=nil end
             return false
         end
@@ -2910,13 +2954,18 @@ return function(api,Q,D)
             job.sent=true
             if Q.call('place','PlaceableService','Place',{region,offset},function(ok,value,_,dispatch)
                 job.rejected=dispatch=='not-sent' or ok and value==false
-                if ok or dispatch=='not-sent'then c.PendingRequest=false end
+                if job.pendingOwned and c.Item==item and (ok or dispatch=='not-sent')then
+                    c.PendingRequest=false;job.pendingOwned=nil
+                end
                 if ok and value and c.Item==item and type(c.StopLocalPlacement)=='function'then pcall(c.StopLocalPlacement,c)end
             end,function()
-                local allowed=Q.enabled(ctx) and not Q.manual() and not api.extractionReady() and c.Active and c.Item==item
+                local allowed=Q.enabled(ctx) and ctx.questPlacement==job and not ctx.questPreviewCancel
+                    and api.controller('PlaceablePlacementController')==c and not Q.manual() and not api.extractionReady() and c.Active and c.Item==item
                     and c.ValidRegion==region and c.PlacementOffset==offset and not c.PendingRequest
+                    and live(region) and region:IsDescendantOf(ctx.drill) and live(item)
+                    and item:GetAttribute('CraftedPlaceable')==true
                     and item:GetAttribute('PlacingUserId')==api.Players.LocalPlayer.UserId
-                if allowed then c.PendingRequest=true end
+                if allowed then c.PendingRequest=true;job.pendingOwned=true end
                 return allowed
             end)then job.token=s.questCalls.place else job.sent=nil end
             return true
@@ -4654,12 +4703,26 @@ end)()
         if not seat or not seat.Parent or ctx.humanoid.Health<=0 then return false end
         local serverNow=workspace:GetServerTimeNow();local last=tonumber(drill:GetAttribute('LastBoost'))
         if last and serverNow-last<60 then return false end
+        local character,band,class=ctx.character,workspace:GetAttribute('InfiniteDepthOffsetMeters'),s.classData and s.classData.SelectedClass
         if Q.call('boost','DrillService','ActivateBoost',{},function(ok,accepted,cooldown)
             if ok and accepted==false and finite(tonumber(cooldown))then
                 s.questBoostAt=math.max(s.questBoostAt or 0,now()+math.max(1,tonumber(cooldown)))
             end
-        end,function()return Q.enabled(ctx) and ctx.questDriving and not api.extractionReady()
-            and drill:GetAttribute('DriverUserId')==user end)then
+        end,function()
+            local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+            local ok,uis=pcall(function()return game:GetService('UserInputService')end)
+            local focused=not ok or not uis or type(uis.GetFocusedTextBox)~='function' or uis:GetFocusedTextBox()~=nil
+            local boosted=tonumber(drill:GetAttribute('LastBoost'))
+            return Q.enabled(ctx) and cfg.driveDepth and ctx.questDriving and not Q.manual() and not focused
+                and not api.extractionReady() and not ctx.questHealing and not ctx.nativeGateMotion and not ctx.questMineEntry
+                and ctx.character==character and ctx.drill==drill and drill==workspace:FindFirstChild('Drill')
+                and band==workspace:GetAttribute('InfiniteDepthOffsetMeters') and class==(s.classData and s.classData.SelectedClass)
+                and (current.kind=='depth' or current.kind=='fuel') and drill:GetAttribute('DriverUserId')==user
+                and seat.Parent and seat:IsDescendantOf(drill)
+                and seat==(drill:FindFirstChild('LocalDriverSeat') or drill:FindFirstChild('VehicleSeat'))
+                and (tonumber(drill:GetAttribute('PowerBurst')) or 0)>0
+                and (not boosted or workspace:GetServerTimeNow()-boosted>=60)
+        end)then
             s.questBoostAt=now()+60;status('Requested native drill Power Burst; observing its 60-second cooldown')
             return true
         end
@@ -5496,13 +5559,18 @@ return function(api,Q)
             status('Turret recipe is not natively craftable at this source/level');return false
         end
         ctx.questNeedScrap=nil
-        job={ctx=ctx,started=now(),source=c.CraftSource,
+        job={ctx=ctx,started=now(),source=c.CraftSource,class=plan.name,level=plan.level,objective=plan.objective,
             before=tonumber(s.questCraftState.CraftedCounts and s.questCraftState.CraftedCounts.BasicSentry) or 0};s.questCraftJob=job
         if not Q.call('craft','CraftingService','Craft',{'BasicSentry',c.CraftSource},function(ok,value,_,dispatch)
             job.rejected=dispatch=='not-sent' or ok and value==false
             if ok and type(value)=='table'then job.accepted=true;s.questCraftState=value;if type(c.ApplyState)=='function'then pcall(c.ApplyState,c,value)end end
-        end,function()return Q.enabled(ctx) and not api.extractionReady() and not Q.manual() and not c.PendingCraft
-            and not calls.place and not S.blueprint(ctx) and c:CanCraft('BasicSentry')end)then s.questCraftJob=nil;return false end
+        end,function()
+            local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+            return Q.enabled(ctx) and s.questCraftJob==job and not api.extractionReady() and not Q.manual()
+                and current.name==job.class and current.level==job.level and current.kind=='turret' and current.objective==job.objective
+                and api.controller('CraftingController')==c and c.CraftSource==job.source and not c.PendingCraft
+                and not calls.place and not S.blueprint(ctx) and c:CanCraft('BasicSentry')
+        end)then s.questCraftJob=nil;return false end
         return true
     end
     function S.positionPreview(ctx,c,job)
@@ -5592,18 +5660,22 @@ return function(api,Q)
             job.sent,job.issuedAt=true,now();job.attempts=(job.attempts or 0)+1
             if not Q.call('place','PlaceableService','Place',{region,offset},function(ok,value,_,dispatch)
                 job.rejected=dispatch=='not-sent' or ok and value==false
-                if ok or dispatch=='not-sent'then c.PendingRequest=false end
+                if job.pendingOwned and c.Item==item and (ok or dispatch=='not-sent')then
+                    c.PendingRequest=false;job.pendingOwned=nil
+                end
                 if ok and value then
                     job.accepted=true
                     if c.Item==item and type(c.StopLocalPlacement)=='function'then pcall(c.StopLocalPlacement,c)end
                 end
                 s.questPollAt=0
             end,function()
-                local allowed=Q.enabled(ctx) and not api.extractionReady() and not Q.manual() and c.Active
+                local allowed=Q.enabled(ctx) and ctx.questPlacement==job and not ctx.questPreviewCancel
+                and api.controller('PlaceablePlacementController')==c and not api.extractionReady() and not Q.manual() and c.Active
                 and c.Item==item and c.ValidRegion==region and c.PlacementOffset==offset
-                and not c.PendingRequest and live(region) and live(item)
+                and not c.PendingRequest and live(region) and region:IsDescendantOf(ctx.drill) and live(item)
+                and item:GetAttribute('CraftedPlaceable')==true
                 and item:GetAttribute('PlacingUserId')==api.Players.LocalPlayer.UserId
-                if allowed then c.PendingRequest=true end
+                if allowed then c.PendingRequest=true;job.pendingOwned=true end
                 return allowed
             end)then job.sent=nil;return false end
             return true
@@ -5934,14 +6006,17 @@ return function(api,Q)
             if not job.cancelRequested and not c.PendingCancel and not calls.placementCancel then
                 job.cancelRequested=true;job.cancelAt=now()
                 local issued=Q.call('placementCancel','PlaceableService','CancelPlacement',{},function(ok,value,_,dispatch)
-                    c.PendingCancel=false
+                    if job.cancelPendingOwned and c.Item==item then c.PendingCancel=false;job.cancelPendingOwned=nil end
                     if dispatch=='not-sent'then job.cancelRequested=nil;job.cancelAt=nil;return end
                     -- Native CancelPlacement stops its local preview on both
                     -- fulfilled and rejected promises, including a pending Place.
                     if c.Item==item and type(c.StopLocalPlacement)=='function'then pcall(c.StopLocalPlacement,c)end
                     if ctx.questPreviewCancel==job then ctx.questPreviewCancel=nil end
                 end,function()
-                    if c.Active and c.Item==item and not c.PendingCancel then c.PendingCancel=true;return true end
+                    if api.owned() and ctx.questPreviewCancel==job and api.controller('PlaceablePlacementController')==c
+                        and c.Active and c.Item==item and not c.PendingCancel then
+                        c.PendingCancel=true;job.cancelPendingOwned=true;return true
+                    end
                     return false
                 end)
                 if not issued then job.cancelRequested=nil;job.cancelAt=nil end
@@ -5977,7 +6052,7 @@ return function(api,Q)
             local record=s.dailyRewardLedger[tier]
             if record and type(entry)=='table'then
                 local progress,amount=tonumber(entry.Progress),tonumber(entry.Amount)
-                if entry.Claimed==true and not record.confirmed then
+                if entry.Claimed==true and fingerprint(entry)==record.fingerprint and not record.confirmed then
                     record.confirmed=true;s.stats.dailyQuestClaims=(s.stats.dailyQuestClaims or 0)+1
                 elseif entry.Claimed~=true and finite(progress) and finite(amount) and amount>0
                     and (fingerprint(entry)~=record.fingerprint or progress<amount and record.confirmed)then
@@ -6708,6 +6783,8 @@ end)()
     end
     local function enabled(ctx)
         return cfg.classQuest and api.owned() and ctx and ctx.active and s.farm==ctx
+            and ctx.character==api.Players.LocalPlayer.Character
+            and ctx.drill==workspace:FindFirstChild('Drill') and ctx.drill and ctx.drill.Parent
             and not s.teleporting and not s.request and not s.awaiting and not s.departureAt
             and ctx.humanoid.Health>0 and not workspace:GetAttribute('InCutScene')
             and not workspace:GetAttribute('InfiniteRebasing') and api.Players.LocalPlayer.GameplayPaused~=true
@@ -7140,11 +7217,12 @@ end)()
         if not job.owns then if s.questDelivery==job then s.questDelivery=nil end; return end
         if manual() then setStatus('Quest release waits for manual drag'); return end
         if job.releaseFailed then return end
-        call('drag','DragService','Cancel',{true},function(ok,value)
+        call('drag','DragService','Cancel',{true},function(ok,value,_,dispatch)
+            if dispatch=='not-sent'then return end -- The owned lease still needs a later safe release.
             if ok and value~=false then
                 job.owns=false; if s.questDelivery==job then s.questDelivery=nil end
             else job.releaseFailed=true; setStatus('Quest drag release unconfirmed; deliveries paused') end
-        end)
+        end,function()return api.owned() and s.questDelivery==job and job.owns and not manual()end)
     end
     function Q.cleanup(ctx)
         if Q.parasite then pcall(Q.parasite.stop,ctx)end
@@ -7375,7 +7453,8 @@ end)()
             local moved,result=pcall(place,job)
             if not moved or not result then release(job); return end
             job.stage,job.readyAt='placed',now()+.55
-        end,function()return enabled(ctx) and eligible() and not manual()end) then
+        end,function()return enabled(ctx) and s.questDelivery==job and not job.cancelled
+            and not api.extractionReady() and eligible() and not manual()end) then
             job.pending=nil; s.questDelivery=nil; ctx.bringEquipmentLock=nil; return false
         end
         return true
@@ -7439,9 +7518,12 @@ end)()
             end
             job.stage='pickup'; job.receiptUntil=now()+5
             job.pending=true
-            if call('drag','InteractionService','Interact',{job.item},function()
-                job.pending=nil; job.stage='receipt'
-            end,function()return enabled(ctx) and free(job.item,job.processingCarry and 'sale') and job.owns
+            if call('drag','InteractionService','Interact',{job.item},function(_,_,_,dispatch)
+                job.pending=nil
+                job.stage=dispatch=='not-sent' and 'placed' or 'receipt'
+            end,function()return enabled(ctx) and s.questDelivery==job and not job.cancelled
+                and not api.extractionReady() and not manual()
+                and free(job.item,job.processingCarry and 'sale') and job.owns
                 and (not job.processingCarry or Q.drillSupport.processing.inputEligible(job.item,ctx) and api.hasRoom(ctx,job.item))end)then job.pickupToken=calls.drag
             else job.pending=nil end
         end
@@ -7454,7 +7536,11 @@ end)()
         if job.stage=='placed' and now()>=job.readyAt then
             job.stage='receipt'; job.receiptUntil=now()+5
             pcall(place,job);clearHold(job)
-            local sent,dropToken=call('drag','DragService','Cancel',{true},function(ok,value)
+            local sent,dropToken=call('drag','DragService','Cancel',{true},function(ok,value,_,dispatch)
+                if dispatch=='not-sent'then
+                    job.stage='placed';job.readyAt=now()+.3
+                    return -- Retain our old lease for a later safe release.
+                end
                 if job.kind=='smelt'then job.dropOutcomeKnown=ok==true end
                 if ok and value~=false then
                     job.owns=false
@@ -7464,7 +7550,7 @@ end)()
                         job.droppedAt=now();job.receiptUntil=job.droppedAt+8
                     end
                 else job.releaseFailed=true; release(job) end
-            end)
+            end,function()return api.owned() and s.questDelivery==job and job.owns and not job.cancelled and not manual()end)
             if sent and job.kind=='smelt'then job.dropToken=dropToken end
         elseif job.stage=='receipt' then
             if calls.drag or job.owns then return true end
@@ -7679,6 +7765,21 @@ end)()
         setStatus('Wall needs over 10 seconds; collecting chests and recovering while observing native damage')
         return true,false
     end
+    local function throttleOwner(ctx,lease,drill,character,band)
+        return api.owned() and ctx.active and s.farm==ctx and ctx.character==character
+            and api.Players.LocalPlayer.Character==character and ctx.humanoid.Health>0
+            and ctx.drill==drill and drill and drill.Parent and workspace:FindFirstChild('Drill')==drill
+            and workspace:GetAttribute('InfiniteDepthOffsetMeters')==band
+            and s.questDriveLease==lease and lease and lease.ctx==ctx and lease.drill==drill
+            and lease.confirmed==true and not lease.abandoned and ctx.questDriving
+            and driverId(drill)==api.Players.LocalPlayer.UserId
+    end
+    local function focusedText()
+        local ok,uis=pcall(function()return game:GetService('UserInputService')end)
+        if not ok or not uis or type(uis.GetFocusedTextBox)~='function'then return nil end
+        local read,value=pcall(uis.GetFocusedTextBox,uis)
+        if read then return value~=nil end
+    end
     local function drive(ctx,plan)
         if plan.kind~='depth' or not cfg.driveDepth then Q.stopDrive(ctx);ctx.questOwns=nil;return false end
         if manual()then Q.stopDrive(ctx);ctx.questOwns=nil;setStatus('Quest driving yields to manual item work');return false end
@@ -7764,8 +7865,15 @@ end)()
         end
         mobileThrottle(ctx,presentation,lease)
         if now()>=(ctx.questThrottleAt or 0) then
+            local drill,character,band,class=ctx.drill,ctx.character,workspace:GetAttribute('InfiniteDepthOffsetMeters'),s.classData and s.classData.SelectedClass
             if call('throttle','DrillService','UpdateDriverThrottle',{1},function()end,
-                function()return enabled(ctx) and ctx.questDriving and driverId(ctx.drill)==user end)
+                function()return throttleOwner(ctx,lease,drill,character,band) and enabled(ctx) and cfg.driveDepth
+                    and class==(s.classData and s.classData.SelectedClass)
+                    and (Q.plan(s.classData,s.questCatalog,true).kind=='depth' or plan.objective=='ContributeFuel'
+                        and Q.plan(s.classData,s.questCatalog,true).kind=='fuel')
+                    and not manual() and focusedText()==false and not api.extractionReady() and not ctx.questHealing
+                    and not ctx.nativeGateMotion and not ctx.questMineEntry
+                    and not(finite(ctx.humanoid.MaxHealth) and ctx.humanoid.Health<=ctx.humanoid.MaxHealth*.3)end)
                 then ctx.questThrottleAt=now()+.25 end
         end
         local watch=ctx.questDriveWatch
@@ -7894,7 +8002,10 @@ end)()
             if ok and uis and type(uis.GetFocusedTextBox)=='function' and uis:GetFocusedTextBox()then
                 clearThrottle(ctx);ctx.questDrivePausedAt=ctx.questDrivePausedAt or now()
                 if driverId(ctx.drill)==api.Players.LocalPlayer.UserId and now()>=(ctx.questThrottleAt or 0)then
-                    if call('throttle','DrillService','UpdateDriverThrottle',{0},function()end)then ctx.questThrottleAt=now()+.25 end
+                    local lease,drill,character,band=s.questDriveLease,ctx.drill,ctx.character,workspace:GetAttribute('InfiniteDepthOffsetMeters')
+                    if call('throttle','DrillService','UpdateDriverThrottle',{0},function()end,
+                        function()return throttleOwner(ctx,lease,drill,character,band) and focusedText()==true end)
+                        then ctx.questThrottleAt=now()+.25 end
                 end
                 setStatus('Driving input paused while a text box is focused');return true
             end
@@ -10601,8 +10712,9 @@ end)()
     end
     local function operation(ctx, service, method, argument, callback)
         ctx.check()
-        if not safeToWork(ctx) then return false end
-        return api.request('loot-action', service, method, api.pack(argument), callback)
+        if not pickupAllowed(ctx,argument) then return false end
+        return api.request('loot-action', service, method, api.pack(argument), callback,
+            function()return pickupAllowed(ctx,argument)end)
     end
     function F.isChurchSavePrompt(item)
         -- UIController's native FramePrompt handler opens the frame whose name
@@ -10971,6 +11083,17 @@ end)()
         s.rareShardDrop = record
         s.smartLootStatus = 'Making room for ' .. id(item) .. ': dropping Rare Shards'
         task.spawn(function()
+            -- This coroutine may run after OFF, a manual action, inventory
+            -- changes or an improved owned weapon. A skipped drop is proven
+            -- unsent and must neither consume a shard nor quarantine its stack.
+            local inventory=tools(ctx)
+            if s.rareShardDrop~=record or not pickupAllowed(ctx,item,true)
+                or hasRoom(ctx,item,inventory) or not canReplaceRare(ctx,item,inventory)
+                or rareShardTool(ctx,inventory)~=tool or stackCount(tool)~=record.count then
+                record.notSent,record.settled,record.settledAt=true,true,now()
+                if s.rareShardDrop==record then s.rareShardDrop=nil end
+                return
+            end
             -- Native hotbar action: exactly one Tool argument. No guessed stack
             -- count or DropAll argument; repeat only after a real count decrease.
             record.result = api.pack(pcall(function() return rf:InvokeServer(tool) end))
@@ -10990,6 +11113,17 @@ end)()
                 or armorSlot(item) and armorBetter(ctx, item, armor)
                 or weaponBetter(ctx, item, owned) and room
         end, useful
+    end
+    pickupAllowed=function(ctx,item,needsRoom)
+        local player=api.Players.LocalPlayer
+        local drag=controller('DragController')
+        local current=cfg.lootExtract and api.owned() and s.farm==ctx and ctx.character==player.Character
+            and ctx.humanoid.Health>0 and safeToWork(ctx)
+            and not(drag and drag.LockedTarget~=nil) and player:GetAttribute('PlacingCraftedPlaceable')~=true
+            and F.freeWorldItemAllowed(item)
+        if not current then return false end
+        local eligible,useful=usefulSnapshot(ctx,false)
+        return (needsRoom and useful or eligible)(item)
     end
     local function pickupRecord(ctx, target)
         local record = {item = target, id = id(target), slot = armorSlot(target), inventory = {}, started = now(),
@@ -12335,13 +12469,31 @@ end)()
             or prompt.Enabled == false or api.Players.LocalPlayer.GameplayPaused == true
             or (ctx.root.Position - point).Magnitude > radius or s.churchSave then return false end
         local record = {started = now(), prompt = prompt, point = point}
+        local player,character,humanoid,drill=api.Players.LocalPlayer,ctx.character,ctx.humanoid,ctx.drill
+        local band=workspace:GetAttribute('InfiniteDepthOffsetMeters')
         s.churchSave = record
         local issued = api.request('church-save', 'PlayerService', 'SaveGear', api.pack(), function(result)
             record.settled, record.accepted = true, result[1] and not not result[2]
             record.retryAt = now() + 15
             if record.accepted then
                 status('Church SaveGear accepted; awaiting the game saved-exit state')
-            else status('Church SaveGear rejected; retrying the native church flow after 15 seconds') end
+            else status('Church SaveGear unconfirmed; native retry remains available after 15 seconds') end
+        end,function()
+            -- The transition request intentionally stops ctx before dispatch.
+            -- Check its frozen living owner and native prompt, not ctx.active.
+            local current=saveGearFrame();local drag=controller('DragController')
+            return api.owned() and s.churchSave==record and F.extractionReady()
+                and player==api.Players.LocalPlayer and player.Character==character and humanoid.Health>0
+                and drill and drill.Parent and workspace:FindFirstChild('Drill')==drill
+                and band==workspace:GetAttribute('InfiniteDepthOffsetMeters')
+                and not s.teleporting and not s.awaiting and not s.departureAt
+                and not workspace:GetAttribute('InCutScene') and not workspace:GetAttribute('InfiniteRebasing')
+                and player.GameplayPaused~=true and not humanoid.SeatPart and not humanoid.Sit
+                and not(drag and drag.LockedTarget) and player:GetAttribute('PlacingCraftedPlaceable')~=true
+                and player:GetAttribute('SavedExitTeleportLocked')~=true
+                and F.isChurchSavePrompt(prompt) and prompt.Enabled~=false and tag(prompt,'FramePrompt')
+                and current==frame and current.Visible==true
+                and position(prompt) and (ctx.root.Position-position(prompt)).Magnitude<=radius
         end)
         if not issued then s.churchSave = nil; status('Church save request not ready; retrying without a duplicate'); return false end
         record.issued = true
@@ -13842,6 +13994,10 @@ end
             return
         end
         local deadIdentity = model or s.lastCharacter or "missing"
+        if s.awaiting and s.awaiting.kind=="revive" then
+            status("Revive accepted; waiting for the character to become alive")
+            return
+        end
         if s.reviveIdentity ~= deadIdentity then
             local kit = (tonumber(player:GetAttribute("DeathChestReviveKits")) or 0) > 0
             local backpack = child(player, "Backpack")
