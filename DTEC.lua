@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.74: honor due driving turns after sales and freeze one exit-request timestamp.
+-- Version 0.75: buy prioritized cards, then the cheapest safe nonpriority upgrade.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 74
+    local REVISION = 75
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.74-drive-sale-fairness-and-exit-stamp"
+    local BUILD = "v0.75-affordable-upgrade-fallback"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -3233,16 +3233,15 @@ end)()
                 if known and not blocked[name] and D.capAllowed(ctx,offer,c)then
                     if lastResort[name]then
                         if not desperateCost or (cost or 0)<desperateCost then desperate,desperateCost=offer,cost or 0 end
-                    elseif (name~='TeamGunDamage' and name~='TeamExplosiveDamage' or value) and (not fallbackCost or (cost or 0)<fallbackCost)then fallback,fallbackCost=offer,cost or 0 end
+                    elseif not fallbackCost or (cost or 0)<fallbackCost then fallback,fallbackCost=offer,cost or 0 end
                 end
             end
         end
         local choice=best or fallback or desperate
             or blockedChoice and (reward or wallet>=blockedCost) and blockedChoice
-        if plan.kind=='depth' and cfg.driveDepth then saving=nil end -- Spend this round; no legendary-card saving loop.
-        local choiceScore=choice and D.score(ctx,plan,choice) or 0
-        if saving and choice and (math.floor(choiceScore/1000000)>math.floor(savingScore/1000000)
-            or (rarity[choice.Rarity] or 0)>=(rarity[saving.Rarity] or 0) and choiceScore>=savingScore)then saving=nil end
+        -- Keep priority ranking, then spend on the cheapest safe normal card.
+        -- An unaffordable preferred card cannot hold an affordable roll hostage.
+        if choice or plan.kind=='depth' and cfg.driveDepth then saving=nil end
         return not saving and choice or nil,key,version,reward~=nil,saving,
             choice and blocked[choice.UpgradeName] and 'blacklist_fallback' or not choice and not saving and 'no_eligible' or nil
     end
@@ -3259,11 +3258,10 @@ end)()
         if blockedChoice then return math.max(Q.coinTarget(blockedCost,false),Q.supplyFundingTarget(ctx,plan))end
         for _,offer in ipairs(c and c.Options or {})do
             local price=D.cost(offer)
-            local value=D.score(ctx,plan,offer)
             local name=offer.UpgradeName
             local known=type(name)=='string' and (weights[name] or lastResort[name] or type(c.DisplayInfo)=='table' and c.DisplayInfo[name])
             if offer.Type=='Coins' and finite(price) and price>=0 and known and not blocked[name]
-                and D.capAllowed(ctx,offer,c) and (name~='TeamGunDamage' and name~='TeamExplosiveDamage' or value)then
+                and D.capAllowed(ctx,offer,c)then
                 if lastResort[name]then desperate=math.min(desperate or price,price)
                 else fallback=math.min(fallback or price,price)end
             end
@@ -3358,7 +3356,7 @@ end)()
                     if blockedChoice then
                         info(string.format('all three Coin cards blacklisted; cheapest %s needs %.0f Coins (1000 held for medkits)',blockedChoice.UpgradeName,Q.coinTarget(blockedCost,false)))
                     elseif target<=math.max(Q.medicalReserve,Q.supplyFundingTarget(ctx,current))then
-                        info('no eligible card on this roll: capped, irrelevant or incomplete; Coins retained')
+                        info('no eligible card on this roll: capped or incomplete; Coins retained')
                     else info(string.format('%.0f Coins; funding target %.0f',wallet,target))end
                 end
                 return
