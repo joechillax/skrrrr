@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.72: prevent unrelated checkouts from starving medical discovery and retain native HP drops.
+-- Version 0.73: retain bounded native work and reservation observations at the exit request.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 72
+    local REVISION = 73
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.72-medical-search-fairness"
+    local BUILD = "v0.73-frozen-stall-context"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -504,7 +504,64 @@ end)()
         {'Mobile native seat throttle','driving'},
         {'Native forward input unavailable','driving'},
     }
+    local exitLabels={
+        phase={funding=true,loot=true,drive=true,upgrades=true,unknown=true},
+        route={parked=true,unparked=true},driver={none=true,self=true,other=true,invalid=true},
+        seat={none=true,['sit-only']=true,drill=true,other=true},hotbar={visible=true,hidden=true,unavailable=true},
+        work={recovery=true,['drive-defense']=true,['mine-transition']=true,mining=true,startup=true,combat=true,
+            ['seat-entry']=true,driving=true,chest=true,delivery=true,other=true},
+        stage={['head-start']=true,['stop-unresolved']=true,['stop-owner']=true,['seat-start']=true,
+            ['start-timeout']=true,['start-retry']=true,['seats-loading']=true,['foreign-driver']=true,
+            ['fuel-empty']=true,['fuel-loading']=true,refuelling=true,['seat-exit']=true,['text-focus']=true,
+            ['drive-stalled']=true,wall=true,['pickaxe-unready']=true,['mining-wait']=true,startup=true,
+            ['chest-scan']=true,['chest-open']=true,['delivery-unconfirmed']=true,driving=true},
+        flags={currentChest=true,featureHold=true,questOwns=true,chestLease=true,smartLoot=true,defense=true,
+            equipment=true,loot=true,bring=true,delivery=true,cash=true,upgrade=true,equipmentLock=true,
+            worldScan=true,workerFailed=true,chestPending=true,paused=true,cutscene=true,rebase=true},
+        calls={drive=true,throttle=true,cash=true,drag=true,shop=true,wallet=true,upgrade=true,upgradeWallet=true,
+            classes=true,crateRead=true,crateClaim=true,medicalDrop=true,healingWallet=true,inventoryDrop=true,place=true},
+    }
+    local function observeExit(run)
+        if run.exitContext then return end
+        local exit=s.questChurchExit;local detail=exit and exit.observed
+        if type(detail)~='table' or not finite(detail.at) or detail.at~=exit.requestedAt
+            or detail.at<run.started or detail.at>now() or not finite(detail.runStarted)
+            or detail.runStarted~=s.lootStarted then return end
+        local copy={}
+        for key,allowed in pairs(exitLabels)do
+            local value=detail[key]
+            if key=='flags' or key=='calls'then
+                local values,seen={},{}
+                if type(value)=='table'then for i=1,20 do
+                    local label=value[i]
+                    if type(label)=='string' and allowed[label] and not seen[label]then
+                        seen[label]=true;values[#values+1]=label
+                    end
+                end end
+                copy[key]=table.concat(values,', ')
+            elseif type(value)=='string' and allowed[value]then copy[key]=value end
+        end
+        for _,key in ipairs({'idleAge','workerAge','walletAge','equipmentAge','fuel','capacity'})do
+            local value=finite(detail[key]);if value and value>=0 then copy[key]=math.min(value,999999)end
+        end
+        run.exitContext=copy
+    end
+    local function exitText(run)
+        local detail=run.exitContext
+        if not detail then return end
+        local function age(key)return detail[key] and string.format('%.0fs',detail[key])or 'unknown'end
+        local function value(key)return detail[key] and string.format('%.0f',detail[key])or '?'end
+        return 'Phase '..(detail.phase or 'unknown')..' | Work '..(detail.work or 'unknown')..' | Stage '..(detail.stage or 'unmapped')
+            ..'\nIdle '..age('idleAge')..' | Worker pulse age '..age('workerAge')..' | Wallet age '..age('walletAge')
+            ..'\nDriver '..(detail.driver or 'unknown')..' | Seat '..(detail.seat or 'unknown')
+            ..' | Fuel '..value('fuel')..' / '..value('capacity')
+            ..'\nRoute '..(detail.route or 'unknown')..' | Hotbar '..(detail.hotbar or 'unknown')..' | Equipment request age '..age('equipmentAge')
+            ..'\nActive flags: '..(detail.flags~='' and detail.flags or 'none')
+            ..'\nPending calls: '..(detail.calls~='' and detail.calls or 'none')
+            ..'\nFrozen when the exit was requested; observations do not establish the cause.'
+    end
     local function observeFarm(run)
+        observeExit(run)
         local progress=run.farmProgress
         if not progress then
             progress={baseline={},latest={},invalid={},partial=now()>run.started+.001}
@@ -732,6 +789,8 @@ end)()
             fields[#fields+1]={name='Quest progress (observed)',value=questText(run),inline=false}
         end
         fields[#fields+1]={name='Farm diagnostics',value=farmText(run),inline=false}
+        local frozen=exitText(run)
+        if frozen then fields[#fields+1]={name='At exit request (observed)',value=frozen,inline=false}end
         if run.farmProgress.questsOn then fields[#fields+1]={name='Survival diagnostics',value=survivalText(run),inline=false}end
         return {id = run.id, status = 'queued', attempts = 0, created = clock(), revision=s.revision, version=s.version, build=s.build, body = {
             username = 'DTEC JoeJoe Automation',
@@ -9405,6 +9464,74 @@ end)()
         status('Chest farm running; optional settings updated')
         if s.gui then pcall(s.gui.update) end
     end
+    -- Freeze observations before extraction cleans up the worker. Fixed labels
+    -- and finite scalars only: never copy a status, request or inventory object.
+    local function questExitContext(ctx,watch)
+        local player=api.Players.LocalPlayer
+        if not ctx or not ctx.active or s.farm~=ctx or ctx.character~=player.Character then return end
+        local at=now()
+        local function number(v)
+            return type(v)=='number' and v==v and math.abs(v)<math.huge and v>=0 and v or nil
+        end
+        local function age(v)local n=number(v);return n and n<=at and at-n or nil end
+        local phase=ctx.questDepthEconomy and ctx.questDepthEconomy.phase
+        local details={at=at,runStarted=s.lootStarted,
+            phase=({funding=true,loot=true,drive=true,upgrades=true})[phase] and phase or 'unknown',
+            idleAge=age(watch.at),workerAge=age(ctx.featurePulse),walletAge=age(s.questWalletAt),
+            equipmentAge=s.equipmentRequest and age(s.equipmentRequest.started),
+            route=ctx.routeParked==true and 'parked' or 'unparked',
+            work=ctx.questHealing and 'recovery' or ctx.questDrivingDefense and 'drive-defense'
+                or ctx.questMineEntry and 'mine-transition' or ctx.questMining and 'mining'
+                or ctx.questStartup and 'startup' or ctx.questCombat and 'combat'
+                or ctx.questDriving and 'driving' or ctx.questSeating and 'seat-entry'
+                or ctx.questChestTaking and 'chest' or s.questDelivery and 'delivery' or 'other',
+            flags={},calls={}}
+        for _,entry in ipairs({
+            {'currentChest',ctx.currentChest},{'featureHold',ctx.featureHold},{'questOwns',ctx.questOwns},
+            {'chestLease',ctx.questChestLease},{'smartLoot',ctx.smartLootWindow},{'defense',ctx.defenseMoving},
+            {'equipment',s.equipmentRequest},{'loot',s.lootRequest},{'bring',s.bringDelivery},
+            {'delivery',s.questDelivery},{'cash',s.questCashJob},{'upgrade',s.questUpgradeJob},
+            {'equipmentLock',ctx.bringEquipmentLock},{'worldScan',ctx.worldScan or ctx.worldReading},
+            {'workerFailed',ctx.failed},{'chestPending',ctx.chestsDirty or ctx.chestCandidatesPending or next(ctx.worldPending or {})},
+            {'paused',player.GameplayPaused==true},{'cutscene',workspace:GetAttribute('InCutScene')==true},
+            {'rebase',workspace:GetAttribute('InfiniteRebasing')==true},
+        })do if entry[2]then details.flags[#details.flags+1]=entry[1]end end
+        for _,key in ipairs({'drive','throttle','cash','drag','shop','wallet','upgrade','upgradeWallet',
+            'classes','crateRead','crateClaim','medicalDrop','healingWallet','inventoryDrop','place'})do
+            if s.questCalls and s.questCalls[key]then details.calls[#details.calls+1]=key end
+        end
+        local drill=ctx.drill
+        pcall(function()if drill and drill==workspace:FindFirstChild('Drill')then
+            local driver=drill:GetAttribute('DriverUserId')
+            details.driver=driver==nil and 'none' or number(driver) and (driver==player.UserId and 'self' or 'other') or 'invalid'
+            details.fuel=number(drill:GetAttribute('Fuel'));details.capacity=number(drill:GetAttribute('MaxFuel'))
+            local seat=ctx.humanoid.SeatPart
+            details.seat=not seat and (ctx.humanoid.Sit and 'sit-only' or 'none')
+                or seat:IsDescendantOf(drill) and 'drill' or 'other'
+        end end)
+        pcall(function()
+            local hotbar=controller('HotbarController');local ui=hotbar and hotbar.BackpackUI
+            details.hotbar=ui and (ui.Visible==true and 'visible' or 'hidden') or 'unavailable'
+        end)
+        local text=type(s.questStatus)=='string' and s.questStatus or ''
+        for _,entry in ipairs({
+            {'Head start:','head-start'},{'Previous native driver stop','stop-unresolved'},
+            {'Native driver stop has not cleared','stop-owner'},{'Approaching driver seat','seat-start'},
+            {'Drill start not confirmed','start-timeout'},{'Drill start failed','start-retry'},
+            {'Native drill seats still loading','seats-loading'},{'Native physical seat','seats-loading'},
+            {'Another player is driving','foreign-driver'},{'No loaded free fuel','fuel-empty'},
+            {'Drill fuel state loading','fuel-loading'},{'Refuelling','refuelling'},
+            {'Leaving the actual seat','seat-exit'},{'Seat exit unconfirmed','seat-exit'},
+            {'Driving input paused','text-focus'},{'Drill made no observed distance','drive-stalled'},
+            {'Wall','wall'},{'Owned pickaxe readiness','pickaxe-unready'},
+            {'Mining waits','mining-wait'},{'Awaiting Void startup','startup'},
+            {'Claiming owned Void','startup'},{'Checking loaded chests','chest-scan'},
+            {'Opening a nearby chest','chest-open'},{'Delivery did not confirm','delivery-unconfirmed'},
+            {'Driving drill with native','driving'},{'Mobile native seat throttle','driving'},
+            {'Native forward input unavailable','driving'},
+        })do if text:find(entry[1],1,true)==1 then details.stage=entry[2];break end end
+        return details
+    end
     -- This clock survives worker recovery. Requests, retry messages, local
     -- movement and camera changes are not evidence of useful quest progress.
     function F.checkQuestExit(ctx)
@@ -9515,6 +9642,8 @@ end)()
             or now()-watch.at >= 90 and 'No meaningful progress for 1.5 minutes'
         if reason then
             s.questChurchExit = {reason=reason, requestedAt=now()}
+            local ok,details=pcall(questExitContext,ctx,watch)
+            if ok then s.questChurchExit.observed=details end
             status(reason..'; saving at a church / altar before leaving')
         end
     end
