@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.73: retain bounded native work and reservation observations at the exit request.
+-- Version 0.74: honor due driving turns after sales and freeze one exit-request timestamp.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 73
+    local REVISION = 74
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.73-frozen-stall-context"
+    local BUILD = "v0.74-drive-sale-fairness-and-exit-stamp"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -8450,7 +8450,9 @@ end)()
                 local busy=deliveryStep(ctx,plan)
                 if busy and not (sale.cancelled and sale.movementReleased) then return true end
             end
-            if not Q.refuelActive(ctx,plan) and Q.drillSupport.sellLoose(ctx,plan,true) then return true end
+            -- Finish the existing sale above, then give an already-due drive
+            -- its turn. A stream of new sale items must not restart this lane.
+            if not drivingDue and not Q.refuelActive(ctx,plan) and Q.drillSupport.sellLoose(ctx,plan,true) then return true end
         end
         if ctx.questMineEntry and Q.drillSupport.entry(ctx,ctx.questDepthMine~=nil)then return true end
         if ctx.questDepthMine and Q.drillSupport.depthMine and Q.drillSupport.depthMine(ctx,plan)then return true end
@@ -9466,10 +9468,9 @@ end)()
     end
     -- Freeze observations before extraction cleans up the worker. Fixed labels
     -- and finite scalars only: never copy a status, request or inventory object.
-    local function questExitContext(ctx,watch)
+    local function questExitContext(ctx,watch,at)
         local player=api.Players.LocalPlayer
         if not ctx or not ctx.active or s.farm~=ctx or ctx.character~=player.Character then return end
-        local at=now()
         local function number(v)
             return type(v)=='number' and v==v and math.abs(v)<math.huge and v>=0 and v or nil
         end
@@ -9641,8 +9642,9 @@ end)()
         local reason = now()-s.lootStarted >= minutes*60 and tostring(minutes)..'-minute quest run limit reached'
             or now()-watch.at >= 90 and 'No meaningful progress for 1.5 minutes'
         if reason then
-            s.questChurchExit = {reason=reason, requestedAt=now()}
-            local ok,details=pcall(questExitContext,ctx,watch)
+            local requestedAt=now()
+            s.questChurchExit = {reason=reason, requestedAt=requestedAt}
+            local ok,details=pcall(questExitContext,ctx,watch,requestedAt)
             if ok then s.questChurchExit.observed=details end
             status(reason..'; saving at a church / altar before leaving')
         end
