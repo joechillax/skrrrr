@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.71: complete the native loot-seat handoff after observed automatic reseating.
+-- Version 0.72: prevent unrelated checkouts from starving medical discovery and retain native HP drops.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 71
+    local REVISION = 72
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.71-loot-seat-handoff"
+    local BUILD = "v0.72-medical-search-fairness"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -371,6 +371,50 @@ end)()
         value = tonumber(value)
         return value and value == value and math.abs(value) < math.huge and value >= 0 and value or nil
     end
+    local function clearHealthWatch(record)
+        record=record or s.reportHealthWatch
+        if not record then return end
+        if record.connection then pcall(record.connection.Disconnect,record.connection)end
+        if s.reportHealthWatch==record then s.reportHealthWatch=nil end
+    end
+    clearHealthWatch() -- Retire an older reporter's read-only event handler on replacement.
+    local function watchHealth(run,ctx)
+        local player=(api.Players or game:GetService('Players')).LocalPlayer
+        local h=ctx.humanoid
+        if not h or ctx.character~=player.Character or h.Parent~=ctx.character then return end
+        local record=s.reportHealthWatch
+        if record and (record.run~=run or record.character~=ctx.character or record.humanoid~=h)then
+            clearHealthWatch(record);record=nil
+        end
+        if not record then
+            record={run=run,character=ctx.character,humanoid=h,health=finite(h.Health),maximum=finite(h.MaxHealth)}
+            s.reportHealthWatch=record
+        end
+        if record.connection or not h.HealthChanged then return end
+        local function observe()
+            if s.reportHealthWatch~=record or s.reportRun~=run or run.ended
+                or currentAccount()~=ledgerAccount or player.Character~=record.character
+                or h.Parent~=record.character then clearHealthWatch(record);return end
+            -- Read the current native properties, never a supplied event value.
+            -- No action, inventory/map scan, snapshot trigger, send or file write.
+            local hp,maximum=finite(h.Health),finite(h.MaxHealth)
+            if not hp or not maximum or maximum<=0 then return end
+            local progress=run.farmProgress;if not progress then return end
+            local previous=record.health
+            if previous and record.maximum and maximum<record.maximum then previous=math.min(previous,maximum)end
+            if previous and hp<previous then
+                progress.lastHpDropFrom=math.max(0,math.min(100,previous/maximum*100))
+                progress.lastHpDropTo=math.max(0,math.min(100,hp/maximum*100));progress.lastHpDropAt=now()
+            end
+            if hp>0 then
+                local ratio=math.max(0,math.min(100,hp/maximum*100))
+                progress.lastLivingHp=ratio;progress.lowLivingHp=math.min(progress.lowLivingHp or ratio,ratio)
+            end
+            record.health,record.maximum=hp,maximum
+        end
+        local ok,connection=pcall(function()return h.HealthChanged:Connect(observe)end)
+        if ok then record.connection=connection end
+    end
     local function attribute(item, key)
         local db = s.itemDatabase
         if db and type(db.GetAttribute) == 'function' then
@@ -480,6 +524,7 @@ end)()
         if wallet then progress.lastCoins=wallet end
         local ctx=s.farm
         if ctx and ctx.active then
+            pcall(watchHealth,run,ctx)
             local text=type(s.questStatus)=='string' and s.questStatus or ''
             for _,entry in ipairs(driveStates)do
                 if text:find(entry[1],1,true)==1 then
@@ -664,6 +709,7 @@ end)()
             ..'\nHP rises during recovery: '..delta('questHealingHpRises')..' | Medical timeouts: '..delta('questMedicalUseTimeouts')
             ..'\nUpgrades confirmed: '..delta('confirmedQuestUpgrades')
             ..'\nNative drive advance: '..(progress.lastNativeDriveAdvanceAt and string.format('last observed %.0fs before report',math.max(0,now()-progress.lastNativeDriveAdvanceAt))or 'not observed')
+            ..'\nObserved HP drop: '..(progress.lastHpDropAt and string.format('%.0f%% → %.0f%%; %.0fs before report',progress.lastHpDropFrom,progress.lastHpDropTo,math.max(0,now()-progress.lastHpDropAt))or 'not observed')
             ..'\nHP rises do not prove medicine caused them.'
     end
     local function payload(outcome, reason)
@@ -706,6 +752,7 @@ end)()
         local record = payload(outcome, reason)
         if not record then return end
         s.reportRun.ended = true
+        clearHealthWatch()
         ledger.departure = nil
         enqueue(record)
         R.pump()
@@ -720,6 +767,7 @@ end)()
         if ledger.departure and ledger.departure.id == s.job then ledger.departure = nil; persist() end
     end
     function R.arrived(isLobby)
+        if isLobby then clearHealthWatch()end
         if not readyLedger()then return end
         local staged = ledger.departure
         if isLobby and staged and staged.id ~= s.job then
@@ -11750,10 +11798,40 @@ end)()
             if not cache.target.Parent or not F.medicalLocationAllowed(ctx,cache.target)then cache.target=nil
             elseif now()<(cache.targetUntil or 0)then
                 movement.prefetchAt(ctx,position(cache.target));return true,'streaming medical stock at a verified shop',progressed
-            else cache.tried[cache.target]=now()+30;cache.target=nil end
+            else cache.tried[cache.target]=now()+30;cache.target=nil;cache.surveyDue=true end
         end
         local blocked=F.healingMovementBlocked(ctx)
         if blocked then return false,'medical search waits: '..blocked,progressed end
+        if now()<(cache.surveyHoldUntil or 0)then
+            if cache.surveyPoint then movement.prefetchAt(ctx,cache.surveyPoint)end
+            return true,'streaming the newly surveyed medical area',progressed
+        end
+        local function survey()
+            if not quest.drillSupport.inDungeon(ctx) and now()>=(cache.surveyAt or 0)then
+                cache.surveyAt=now()+3;cache.survey=cache.survey+1
+                local direction=cache.survey%2==1 and 1 or -1
+                local offset=math.ceil(cache.survey/2)*160*direction
+                local surveyOrigin=cache.origin+Vector3.new(offset,0,0)
+                -- Streaming is read-only. Ask for the candidate area before its
+                -- floor is visible, but never move there without actual geometry.
+                movement.prefetchAt(ctx,surveyOrigin)
+                local point=healingFloor(ctx,surveyOrigin)
+                if point then
+                    movement.cancel(ctx);movement.hover(ctx);ctx.root.CFrame=CFrame.new(point);ctx.questHealPoint=point
+                    movement.prefetchAt(ctx,point-Vector3.new(0,100,0));ctx.worldRefreshAt=0
+                    cache.surveyPoint=point;cache.surveyHoldUntil=now()+3
+                    return true,'surveying loaded safe tunnel for a medical shop',true
+                end
+            end
+            return false
+        end
+        -- Unrelated loaded shops cannot monopolize discovery. After a real
+        -- shop streaming window, give the next safe survey probe its turn.
+        -- This alternation survives bounded search bursts in the same scope.
+        if cache.surveyDue and not quest.drillSupport.inDungeon(ctx) and now()>=(cache.surveyAt or 0)then
+            cache.surveyDue=nil
+            local surveyed,reason,moved=survey();if surveyed then return surveyed,reason,moved end
+        end
         local target,distance,pose
         for candidate in pairs(cache.candidates)do
             local p=position(candidate)
@@ -11772,23 +11850,7 @@ end)()
             cache.target,cache.targetUntil=target,now()+3;movement.prefetchAt(ctx,position(target))
             ctx.worldRefreshAt=0;return true,'searching medical stock at a verified shop',true
         end
-        -- No shop is loaded yet. Survey only positions with actual collidable
-        -- current-scope floor, retaining the origin across bounded search bursts.
-        if not quest.drillSupport.inDungeon(ctx) and now()>=(cache.surveyAt or 0)then
-            cache.surveyAt=now()+3;cache.survey=cache.survey+1
-            local direction=cache.survey%2==1 and 1 or -1
-            local offset=math.ceil(cache.survey/2)*160*direction
-            local surveyOrigin=cache.origin+Vector3.new(offset,0,0)
-            -- Streaming is read-only. Ask for the candidate area before its
-            -- floor is visible, but never move there without actual geometry.
-            movement.prefetchAt(ctx,surveyOrigin)
-            local point=healingFloor(ctx,surveyOrigin)
-            if point then
-                movement.cancel(ctx);movement.hover(ctx);ctx.root.CFrame=CFrame.new(point);ctx.questHealPoint=point
-                movement.prefetchAt(ctx,point-Vector3.new(0,100,0));ctx.worldRefreshAt=0
-                return true,'surveying loaded safe tunnel for a medical shop',true
-            end
-        end
+        local surveyed,reason,moved=survey();if surveyed then return surveyed,reason,moved end
         return progressed,'searching the actual streamed map for a medical shop',progressed
     end
     local function bossAt(origin, source)
