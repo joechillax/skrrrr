@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.69: count verified native drive activity and prevent medical checkout starvation.
+-- Version 0.70: count only net recovery highs as activity and identify the recovery wait stage.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 69
+    local REVISION = 70
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.69-native-drive-activity-and-medical-checkout"
+    local BUILD = "v0.70-recovery-high-water"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -474,6 +474,13 @@ end)()
             if living and hp and hp>0 and maximum and maximum>0 then
                 local ratio=math.max(0,math.min(100,hp/maximum*100))
                 progress.lastLivingHp=ratio;progress.lowLivingHp=math.min(progress.lowLivingHp or ratio,ratio)
+                if ctx.questHealing then
+                    local stages={['safety-handoff']=true,['route-handoff']=true,['cash-receipt']=true,
+                        ['item-reservation']=true,['consume-receipt']=true,['handler-wait']=true,
+                        ['unresolved-item']=true,['supply-checkout']=true,['shop-search']=true,
+                        ['cash-search']=true,['funding-sale']=true,['safe-chest']=true,['no-ready-supply']=true}
+                    progress.lastRecoveryStage=stages[ctx.questRecoveryStage] and ctx.questRecoveryStage or 'unobserved'
+                end
                 progress.lastLivingWork=ctx.questHealAttempt and 'medical-use' or ctx.questHealing and 'recovery'
                     or ctx.questDrivingDefense and 'drive-defense' or ctx.questCombat and 'combat'
                     or ctx.questMining and 'mining' or ctx.questDriving and 'driving' or ctx.questSeating and 'seat-entry'
@@ -620,6 +627,7 @@ end)()
         local low=progress.lowLivingHp and string.format('%.0f%%',progress.lowLivingHp)or 'unavailable'
         return 'Observed living HP: last '..last..' | low '..low
             ..'\nLast living work: '..(progress.lastLivingWork or 'unavailable')..' | Reservation: '..(progress.lastLivingReservation or 'unavailable')
+            ..'\nLast recovery stage: '..(progress.lastRecoveryStage or 'unobserved')
             ..'\nMedical packets: '..delta('questMedicalRequests')..' | Stack receipts: '..delta('questMedicalStackReceipts')
             ..'\nHP rises during recovery: '..delta('questHealingHpRises')..' | Medical timeouts: '..delta('questMedicalUseTimeouts')
             ..'\nUpgrades confirmed: '..delta('confirmedQuestUpgrades')
@@ -2219,6 +2227,7 @@ return function(api,Q)
         local keep=cfg.classQuest and sameLife and (attempt~=nil or temporary and ctx.questHealing==true)
             and ctx.humanoid.MaxHealth>0 and ctx.humanoid.Health/ctx.humanoid.MaxHealth<.7
         ctx.questHealing=keep and true or nil
+        if not keep then ctx.questRecoveryStage=nil end
         local search=ctx.questMedicalSearch
         if api.clearMedicalSearch and (search or not keep)then api.clearMedicalSearch(ctx,search)end
         ctx.questMedicalSearch,ctx.questMedicalSearchRetryAt,ctx.questMedicalLowWalletAt,ctx.questHealReadiness=nil,nil,nil,nil
@@ -2289,6 +2298,7 @@ return function(api,Q)
         return ledger,wait
     end
     function H.step(ctx,plan)
+        ctx.questRecoveryStage='safety-handoff'
         local h=ctx.humanoid;local maximum=tonumber(h.MaxHealth)
         if not cfg.classQuest or not maximum or maximum<=0 or h.Health<=0 then H.cleanup(ctx);return false end
         local ratio=h.Health/maximum
@@ -2324,7 +2334,7 @@ return function(api,Q)
             -- These guards exclude every native release/stock-return branch.
             Q.release(expired)
         end
-        if not Q.holdRoute(ctx)then return true end
+        if not Q.holdRoute(ctx)then ctx.questRecoveryStage='route-handoff';return true end
         api.watch(ctx)
         if not h.SeatPart and now()>=(ctx.questHealRetreatAt or 0)
             and (not api.healingPointSafe or not api.healingPointSafe(ctx,ctx.root.Position)) then
@@ -2335,13 +2345,14 @@ return function(api,Q)
             if job.healingFunding or job.kind=='supply' and H.isMedical(job.item) then Q.deliveryStep(ctx,plan)
             else Q.release(job)end
         end
-        if Q.cashStep(ctx)then return true end
+        if Q.cashStep(ctx)then ctx.questRecoveryStage='cash-receipt';return true end
         local reserved=s.questDelivery
         local detached=reserved and reserved.cancelled and reserved.movementReleased
         if Q.manual() or reserved and not detached or s.bringDelivery or s.lootRequest or ctx.bringEquipmentLock then
+            ctx.questRecoveryStage='item-reservation'
             s.questStatus='Quest healing: waiting for owned item action to release';return true
         end
-        if H.observe(ctx)then return true end
+        if H.observe(ctx)then ctx.questRecoveryStage='consume-receipt';return true end
         local tool,best
         for _,found in ipairs(api.ownedTools(ctx))do
             if H.isMedical(found) and not (ctx.questHealTried or {})[found]then
@@ -2355,6 +2366,7 @@ return function(api,Q)
             end
         end
         if tool then
+            ctx.questRecoveryStage='handler-wait'
             local ledger,wait=readiness(ctx,tool)
             if not wait or wait.retryAt then wait={started=now(),character=ctx.character};ledger[tool]=wait end
             local active=api.equip(ctx,tool)
@@ -2363,6 +2375,7 @@ return function(api,Q)
                     started=now(),character=ctx.character,humanoid=h}
                 local sent,reason=api.consume(ctx,active)
                 if sent then
+                    ctx.questRecoveryStage='consume-receipt'
                     observed('questMedicalRequests')
                     ledger[tool]=nil
                     ctx.questHealAttempt=attempt
@@ -2374,6 +2387,7 @@ return function(api,Q)
             s.questStatus='Medical handler readiness unconfirmed after 8s; seeking other real supplies without repeating Consume'
         end
         if detached then
+            ctx.questRecoveryStage='unresolved-item'
             if Q.chestTurn(ctx,plan)then return true end
             s.questStatus='Quest healing: unresolved item request reserved; native regeneration while held medical stock is unavailable'
             return true
@@ -2382,6 +2396,7 @@ return function(api,Q)
         for _,id in ipairs(supplies)do
             local ready,reason=Q.supplyReady(ctx,id)
             if ready and Q.supply(ctx,plan,id)then
+                ctx.questRecoveryStage='supply-checkout'
                 s.questStatus='Quest healing: collecting medical supplies at the current coin quote';return true
             end
             problem=reason or s.questUpgradeJob and 'waiting for the upgrade receipt'
@@ -2389,16 +2404,19 @@ return function(api,Q)
                 or Q.calls.upgradeWallet and 'currency read still pending' or problem
         end
         local searching,searchReason=H.search(ctx)
-        if searching then return true end
+        if searching then ctx.questRecoveryStage='shop-search';return true end
         problem=searchReason or problem
         if Q.collectMoney(ctx)then
+            ctx.questRecoveryStage='cash-search'
             s.questStatus='Quest healing: collecting available Coins for medical supplies';return true
         end
         if Q.drillSupport.sellLoose(ctx,plan)then
+            ctx.questRecoveryStage='funding-sale'
             if s.questDelivery then s.questDelivery.healingFunding=true end
             s.questStatus='Quest healing: selling disposable loot for medical supplies';return true
         end
-        if Q.chestTurn(ctx,plan)then return true end
+        if Q.chestTurn(ctx,plan)then ctx.questRecoveryStage='safe-chest';return true end
+        ctx.questRecoveryStage='no-ready-supply'
         s.questStatus=string.format('Quest healing %.0f%% → 70%%; %s; seeking safer chests and sales of $100+',ratio*100,problem or 'medical supply retry pending')
         return true
     end
@@ -8050,6 +8068,7 @@ end)()
         local ratio=h.Health/maximum
         if ratio>=.7 or not ctx.questHealing and ratio>.3 then return false,false end
         ctx.questHealing=true
+        ctx.questRecoveryStage='safety-handoff'
         Q.drillSupport.stopMine(ctx);Q.stopDrive(ctx)
         local worm=Q.parasite and Q.parasite.target(ctx)
         if ctx.combatTarget~=worm then ctx.combatTarget=nil;ctx.questCombat=nil end
@@ -9250,7 +9269,28 @@ end)()
             elseif quest and quest.drillSupport.activeMine() and not watch.inDungeon then
                 watch.inDungeon=true;watch.at=now() -- One confirmed native entry starts a new activity.
             end
-            if ctx.questHealing then increase('healing', ctx.humanoid.Health) else watch.values.healing = nil end
+            -- Repeated damage/regeneration is not forward recovery. Retain the
+            -- same-life high through worker/temporary healing handoffs; only a
+            -- new HP fraction high can refresh the global activity deadline.
+            local h=ctx.humanoid
+            local hp,maximum=h.Health,h.MaxHealth
+            local valid=ctx.character==api.Players.LocalPlayer.Character and h.Parent==ctx.character
+                and type(hp)=='number' and hp==hp and hp>0 and hp<math.huge
+                and type(maximum)=='number' and maximum==maximum and maximum>0 and maximum<math.huge
+            local recovery=watch.recovery
+            local same=recovery and recovery.character==ctx.character and recovery.humanoid==h
+                and recovery.job==game.JobId and recovery.runStarted==s.lootStarted
+            if ctx.questHealing and valid then
+                local ratio=hp/maximum
+                if not same then
+                    watch.recovery={character=ctx.character,humanoid=h,maximum=maximum,high=ratio,
+                        job=game.JobId,runStarted=s.lootStarted}
+                elseif recovery.maximum~=maximum then
+                    recovery.maximum=maximum;recovery.high=math.max(recovery.high,ratio)
+                elseif ratio>recovery.high then
+                    recovery.high=ratio;watch.at=now()
+                end
+            elseif not valid or not same or hp/maximum>=.7 then watch.recovery=nil end
             local mining = ctx.questMineJob
             for _, target in pairs({combat=ctx.combatTarget, mining=mining and mining.node}) do
                 if target and target.Parent then
