@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.75: buy prioritized cards, then the cheapest safe nonpriority upgrade.
+-- Version 0.76: advance due driving, retire disabled depth refuelling and fence upgrade receipts.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 75
+    local REVISION = 76
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.75-affordable-upgrade-fallback"
+    local BUILD = "v0.76-scheduler-and-lifecycle-fixes"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -3284,9 +3284,12 @@ end)()
     function D.settleUpgrade(ctx)
         local job=s.questUpgradeJob
         if not job then return false end
-        local count=tonumber(ctx.drill:GetAttribute(job.name)) or 0
-        if count>job.before or job.confirmed or job.rejected or now()-job.started>=8 then
-            if count>job.before or job.confirmed then
+        local sameLife=job.ctx and job.ctx.character==ctx.character and job.ctx.humanoid==ctx.humanoid
+            and job.ctx.drill==ctx.drill
+        local count=sameLife and tonumber(ctx.drill:GetAttribute(job.name)) or job.before
+        local confirmed=sameLife and (count>job.before or job.confirmed)
+        if confirmed or job.rejected or not sameLife or now()-job.started>=8 then
+            if confirmed then
                 s.stats.confirmedQuestUpgrades=(s.stats.confirmedQuestUpgrades or 0)+1
                 s.questUpgradeStatus='Upgrades: confirmed '..job.name
             elseif job.rejected then ledger[job.key]=now()+5;s.questUpgradeStatus='Upgrades: server rejected '..job.name..'; retry in 5s'
@@ -6552,7 +6555,8 @@ end)()
         local eligible=plan.kind=='depth' and cfg.driveDepth or plan.kind=='fuel'
         local selected=type(s.classData)=='table' and s.classData.SelectedClass or plan.name
         if latch and selected and latch.class and selected~=latch.class then s.questRefuelLatch=nil;latch=nil end
-        if not cfg.classQuest or api.extractionReady() or not(eligible or latch)then
+        if not cfg.classQuest or api.extractionReady() or not(eligible or latch)
+            or latch and latch.kind=='depth' and not cfg.driveDepth and not eligible then
             s.questRefuelLatch=nil;ctx.questRefuel=nil;return false
         end
         if ctx.drill~=current or not current or not current.Parent then ctx.questRefuel=nil;return false end
@@ -8337,6 +8341,9 @@ end)()
         local plan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if not enabled(ctx) then ctx.questProgressAt=now(); Q.cleanup(ctx); return false end
         Q.refuelActive(ctx,plan) -- Observe an empty tank even while healing/urgent combat preempts driving.
+        -- Advance the cadence before optional work can return early. A pending
+        -- independent upgrade or continuous sales cannot pin an expired break.
+        Q.drillSupport.depthEconomy(ctx,plan)
         if not ctx.humanoid.SeatPart and not ctx.humanoid.Sit then ctx.questSeatExit=nil end
         if (plan.kind~='depth' and plan.kind~='fuel' or api.extractionReady()
             or ctx.humanoid.MaxHealth>0 and ctx.humanoid.Health/ctx.humanoid.MaxHealth<=.3)
