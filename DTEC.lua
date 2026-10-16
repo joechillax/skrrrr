@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.68: choose the cheapest card only when all three Coin cards are blacklisted.
+-- Version 0.69: count verified native drive activity and prevent medical checkout starvation.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 68
+    local REVISION = 69
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.68-cheapest-blacklisted-roll-fallback"
+    local BUILD = "v0.69-native-drive-activity-and-medical-checkout"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -184,7 +184,8 @@ end)()
     local function now() return os.clock() end
     s.stats = s.stats or { started = now(), coreEarned = 0, coinEarned = 0, gems = 0,
         promptFires = 0, lootObserved = 0, badgeClaims = 0, chestProgress = 0 }
-    for _,key in ipairs({'questCashRequests','questCashConfirmed','questCashRejected'})do
+    for _,key in ipairs({'questCashRequests','questCashConfirmed','questCashRejected','confirmedQuestUpgrades',
+        'questMedicalRequests','questMedicalStackReceipts','questHealingHpRises','questMedicalUseTimeouts'})do
         if s.stats[key]==nil then s.stats[key]=0 end
     end
     s.chests = s.chests or {}
@@ -465,10 +466,34 @@ end)()
                 if ok and read and player and owner==player.UserId then progress.driveSeen=true end
             end
             if ctx.questMobileThrottle then progress.mobileFramesSeen=true end
+            local living,hp,maximum=pcall(function()
+                local player=(api.Players or game:GetService('Players')).LocalPlayer
+                if ctx.character~=player.Character or not ctx.humanoid then return end
+                return finite(ctx.humanoid.Health),finite(ctx.humanoid.MaxHealth)
+            end)
+            if living and hp and hp>0 and maximum and maximum>0 then
+                local ratio=math.max(0,math.min(100,hp/maximum*100))
+                progress.lastLivingHp=ratio;progress.lowLivingHp=math.min(progress.lowLivingHp or ratio,ratio)
+                progress.lastLivingWork=ctx.questHealAttempt and 'medical-use' or ctx.questHealing and 'recovery'
+                    or ctx.questDrivingDefense and 'drive-defense' or ctx.questCombat and 'combat'
+                    or ctx.questMining and 'mining' or ctx.questDriving and 'driving' or ctx.questSeating and 'seat-entry'
+                    or ctx.questChestTaking and 'chest' or ctx.questMineEntry and 'mine-transition'
+                    or s.questDelivery and 'item-delivery' or 'other'
+                local calls=s.questCalls or {}
+                progress.lastLivingReservation=calls.upgrade and 'upgrade' or calls.shop and 'shop'
+                    or calls.drag and 'item' or calls.medicalDrop and 'medical-drop'
+                    or s.equipmentRequest and 'equipment' or calls.cash and 'cash'
+                    or calls.wallet and 'checkout-balance' or calls.healingWallet and 'medical-balance'
+                    or calls.upgradeWallet and 'upgrade-balance' or 'none'
+            end
         end
+        local drive=s.questActivity and s.questActivity.drill
+        local advance=drive and finite(drive.lastProgressAt)
+        if advance and advance>=run.started and advance<=now()then progress.lastNativeDriveAdvanceAt=advance end
         -- Scalar counters only. Observations never inspect the map, yield,
         -- request an action or reset an existing diagnostic/scheduler budget.
-        for _,key in ipairs({'lootObserved','promptFires','questCashRequests','questCashConfirmed','questCashRejected'})do
+        for _,key in ipairs({'lootObserved','promptFires','questCashRequests','questCashConfirmed','questCashRejected',
+            'confirmedQuestUpgrades','questMedicalRequests','questMedicalStackReceipts','questHealingHpRises','questMedicalUseTimeouts'})do
             local value=finite((s.stats or {})[key])
             if value then
                 if progress.baseline[key]==nil then
@@ -585,6 +610,22 @@ end)()
             ..(progress.mobileFramesSeen and ' | Mobile frame input observed' or '')
             ..(progress.partial and '\nCounts cover only the observed part of this run.' or '')
     end
+    local function survivalText(run)
+        local progress=run.farmProgress
+        local function delta(key)
+            local before,after=progress.baseline[key],progress.latest[key]
+            return before and after and not progress.invalid[key] and tostring(math.floor(after-before)) or 'unavailable'
+        end
+        local last=progress.lastLivingHp and string.format('%.0f%%',progress.lastLivingHp)or 'unavailable'
+        local low=progress.lowLivingHp and string.format('%.0f%%',progress.lowLivingHp)or 'unavailable'
+        return 'Observed living HP: last '..last..' | low '..low
+            ..'\nLast living work: '..(progress.lastLivingWork or 'unavailable')..' | Reservation: '..(progress.lastLivingReservation or 'unavailable')
+            ..'\nMedical packets: '..delta('questMedicalRequests')..' | Stack receipts: '..delta('questMedicalStackReceipts')
+            ..'\nHP rises during recovery: '..delta('questHealingHpRises')..' | Medical timeouts: '..delta('questMedicalUseTimeouts')
+            ..'\nUpgrades confirmed: '..delta('confirmedQuestUpgrades')
+            ..'\nNative drive advance: '..(progress.lastNativeDriveAdvanceAt and string.format('last observed %.0fs before report',math.max(0,now()-progress.lastNativeDriveAdvanceAt))or 'not observed')
+            ..'\nHP rises do not prove medicine caused them.'
+    end
     local function payload(outcome, reason)
         local run = s.reportRun
         if not run or run.ended then return nil end
@@ -605,6 +646,7 @@ end)()
             fields[#fields+1]={name='Quest progress (observed)',value=questText(run),inline=false}
         end
         fields[#fields+1]={name='Farm diagnostics',value=farmText(run),inline=false}
+        if run.farmProgress.questsOn then fields[#fields+1]={name='Survival diagnostics',value=survivalText(run),inline=false}end
         return {id = run.id, status = 'queued', attempts = 0, created = clock(), revision=s.revision, version=s.version, build=s.build, body = {
             username = 'DTEC JoeJoe Automation',
             embeds = {{title = 'Earth run - ' .. outcome, color = outcome == 'LOSS' and 15158332
@@ -2004,6 +2046,7 @@ end)()
 -- full toolbar slot to medical supplies during healing; no paid revives.
 return function(api,Q)
     local H,s,cfg,now={},api.state,api.state.config,api.now
+    local function observed(key)s.stats[key]=(s.stats[key] or 0)+1 end
     local known={Advanced_Medkit=.6,Basic_Medkit=.3,Bandages=.1,Golden_Medkit=1}
     local function finite(value)return type(value)=='number' and value==value and math.abs(value)<math.huge end
     local function scope(ctx)
@@ -2116,6 +2159,14 @@ return function(api,Q)
         return finite(value) and value>=1 and value%1==0
     end
     function H.observe(ctx)
+        -- Read-only recovery evidence. HP rises may be regeneration/teammates;
+        -- they never authorize replaying an uncertain medical packet.
+        local hp=ctx.humanoid.Health;local prior=ctx.questMedicalHpWatch
+        if cfg.classQuest and ctx.character==api.Players.LocalPlayer.Character and finite(hp) and hp>0 then
+            if prior and prior.character==ctx.character and prior.humanoid==ctx.humanoid
+                and ctx.questHealing and hp>prior.health then observed('questHealingHpRises')end
+            ctx.questMedicalHpWatch={character=ctx.character,humanoid=ctx.humanoid,health=hp}
+        else ctx.questMedicalHpWatch=nil end
         -- A late exact stack loss proves that the earlier unit was consumed.
         -- Re-arm only its remaining unit; HP changes or stale/missing count
         -- metadata cannot authorize replaying an uncertain Consume.
@@ -2126,6 +2177,7 @@ return function(api,Q)
                 and tool.Parent and (tool.Parent==ctx.character or tool.Parent==backpack) and H.isMedical(tool)then
                 local count=tool:GetAttribute('MedicalStackCount')
                 if nativeCount(record.nativeCount) and nativeCount(count) and count<record.nativeCount then
+                    observed('questMedicalStackReceipts')
                     ctx.questHealTried[tool]=nil
                 end
             end
@@ -2138,12 +2190,14 @@ return function(api,Q)
         local count=attempt.tool:GetAttribute('MedicalStackCount')
         local consumed=not attempt.tool.Parent or nativeCount(attempt.nativeCount) and nativeCount(count) and count<attempt.nativeCount
         if consumed then
+            observed('questMedicalStackReceipts')
             ctx.questHealAttempt=nil
         elseif ctx.humanoid.Health>attempt.health then
             -- Passive or teammate healing can raise HP without consuming this
             -- unit. Recovery may continue, but its unknown packet is not replayed.
             quarantine(ctx,attempt);ctx.questHealAttempt=nil
         elseif now()-attempt.started>=3 then
+            observed('questMedicalUseTimeouts')
             quarantine(ctx,attempt)
             ctx.questHealAttempt=nil;s.questStatus='Medical use unconfirmed; no repeated consume for that item'
         end
@@ -2309,6 +2363,7 @@ return function(api,Q)
                     started=now(),character=ctx.character,humanoid=h}
                 local sent,reason=api.consume(ctx,active)
                 if sent then
+                    observed('questMedicalRequests')
                     ledger[tool]=nil
                     ctx.questHealAttempt=attempt
                     s.questStatus='Quest healing: using '..api.id(tool)..'; awaiting actual HP recovery'
@@ -2344,7 +2399,7 @@ return function(api,Q)
             s.questStatus='Quest healing: selling disposable loot for medical supplies';return true
         end
         if Q.chestTurn(ctx,plan)then return true end
-        s.questStatus=string.format('Quest healing %.0f%% → 70%%; %s; seeking safer chests and sales of $150+',ratio*100,problem or 'medical supply retry pending')
+        s.questStatus=string.format('Quest healing %.0f%% → 70%%; %s; seeking safer chests and sales of $100+',ratio*100,problem or 'medical supply retry pending')
         return true
     end
     return H
@@ -3096,10 +3151,11 @@ end)()
             if calls.upgradeWallet or calls.wallet or calls.shop or now()<(ctx.questUpgradeWalletAt or 0)then return end
             ctx.questUpgradeWalletAt=now()+3
             local walletVersion=s.questWalletVersion or 0
+            local medicalEpoch=ctx.questMedicalCheckoutEpoch or 0
             Q.call('upgradeWallet','CurrencyService','GetCurrency',{},function(ok,wallet)
                 if ok and finite(wallet) and wallet>=0 then
                     local balance,observedAt,version=Q.observeCoins(wallet,walletVersion)
-                    if balance~=nil and callback then callback(balance,observedAt,version)end
+                    if balance~=nil and callback and medicalEpoch==(ctx.questMedicalCheckoutEpoch or 0)then callback(balance,observedAt,version)end
                 else info('wallet read unavailable; purchases paused')end
             end,function()return Q.enabled(ctx) and not api.extractionReady()end)
         end
@@ -8543,10 +8599,14 @@ end)()
             end
         end
         -- Coin purchases share a reservation with native drill upgrades.
-        if s.questUpgradeJob or calls.upgrade or calls.upgradeWallet then return false end
+        if s.questUpgradeJob or calls.upgrade then return false end
         if now()<(ctx.questSupplyAt or 0) then ctx.questOwns=nil; return false end
-        ctx.questSupplyAt=now()+3
         local item=nearest(looseItems(),ctx.root.Position,function(item)return stock(item) and api.id(item)==id and supplyAccessible(ctx,item) and supplyRetryReady(item)end)
+        -- An upgrade balance lookup spends nothing. Let needed medicine reserve
+        -- checkout first; its existing shop reservation blocks a late upgrade
+        -- dispatch, and the medical Buy still requires its own fresh quote/wallet.
+        if calls.upgradeWallet and not(ctx.questHealing and item and Q.healing.isMedical(item))then return false end
+        ctx.questSupplyAt=now()+3
         local pad=item and nearest(api.tagged('BuyPart'),api.part(item).Position,function(pad)return checkout(pad) and supplyAccessible(ctx,item,pad)end)
         if not item or not pad then ctx.questOwns=nil; setStatus('No free or coin-shop quest supply loaded: '..id); return false end
         if id:sub(-5)~='_Ammo' and not api.hasRoom(ctx,item) and not Q.healing.canMakeRoom(ctx,item) then ctx.questOwns=nil; setStatus('Quest tool needs a free toolbar slot; no purchase'); return false end
@@ -8555,6 +8615,7 @@ end)()
             healingSupply=ctx.questHealing and Q.healing.isMedical(item) or nil,
             stockOrigin=item:GetPivot(),originOffset=workspace:GetAttribute('InfiniteDepthOffsetMeters')}
         if obstructed(job) then ctx.questOwns=nil; return false end
+        if job.healingSupply then ctx.questMedicalCheckoutEpoch=(ctx.questMedicalCheckoutEpoch or 0)+1 end
         Q.stopDrive(ctx)
         s.questDelivery=job; ctx.bringEquipmentLock=job; setStatus('Checking coin checkout for '..id)
         return true
@@ -9183,6 +9244,7 @@ end)()
             increase(tostring(data.SelectedClass)..':level', progress.Level)
             for key, value in pairs(progress.Objectives or {}) do increase(tostring(data.SelectedClass)..':'..key, value) end
         end
+        local plan=quest and quest.plan(s.classData,s.questCatalog,cfg.driveDepth)
         if ctx then
             if api.Players.LocalPlayer:GetAttribute('InDungeon')~=true then watch.inDungeon=false
             elseif quest and quest.drillSupport.activeMine() and not watch.inDungeon then
@@ -9216,8 +9278,35 @@ end)()
                     watch.health[node]=value;watch.wall={node=node,drill=ctx.drill,band=band}
                 else watch.wall=nil end
             else watch.wall=nil end
+            -- DistanceController reads the actual Drill pivot, not the character
+            -- or a throttle request. Native class counters can arrive later.
+            local seen,metres,band=pcall(function()
+                local player=api.Players.LocalPlayer
+                local drill=workspace:FindFirstChild('Drill');local lease=s.questDriveLease
+                if not cfg.driveDepth or not plan or plan.kind~='depth' or not ctx.active or s.farm~=ctx
+                    or ctx.character~=player.Character or ctx.humanoid.Parent~=ctx.character or ctx.humanoid.Health<=0
+                    or ctx.drill~=drill or not drill or not drill.Parent or not ctx.questDriving
+                    or drill:GetAttribute('DriverUserId')~=player.UserId or not lease or lease.ctx~=ctx
+                    or lease.drill~=drill or not lease.confirmed or lease.abandoned then return end
+                local native=controller('DistanceController')
+                return native and native.CurrentLogicalDistance,workspace:GetAttribute('InfiniteDepthOffsetMeters')
+            end)
+            local drive=watch.drill
+            if seen and type(metres)=='number' and metres==metres and math.abs(metres)<math.huge then
+                local same=drive and drive.character==ctx.character and drive.humanoid==ctx.humanoid
+                    and drive.drill==ctx.drill and drive.band==band and drive.job==game.JobId
+                    and drive.runStarted==s.lootStarted and drive.class==plan.name
+                if not same then
+                    drive={character=ctx.character,humanoid=ctx.humanoid,drill=ctx.drill,band=band,job=game.JobId,
+                        runStarted=s.lootStarted,class=plan.name,distanceHigh=metres};watch.drill=drive
+                elseif not drive.active then
+                    drive.distanceHigh=math.max(drive.distanceHigh,metres) -- Resume calibrates; it is not progress.
+                elseif metres>drive.distanceHigh+1 then
+                    drive.distanceHigh=metres;drive.lastProgressAt=now();watch.at=now()
+                end
+                drive.active=true
+            elseif drive then drive.active=false end
         end
-        local plan=quest and quest.plan(s.classData,s.questCatalog,cfg.driveDepth)
         local minutes=plan and plan.kind=='depth' and cfg.driveDepth and 35 or 20
         local reason = now()-s.lootStarted >= minutes*60 and tostring(minutes)..'-minute quest run limit reached'
             or now()-watch.at >= 90 and 'No meaningful progress for 1.5 minutes'
