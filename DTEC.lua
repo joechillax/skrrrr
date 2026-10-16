@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.70: count only net recovery highs as activity and identify the recovery wait stage.
+-- Version 0.71: complete the native loot-seat handoff after observed automatic reseating.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 70
+    local REVISION = 71
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.70-recovery-high-water"
+    local BUILD = "v0.71-loot-seat-handoff"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -436,6 +436,30 @@ end)()
         end
         quest.currentName,quest.currentLevel=name,level
     end
+    local driveStates={
+        {'Previous native driver stop is unresolved','stop-pending'},
+        {'Native driver stop has not cleared server ownership','stop-owner'},
+        {'Drill made no observed distance progress','no-distance'},
+        {'Drill start not confirmed','start-unconfirmed'},
+        {'Approaching driver seat','seat-start'},
+        {'Native physical seat and local driver presentation','seat-loading'},
+        {'Native drill seats still loading','seat-loading'},
+        {'Drill belongs to another driver','foreign-driver'},
+        {'Another player is driving','foreign-driver'},
+        {'Driving input paused while a text box is focused','text-focus'},
+        {'No loaded free fuel for the drill','no-fuel'},
+        {'Refuelling','refuel'},
+        {'Driving damage observed','drive-defense-handoff'},
+        {'Driving paused after native damage','drive-defense'},
+        {'Wall drilling has no fresh damage receipt','wall-no-damage'},
+        {'Wall needs over 10 seconds','wall-detour'},
+        {'Wall estimate','wall-driving'},
+        {'Wall damage rate loading','wall-driving'},
+        {'Loot break: native driver released','loot-seat-clear'},
+        {'Driving drill with native forward input','driving'},
+        {'Mobile native seat throttle','driving'},
+        {'Native forward input unavailable','driving'},
+    }
     local function observeFarm(run)
         local progress=run.farmProgress
         if not progress then
@@ -456,6 +480,12 @@ end)()
         if wallet then progress.lastCoins=wallet end
         local ctx=s.farm
         if ctx and ctx.active then
+            local text=type(s.questStatus)=='string' and s.questStatus or ''
+            for _,entry in ipairs(driveStates)do
+                if text:find(entry[1],1,true)==1 then
+                    progress.lastDriveState,progress.lastDriveStateAt=entry[2],now();break
+                end
+            end
             local cycle=ctx.questDepthEconomy
             local phase=cycle and cycle.phase
             if phase=='funding' or phase=='upgrades' or phase=='drive' or phase=='loot'then progress.lastDrivePhase=phase end
@@ -613,6 +643,8 @@ end)()
             ..' | Native driver observed: '..(progress.driveSeen==true and 'YES' or progress.driveSeen==false and 'NO' or 'unavailable')
             ..'\nLast drive phase: '..(progress.lastDrivePhase or 'unavailable')
             ..' | Last observed Coins: '..(progress.lastCoins and string.format('%.0f',progress.lastCoins) or 'unavailable')
+            ..'\nLast drive state: '..(progress.lastDriveState or 'unobserved')
+            ..(progress.lastDriveStateAt and string.format(' | observed %.0fs before report',math.max(0,now()-progress.lastDriveStateAt))or '')
             ..'\nCash pickups: '..delta('questCashRequests')..' requests | '..delta('questCashConfirmed')..' verified | '..delta('questCashRejected')..' rejected'
             ..(progress.mobileFramesSeen and ' | Mobile frame input observed' or '')
             ..(progress.partial and '\nCounts cover only the observed part of this run.' or '')
@@ -6781,12 +6813,87 @@ end)()
         if not bound then release();return false end
         return true
     end
+    function Q.clearLootStop(ctx)
+        local record=ctx.questLootStop
+        if record and record.connection then pcall(record.connection.Disconnect,record.connection)end
+        ctx.questLootStop=nil
+    end
+    local function lootStopCurrent(ctx,record)
+        local cycle=ctx.questDepthEconomy
+        return record and ctx.questLootStop==record and cfg.classQuest and cfg.driveDepth and enabled(ctx)
+            and ctx.active and s.farm==ctx and not manual() and not api.extractionReady()
+            and not ctx.questHealing and not ctx.nativeGateMotion and not ctx.questMineEntry
+            and record.cycle==cycle and cycle and (cycle.phase=='loot' or cycle.phase=='funding')
+            and record.character==ctx.character and ctx.character==api.Players.LocalPlayer.Character
+            and record.humanoid==ctx.humanoid and ctx.humanoid.Health>ctx.humanoid.MaxHealth*.3
+            and record.drill==ctx.drill and ctx.drill==workspace:FindFirstChild('Drill') and ctx.drill.Parent
+            and record.band==workspace:GetAttribute('InfiniteDepthOffsetMeters')
+            and record.class==(s.classData and s.classData.SelectedClass)
+            and record.job==game.JobId and record.runStarted==s.lootStarted
+    end
+    local function observeLootStop(ctx,lease)
+        local cycle=ctx.questDepthEconomy;local record=ctx.questLootStop
+        if record and record.lease==lease then
+            if lootStopCurrent(ctx,record)then return record end
+            Q.clearLootStop(ctx);return
+        end
+        if not cycle or cycle.phase~='loot' and cycle.phase~='funding' or not lease
+            or lease.ctx~=ctx or lease.drill~=ctx.drill or not lease.confirmed then return end
+        Q.clearLootStop(ctx)
+        record={cycle=cycle,lease=lease,character=ctx.character,humanoid=ctx.humanoid,drill=ctx.drill,
+            band=workspace:GetAttribute('InfiniteDepthOffsetMeters'),class=s.classData and s.classData.SelectedClass,
+            job=game.JobId,runStarted=s.lootStarted};ctx.questLootStop=record
+        if not lootStopCurrent(ctx,record)then Q.clearLootStop(ctx);return end
+        local function observe()
+            if not lootStopCurrent(ctx,record)then return end
+            local owner=record.drill:GetAttribute('DriverUserId')
+            if owner==nil then record.releasedAt=record.releasedAt or now()
+            elseif owner~=api.Players.LocalPlayer.UserId then record.foreignSeen=true end
+        end
+        -- Capture an actual clear even if native proximity StartDriving seats
+        -- us again before the optional worker's next (possibly lagged) pulse.
+        pcall(function()
+            record.connection=record.drill:GetAttributeChangedSignal('DriverUserId'):Connect(observe)
+        end)
+        observe();return record
+    end
+    function Q.leaveLootSeat(ctx,cycle)
+        local record=ctx.questLootStop;local lease=record and record.lease
+        if not lootStopCurrent(ctx,record) or record.cycle~=cycle or record.foreignSeen
+            or not lease or not lease.abandoned or lease.stopAccepted~=true or not record.releasedAt
+            or not Q.driveStopped(ctx,lease) or calls.drive or humanDrivingInput(ctx)
+            or s.questDelivery or s.questCashJob or calls.drag or calls.cash or calls.shop
+            or s.bringDelivery or s.lootRequest or s.equipmentRequest or ctx.bringEquipmentLock then return false end
+        local seat=ctx.drill:FindFirstChild('DrillPhysicsSeat') or ctx.drill:FindFirstChild('VehicleSeat')
+        if not seat or not seat.Parent or not seat:IsA('BasePart') or not seat:IsDescendantOf(ctx.drill)
+            or (ctx.root.Position-seat.Position).Magnitude>3 then return false end
+        if not Q.holdRoute(ctx)then return ctx.questOwns==true end
+        -- Native TrainComponent auto-starts every0.1s inside three studs. Move
+        -- only this detached character after our accepted stop and real clear.
+        api.hover(ctx);ctx.root.CFrame=seat.CFrame*CFrame.new(0,5,12)
+        if ctx.root.AssemblyLinearVelocity then ctx.root.AssemblyLinearVelocity=Vector3.zero end
+        setStatus('Loot break: native driver released; moving clear of the auto-start area')
+        return true
+    end
     function Q.stopDrive(ctx)
         local wasDriving=ctx.questDriving or ctx.questSeating
         local lease=s.questDriveLease
         local wall=ctx.questWallWork;local drill=ctx.drill;local attached=ctx.humanoid.SeatPart
         local localSeat=drill and drill:FindFirstChild('LocalDriverSeat')
         local pending=calls.drive or lease and lease.abandoned and lease.stopIssued and lease.stopAccepted~=true
+        local handoff=ctx.questLootStop
+        if lootStopCurrent(ctx,handoff) and not handoff.foreignSeen and not handoff.recoveryUsed
+            and handoff.releasedAt and now()-handoff.releasedAt<=8
+            and handoff.lease.confirmed and handoff.lease.abandoned and handoff.lease.stopAccepted==true
+            and (not lease or lease==handoff.lease) and attached and attached==localSeat
+            and localSeat.Occupant==ctx.humanoid and driverId(drill)==api.Players.LocalPlayer.UserId
+            and not pending and not humanDrivingInput(ctx)then
+            -- The prior session actually cleared, then this exact character
+            -- was reseated in the still-owned break. Rearm once for this newly
+            -- observed session; an accepted/unknown stop alone is insufficient.
+            handoff.recoveryUsed=true;ctx.questDriving=true;wasDriving=true
+            lease={ctx=ctx,drill=drill,started=now(),confirmed=true};s.questDriveLease=lease
+        end
         local defense=ctx.questDrivingDefense
         if cfg.classQuest and enabled(ctx) and not manual() and defense and defense.driverReleased
             and defense.character==ctx.character and ctx.character==api.Players.LocalPlayer.Character
@@ -6819,6 +6926,7 @@ end)()
             ctx.questDriving=true;wasDriving=true;wall.released=nil
             lease={ctx=ctx,drill=drill,started=now(),confirmed=true};s.questDriveLease=lease
         end
+        if wasDriving and lease then observeLootStop(ctx,lease)end
         clearThrottle(ctx)
         if (ctx.questDriving or ctx.questSeating) and (not lease or lease.ctx~=ctx) then
             lease={ctx=ctx,drill=ctx.drill,started=ctx.questSeating or now()};s.questDriveLease=lease
@@ -6829,6 +6937,10 @@ end)()
                 -- It cannot later stop a new session just because its ID is ours.
                 s.questDriveLease=nil
             else lease.abandoned=true;Q.recoverDrive()end
+        end
+        local observed=ctx.questLootStop
+        if observed and lootStopCurrent(ctx,observed) and driverId(ctx.drill)==nil then
+            observed.releasedAt=observed.releasedAt or now()
         end
         ctx.questDriving=nil
         ctx.questSeatAckAt=nil
@@ -6933,6 +7045,7 @@ end)()
         if Q.healing then pcall(Q.healing.cleanup,ctx)end
         if Q.drillSupport then pcall(Q.drillSupport.cleanup,ctx)end
         pcall(Q.stopDrive,ctx)
+        Q.clearLootStop(ctx)
         if s.questDelivery and s.questDelivery.ctx==ctx then pcall(release,s.questDelivery) end
         if s.questCashJob and s.questCashJob.ctx==ctx then
             s.questCashJob.cancelled=true
@@ -8237,11 +8350,13 @@ end)()
         local refilling=refuelWork(ctx,plan)
         if refilling~=nil then return refilling end
         local cycle=Q.drillSupport.depthEconomy(ctx,plan)
+        if cycle and cycle.phase=='drive' then Q.clearLootStop(ctx)end
         if cycle and cycle.phase~='drive' and not Q.manual() and not Q.drillSupport.inDungeon(ctx) then
             Q.stopDrive(ctx)
             if ctx.humanoid.SeatPart or ctx.humanoid.Sit then
                 local ready,holding=Q.unseat(ctx);if not ready then return holding end
             end
+            if Q.leaveLootSeat(ctx,cycle)then return true end
             -- Finish the existing native owner before starting another pickup,
             -- sale, upgrade or driver session. A deadline cannot cancel an RPC.
             if s.questDelivery then
