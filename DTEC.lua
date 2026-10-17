@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.83: continuous lobby walking, interior pad arrival and solo-queue race guards.
+-- Version 0.84: native lobby movement after player controls; no geometry gate before walking.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 83
+    local REVISION = 84
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.83-continuous-lobby-walking"
+    local BUILD = "v0.84-native-lobby-walking"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -1258,9 +1258,12 @@ return function(api)
         local job=s.lobbyWalk
         if job then
             job.cancelled=true;disconnect(job)
+            if job.frameName and job.renderService then pcall(job.renderService.UnbindFromRenderStep,job.renderService,job.frameName)end
+            if job.frameConnection then pcall(job.frameConnection.Disconnect,job.frameConnection)end
             local _,model,h,root=api.character()
             if job.moving and api.owned() and model==job.character and h==job.humanoid and root==job.root
                 and root.Parent and h.Health>0 and type(h.MoveTo)=='function'then
+                if job.frameIssued and type(h.Move)=='function'then pcall(h.Move,h,Vector3.new(0,0,0),false)end
                 pcall(h.MoveTo,h,root.Position) -- Cancel only this walk's last owned goal.
             end
             s.lobbyWalk=nil
@@ -1377,54 +1380,38 @@ return function(api)
             q.settled=true
         end)
     end
-    -- Read ahead while retaining one final MoveTo goal. Probe geometry without
-    -- making the humanoid stop at the end of every short checked segment.
-    local function clearStep(job,goal)
-        local ok,result=pcall(function()
-            if type(workspace.Raycast)~='function' or type(workspace.Blockcast)~='function'then return end
-            local root,h=job.root,job.humanoid;local origin=root.Position
-            local hip=finite(h.HipHeight) and math.max(0,h.HipHeight) or 2
-            local size=root.Size
-            if not vector(size) or size.X<=0 or size.Y<=0 or size.X>10 or size.Y>10 or hip>6 then return end
-            local offset=hip+size.Y*.5
-            -- R6 HipHeight is an offset above its leg; R15 already includes
-            -- leg clearance. Do not misread clear R6 ground as a two-stud drop.
-            if Enum.HumanoidRigType and h.RigType==Enum.HumanoidRigType.R6 then
-                local leg=job.character:FindFirstChild('Left Leg')
-                if not leg or leg.Parent~=job.character or not leg:IsA('BasePart') or not vector(leg.Size)
-                    or leg.Size.Y<=0 or leg.Size.Y>6 then return end
-                offset=offset+leg.Size.Y
-            end
-            local floorY=origin.Y-offset
-            local dx,dz=goal.X-origin.X,goal.Z-origin.Z;local distance=math.sqrt(dx*dx+dz*dz)
+    local function bindMovement(job)
+        if job.frameName or job.frameConnection then return end
+        local ok,service=pcall(game.GetService,game,'RunService');if not ok or not service then return end
+        local function frame()
+            if s.lobbyWalk~=job or not W.guard()then return end
+            if job.mode=='enter' and ((tonumber(job.zone:GetAttribute('PlayerCount'))or 0)>0
+                or (tonumber(job.zone:GetAttribute('State'))or 0)>1)then W.stop(false);return end
+            if job.mode=='enter' and W.inside(job.zone,job.root.Position,1.5)==true
+                or job.mode=='exit' and near(job.root.Position,job.goal,2.5)then W.stop(false);return end
+            if not job.points or job.repath then return end
+            while not job.direct and job.index<=#job.points and near(job.root.Position,job.points[job.index].position,2)do job.index=job.index+1 end
+            local point=job.points[job.index];if not point then return end
+            local p=job.root.Position;local dx,dz=point.position.X-p.X,point.position.Z-p.Z
+            local distance=math.sqrt(dx*dx+dz*dz)
             if distance<.05 then return end
-            local speed=finite(h.WalkSpeed) and math.max(0,h.WalkSpeed) or 16
-            local length=math.min(math.max(12,math.min(48,speed*1.5)),distance);dx,dz=dx/distance,dz/distance
-            local ray=RaycastParams.new();ray.FilterType=Enum.RaycastFilterType.Exclude
-            ray.FilterDescendantsInstances={job.character};ray.RespectCanCollide=true;ray.IgnoreWater=false
-            ray.CollisionGroup=root.CollisionGroup
-            local width=math.max(3,size.X+1);local height=math.max(5,size.Y+offset)
-            local box=Vector3.new(width,height,width);local previous
-            for i=0,math.ceil(length/2)do
-                local along=math.min(i*2,length);local x,z=origin.X+dx*along,origin.Z+dz*along
-                local ground
-                for _,side in ipairs({0,-width*.5,width*.5})do
-                    local hit=workspace:Raycast(Vector3.new(x-dz*side,floorY+2,z+dx*side),Vector3.new(0,-4,0),ray)
-                    if not hit or not vector(hit.Position) or not vector(hit.Normal) or hit.Normal.Y<.7
-                        or math.abs(hit.Position.Y-floorY)>1.5 or Enum.Material and hit.Material==Enum.Material.Water then return end
-                    if side==0 then ground=hit.Position.Y end
-                end
-                local center=Vector3.new(x,ground+.5+height*.5,z)
-                if previous then
-                    local hit=workspace:Blockcast(CFrame.new(previous),box,center-previous,ray)
-                    if hit and (not vector(hit.Normal) or hit.Normal.Y<.7 or not vector(hit.Position)
-                        or math.abs(hit.Position.Y-ground)>1.5)then return end
-                end
-                previous=center;floorY=ground
-            end
-            return Vector3.new(origin.X+dx*length,floorY+offset,origin.Z+dz*length)
-        end)
-        return ok and vector(result) and result or nil
+            if point.jump then job.humanoid.Jump=true end
+            -- PlayerModule applies neutral Move input each frame and can cancel
+            -- MoveTo. Apply normal owned walking after it, without disabling it.
+            if type(job.humanoid.Move)=='function'then
+                local moved=pcall(job.humanoid.Move,job.humanoid,Vector3.new(dx/distance,0,dz/distance),false)
+                if moved then job.frameIssued=true else W.stop(true)end
+            elseif type(job.humanoid.MoveTo)=='function'then pcall(job.humanoid.MoveTo,job.humanoid,point.position)end
+        end
+        if type(service.BindToRenderStep)=='function' and type(service.UnbindFromRenderStep)=='function'then
+            local priority=Enum and Enum.RenderPriority and Enum.RenderPriority.Input and Enum.RenderPriority.Input.Value
+            local name='DTEC_LobbyWalk_'..tostring(job)
+            local bound=pcall(service.BindToRenderStep,service,name,(finite(priority) and priority or 100)+1,frame)
+            if bound then job.frameName,job.renderService=name,service;return end
+        end
+        if service.RenderStepped and type(service.RenderStepped.Connect)=='function'then
+            job.frameConnection=service.RenderStepped:Connect(frame)
+        end
     end
     function W.step(zone,mode,exit)
         local allowed,reason=W.guard()
@@ -1448,18 +1435,9 @@ return function(api)
             end
             api.status('Lobby walking: waiting for the owned path computation');return false
         end
-        if job.direct and job.points and not near(root.Position,job.points[1].position,.75)
-            and not clearStep(job,job.points[1].position)then
-            disconnect(job);job.direct=nil;job.noPath=nil;job.moving=nil;job.lastGoal=nil
-            job.failures=job.failures+1;job.retryAt=now()+3
-            if type(h.MoveTo)=='function'then pcall(h.MoveTo,h,root.Position)end
-        end
         if not job.points and (not job.attempted or job.noPath and now()>=(job.retryAt or 0))then
             job.attempted=true
-            local point=clearStep(job,goal)
-            if point then
-                job.points={{position=goal}};job.index=1;job.direct=true;job.lastGoal=nil
-            end
+            job.points={{position=goal}};job.index=1;job.direct=true;job.lastGoal=nil
         end
         if job.failures>=3 or now()-job.started>=60 then
             W.stop(true);s.lobbyWalkPauseUntil=now()+5
@@ -1484,13 +1462,14 @@ return function(api)
         end
         if not current(job) or type(h.MoveTo)~='function'then W.stop(true);return false end
         api.muteTouches(model)
+        bindMovement(job)
         if point~=job.lastGoal or now()>=(job.moveAt or 0)then
             if point.jump then h.Jump=true end
             local moved=pcall(h.MoveTo,h,point.position)
             if not moved then W.stop(true);api.status('Native lobby walking unavailable; waiting without teleporting');return false end
             job.lastGoal,job.moveAt,job.moving=point,now()+3,true
         end
-        api.status((job.direct and 'Walking along checked ground to the lobby ' or 'Walking to the lobby ')..(mode=='exit' and 'exit point' or 'Earth pad'))
+        api.status((job.direct and 'Walking directly to the lobby ' or 'Walking to the lobby ')..(mode=='exit' and 'exit point' or 'Earth pad'))
         return false
     end
     function W.leave(zone)
