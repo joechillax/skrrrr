@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.84: native lobby movement after player controls; no geometry gate before walking.
+-- Version 0.85: preserve native queue-pad touches during lobby walking and admission.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 84
+    local REVISION = 85
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.84-native-lobby-walking"
+    local BUILD = "v0.85-native-queue-touch"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -980,6 +980,11 @@ end
             end
         end
     end
+    local function nativeZoneTouch(zone)
+        -- A real transmitter means PartyZoneComponent owns admission through
+        -- its Touched callback. Do not suppress it or race it with another RPC.
+        return zone and zone:FindFirstChildOfClass('TouchTransmitter')~=nil
+    end
     local function configureParty()
         local c = controller("PartyCreateController")
         if not c or not c.CreateUI then return nil end
@@ -1191,7 +1196,7 @@ end
         status("Teleport failed; retrying automatically: " .. tostring(reason))
     end
     local buildLobbyWalk = (function()
--- Lobby character travel uses native pathfinding and Humanoid:MoveTo only.
+-- Lobby character travel uses native humanoid walking and guarded path recovery.
 return function(api)
     local W,s,now={},api.state,api.now
     local function finite(n)return type(n)=='number' and n==n and math.abs(n)<math.huge end
@@ -1385,6 +1390,8 @@ return function(api)
         local ok,service=pcall(game.GetService,game,'RunService');if not ok or not service then return end
         local function frame()
             if s.lobbyWalk~=job or not W.guard()then return end
+            local party=api.controller('PartyCreateController')
+            if job.mode=='enter' and (s.zone or party and party.Zone)then W.stop(false);return end
             if job.mode=='enter' and ((tonumber(job.zone:GetAttribute('PlayerCount'))or 0)>0
                 or (tonumber(job.zone:GetAttribute('State'))or 0)>1)then W.stop(false);return end
             if job.mode=='enter' and W.inside(job.zone,job.root.Position,1.5)==true
@@ -1461,7 +1468,8 @@ return function(api)
             api.status('Lobby path ended outside the pad; recalculating without teleporting');return false
         end
         if not current(job) or type(h.MoveTo)~='function'then W.stop(true);return false end
-        api.muteTouches(model)
+        if mode=='enter' and api.nativeTouch and api.nativeTouch(zone)then api.restoreEntryTouches()
+        else api.muteTouches(model)end
         bindMovement(job)
         if point~=job.lastGoal or now()>=(job.moveAt or 0)then
             if point.jump then h.Jump=true end
@@ -1503,6 +1511,7 @@ end)()
     lobbyWalker=buildLobbyWalk({state=s,now=now,owned=owned,Players=Players,character=character,
         enabled=function()return features and features.enabled()end,ready=function()return openingReady(Players.LocalPlayer)end,
         controller=controller,status=status,muteTouches=muteZoneTouches,
+        nativeTouch=nativeZoneTouch,restoreEntryTouches=restoreZoneTouches,
         restoreTouches=function()
             local c=controller('PartyCreateController')
             -- Keep the original touch/RPC serialization while a queue entry or
@@ -14677,6 +14686,7 @@ end
         local zone = c.Zone or s.zone
         if zone and zone.Parent then
             lobbyWalker.stop(false)
+            muteZoneTouches(model)
             if s.zone~=zone then s.zoneOwned=false;s.partyToken=nil end
             s.zone = zone
             if not s.zoneOwned and c.CreateUI.Visible and s.zoneEntered~=zone
@@ -14733,10 +14743,15 @@ end
         end
         if not selected then lobbyWalker.stop(true);status("Waiting for an empty PartyZone"); return end
         if now() < (s.nextAction or 0) then return end
-        -- Walk into the actual native zone before the existing serialized
-        -- queue request. Preserve its touch guard so one entry sends one RPC.
+        -- Let the real PartyZoneComponent touch admit the walking character.
+        -- Muting it during approach prevents the game's native entry trigger.
+        local natural=nativeZoneTouch(selected)
+        if natural then s.touchCandidate=nil;restoreZoneTouches()end
         if s.zoneOriginCharacter ~= model then s.zoneOrigin, s.zoneOriginCharacter = root.CFrame, model end
         if not lobbyWalker.step(selected,'enter')then return end
+        if natural then status('On the lobby pad; waiting for native queue admission');return end
+        -- Transmitter-free compatibility only: no native Touched listener can
+        -- race this serialized, actual-interior request. Recheck at dispatch.
         muteZoneTouches(model)
         s.touchCandidate, s.touchAt = selected, now()
         request("create", "TeleportManagerService", "TouchedZone", pack(selected), function(result)
@@ -14744,7 +14759,8 @@ end
             elseif s.touchCandidate == selected then s.touchAt = now() end
         end,function(token)
             local currentParty=controller('PartyCreateController')
-            return s.request==token and s.touchCandidate==selected and not s.zone and not(currentParty and currentParty.Zone)
+            return s.request==token and s.touchCandidate==selected and not nativeZoneTouch(selected)
+                and not s.zone and not(currentParty and currentParty.Zone)
                 and lobbyWalker.entryAllowed(selected,model,humanoid,root)
         end)
     end
