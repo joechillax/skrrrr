@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.88: scouting progress, native combat seat handoffs and normal zoom recovery.
+-- Version 0.89: direct chest returns, single-owner movement and responsive combat/receipt handoffs.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 88
+    local REVISION = 89
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.88-movement-defense-camera"
+    local BUILD = "v0.89-chest-movement-handoffs"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -9114,7 +9114,7 @@ end)()
         local threat=ctx.questThreat
         local liveThreat=threat and threat.Parent and (not api.enemyAlive or api.enemyAlive(threat))
             and (not api.isFuelLeech(threat) or Q.drillSupport.leechReady(ctx,threat))
-        local target=liveThreat and threat or ctx.combatTarget
+        local target=liveThreat and threat or ctx.combatTarget or api.localDefenseTarget and api.localDefenseTarget(ctx)
         local compatible
         if target and target.Parent and (not api.enemyAlive or api.enemyAlive(target))
             and (not api.questTargetAllowed or api.questTargetAllowed(ctx,target))then
@@ -9230,6 +9230,13 @@ end)()
         end
         return requiredClass and api.findTool(ctx,requiredClass) or nil,true
     end
+    function Q.deliveryChestReady(ctx,job)
+        -- Only a positively accepted native drop can share its replication wait
+        -- with chest work. Pending/unknown item mutations retain their lane.
+        return job and job.ctx==ctx and (job.kind=='sale' or job.kind=='gold') and not job.shop
+            and job.stage=='receipt' and job.background==true and job.droppedAt~=nil
+            and not job.cancelled and not job.owns and not job.pending and not calls.drag and not ctx.bringEquipmentLock
+    end
     function Q.chestTurn(ctx,plan)
         local delivery=s.questDelivery;local cash=s.questCashJob
         local visit=ctx.questDepthMine
@@ -9241,7 +9248,7 @@ end)()
         local cashDetached=detachedWork and cash and cash.cancelled and not cash.movementHeld
         if not cfg.classQuest or not ctx.questChestCandidate or not api.chestCandidate or ctx.currentChest
             or ctx.featureHold or ctx.defenseMoving or ctx.dodgeUntil and now()<ctx.dodgeUntil
-            or delivery and not deliveryDetached or cash and not cashDetached
+            or delivery and not deliveryDetached and not Q.deliveryChestReady(ctx,delivery) or cash and not cashDetached
             or s.bringDelivery or s.lootRequest or s.equipmentRequest
             or ctx.questMineEntry or ctx.questPotionUsing or Q.drillSupport.inDungeon(ctx) and not Q.drillSupport.activeMine()
                 and not Q.special.bound(ctx) or Q.manual()
@@ -9452,7 +9459,10 @@ end)()
             local sale=s.questDelivery
             if sale and sale.ctx==ctx and (sale.kind=='sale' or sale.kind=='gold') then
                 local busy=deliveryStep(ctx,plan)
-                if busy and not (sale.cancelled and sale.movementReleased) then return true end
+                if busy and not (sale.cancelled and sale.movementReleased) then
+                    if not drivingDue and Q.deliveryChestReady(ctx,sale)then Q.chestTurn(ctx,plan)end
+                    return true
+                end
             end
             -- Finish the existing sale above, then give an already-due drive
             -- its turn. A stream of new sale items must not restart this lane.
@@ -9474,7 +9484,10 @@ end)()
             -- sale, upgrade or driver session. A deadline cannot cancel an RPC.
             if s.questDelivery then
                 local sale=s.questDelivery;local busy=deliveryStep(ctx,plan)
-                if busy and not (sale.cancelled and sale.movementReleased) then return true end
+                if busy and not (sale.cancelled and sale.movementReleased) then
+                    if Q.deliveryChestReady(ctx,sale)then Q.chestTurn(ctx,plan)end
+                    return true
+                end
                 if s.questDelivery then ctx.questOwns=nil;return false end
             end
             if Q.cashStep(ctx) then return true end
@@ -10154,14 +10167,27 @@ return function(api)
         s.routeScanX, ctx.flags.ScanX = x, x
         s.routeLogical = geometry.offset + math.max(0, x - geometry.start.X) / geometry.scale
     end
-    function M.cancel(ctx)
+    function M.cancel(ctx, preserveChestReturn)
+        if not preserveChestReturn then ctx.chestDetour=nil end
         local token = ctx.travel
         if not token then return end
         token.cancelled = true
         if token.tween then pcall(function() token.tween:Cancel() end) end
         ctx.travel = nil
     end
+    function M.beginChestDetour(ctx)
+        -- Chest positioning and route tweens share the same root. Transfer
+        -- ownership synchronously, before the recovered chest routine can pose.
+        M.cancel(ctx,true)
+        local geometry=api.state.routeGeometry
+        if not ctx.chestDetour and geometry and not ctx.dungeon and not ctx.questHealing
+            and not ctx.defenseMoving and not ctx.pendingThreat and now()>=(ctx.dodgeUntil or 0)then
+            ctx.chestDetour={character=ctx.character,root=ctx.root,drill=ctx.drill,position=point(ctx),
+                start=geometry.start,finishX=geometry.finishX,offset=geometry.offset,scale=geometry.scale}
+        end
+    end
     function M.paused(ctx)
+        if ctx.currentChest and coroutine.running()~=ctx.lootThread then return true end
         if ctx.questOwns or ctx.questDriving or ctx.questSeating then return true end
         if ctx.dungeon then return true end
         if ctx.smartLootWindow and now() < ctx.smartLootWindow.untilAt and coroutine.running() ~= ctx.featureThread then return true end
@@ -10390,8 +10416,25 @@ return function(api)
         -- A detour already inside this segment rejoins at its current X; one
         -- beyond it returns directly to its end, not back to the start and out.
         current=point(ctx)
-        local rejoinX=math.max(checkpoint,math.min(x,current.X))
-        if not M.travel(ctx, M.scanPoint(ctx, rejoinX)) then return false end
+        local detour=ctx.chestDetour
+        local geometry=api.state.routeGeometry
+        local direct=detour and geometry and detour.character==ctx.character and detour.root==ctx.root
+            and detour.drill==ctx.drill and detour.start==geometry.start and detour.finishX==geometry.finishX
+            and detour.offset==geometry.offset and detour.scale==geometry.scale
+        local rejoinX=math.max(checkpoint,math.min(x,direct and detour.position.X or current.X))
+        if direct then
+            -- Return a completed chest batch directly to its saved route axis.
+            -- Check both loaded locations; distant loot never credits unscouted X.
+            if not M.routeReady(ctx,rejoinX)then return false end
+            ctx.check()
+            if M.paused(ctx)then return false end
+            M.cancel(ctx)
+            ctx.root.CFrame=CFrame.new(M.scanPoint(ctx,rejoinX))
+            if ctx.root.AssemblyLinearVelocity then ctx.root.AssemblyLinearVelocity=Vector3.zero end
+        else
+            ctx.chestDetour=nil
+            if not M.travel(ctx, M.scanPoint(ctx, rejoinX)) then return false end
+        end
         -- The rejoin can yield; require loaded geometry again before advancing.
         if not M.routeReady(ctx, x) then return false end
         local reached=M.travel(ctx, M.scanPoint(ctx, x), function(position) M.commitRoute(ctx, position) end)
@@ -10414,6 +10457,7 @@ end
 end)()
     local movement = buildMovement(api)
     F.travelDepth, F.cancelTravel = movement.travel, movement.cancel
+    F.beginChestDetour=movement.beginChestDetour
     F.syncRoute, F.initializeRoute, F.travelRoute = movement.syncRoute, movement.initializeRoute, movement.travelRoute
     F.hover = movement.hover
     local DEFAULTS = { lootExtract = false, minutes = 7, classQuest = false, driveDepth = true }
@@ -12164,6 +12208,7 @@ end)()
         end,
         findTool=findTool, canSelectEquipment=F.canSelectEquipment, hasRoom=hasRoom, ownedTools=tools, enemies=F.enemies, enemyAlive=F.enemyAlive, questTargetAllowed=F.questTargetAllowed,
         swordTargetAllowed=F.swordTargetAllowed, weaponClass=function(ctx,target)return F.weaponClass(ctx,target)end,
+        localDefenseTarget=function(ctx)return F.localDefenseTarget(ctx)end,
         attack=function(ctx,active)return F.swing(ctx,active)end,
         isFuelLeech=F.isFuelLeech, persist=persist, hover=movement.hover,
         miningBounds=function(node)
@@ -12788,6 +12833,18 @@ end)()
             return 'Pickaxe'
         end
         if not F.swordTargetAllowed(target) or ctx.pickaxeTargets and ctx.pickaxeTargets[target]then return 'Pickaxe' end
+    end
+    function F.localDefenseTarget(ctx)
+        local record=ctx.localDefense
+        local target=record and record.target
+        local p=target and (target.PrimaryPart or target:FindFirstChild('HumanoidRootPart') or target:FindFirstChild('RootPart'))
+        if not record or record.character~=ctx.character or record.root~=ctx.root or record.drill~=ctx.drill
+            or record.band~=workspace:GetAttribute('InfiniteDepthOffsetMeters') or ctx.questParasiteTarget
+            or not p or not p.Parent or not F.enemyAlive(target) or not F.questTargetAllowed(ctx,target)
+            or (p.Position-ctx.root.Position).Magnitude>record.range or F.weaponClass(ctx,target)~='Pickaxe'then
+            ctx.localDefense=nil;return
+        end
+        return target
     end
     function F.afterAttack(ctx, target, class, before)
         if cfg.classQuest and (ctx.questCombat or ctx.questMining) and target and F.enemyAlive(target) then
@@ -14049,10 +14106,11 @@ end
             -- Native armor compatibility precedes an exact kill requirement.
             -- Only loaded living targets already in local melee reach can
             -- trigger this in-place defense; it never starts a distant chase.
-            local armorTarget,armorDistance
+            local armorTarget,armorDistance,armorRange
             if features and not ctx.questParasiteTarget then
                 local range=selected and selected.melee and selected.range or 13
                 range=type(range)=='number' and math.max(0,math.min(45,range)) or 13
+                armorRange=range
                 for _,npc in ipairs(features.enemies())do
                     local p=npc.PrimaryPart or npc:FindFirstChild('HumanoidRootPart') or npc:FindFirstChild('RootPart')
                     if p and features.enemyAlive(npc) and features.questTargetAllowed(ctx,npc)
@@ -14062,6 +14120,8 @@ end
                     end
                 end
             end
+            ctx.localDefense=armorTarget and {target=armorTarget,range=armorRange,character=ctx.character,
+                root=ctx.root,drill=ctx.drill,band=workspace:GetAttribute('InfiniteDepthOffsetMeters')} or nil
             local target=armorTarget or ctx.combatTarget or combat.target
             local preferClass = features and features.weaponClass(ctx,target)
             if preferClass then
@@ -14370,6 +14430,7 @@ end
                     local record = chestRecord(entry)
                     if record.locked or record.retired or now() < (record.retryAt or 0) then return "locked" end
                     local attempts = s.stats.promptFires
+                    features.beginChestDetour(ctx)
                     ctx.currentChest = record
                     record.healingPosed=nil
                     ctx.chestStarted = now()
@@ -14647,6 +14708,7 @@ end
             local offset = math.min(2, radius / 4)
             local destination = target + Vector3.new(0, offset, offset)
             if ctx.questHealing and not features.healingPointSafe(ctx,destination)then return false end
+            features.beginChestDetour(ctx)
             if ((root.CFrame.Position or root.Position) - destination).Magnitude > 0.5 then
                 root.CFrame = CFrame.new(destination)
             end
@@ -14768,7 +14830,7 @@ end
                         if reached then
                             s.routeScanX=math.max(s.routeScanX or nextX,nextX)
                             ctx.flags.ScanX=s.routeScanX
-                            taskApi.wait(0.15)
+                            taskApi.wait(0.03) -- Yield one frame between scouting segments.
                             local candidates = ctx.helpers[9164528]()
                             for _, entry in ipairs(candidates) do
                                 ctx.check(); ctx.awaitCombat()
