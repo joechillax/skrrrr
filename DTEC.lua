@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.80: walk to lobby queue pads without character teleports.
+-- Version 0.81: native opening readiness, quest potions, blueprint stacks and cutscene context.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 80
+    local REVISION = 81
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.80-lobby-walking"
+    local BUILD = "v0.81-game-update-compatibility"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -286,6 +286,14 @@ end)()
         local humanoid = model and model:FindFirstChildOfClass("Humanoid")
         local root = model and model:FindFirstChild("HumanoidRootPart")
         return player, model, humanoid, root
+    end
+    local function openingReady(player)
+        local gui=player and player:FindFirstChild('PlayerGui')
+        -- Match Client.lua's native opening wait. Do not dismiss the player's
+        -- free-class choice or manufacture its loading/readiness attributes.
+        return gui and not gui:FindFirstChild('LoadingScreen') and not gui:FindFirstChild('Intro')
+            and not(gui:FindFirstChild('FreeClass') and player:GetAttribute('ChoseFreeClass')~=true)
+            and player:GetAttribute('LoadingDone')~=false and player:GetAttribute('FreeClassDone')~=false
     end
     local function alive(player, model, humanoid, root)
         return player and model and model.Parent and humanoid and root and root.Parent
@@ -1196,7 +1204,8 @@ return function(api)
     local function isLobby()return game.PlaceId==101906032112547 or workspace:FindFirstChild('Lobby')~=nil end
     local function current(job,queueEntry)
         local player,model,h,root=api.character()
-        return api.owned() and game:IsLoaded() and isLobby() and api.enabled() and model and model.Parent and h and root and root.Parent
+        return api.owned() and game:IsLoaded() and isLobby() and api.enabled() and (not api.ready or api.ready())
+            and model and model.Parent and h and root and root.Parent
             and player.Character==model and finite(h.Health) and h.Health>0 and player:GetAttribute('RejoinDead')~=true
             and not s.teleporting and not s.departureAt and (not s.request or queueEntry and s.request.kind=='create') and not s.awaiting
             and not workspace:GetAttribute('InCutScene') and player.GameplayPaused~=true
@@ -1431,7 +1440,8 @@ end
 end)()
     local features
     lobbyWalker=buildLobbyWalk({state=s,now=now,owned=owned,Players=Players,character=character,
-        enabled=function()return features and features.enabled()end,controller=controller,status=status,muteTouches=muteZoneTouches,
+        enabled=function()return features and features.enabled()end,ready=function()return openingReady(Players.LocalPlayer)end,
+        controller=controller,status=status,muteTouches=muteZoneTouches,
         restoreTouches=function()
             local c=controller('PartyCreateController')
             -- Keep the original touch/RPC serialization while a queue entry or
@@ -6417,6 +6427,7 @@ return function(api,Q)
     local exact={CutlassKills='Sword_Pirate',FlintlockKills='Flintlock',UseSpeedPotion='SpeedPotion',
         UseStrengthPotion='StrengthPotion',UseInvisibilityPotion='InvisibilityPotion',UseReviveKit='ReviveKit',
         BlessTeammates='Staff_Priest',ConsumeCorpses='VampirePendant',MeleeLifestealHealing='VampirePendant'}
+    for objective,id in pairs(Q.capabilities.potions)do exact[objective]=id end
     local turrets={BasicSentry=true,AdvancedSentry=true,Flamethrower=true,Frostthrower=true}
     local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
     function I.catalog()
@@ -7192,7 +7203,8 @@ end)()
     local guns = {GunKills=true, HeadShot=true, ShotgunKills='Shotgun', RifleKills='Rifle'}
     local mining = {MineCoal=true,MineDiamond=true,MineRuby=true,MineOres=true,MineGems=true}
     local sales = {SellGoldItems=true,SellCorpse=true,SellScrap=true,SellGems=true}
-    local potions = {UseSpeedPotion='SpeedPotion',UseStrengthPotion='StrengthPotion',UseInvisibilityPotion='InvisibilityPotion'}
+    local potions = {UseSpeedPotion='SpeedPotion',UseStrengthPotion='StrengthPotion',UseInvisibilityPotion='InvisibilityPotion',
+        UseNightVisionPotion='NightVisionPotion',UseLuckPotion='LuckPotion'}
     local upgradeGoals = {BuyDriveSpeed='DriveSpeed',BuyEngineOverdrive='EngineOverdrive'}
     local specialGoals={ShredScrap=true,PlaceTurrets=true,TurretKills=true,CompleteDungeon=true,CompleteGoblinRing=true}
     local stock
@@ -10994,7 +11006,8 @@ end)()
         end
         return list
     end
-    -- ToolStack uses MedicalStackCount for relics as well as stacked medical tools.
+    local auraModule
+    -- ToolStack uses MedicalStackCount for relics, blueprints and stacked medical tools.
     local RELICS = {RareShard = true, EpicShard = true, LegendaryShard = true, MythicShard = true, VoidCrystal = true}
     local function isRelic(item) return RELICS[id(item)] == true or attr(item, 'Class') == 'Relic'
         or attr(item,'Category')=='Relic' or attr(item,'Relic')==true or attr(item,'ClassRelic')==true end
@@ -11039,10 +11052,31 @@ end)()
         local ok,passives=pcall(resolver.ResolvePlayerPassives,api.Players.LocalPlayer,workspace)
         return ok and type(passives)=='table' and passives.StackMedicalTools==true
     end
+    local function blueprintStacks(ctx,item,inventory)
+        local rules=auraModule and auraModule('ToolStack')
+        if not rules or type(rules.IsBlueprint)~='function' or type(rules.CanStackBlueprints)~='function'then return end
+        local ok,blueprint=pcall(rules.IsBlueprint,item)
+        if not ok or not blueprint then return end
+        local matches={}
+        for _,owned in ipairs(inventory or tools(ctx))do
+            local checked,compatible=pcall(rules.CanStackBlueprints,item,owned)
+            if owned~=item and checked and compatible then matches[owned]=stackCount(owned)end
+        end
+        return next(matches)and matches or nil
+    end
+    local function blueprintReceipt(ctx,pending)
+        if not pending.stackTargets or not ctx.active or not api.owned()
+            or ctx.character~=api.Players.LocalPlayer.Character then return false end
+        for _,owned in ipairs(tools(ctx))do
+            local before=pending.stackTargets[owned]
+            if before and stackCount(owned)>before then return true end
+        end
+        return false
+    end
     local function hasRoom(ctx, item, inventory)
         inventory = inventory or tools(ctx)
         return #inventory < toolbarCapacity() or (RELICS[id(item)] == true or stacksMedical(item))
-            and inventoryCount(ctx, id(item), inventory) > 0
+            and inventoryCount(ctx, id(item), inventory) > 0 or blueprintStacks(ctx,item,inventory)~=nil
     end
     F.isRelic, F.stackCount, F.hasRoom = isRelic, stackCount, hasRoom
     local rarity = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6, Secret = 7 }
@@ -11649,6 +11683,7 @@ end)()
         return operation(ctx, 'InteractionService', 'Interact', item, callback)
     end
     local function gearReceipt(ctx, pending)
+        if blueprintReceipt(ctx,pending)then return true end
         if pending.relic and inventoryCount(ctx, pending.id) > pending.beforeCount then return true end
         for _, tool in ipairs(tools(ctx)) do
             if id(tool) == pending.id and not pending.inventory[tool] then return true end
@@ -11796,7 +11831,7 @@ end)()
     end
     local function pickupRecord(ctx, target)
         local record = {item = target, id = id(target), slot = armorSlot(target), inventory = {}, started = now(),
-            relic = isRelic(target), beforeCount = inventoryCount(ctx, id(target))}
+            relic = isRelic(target), beforeCount = inventoryCount(ctx, id(target)),stackTargets=blueprintStacks(ctx,target)}
         for _, item in ipairs(tools(ctx)) do record.inventory[item] = true end
         for _, item in ipairs(children(ctx.character)) do record.inventory[item] = true end
         return record
@@ -11819,7 +11854,6 @@ end)()
         roomPending = function() return s.rareShardDrop ~= nil end,
         receipt = pickupRecord, received = gearReceipt, confirm = finishGearReceipt, accepted = api.accepted,
         interact = function(ctx, item, callback) return operation(ctx, 'InteractionService', 'Interact', item, callback) end})
-    local auraModule
     local questApi
     questApi = {state=s, now=now, controller=controller, remote=api.remote, event=api.event, RS=api.RS, RunService=api.RunService,
         passives=function()
@@ -12013,7 +12047,7 @@ end)()
         s.smartLootStatus = 'Picking up ' .. id(target)
         if not move(ctx, target) then release(ctx); return false end
         local record = { item = target, id = id(target), slot = armorSlot(target), inventory = {}, started = now(),
-            relic = isRelic(target), beforeCount = inventoryCount(ctx, id(target)) }
+            relic = isRelic(target), beforeCount = inventoryCount(ctx, id(target)),stackTargets=blueprintStacks(ctx,target) }
         for _, item in ipairs(tools(ctx)) do record.inventory[item] = true end
         for _, item in ipairs(children(ctx.character)) do record.inventory[item] = true end
         ctx.gearPickup = record; ctx.itemRetry[target] = now() + 300
@@ -13027,6 +13061,7 @@ end)()
 
     local function packingReceipt(ctx, pending)
         if not pending or not pending.expected or not pending.inventory then return false end
+        if blueprintReceipt(ctx,pending)then return true end
         if pending.item and isRelic(pending.item)
             and inventoryCount(ctx, pending.expected) > (pending.beforeCount or 0) then return true end
         for _, tool in ipairs(tools(ctx)) do
@@ -13062,6 +13097,7 @@ end)()
         if not pending.expected then
             pending.expected = id(item)
             pending.beforeCount = inventoryCount(ctx, pending.expected)
+            pending.stackTargets=blueprintStacks(ctx,pending.item)
             for _, tool in ipairs(tools(ctx)) do pending.inventory[tool] = true end
             for _, piece in ipairs(children(ctx.character)) do pending.inventory[piece] = true end
         end
@@ -14598,7 +14634,7 @@ end
                     s.startedZone, s.zoneStartedAt = zone, now()
                     waitTransition("start", zone)
                 else status("Solo start rejected; retrying after backoff") end
-            end)
+            end,function()return openingReady(player)end)
             return
         end
         s.zone, s.zoneOwned = nil, false
@@ -14731,10 +14767,17 @@ end
         if now() >= (record.nextAttempt or 0) then
             -- These are the exact two calls made by CutSceneUI.Skip.MouseButton1Click.
             local method = private and "VoteSkipPrivate" or "VoteSkip"
-            local args = private and pack(runtimeId, record.name) or pack(record.name, runtimeId)
+            local args = private and pack(runtimeId, record.name) or pack(record.name, context)
             request("skip-cutscene", "CutSceneService", method, args, function(result)
                 record.voted = accepted(result)
                 record.nextAttempt = now() + 5
+            end,function()
+                return owned() and openingReady(Players.LocalPlayer) and s.cutsceneSkip==record and controller('CutSceneController')==c
+                    and c.CurrentCutSceneSessionId==record.session and c.CurrentCutScene==record.name
+                    and c.CurrentCutSceneContext==context and not c.AbortingCutScene
+                    and (not context or context.RuntimeId==runtimeId and context.DisableSkip~=true
+                        and (context.Private and runtimeId~=nil or false)==private)
+                    and c.UI and c.UI.Enabled and c.SkipButton and c.SkipButton.Visible
             end)
         end
         return true
@@ -14762,7 +14805,7 @@ end
         s.services = serviceRoot
         setup(player, packages)
         features.ui(player)
-        if features.quest and features.quest.recoverDrive then pcall(features.quest.recoverDrive)end
+        if openingReady(player) and features.quest and features.quest.recoverDrive then pcall(features.quest.recoverDrive)end
         updateMetrics(player)
         local live = alive(player, model, humanoid, root)
         local isLobby = game.PlaceId == 101906032112547 or workspace:FindFirstChild("Lobby")
@@ -14771,6 +14814,10 @@ end
         reports.observe(player, isPlanet, live)
         reports.pump()
         pumpRequest()
+        if not openingReady(player)then
+            stopFarm();lobbyWalker.stop(true)
+            status('Waiting for native loading, intro or free-class selection to finish');return
+        end
         if s.departureAt and not s.teleporting then
             if now() - s.departureAt < 30 then status("Waiting for departure/loading fade"); return end
             s.departureAt = nil
