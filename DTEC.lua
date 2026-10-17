@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.86: match native public cutscene skip name and runtime ID arguments.
+-- Version 0.87: native equipment receipts, ready mine entry, 7000-Coin head start and automatic noclip.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 86
+    local REVISION = 87
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.86-native-cutscene-vote"
+    local BUILD = "v0.87-responsive-handoffs"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -40,6 +40,7 @@ return function(source)
         for _, connection in ipairs(previous.connections) do pcall(function() connection:Disconnect() end) end
     end
     if previous and previous.fullbright then pcall(previous.fullbright.cleanup)end
+    if previous and previous.noclip then pcall(previous.noclip.cleanup)end
     if previous and previous.lobbyWalker then pcall(previous.lobbyWalker.cleanup);previous.lobbyWalker=nil end
     if previous and previous.gui then pcall(previous.gui.dispose); previous.gui = nil end
     local s = previous and previous.job == job and previous or {}
@@ -205,6 +206,56 @@ end)()
     s.claims = s.claims or {}
     s.gemSeen = s.gemSeen or setmetatable({}, { __mode = "k" })
     local function owned() return env[KEY] == s and s.owner == owner end
+    local buildCharacterNoclip = (function()
+-- Character collision policy shared by lobby, chest-only and quest modes.
+-- Touch transmitters, anchoring, seat joints and world/drill parts are untouched.
+return function(api)
+    local N={}
+    local model,added
+    local parts=setmetatable({}, {__mode='k'})
+    local function restore()
+        if added then pcall(function()added:Disconnect()end);added=nil end
+        for part,value in pairs(parts)do
+            pcall(function()if part.Parent then part.CanCollide=value end end)
+        end
+        parts=setmetatable({}, {__mode='k'});model=nil
+    end
+    local function apply(part)
+        if model and part:IsA('BasePart') and part:IsDescendantOf(model)then
+            if parts[part]==nil then parts[part]=part.CanCollide end
+            if part.CanCollide then part.CanCollide=false end
+        end
+    end
+    function N.step()
+        if not api.owned()then N.cleanup();return end
+        local player=api.Players.LocalPlayer
+        local current=player and player.Character
+        if current~=model then
+            restore();model=current
+            if model then
+                if model.DescendantAdded then added=model.DescendantAdded:Connect(apply)end
+                for _,part in ipairs(model:GetDescendants())do apply(part)end
+            end
+        end
+        for part,value in pairs(parts)do
+            if not model or not part:IsDescendantOf(model)then
+                pcall(function()if part.Parent then part.CanCollide=value end end)
+                parts[part]=nil
+            elseif part.CanCollide then part.CanCollide=false end
+        end
+    end
+    function N.cleanup()
+        if N.connection then pcall(function()N.connection:Disconnect()end);N.connection=nil end
+        restore()
+    end
+    local signal=api.RunService.PreSimulation or api.RunService.Stepped
+    if signal then N.connection=signal:Connect(N.step)end
+    N.step()
+    return N
+end
+
+end)()
+    s.noclip=buildCharacterNoclip({owned=owned,Players=Players,RunService=RunService})
     local requestSlots = { "request", "rewardRequest", "classRequest", "skipRequest", "probeRequest", "equipmentRequest", "lootRequest", "lootQuery", "upgradeRequest" }
     local function requestSlot(kind)
         if kind == "claim-reward" or kind == "claim-vip" then return "rewardRequest" end
@@ -3399,7 +3450,7 @@ end)()
     -- A depth run funds its initial budget before taking the driver seat.
     -- Later rounds allow up to one minute of loot, sales and upgrade work.
     -- A gem value is not a finish signal; confirmed empty loaded work may yield early.
-    D.depthFundingCoins,D.depthDriveSeconds,D.depthLootSeconds=10000,150,60
+    D.depthFundingCoins,D.depthDriveSeconds,D.depthLootSeconds=7000,150,60
     D.depthFundingIdleSeconds=60
     function D.depthEconomy(ctx,plan)
         if plan.kind~='depth' or not cfg.driveDepth or not Q.enabled(ctx) then return end
@@ -3421,7 +3472,7 @@ end)()
         ctx.questDepthEconomy,s.questDepthEconomy=cycle,cycle
         local wallet=Q.coinBalance(s.questWallet,s.questWalletAt,s.questWalletVersion)
         if cycle.phase=='funding' then
-            -- Aim for 10k while real funding progresses. An exhausted loaded
+            -- Aim for 7k while real funding progresses. An exhausted loaded
             -- route must not wait below the target until the 90s save exit.
             -- The existing activity watch counts native income, chest removal,
             -- observed loot and objective changes; requests cannot reset it.
@@ -3461,7 +3512,7 @@ end)()
         local cycle=D.depthEconomy(ctx,plan)
         if not cycle then return end
         if cycle.phase=='funding' then
-            return string.format('Head start: chests, mines, ore processing and sales, %.0f / 10000 Coins',s.questWallet or 0)
+            return string.format('Head start: chests, mines, ore processing and sales, %.0f / %.0f Coins',s.questWallet or 0,D.depthFundingCoins)
         elseif cycle.phase=='loot' then
             return string.format('Chest loot, sales and upgrade checks: up to %.0fs remaining',math.max(0,D.depthLootSeconds-(now()-cycle.lootAt)))
         end
@@ -5545,7 +5596,16 @@ end)()
         if not collectAll and not refueling and (plan.kind=='waiting' or plan.kind=='advance' or plan.kind=='complete' or plan.kind=='unsupported')then D.cleanup(ctx);return false end
         if ctx.questMineEntry and (not ctx.questMineEntry.exit or not D.inDungeon(ctx)) and D.entry(ctx)then return true end
         if D.activeMine() and now()<(ctx.questMineReadyAt or 0)then
-            Q.holdRoute(ctx);api.watch(ctx);status('Mineshaft entry confirmed; allowing veins to stream in');return true
+            local mine=D.activeMine();local loaded=false
+            if api.Players.LocalPlayer.GameplayPaused~=true then
+                for _,node in ipairs(api.tagged('Ore'))do
+                    if D.mineshaft(node)==mine and D.nodeAllowed(node,false) and D.accessible(node)then loaded=true;break end
+                end
+            end
+            if not loaded then
+                Q.holdRoute(ctx);api.watch(ctx);status('Mineshaft entry confirmed; allowing veins to stream in');return true
+            end
+            ctx.questMineReadyAt=nil -- Actual usable vein; no remaining blind entry sleep.
         end
         if now()<(ctx.questMineYieldUntil or 0)then return false end
         local detached=collectAll and detachedDepthDelivery(ctx,activeMine)
@@ -11189,6 +11249,27 @@ end)()
                 or active.Tool.Name == name .. tostring(api.Players.LocalPlayer.UserId) then return active end
         end
     end
+    local function observeEquipment(ctx)
+        local c=controller('ToolController')
+        if not c or ctx.equipmentObserverController==c or not ctx.connect
+            or not c.ToolChanged or type(c.ToolChanged.Connect)~='function' then return end
+        if ctx.equipmentObserver then pcall(function()ctx.equipmentObserver:Disconnect()end)end
+        ctx.equipmentObserverController=c
+        ctx.equipmentObserver=ctx.connect(c.ToolChanged,function(active)
+            if not ctx.active or not api.owned() or s.farm~=ctx
+                or ctx.character~=api.Players.LocalPlayer.Character or controller('ToolController')~=c
+                or not active or active~=c.ActiveTool or c.ServerEquipId==nil then return end
+            for tool,record in pairs(s.equipRecords or {})do
+                if record.selectionContext==ctx and record.selectionController==c
+                    and record.selection and activeFor(ctx,tool)==active then
+                    -- Retain the native effect receipt even if driving or another
+                    -- native selection removes the handler before our next poll.
+                    -- An unresolved transport still owns its original reservation.
+                    record.nativeSelection=record.selection
+                end
+            end
+        end)
+    end
     local function rebindHandler(ctx,tool)
         local c=controller('ToolController');local name=id(tool)
         if not c or type(c.Equip)~='function' or not name or c.ServerEquipId==nil
@@ -11318,6 +11399,7 @@ end)()
             and not(scene and (scene.CurrentCutScene or scene.AbortingCutScene))
     end
     local function equip(ctx, tool)
+        observeEquipment(ctx)
         local record=tool and s.equipRecords[tool]
         if ctx.bringEquipmentLock or not tool or not tool.Parent or not F.canSelectEquipment(ctx,tool)then
             if record then record.emptyRecovery=nil end
@@ -11330,6 +11412,11 @@ end)()
         end
         local active = activeFor(ctx, tool)
         if active then s.equipRecords[tool] = nil; return active end
+        if record and record.accepted and not record.pending and not record.uncertain
+            and record.selection and record.nativeSelection==record.selection
+            and record.selectionContext==ctx and record.selectionController==controller('ToolController')then
+            s.equipRecords[tool]=nil;record=nil
+        end
         if rebindHandler(ctx,tool)then
             if record then record.emptyRecovery=nil end
             active=activeFor(ctx,tool)
@@ -11392,6 +11479,8 @@ end)()
         local acceptedBefore=record.accepted
         record.pending = true; record.notDispatched = nil; record.rejected = nil
         record.issuedAt=now();record.settledAt=nil
+        record.selection={};record.nativeSelection=nil
+        record.selectionContext,record.selectionController=ctx,nativeController
         local dispatchGuard=function(token)
             if not equipmentSelectionReady() or not ctx.active or not api.owned() or s.farm~=ctx
                 or ctx.character~=api.Players.LocalPlayer.Character or ctx.humanoid.Health<=0
@@ -14875,6 +14964,7 @@ end
     end
     local function tick()
         loadFresh()
+        s.noclip.step()
         local player, model, humanoid, root = character()
         lobbyWalker.guard()
         if not game:IsLoaded() or not player or not child(player, "PlayerGui") then
