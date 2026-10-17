@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.87: native equipment receipts, ready mine entry, 7000-Coin head start and automatic noclip.
+-- Version 0.88: scouting progress, native combat seat handoffs and normal zoom recovery.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 87
+    local REVISION = 88
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.87-responsive-handoffs"
+    local BUILD = "v0.88-movement-defense-camera"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -41,6 +41,7 @@ return function(source)
     end
     if previous and previous.fullbright then pcall(previous.fullbright.cleanup)end
     if previous and previous.noclip then pcall(previous.noclip.cleanup)end
+    if previous and previous.cameraRecovery then pcall(previous.cameraRecovery.cleanup)end
     if previous and previous.lobbyWalker then pcall(previous.lobbyWalker.cleanup);previous.lobbyWalker=nil end
     if previous and previous.gui then pcall(previous.gui.dispose); previous.gui = nil end
     local s = previous and previous.job == job and previous or {}
@@ -256,6 +257,64 @@ end
 
 end)()
     s.noclip=buildCharacterNoclip({owned=owned,Players=Players,RunService=RunService})
+    local buildCameraRecovery = (function()
+-- Briefly use the standard zoom limits to leave first person, then release them.
+return function(api)
+    local C={}
+    local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
+    local function restore()
+        local job=C.pending;C.pending=nil
+        if not job then return end
+        pcall(function()
+            if job.player.CameraMinZoomDistance==job.minimum then job.player.CameraMinZoomDistance=job.beforeMin end
+            if job.player.CameraMaxZoomDistance==job.maximum then job.player.CameraMaxZoomDistance=job.restoreMax end
+        end)
+    end
+    function C.cleanup()
+        C.closed=true
+        if C.connection then pcall(function()C.connection:Disconnect()end);C.connection=nil end
+        restore()
+    end
+    local function update()
+        if C.closed then return end
+        if not api.owned()then C.cleanup();return end
+        local player=api.Players.LocalPlayer;local camera=workspace.CurrentCamera
+        local subject=camera and camera.CameraSubject;local character=player and player.Character
+        if not player or not camera or camera.CameraType~=Enum.CameraType.Custom
+            or not character or not subject or not subject:IsDescendantOf(character)then restore();return end
+        local distance=(camera.CFrame.Position-camera.Focus.Position).Magnitude
+        if not finite(distance)then restore();return end
+        if C.pending then
+            local job=C.pending
+            if job.player~=player or job.camera~=camera or job.character~=character
+                or distance>1.5 or api.now()-job.started>=1 then restore()end
+            return
+        end
+        if api.now()<(C.retryAt or 0)then return end
+        if player.CameraMode~=Enum.CameraMode.LockFirstPerson and distance>1 then return end
+        local minimum,maximum=player.CameraMinZoomDistance,player.CameraMaxZoomDistance
+        if not finite(minimum) or not finite(maximum)then return end
+        local target=math.max(8,minimum)
+        local job={player=player,camera=camera,character=character,beforeMin=minimum,
+            minimum=target,maximum=math.max(maximum,target),restoreMax=maximum<=1.5 and 16 or maximum,started=api.now()}
+        C.pending=job;C.retryAt=api.now()+2
+        player.CameraMode=Enum.CameraMode.Classic
+        -- Set maximum first: Roblox clamps minimum to the current maximum.
+        player.CameraMaxZoomDistance=job.maximum
+        player.CameraMinZoomDistance=job.minimum
+    end
+    function C.step()
+        local ok=pcall(update)
+        if not ok then restore()end
+    end
+    local signal=api.RunService.RenderStepped or api.RunService.Heartbeat
+    if signal then C.connection=signal:Connect(C.step)end
+    C.step()
+    return C
+end
+
+end)()
+    s.cameraRecovery=buildCameraRecovery({owned=owned,now=now,Players=Players,RunService=RunService})
     local requestSlots = { "request", "rewardRequest", "classRequest", "skipRequest", "probeRequest", "equipmentRequest", "lootRequest", "lootQuery", "upgradeRequest" }
     local function requestSlot(kind)
         if kind == "claim-reward" or kind == "claim-vip" then return "rewardRequest" end
@@ -4891,6 +4950,7 @@ end)()
         elseif not watch.intent and watch.damageAt and now()-watch.damageAt>3 then watch.damageAt=nil;watch.damagePoint=nil end
     end
     function D.stopDrivingDefense(ctx,preserveIntent)
+        Q.clearDefenseStop(ctx)
         local job=ctx.questDrivingDefense
         if job then
             if ctx.combatTarget==job.target then ctx.combatTarget=nil;ctx.questCombat=nil end
@@ -7833,6 +7893,54 @@ end)()
         setStatus('Loot break: native driver released; moving clear of the auto-start area')
         return true
     end
+    function Q.clearDefenseStop(ctx)
+        local record=ctx.questDefenseStop
+        if record and record.connection then pcall(record.connection.Disconnect,record.connection)end
+        ctx.questDefenseStop=nil
+    end
+    local function observeDefenseStop(ctx,defense,lease)
+        if not defense or ctx.questDrivingDefense~=defense or defense.character~=ctx.character or defense.drill~=ctx.drill
+            or defense.band~=workspace:GetAttribute('InfiniteDepthOffsetMeters') or defense.class~=(s.classData and s.classData.SelectedClass)
+            or not lease or defense.driveLease~=lease
+            or lease.ctx~=ctx or lease.drill~=ctx.drill or not lease.confirmed then Q.clearDefenseStop(ctx);return end
+        local record=ctx.questDefenseStop
+        if record and record.defense==defense and record.lease==lease then record.observe();return end
+        Q.clearDefenseStop(ctx)
+        record={defense=defense,lease=lease,character=ctx.character,humanoid=ctx.humanoid,drill=ctx.drill,
+            band=workspace:GetAttribute('InfiniteDepthOffsetMeters'),class=s.classData and s.classData.SelectedClass,
+            job=game.JobId,runStarted=s.lootStarted};ctx.questDefenseStop=record
+        record.current=function()
+            return ctx.questDefenseStop==record and ctx.questDrivingDefense==defense
+                and ctx.active and s.farm==ctx and api.owned() and cfg.classQuest and cfg.driveDepth
+                and enabled(ctx) and not manual() and not humanDrivingInput(ctx) and not api.extractionReady()
+                and record.character==ctx.character and ctx.character==api.Players.LocalPlayer.Character
+                and record.humanoid==ctx.humanoid and ctx.humanoid.Health>0
+                and record.drill==ctx.drill and ctx.drill==workspace:FindFirstChild('Drill') and ctx.drill.Parent
+                and record.band==workspace:GetAttribute('InfiniteDepthOffsetMeters')
+                and record.class==(s.classData and s.classData.SelectedClass)
+                and record.job==game.JobId and record.runStarted==s.lootStarted
+        end
+        local function observe()
+            if not record.current() or s.questDriveLease~=lease then return end
+            local owner=record.drill:GetAttribute('DriverUserId')
+            if finite(owner) and owner~=0 and owner~=api.Players.LocalPlayer.UserId then
+                defense.driverReleaseForeign=true;defense.driverReleased=nil;return
+            end
+            local token=lease.stopToken or calls.drive
+            if not lease.abandoned or not lease.stopIssued or not token or not token.called
+                or token.service~='DrillService' or token.method~='StopDriving' then return end
+            if owner==nil or owner==0 then record.releasedAt=record.releasedAt or now()end
+            -- The event may precede the reply. Retain the real release, but only
+            -- a settled accepted stop can authorize stopping a new native seat.
+            if record.releasedAt and lease.stopAccepted==true and not defense.driverReleaseForeign then defense.driverReleased=true end
+        end
+        record.observe=observe
+        pcall(function()
+            local signal=record.drill:GetAttributeChangedSignal('DriverUserId')
+            record.connection=ctx.connect and ctx.connect(signal,observe) or signal:Connect(observe)
+        end)
+        observe()
+    end
     function Q.stopDrive(ctx)
         local wasDriving=ctx.questDriving or ctx.questSeating
         local lease=s.questDriveLease
@@ -7853,7 +7961,9 @@ end)()
             lease={ctx=ctx,drill=drill,started=now(),confirmed=true};s.questDriveLease=lease
         end
         local defense=ctx.questDrivingDefense
-        if cfg.classQuest and enabled(ctx) and not manual() and defense and defense.driverReleased
+        if defense and ctx.questDefenseStop then ctx.questDefenseStop.observe()end
+        if cfg.classQuest and enabled(ctx) and not manual() and defense and defense.driverReleased and not defense.driverReleaseForeign
+            and (not ctx.questDefenseStop or ctx.questDefenseStop.current())
             and defense.character==ctx.character and ctx.character==api.Players.LocalPlayer.Character
             and defense.drill==drill and drill==workspace:FindFirstChild('Drill') and drill.Parent
             and defense.band==workspace:GetAttribute('InfiniteDepthOffsetMeters')
@@ -7889,6 +7999,7 @@ end)()
         if (ctx.questDriving or ctx.questSeating) and (not lease or lease.ctx~=ctx) then
             lease={ctx=ctx,drill=ctx.drill,started=ctx.questSeating or now()};s.questDriveLease=lease
         end
+        if defense then observeDefenseStop(ctx,defense,lease)end
         if lease and lease.ctx==ctx then
             if lease.confirmed and driverId(lease.drill)~=api.Players.LocalPlayer.UserId and not calls.drive then
                 -- A replicated different/no driver ends a confirmed lease.
@@ -7896,6 +8007,7 @@ end)()
                 s.questDriveLease=nil
             else lease.abandoned=true;Q.recoverDrive()end
         end
+        if defense then observeDefenseStop(ctx,defense,lease)end
         local observed=ctx.questLootStop
         if observed and lootStopCurrent(ctx,observed) and driverId(ctx.drill)==nil then
             observed.releasedAt=observed.releasedAt or now()
@@ -10257,6 +10369,11 @@ return function(api)
         return false
     end
     function M.travelRoute(ctx, x)
+        local current=point(ctx)
+        local checkpoint=api.state.routeScanX or current.X
+        -- Another owned scouting pass may already have advanced this request.
+        -- Never fly backwards to, or later commit, a retired target.
+        if not finite(x) or not finite(checkpoint) or x<checkpoint then return false end
         -- Prefetch is useful during an engine loading pause too; it must not
         -- depend on permission to move the character first.
         streamAhead(ctx, M.scanPoint(ctx, x, true))
@@ -10265,13 +10382,22 @@ return function(api)
         -- usable while the resumable reader discovers the rest of the map.
         if ctx.worldScan then return false end
         if M.paused(ctx) then return false end
-        -- Rise at the checkpoint first; chest collection must not set the scan
-        -- height or sideways route axis for the rest of the run.
+        -- Check loading before the rejoin too. A streaming wait must not keep
+        -- dragging a looting character back to the old checkpoint each retry.
         M.hover(ctx)
-        local checkpoint = api.state.routeScanX or point(ctx).X
-        if not M.travel(ctx, M.scanPoint(ctx, checkpoint)) then return false end
         if not M.routeReady(ctx, x) then return false end
-        return M.travel(ctx, M.scanPoint(ctx, x), function(position) M.commitRoute(ctx, position) end)
+        -- Restore the route height/axis without an unnecessary backward leg.
+        -- A detour already inside this segment rejoins at its current X; one
+        -- beyond it returns directly to its end, not back to the start and out.
+        current=point(ctx)
+        local rejoinX=math.max(checkpoint,math.min(x,current.X))
+        if not M.travel(ctx, M.scanPoint(ctx, rejoinX)) then return false end
+        -- The rejoin can yield; require loaded geometry again before advancing.
+        if not M.routeReady(ctx, x) then return false end
+        local reached=M.travel(ctx, M.scanPoint(ctx, x), function(position) M.commitRoute(ctx, position) end)
+        -- A rejoin at the endpoint can leave no forward tween to report progress.
+        if reached then M.commitRoute(ctx, M.scanPoint(ctx, x)) end
+        return reached
     end
     function M.cleanup(ctx)
         pcall(M.cancel,ctx)
@@ -14640,7 +14766,8 @@ end
                         local nextX = math.min(scanX + 150, ctx.scanEnd or 36000)
                         local reached = features.travelRoute(ctx, nextX)
                         if reached then
-                            ctx.flags.ScanX, s.routeScanX = nextX, nextX
+                            s.routeScanX=math.max(s.routeScanX or nextX,nextX)
+                            ctx.flags.ScanX=s.routeScanX
                             taskApi.wait(0.15)
                             local candidates = ctx.helpers[9164528]()
                             for _, entry in ipairs(candidates) do
@@ -14965,6 +15092,7 @@ end
     local function tick()
         loadFresh()
         s.noclip.step()
+        s.cameraRecovery.step()
         local player, model, humanoid, root = character()
         lobbyWalker.guard()
         if not game:IsLoaded() or not player or not child(player, "PlayerGui") then
