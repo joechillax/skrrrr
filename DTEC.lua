@@ -1,8 +1,8 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.81: native opening readiness, quest potions, blueprint stacks and cutscene context.
+-- Version 0.82: checked walking recovery for lobby pads and a 45-minute depth-run limit.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
--- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
+-- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
 -- Hides the default Gameplay Paused popup after readiness; streaming pauses still apply.
 -- Includes local ending reports, personal Discord delivery, cached discovery, and ranged dodging.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 81
+    local REVISION = 82
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.81-game-update-compatibility"
+    local BUILD = "v0.82-lobby-walk-recovery"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -1246,6 +1246,7 @@ return function(api)
                 end
             else
                 if q.path and type(q.path.Destroy)=='function'then pcall(q.path.Destroy,q.path)end
+                job.noPath=q.noPath==true
                 job.failures=job.failures+1;job.retryAt=now()+3
             end
         end
@@ -1345,7 +1346,8 @@ return function(api)
                 if not service or not current(job) or s.lobbyWalk~=job then return end
                 local path=service:CreatePath({AgentRadius=2,AgentHeight=6,AgentCanJump=true,WaypointSpacing=4})
                 q.path=path;path:ComputeAsync(job.root.Position,goal)
-                if not current(job) or s.lobbyWalk~=job or q.cancelled or path.Status~=Enum.PathStatus.Success then return end
+                if not current(job) or s.lobbyWalk~=job or q.cancelled then return end
+                if path.Status~=Enum.PathStatus.Success then q.noPath=path.Status==Enum.PathStatus.NoPath;return end
                 local points=path:GetWaypoints()
                 if type(points)~='table' or #points<1 or #points>128 then return end
                 q.points={}
@@ -1358,6 +1360,57 @@ return function(api)
             if not ok then q.ok=false end
             q.settled=true
         end)
+    end
+    -- NoPath need not mean a wall exists (queue meshes/streamed navmesh can
+    -- lack a route). Prove only a short, level walking corridor, then let the
+    -- native humanoid traverse it. Missing/uncertain geometry never grants it.
+    local function clearStep(job,goal)
+        local ok,result=pcall(function()
+            if type(workspace.Raycast)~='function' or type(workspace.Blockcast)~='function'
+                or type(workspace.GetPartBoundsInBox)~='function'then return end
+            local root,h=job.root,job.humanoid;local origin=root.Position
+            local hip=finite(h.HipHeight) and math.max(0,h.HipHeight) or 2
+            local size=root.Size
+            if not vector(size) or size.X<=0 or size.Y<=0 or size.X>10 or size.Y>10 or hip>6 then return end
+            local offset=hip+size.Y*.5
+            -- R6 HipHeight is an offset above its leg; R15 already includes
+            -- leg clearance. Do not misread clear R6 ground as a two-stud drop.
+            if Enum.HumanoidRigType and h.RigType==Enum.HumanoidRigType.R6 then
+                local leg=job.character:FindFirstChild('Left Leg')
+                if not leg or leg.Parent~=job.character or not leg:IsA('BasePart') or not vector(leg.Size)
+                    or leg.Size.Y<=0 or leg.Size.Y>6 then return end
+                offset=offset+leg.Size.Y
+            end
+            local floorY=origin.Y-offset
+            local dx,dz=goal.X-origin.X,goal.Z-origin.Z;local distance=math.sqrt(dx*dx+dz*dz)
+            if distance<.05 then return end
+            local length=math.min(6,distance);dx,dz=dx/distance,dz/distance
+            local ray=RaycastParams.new();ray.FilterType=Enum.RaycastFilterType.Exclude
+            ray.FilterDescendantsInstances={job.character};ray.RespectCanCollide=true;ray.IgnoreWater=false
+            ray.CollisionGroup=root.CollisionGroup
+            local overlap=OverlapParams.new();overlap.FilterType=Enum.RaycastFilterType.Exclude
+            overlap.FilterDescendantsInstances={job.character};overlap.RespectCanCollide=true
+            overlap.CollisionGroup=root.CollisionGroup;overlap.MaxParts=1
+            local width=math.max(3,size.X+1);local height=math.max(5,size.Y+offset)
+            local box=Vector3.new(width,height,width);local previous
+            for i=0,math.ceil(length/2)do
+                local along=math.min(i*2,length);local x,z=origin.X+dx*along,origin.Z+dz*along
+                local ground
+                for _,side in ipairs({0,-width*.5,width*.5})do
+                    local hit=workspace:Raycast(Vector3.new(x-dz*side,floorY+2,z+dx*side),Vector3.new(0,-4,0),ray)
+                    if not hit or not vector(hit.Position) or not vector(hit.Normal) or hit.Normal.Y<.7
+                        or math.abs(hit.Position.Y-floorY)>.75 or Enum.Material and hit.Material==Enum.Material.Water then return end
+                    if side==0 then ground=hit.Position.Y end
+                end
+                local center=Vector3.new(x,ground+.5+height*.5,z)
+                local parts=workspace:GetPartBoundsInBox(CFrame.new(center),box,overlap)
+                if type(parts)~='table' or #parts>0 then return end
+                if previous and workspace:Blockcast(CFrame.new(previous),box,center-previous,ray)then return end
+                previous=center;floorY=ground
+            end
+            return Vector3.new(origin.X+dx*length,floorY+offset,origin.Z+dz*length)
+        end)
+        return ok and vector(result) and result or nil
     end
     function W.step(zone,mode,exit)
         if not W.guard()then api.status('Lobby walking yields to manual input, focus or native readiness');return false end
@@ -1380,13 +1433,26 @@ return function(api)
             end
             api.status('Lobby walking: waiting for the owned path computation');return false
         end
+        if job.direct and job.points and not near(root.Position,job.points[1].position,.75)
+            and not clearStep(job,job.points[1].position)then
+            disconnect(job);job.direct=nil;job.noPath=nil;job.moving=nil;job.lastGoal=nil
+            job.failures=job.failures+1;job.retryAt=now()+3
+            if type(h.MoveTo)=='function'then pcall(h.MoveTo,h,root.Position)end
+        end
+        if not job.points and job.noPath then
+            local point=clearStep(job,goal)
+            if point then
+                job.points={{position=point}};job.index=1;job.direct=true;job.lastGoal=nil
+                job.progressAt=now();job.failures=0
+            end
+        end
         if job.failures>=3 or now()-job.started>=60 then
             W.stop(true);s.lobbyWalkPauseUntil=now()+5
             api.status('Lobby walk blocked; waiting before another walking attempt');return false
         end
         if horizontal(root.Position,job.progressPoint)>=1 then job.progressPoint=root.Position;job.progressAt=now()end
         if job.repath or job.moving and now()-job.progressAt>=6 then
-            disconnect(job);job.repath=nil;job.moving=nil;job.lastGoal=nil;job.failures=job.failures+1;job.retryAt=now()+1
+            disconnect(job);job.repath=nil;job.direct=nil;job.noPath=nil;job.moving=nil;job.lastGoal=nil;job.failures=job.failures+1;job.retryAt=now()+1
             job.progressAt=now()
             if type(h.MoveTo)=='function'then pcall(h.MoveTo,h,root.Position)end
         end
@@ -1394,9 +1460,13 @@ return function(api)
             if now()>=(job.retryAt or 0)then query(job,goal)end
             api.status('Finding a walking path to the lobby '..(mode=='exit' and 'exit point' or 'pad'));return false
         end
-        while job.index<=#job.points and near(root.Position,job.points[job.index].position,2)do job.index=job.index+1 end
+        while job.index<=#job.points and near(root.Position,job.points[job.index].position,job.direct and .75 or 2)do job.index=job.index+1 end
         local point=job.points[job.index]
         if not point then
+            if job.direct then
+                disconnect(job);job.direct=nil;job.moving=nil;job.lastGoal=nil
+                api.status('Continuing the checked walking approach to the lobby pad');return false
+            end
             disconnect(job);job.failures=job.failures+1;job.retryAt=now()+1
             api.status('Lobby path ended outside the pad; recalculating without teleporting');return false
         end
@@ -1408,7 +1478,7 @@ return function(api)
             if not moved then W.stop(true);api.status('Native lobby walking unavailable; waiting without teleporting');return false end
             job.lastGoal,job.moveAt,job.moving=point,now()+3,true
         end
-        api.status('Walking to the lobby '..(mode=='exit' and 'exit point' or 'Earth pad'))
+        api.status((job.direct and 'Walking along checked ground to the lobby ' or 'Walking to the lobby ')..(mode=='exit' and 'exit point' or 'Earth pad'))
         return false
     end
     function W.leave(zone)
@@ -10434,7 +10504,7 @@ end)()
                 drive.active=true
             elseif drive then drive.active=false end
         end
-        local minutes=plan and plan.kind=='depth' and cfg.driveDepth and 35 or 20
+        local minutes=plan and plan.kind=='depth' and cfg.driveDepth and 45 or 20
         local reason = now()-s.lootStarted >= minutes*60 and tostring(minutes)..'-minute quest run limit reached'
             or now()-watch.at >= 90 and 'No meaningful progress for 1.5 minutes'
         if reason then
@@ -10578,9 +10648,9 @@ return function(api)
         end
         minutes.TextEditable = cfg.lootExtract and not cfg.classQuest
         minutes.TextTransparency = minutes.TextEditable and 0 or 0.55
-        local limit=s.questPlan and s.questPlan.kind=='depth' and cfg.driveDepth and 35 or 20
+        local limit=s.questPlan and s.questPlan.kind=='depth' and cfg.driveDepth and 45 or 20
         smartHint.Text = cfg.classQuest and ((cfg.lootExtract and 'Smart loot ON' or 'Smart loot OFF')..'; quest exit at '..limit..' min or 90s idle') or 'Collect useful gear and relics; save at an altar'
-        minimumHint.Text = cfg.classQuest and 'Quest limits: 20 min; depth 35 min / 90s idle' or 'Only applies when loot + extraction is ON'
+        minimumHint.Text = cfg.classQuest and 'Quest limits: 20 min; depth 45 min / 90s idle' or 'Only applies when loot + extraction is ON'
         local elapsed = math.max(0, api.now() - (s.lootStarted or api.now()))
         local ctx = s.farm
         local optionalActive = s.questChurchExit ~= nil or cfg.lootExtract and (s.runExhausted or elapsed >= cfg.minutes * 60)
