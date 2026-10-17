@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.78: reserve spare fuel on the drill and avoid depleted support mines.
+-- Version 0.79: release unavailable planner movement and freeze native handoff state.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 78
+    local REVISION = 79
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.78-fuel-reserves-and-mine-selection"
+    local BUILD = "v0.79-planner-handoff-and-frozen-state"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -516,6 +516,13 @@ end)()
     }
     local exitLabels={
         phase={funding=true,loot=true,drive=true,upgrades=true,unknown=true},
+        planner={waiting=true,complete=true,unsupported=true,advance=true,combat=true,mining=true,depth=true,
+            fuel=true,chests=true,gold=true,sale=true,upgrades=true,potion=true,shred=true,turret=true,dungeon=true,unknown=true},
+        nativeDungeon={yes=true,no=true,unknown=true},boundRoom={unavailable=true,none=true,mine=true,other=true},
+        refuel={none=true,active=true,['other-drill']=true},
+        driveLease={none=true,['other-context']=true,retired=true,active=true,['stop-accepted']=true,['stop-unresolved']=true,abandoned=true},
+        equipmentTransport={none=true,settled=true,pending=true},
+        routeGate={chest=true,feature=true,defense=true,dodge=true,bring=true,loot=true,equipment=true,['await-ack']=true,ready=true},
         route={parked=true,unparked=true},driver={none=true,self=true,other=true,invalid=true},
         seat={none=true,['sit-only']=true,drill=true,other=true},hotbar={visible=true,hidden=true,unavailable=true},
         work={recovery=true,['drive-defense']=true,['mine-transition']=true,mining=true,startup=true,combat=true,
@@ -524,7 +531,7 @@ end)()
             ['start-timeout']=true,['start-retry']=true,['seats-loading']=true,['foreign-driver']=true,
             ['fuel-empty']=true,['fuel-loading']=true,refuelling=true,['seat-exit']=true,['text-focus']=true,
             ['drive-stalled']=true,wall=true,['pickaxe-unready']=true,['mining-wait']=true,startup=true,
-            ['chest-scan']=true,['chest-open']=true,['delivery-unconfirmed']=true,driving=true},
+            ['chest-scan']=true,['chest-open']=true,['delivery-unconfirmed']=true,driving=true,['planner-wait']=true},
         flags={currentChest=true,featureHold=true,questOwns=true,chestLease=true,smartLoot=true,defense=true,
             equipment=true,loot=true,bring=true,delivery=true,cash=true,upgrade=true,equipmentLock=true,
             worldScan=true,workerFailed=true,chestPending=true,paused=true,cutscene=true,rebase=true},
@@ -551,7 +558,7 @@ end)()
                 copy[key]=table.concat(values,', ')
             elseif type(value)=='string' and allowed[value]then copy[key]=value end
         end
-        for _,key in ipairs({'idleAge','workerAge','walletAge','equipmentAge','fuel','capacity'})do
+        for _,key in ipairs({'idleAge','workerAge','walletAge','equipmentAge','fuel','capacity','refuelAge','driveRetryIn'})do
             local value=finite(detail[key]);if value and value>=0 then copy[key]=math.min(value,999999)end
         end
         run.exitContext=copy
@@ -569,6 +576,16 @@ end)()
             ..'\nActive flags: '..(detail.flags~='' and detail.flags or 'none')
             ..'\nPending calls: '..(detail.calls~='' and detail.calls or 'none')
             ..'\nFrozen when the exit was requested; observations do not establish the cause.'
+    end
+    local function handoffText(run)
+        local d=run.exitContext
+        if not d or not(d.planner or d.nativeDungeon or d.boundRoom or d.refuel or d.driveLease or d.routeGate or d.equipmentTransport)then return end
+        local function label(key)return d[key] or 'unknown'end
+        local function seconds(key)return d[key] and string.format('%.0fs',d[key])or 'unknown'end
+        return 'Planner '..label('planner')..' | Native InDungeon '..label('nativeDungeon')..' | Bound room '..label('boundRoom')
+            ..'\nRefill intent '..label('refuel')..' | Age '..seconds('refuelAge')..' | Drive retry in '..seconds('driveRetryIn')
+            ..'\nDrive lease '..label('driveLease')..' | Equipment transport '..label('equipmentTransport')..' | Route gate '..label('routeGate')
+            ..'\nFrozen native/local state; a gate or binding alone does not establish the cause.'
     end
     local function observeFarm(run)
         observeExit(run)
@@ -801,6 +818,8 @@ end)()
         fields[#fields+1]={name='Farm diagnostics',value=farmText(run),inline=false}
         local frozen=exitText(run)
         if frozen then fields[#fields+1]={name='At exit request (observed)',value=frozen,inline=false}end
+        local handoff=handoffText(run)
+        if handoff then fields[#fields+1]={name='Quest handoff (observed)',value=handoff,inline=false}end
         if run.farmProgress.questsOn then fields[#fields+1]={name='Survival diagnostics',value=survivalText(run),inline=false}end
         return {id = run.id, status = 'queued', attempts = 0, created = clock(), revision=s.revision, version=s.version, build=s.build, body = {
             username = 'DTEC JoeJoe Automation',
@@ -9011,7 +9030,13 @@ end)()
         if now()<(ctx.questTickAt or 0) then return ctx.questOwns end
         ctx.questTickAt=now()+.2
         s.questPlan=plan
-        if plan.kind=='waiting' then setStatus('Waiting for native class catalog and quest counters'); return false end
+        if plan.kind=='waiting' then
+            -- Losing planner data retires the old local movement intent just
+            -- like a completed objective. Native mutations keep their original
+            -- reservations/observers through cleanup; no reply is invented.
+            Q.cleanup(ctx)
+            setStatus('Waiting for native class catalog and quest counters');return false
+        end
         if plan.kind=='complete' or plan.kind=='unsupported' then
             Q.cleanup(ctx);setStatus((plan.kind=='complete' and 'Equipped class is fully levelled' or 'Next objectives need unsupported actions')..'; chest farming continues')
             return false
@@ -9980,9 +10005,36 @@ end)()
             local hotbar=controller('HotbarController');local ui=hotbar and hotbar.BackpackUI
             details.hotbar=ui and (ui.Visible==true and 'visible' or 'hidden') or 'unavailable'
         end)
+        -- Freeze the actual planner/native handoff state, separately from the
+        -- last human-readable status. A stale status is not the current gate.
+        local plans={waiting=true,complete=true,unsupported=true,advance=true,combat=true,mining=true,
+            depth=true,fuel=true,chests=true,gold=true,sale=true,upgrades=true,potion=true,shred=true,turret=true,dungeon=true}
+        pcall(function()
+            local plan=quest and quest.plan(s.classData,s.questCatalog,cfg.driveDepth)
+            details.planner=plan and plans[plan.kind] and plan.kind or 'unknown'
+            local native=player:GetAttribute('InDungeon')
+            details.nativeDungeon=native==true and 'yes' or native==false and 'no' or 'unknown'
+            local ui=controller('DungeonUIController');local root=ui and ui._BoundDungeon
+            details.boundRoom=not ui and 'unavailable' or not root and 'none'
+                or quest.drillSupport.mineshaft(root) and 'mine' or 'other'
+            local latch=s.questRefuelLatch
+            details.refuel=not latch and 'none' or latch.drill==ctx.drill and 'active' or 'other-drill'
+            details.refuelAge=latch and latch.drill==ctx.drill and age(latch.started) or nil
+            local retry=ctx.questDriveRetryAt
+            details.driveRetryIn=retry==nil and 0 or number(retry) and math.max(0,retry-at) or nil
+            local lease=s.questDriveLease
+            details.driveLease=not lease and 'none' or (lease.ctx~=ctx or lease.drill~=ctx.drill) and 'other-context'
+                or lease.retired and 'retired' or not lease.abandoned and 'active'
+                or lease.stopAccepted==true and 'stop-accepted' or lease.stopIssued and 'stop-unresolved' or 'abandoned'
+            details.equipmentTransport=not s.equipmentRequest and 'none' or s.equipmentRequest.settled==true and 'settled' or 'pending'
+            details.routeGate=ctx.currentChest and 'chest' or ctx.featureHold and 'feature' or ctx.defenseMoving and 'defense'
+                or at<(ctx.dodgeUntil or 0) and 'dodge' or s.bringDelivery and 'bring' or s.lootRequest and 'loot'
+                or s.equipmentRequest and 'equipment' or ctx.routeParked~=true and 'await-ack' or 'ready'
+        end)
         local text=type(s.questStatus)=='string' and s.questStatus or ''
         for _,entry in ipairs({
-            {'Head start:','head-start'},{'Previous native driver stop','stop-unresolved'},
+            {'Head start:','head-start'},{'Waiting for native class catalog','planner-wait'},
+            {'Previous native driver stop','stop-unresolved'},
             {'Native driver stop has not cleared','stop-owner'},{'Approaching driver seat','seat-start'},
             {'Drill start not confirmed','start-timeout'},{'Drill start failed','start-retry'},
             {'Native drill seats still loading','seats-loading'},{'Native physical seat','seats-loading'},
