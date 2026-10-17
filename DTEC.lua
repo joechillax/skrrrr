@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.90: release borrowed chest claims and confirm local route cancellation before handoffs.
+-- Version 0.91: timer-free smart-loot extraction with two fresh final upgrade checks.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 90
+    local REVISION = 91
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.90-route-lease-receipts"
+    local BUILD = "v0.91-loot-completion-exit"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -1869,6 +1869,7 @@ return function(api)
         return not owner or owner == 0 or owner == api.Players.LocalPlayer.UserId
     end
     local function loose(ctx, item) return api.part(item) ~= nil and looseMetadata(item) end
+    function B.looseItem(ctx,item)return loose(ctx,item)end
     -- Remembered Item Reloading adapted from manual DTeC's Memory/LoadTick.
     -- Only real seen loose drops are remembered. No saved Instance is sent to
     -- the server after unloading; normal bringing revalidates the loaded item.
@@ -10771,7 +10772,7 @@ end)()
     end
     function F.extractionEnabled() return s.questChurchExit ~= nil or cfg.lootExtract and not cfg.classQuest end
     function F.extractionReady()
-        return s.questChurchExit ~= nil or F.extractionEnabled() and s.lootStarted ~= nil and now() - s.lootStarted >= cfg.minutes * 60
+        return s.questChurchExit ~= nil or F.extractionEnabled() and s.runExhausted == true
     end
     local buildGui = (function()
 return function(api)
@@ -10810,7 +10811,7 @@ return function(api)
     ui.screen = make('ScreenGui', parent, { Name = 'DTECJoeJoeAutomationPanel', ResetOnSpawn = false,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 1500, IgnoreGuiInset = false })
     local panel = make('Frame', ui.screen, { Name = 'Panel', AnchorPoint = Vector2.new(1, 0),
-        Position = UDim2.new(1, -20, 0, 30), Size = UDim2.new(0, 410, 0, 570),
+        Position = UDim2.new(1, -20, 0, 30), Size = UDim2.new(0, 410, 0, 490),
         BackgroundColor3 = color.bg, BorderSizePixel = 0, Active = true })
     rounded(panel, 16)
     make('UIStroke', panel, { Color = color.edge, Thickness = 1 })
@@ -10824,7 +10825,7 @@ return function(api)
         TextColor3 = color.muted, BackgroundTransparency = 1, Position = UDim2.new(1, -46, 0, 13),
         Size = UDim2.new(0, 32, 0, 34), AutoButtonColor = false })
     local body = make('Frame', panel, { Position = UDim2.new(0, 0, 0, 64),
-        Size = UDim2.new(1, 0, 0, 506), BackgroundTransparency = 1 })
+        Size = UDim2.new(1, 0, 0, 426), BackgroundTransparency = 1 })
     local function bind(signal, fn)
         local c = signal:Connect(fn); ui.connections[#ui.connections + 1] = c
         return c
@@ -10838,23 +10839,9 @@ return function(api)
         local detail = label(box, subtitle, 46, 35, 232, 26, 10, color.muted)
         return box, detail
     end
-    local smart,smartHint = row(1, 'Smart loot + altar extraction', 'Collect useful gear and relics; save at an altar', 0)
-    local minimum,minimumHint = row(2, 'Minimum run time', 'Only applies when loot + extraction is ON', 80)
-    local classQuest = row(3, 'Auto equipped-class quest', 'Quest weapons, Void gear, smart upgrades and 30/70 healing', 160)
-    local depthQuest = row(4, 'Drive for depth / fuel quests', 'Native depth progress or room for contributed fuel', 240)
-    local function input(parentBox, value, x, y, width, changed)
-        local box = make('TextBox', parentBox, { Text = tostring(value), Font = bold, TextSize = 14,
-            TextColor3 = color.accent, BackgroundColor3 = color.bg, BorderSizePixel = 0,
-            Position = UDim2.new(0, x, 0, y), Size = UDim2.new(0, width, 0, 32), ClearTextOnFocus = false })
-        rounded(box, 7)
-        bind(box.FocusLost, function() changed(box.Text); box.Text = tostring(changed()) end)
-        return box
-    end
-    local minutes = input(minimum, cfg.minutes, 282, 11, 62, function(value)
-        if value ~= nil then api.change('minutes', value) end
-        return cfg.minutes
-    end)
-    label(minimum, 'min', 348, 14, 26, 24, 10, color.muted)
+    local smart,smartHint = row(1, 'Smart loot + altar extraction', 'Collect useful loot; save when the route is cleared', 0)
+    local classQuest = row(2, 'Auto equipped-class quest', 'Quest weapons, Void gear, smart upgrades and 30/70 healing', 80)
+    local depthQuest = row(3, 'Drive for depth / fuel quests', 'Native depth progress or room for contributed fuel', 160)
     local function toggle(parentBox, key)
         local button = make('TextButton', parentBox, { Name = 'Toggle_' .. key, Position = UDim2.new(1, -71, 0, 16),
             Size = UDim2.new(0, 57, 0, 29), Font = bold, TextSize = 11, BorderSizePixel = 0,
@@ -10865,14 +10852,14 @@ return function(api)
     end
     local switches = { lootExtract = toggle(smart, 'lootExtract'), classQuest = toggle(classQuest, 'classQuest'),
         driveDepth = toggle(depthQuest, 'driveDepth') }
-    local status = make('Frame', body, { Position = UDim2.new(0, 16, 0, 320), Size = UDim2.new(1, -32, 0, 176),
+    local status = make('Frame', body, { Position = UDim2.new(0, 16, 0, 240), Size = UDim2.new(1, -32, 0, 176),
         BackgroundTransparency = 1 })
     ui.stage = label(status, 'Waiting for readiness…', 0, 0, 378, 31, 12, color.accent, true)
     ui.stats = label(status, '', 0, 34, 378, 137, 11, color.muted)
     local collapsed = false
     bind(minimize.Activated, function()
         collapsed = not collapsed; body.Visible = not collapsed
-        panel.Size = UDim2.new(0, 410, 0, collapsed and 64 or 570); minimize.Text = collapsed and '+' or '−'
+        panel.Size = UDim2.new(0, 410, 0, collapsed and 64 or 490); minimize.Text = collapsed and '+' or '−'
     end)
     local UIS = api.getService('UserInputService')
     if UIS then
@@ -10900,14 +10887,11 @@ return function(api)
             button.BackgroundColor3 = cfg[key] and color.accent or color.edge
             button.TextColor3 = cfg[key] and color.bg or color.muted
         end
-        minutes.TextEditable = cfg.lootExtract and not cfg.classQuest
-        minutes.TextTransparency = minutes.TextEditable and 0 or 0.55
         local limit=s.questPlan and s.questPlan.kind=='depth' and cfg.driveDepth and 45 or 20
-        smartHint.Text = cfg.classQuest and ((cfg.lootExtract and 'Smart loot ON' or 'Smart loot OFF')..'; quest exit at '..limit..' min or 90s idle') or 'Collect useful gear and relics; save at an altar'
-        minimumHint.Text = cfg.classQuest and 'Quest limits: 20 min; depth 45 min / 90s idle' or 'Only applies when loot + extraction is ON'
+        smartHint.Text = cfg.classQuest and ((cfg.lootExtract and 'Smart loot ON' or 'Smart loot OFF')..'; quest exit at '..limit..' min or 90s idle') or 'Collect useful loot; save when the route is cleared'
         local elapsed = math.max(0, api.now() - (s.lootStarted or api.now()))
         local ctx = s.farm
-        local optionalActive = s.questChurchExit ~= nil or cfg.lootExtract and (s.runExhausted or elapsed >= cfg.minutes * 60)
+        local optionalActive = s.questChurchExit ~= nil or cfg.lootExtract and s.runExhausted
             or cfg.lootExtract and (s.lootRequest or ctx and (ctx.featureHold or ctx.gearPickup))
             or s.featureStatusAt and api.now() - s.featureStatusAt < 3
         ui.stage.Text = optionalActive and s.featureStatus or s.status or 'Waiting for readiness…'
@@ -10950,7 +10934,7 @@ return function(api)
             end
         end
         local camera = workspace.CurrentCamera
-        if camera then scale.Scale = math.min(1, math.max(0.25, math.min((camera.ViewportSize.Y - 60) / 570, (camera.ViewportSize.X - 40) / 410))) end
+        if camera then scale.Scale = math.min(1, math.max(0.25, math.min((camera.ViewportSize.Y - 60) / 490, (camera.ViewportSize.X - 40) / 410))) end
     end
     function ui.dispose()
         for _, c in ipairs(ui.connections) do pcall(function() c:Disconnect() end) end
@@ -11802,8 +11786,8 @@ end)()
                 if not item.Parent or not descendant(item,workspace)then ctx.indexPending[item]=nil end
             end
         end
-        -- Read-only collection before the timer prevents streaming-out churches
-        -- from being forgotten. Movement and SaveGear still require the timer.
+        -- Remember streamed-out churches during the route. Movement and saving
+        -- still require the actual completion or explicit quest-exit condition.
         for _, item in ipairs(tagged('FramePrompt')) do
             if F.isChurchSavePrompt(item) then rememberChurch(ctx, item) end
         end
@@ -11930,6 +11914,7 @@ end)()
         if paused or not point or (point - ctx.root.Position).Magnitude > radius then
             status('Prompt waiting for loaded content and its actual activation range'); return false
         end
+        if F.isChurchSavePrompt(prompt) and not s.questChurchExit and not F.finalLootReady(ctx) then return false end
         local original = prompt.HoldDuration
         if dungeon then
             -- Use the real E-hold duration for dungeon doors: changing the local
@@ -12200,7 +12185,8 @@ end)()
         reloadTick = movement.stepItemReload,
         cancelReload = movement.cancelItemReload,
         reloadEnabled = function(ctx)
-            return not F.extractionReady() and not ctx.questOwns and not ctx.streamWaiting and api.Players.LocalPlayer.GameplayPaused ~= true
+            return (not F.extractionReady() or not s.questChurchExit and not F.finalLootReady(ctx))
+                and not ctx.questOwns and not ctx.streamWaiting and api.Players.LocalPlayer.GameplayPaused ~= true
         end,
         reloadPolicy = reloadPolicy,
         score = lootScore, makeRoom = makeRoom, settleRoom = settleRareDrop,
@@ -12354,12 +12340,12 @@ end)()
     function F.questKeepsRun() return cfg.classQuest and not s.questStalled and not s.questIdle and s.questPlan
         and quest.activePlan(s.questPlan) end
     function F.questPreventsExit() return s.questChurchExit ~= nil or cfg.classQuest end
-    local function upgradeGear(ctx)
+    local function upgradeGear(ctx, finishing)
         if not cfg.lootExtract then return false end
         F.smartLootPending(ctx)
         if not settleGear(ctx) then return false end
         if s.lootRequest then return false end
-        if bring.available() then return bring.step(ctx, not F.extractionReady() and not ctx.questRecoveryDue and not ctx.questRecovering) end
+        if bring.available() then return bring.step(ctx, (not F.extractionReady() or finishing) and not ctx.questRecoveryDue and not ctx.questRecovering) end
         if ctx.questRecoveryDue or ctx.questRecovering then return false end
         -- Snapshot only for this non-yielding candidate pass. Inventory receipts
         -- and packing still read live state after every asynchronous action.
@@ -12424,6 +12410,92 @@ end)()
         while issued and ctx.gearPickup == record and now() < deadline and not gearReceipt(ctx, record) do wait(ctx, 0.05) end
         if issued then finishGearReceipt(ctx, record) end
         release(ctx); return issued
+    end
+    local function lootInventory(ctx)
+        local stamp = {}
+        for _, tool in ipairs(tools(ctx)) do
+            stamp[tool] = table.concat({id(tool), tostring(stackCount(tool)), tostring(weaponValue(tool)),
+                tostring(attr(tool,'Armor')), tostring(attr(tool,'SpeedBoost'))}, ':')
+        end
+        for slot, value in pairs(armorState(ctx)) do
+            stamp[slot] = table.concat({tostring(value.armor),tostring(value.speed),tostring(value.rarity)}, ':')
+        end
+        return stamp
+    end
+    local function sameLootInventory(a,b)
+        for key,value in pairs(a)do if b[key]~=value then return false end end
+        for key,value in pairs(b)do if a[key]~=value then return false end end
+        return true
+    end
+    local function lootExitBlocked(ctx)
+        local drag=controller('DragController')
+        return not s.runExhausted or ctx.currentChest or ctx.flags and ctx.flags.TrackScan
+            or ctx.worldScan or ctx.worldReading or ctx.chestsDirty or ctx.chestCandidatesPending
+            or next(ctx.worldPending or {}) or ctx.streamWaiting or workspace:GetAttribute('InfiniteRebasing')
+            or api.Players.LocalPlayer.GameplayPaused==true or F.smartLootPending(ctx)
+            or s.lootRequest or s.equipmentRequest or s.rareShardDrop or ctx.gearPickup or bring.blocksSave()
+            or ctx.sackDrop or s.pendingSackDrop
+            or ctx.bringEquipmentLock or ctx.questHealing or ctx.questMining or ctx.nativeGateMotion
+            or drag and drag.LockedTarget~=nil or api.Players.LocalPlayer:GetAttribute('PlacingCraftedPlaceable')==true
+    end
+    function F.finalLootReady(ctx)
+        local check=ctx and ctx.lootExitCheck
+        return cfg.lootExtract and not cfg.classQuest and check and check.ready==true and not lootExitBlocked(ctx)
+            and check.character==ctx.character and ctx.character==api.Players.LocalPlayer.Character
+            and check.drill==ctx.drill and ctx.drill==workspace:FindFirstChild('Drill')
+            and check.band==workspace:GetAttribute('InfiniteDepthOffsetMeters') and check.started==s.lootStarted
+            and check.epoch==(ctx.lootExitEpoch or 0)
+            and check.itemCount==#children(workspace:FindFirstChild('Items'))
+            and sameLootInventory(check.inventory,lootInventory(ctx)) or false
+    end
+    function F.finishLoot(ctx)
+        if not cfg.lootExtract or cfg.classQuest then ctx.lootExitCheck=nil;return false end
+        if F.finalLootReady(ctx)then return true end
+        if not settleGear(ctx) or not settleRareDrop(ctx)then ctx.lootExitCheck=nil;return false end
+        if lootExitBlocked(ctx)then ctx.lootExitCheck=nil;return false end
+        -- Continue normal receipt handling and owned collection before checking.
+        -- A quarantined cancelled bring call retains its existing save policy.
+        if upgradeGear(ctx,true) and not(s.bringDelivery and s.bringDelivery.cancelled)then ctx.lootExitCheck=nil;return false end
+        if lootExitBlocked(ctx) or ctx.bringScan or s.lootItemMemory and s.lootItemMemory.reload then
+            ctx.lootExitCheck=nil;return false
+        end
+        if ctx.helpers and ctx.helpers[9164528]then
+            local candidates=ctx.helpers[9164528]()
+            if #candidates>0 or lootExitBlocked(ctx)then ctx.lootExitCheck=nil;return false end
+        end
+        local inventory=lootInventory(ctx)
+        local check=ctx.lootExitCheck
+        if not check or check.ready or check.epoch~=(ctx.lootExitEpoch or 0)
+            or check.character~=ctx.character or check.drill~=ctx.drill or check.started~=s.lootStarted
+            or check.band~=workspace:GetAttribute('InfiniteDepthOffsetMeters')
+            or not sameLootInventory(check.inventory,inventory)then
+            check={pass=1,cursor=1,items=children(workspace:FindFirstChild('Items')),inventory=inventory,
+                character=ctx.character,drill=ctx.drill,started=s.lootStarted,
+                band=workspace:GetAttribute('InfiniteDepthOffsetMeters'),epoch=ctx.lootExitEpoch or 0}
+            ctx.lootExitCheck=check
+        end
+        local nativeBringing=bring.available()
+        local bringing=nativeBringing and not(s.bringDelivery and s.bringDelivery.cancelled)
+        local eligible=usefulSnapshot(ctx,bringing)
+        for _=1,128 do
+            local item=check.items[check.cursor];if not item then break end
+            check.cursor=check.cursor+1
+            local point=position(item)
+            if point and (bringing or not nativeBringing and (point-ctx.root.Position).Magnitude<=180)
+                and (not bringing or bring.looseItem(ctx,item)) and F.freeWorldItemAllowed(item)
+                and now()>=(ctx.itemRetry[item] or 0) and eligible(item)then
+                ctx.lootExitCheck=nil;upgradeGear(ctx,true);return false
+            end
+        end
+        if check.cursor<=#check.items then return false end
+        if check.pass==1 then
+            -- A second fresh item list and live inventory view catch late drops
+            -- and upgrades missed by the earlier cached collection scan.
+            check.pass,check.cursor,check.items=2,1,children(workspace:FindFirstChild('Items'))
+            check.inventory=lootInventory(ctx);return false
+        end
+        check.itemCount,check.ready=#check.items,true
+        return F.finalLootReady(ctx)
     end
     local function sendTool(ctx, active, payload, originalFire)
         local c = controller('ToolController')
@@ -13554,6 +13626,7 @@ end)()
             -- Check its frozen living owner and native prompt, not ctx.active.
             local current=saveGearFrame();local drag=controller('DragController')
             return api.owned() and s.churchSave==record and F.extractionReady()
+                and (s.questChurchExit~=nil or F.finalLootReady(ctx))
                 and player==api.Players.LocalPlayer and player.Character==character and humanoid.Health>0
                 and drill and drill.Parent and workspace:FindFirstChild('Drill')==drill
                 and band==workspace:GetAttribute('InfiniteDepthOffsetMeters')
@@ -13619,6 +13692,9 @@ end)()
             if now() < (save.retryAt or 0) then return false end
             s.churchSave = nil
         end
+        if not s.questChurchExit and not ctx.sackDrop and not F.finishLoot(ctx)then
+            status('Route cleared; double-checking useful loot and pickup receipts');return false
+        end
         local prompt = nearest(ctx, data.church, function(item)
             return (not s.questChurchExit or F.isChurchSavePrompt(item)) and item.Enabled ~= false and F.chestFallbackAllowed(item)
         end)
@@ -13626,7 +13702,7 @@ end)()
             if revisitChurch(ctx) then return true end
             status(s.runExhausted and 'No church SaveGear prompt loaded; available tunnel exhausted, waiting for server content'
                 or s.questChurchExit and s.questChurchExit.reason..'; looking for native church SaveGear prompts'
-                or 'Minimum time met; looking for native church SaveGear prompts')
+                or 'Loot checks complete; looking for native church SaveGear prompts')
             if now() >= (ctx.churchNoticeAt or 0) then
                 ctx.churchNoticeAt = now() + 30
                 print('[Earth Church] No eligible prompt loaded; remembered churches=' .. tostring(#(s.churchMemories or {}))
@@ -13647,7 +13723,7 @@ end)()
             ctx.packRetryAt = math.max(ctx.packRetryAt or 0, now() + 1)
             release(ctx); return true
         end
-        if not F.extractionReady() then release(ctx); return false end
+        if not F.extractionReady() or not s.questChurchExit and not F.finalLootReady(ctx) then release(ctx); return false end
         status('Using church return; awaiting the game saved-exit state')
         -- Set the attempt before dispatch: a synchronous departure can happen during the prompt.
         ctx.extractAt = now() + 15
@@ -13928,6 +14004,8 @@ end)()
         end
         if workspace.DescendantAdded then
             ctx.connect(workspace.DescendantAdded, function(item)
+                local items=workspace:FindFirstChild('Items')
+                if items and (item==items or descendant(item,items))then ctx.lootExitEpoch=(ctx.lootExitEpoch or 0)+1 end
                 if cfg.lootExtract then bring.observe(ctx, item) end
                 if item:IsA('ProximityPrompt') and (cfg.lootExtract or cfg.classQuest or s.questChurchExit) then
                     ctx.indexPending = ctx.indexPending or setmetatable({}, {__mode='k'}); ctx.indexPending[item] = true
@@ -13976,13 +14054,11 @@ end)()
                     if not s.itemDatabase then
                         status('Waiting for item definitions before smart loot / church packing'); return
                     end
-                    -- Church return takes priority as soon as the minimum time is met.
+                    -- Finish the route and double-check useful loot before saving.
                     if F.extractionReady() then
                         local data = index(ctx)
                         if extract(ctx, data) then return end
                         if not s.churchSave and discover(ctx) then return end
-                    elseif F.extractionEnabled() and s.runExhausted then
-                        status(string.format('Chest route complete; church extraction unlocks in %.0fs', cfg.minutes * 60 - (now() - s.lootStarted)))
                     end
                     if cfg.lootExtract and not quest.special.fastPlacement(s.questPlan)then
                         upgradeGear(ctx)
