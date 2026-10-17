@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.92: remove the restarting final loot recheck and save after route exhaustion.
+-- Version 0.93: include unused wrench, revive kits, Vampire Key and lanterns in native toolbar cleanup.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 92
+    local REVISION = 93
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.92-direct-exhausted-route-exit"
+    local BUILD = "v0.93-expanded-item-cleanup"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -6608,13 +6608,14 @@ end
 
 end)()
     local buildQuestInventory = (function()
--- Class starter toolbar cleanup uses the native item-specific drop and real inventory receipts.
+-- Class starter and requested utility cleanup uses native item-specific drops and real inventory receipts.
 return function(api,Q)
     local I,s,cfg,now={},api.state,api.state.config,api.now
     local blocked=s.questInventoryBlocked or setmetatable({}, {__mode='k'});s.questInventoryBlocked=blocked
     local cached,starters
     local shared={ItemBag=true,Money_Sack=true,Large_Sack=true,Pickaxe_Wooden=true,Sword_Wooden=true,
         Pickaxe_Rusty=true,Sword_Rusty=true,Sword_Steel=true,Revolver=true,RPG=true}
+    local cleanupItems={CraftingWrench=true,ReviveKit=true,VampireKey=true,Lantern=true}
     local exact={CutlassKills='Sword_Pirate',FlintlockKills='Flintlock',UseSpeedPotion='SpeedPotion',
         UseStrengthPotion='StrengthPotion',UseInvisibilityPotion='InvisibilityPotion',UseReviveKit='ReviveKit',
         BlessTeammates='Staff_Priest',ConsumeCorpses='VampirePendant',MeleeLifestealHealing='VampirePendant'}
@@ -6725,11 +6726,11 @@ return function(api,Q)
     local function classOnly(tool)
         local _,ids=I.catalog();if not ids or not tool then return false end
         local id=api.id(tool)
-        if not(ids[id] or id=='Blueprint') or shared[id] or tostring(id):lower():find('void',1,true)
+        if not(ids[id] or cleanupItems[id] or id=='Blueprint') or shared[id] or tostring(id):lower():find('void',1,true)
             or api.attr(tool,'Class')=='ItemBag' then return false end
         -- The same native medkit ID is used by Healer starters and purchased supplies.
         -- No exported provenance distinguishes them, so useful medicine is retained.
-        if Q.healing and Q.healing.isMedical(tool) or api.attr(tool,'Class')=='ReviveKit' or id=='ReviveKit'then return false end
+        if Q.healing and Q.healing.isMedical(tool)then return false end
         return true
     end
     function I.allowPickup(ctx,item)
