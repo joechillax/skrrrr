@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.82: checked walking recovery for lobby pads and a 45-minute depth-run limit.
+-- Version 0.83: continuous lobby walking, interior pad arrival and solo-queue race guards.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 82
+    local REVISION = 83
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.82-lobby-walk-recovery"
+    local BUILD = "v0.83-continuous-lobby-walking"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -1207,17 +1207,18 @@ return function(api)
         return api.owned() and game:IsLoaded() and isLobby() and api.enabled() and (not api.ready or api.ready())
             and model and model.Parent and h and root and root.Parent
             and player.Character==model and finite(h.Health) and h.Health>0 and player:GetAttribute('RejoinDead')~=true
-            and not s.teleporting and not s.departureAt and (not s.request or queueEntry and s.request.kind=='create') and not s.awaiting
+            and not s.teleporting and not s.departureAt and (not s.request or queueEntry and (s.request.kind=='create' or s.request.kind=='start')) and not s.awaiting
             and not workspace:GetAttribute('InCutScene') and player.GameplayPaused~=true
             and not h.SeatPart and not h.Sit and root.Anchored~=true
             and not(type(player:GetAttribute('PendingSessionId'))=='string' and player:GetAttribute('PendingSessionId')~='')
             and (not job or job.character==model and job.humanoid==h and job.root==root and not job.cancelled)
     end
-    function W.inside(zone,point)
+    function W.inside(zone,point,inset)
         if not zone or not zone.Parent or not vector(point) or not vector(zone.Size)then return end
         local ok,p=pcall(zone.CFrame.PointToObjectSpace,zone.CFrame,point)
         if not ok or not vector(p)then return end
-        return math.abs(p.X)<=zone.Size.X*.5 and math.abs(p.Z)<=zone.Size.Z*.5
+        inset=inset and math.min(inset,zone.Size.X*.2,zone.Size.Z*.2) or 0
+        return math.abs(p.X)<=zone.Size.X*.5-inset and math.abs(p.Z)<=zone.Size.Z*.5-inset
             and math.abs(p.Y)<=zone.Size.Y*.5+8
     end
     local function disconnect(job)
@@ -1315,13 +1316,15 @@ return function(api)
     end
     function W.guard()
         settleQuery()
-        if not current(s.lobbyWalk)then W.stop(true);return false end
+        if not current(s.lobbyWalk)then W.stop(true);return false,'Lobby walking waits for native character or loading readiness' end
         if manual()then
             local exit=s.lobbyWalkExit;local _,_,_,root=api.character()
             if exit and exit.zone and root and W.inside(exit.zone,root.Position)==false then s.lobbyWalkExit=nil end
-            s.lobbyWalkPauseUntil=now()+2;W.stop(true);return false
+            s.lobbyWalkPauseUntil=now()+2;s.lobbyWalkPauseReason='Lobby walking pauses for manual input or text focus'
+            W.stop(true);return false,s.lobbyWalkPauseReason
         end
-        if now()<(s.lobbyWalkPauseUntil or 0)then W.stop(true);return false end
+        if now()<(s.lobbyWalkPauseUntil or 0)then W.stop(true);return false,s.lobbyWalkPauseReason or 'Lobby walking waits before retrying' end
+        s.lobbyWalkPauseReason=nil
         return true
     end
     function W.entryAllowed(zone,model,h,root)
@@ -1331,9 +1334,22 @@ return function(api)
             and zone and zone.Parent and zone:IsDescendantOf(workspace) and W.inside(zone,root.Position)==true
             and (tonumber(zone:GetAttribute('PlayerCount'))or 0)==0 and (tonumber(zone:GetAttribute('State'))or 0)<=1
     end
+    function W.startAllowed(zone,model,h,root)
+        local _,liveModel,liveHumanoid,liveRoot=api.character()
+        return current(nil,true) and model==liveModel and h==liveHumanoid and root==liveRoot
+            and now()>=(s.lobbyWalkPauseUntil or 0) and not manual() and not s.lobbyWalkExit
+            and zone and zone.Parent and zone:IsDescendantOf(workspace) and W.inside(zone,root.Position)==true
+            and (tonumber(zone:GetAttribute('PlayerCount'))or 0)<=1 and (tonumber(zone:GetAttribute('State'))or 0)<=1
+    end
     local function goalFor(zone,h,root)
         local hip=finite(h.HipHeight) and math.max(0,h.HipHeight) or 2
         local size=root.Size and root.Size.Y;local height=finite(size) and math.max(1,size)*.5 or 1
+        if Enum and Enum.HumanoidRigType and h.RigType==Enum.HumanoidRigType.R6 then
+            local _,model=api.character();local leg=model and model:FindFirstChild('Left Leg')
+            if not leg or leg.Parent~=model or not leg:IsA('BasePart') or not vector(leg.Size)
+                or leg.Size.Y<=0 or leg.Size.Y>6 then return end
+            height=height+leg.Size.Y
+        end
         local ok,goal=pcall(zone.CFrame.PointToWorldSpace,zone.CFrame,Vector3.new(0,zone.Size.Y*.5+hip+height,0))
         return ok and vector(goal) and goal or nil
     end
@@ -1361,13 +1377,11 @@ return function(api)
             q.settled=true
         end)
     end
-    -- NoPath need not mean a wall exists (queue meshes/streamed navmesh can
-    -- lack a route). Prove only a short, level walking corridor, then let the
-    -- native humanoid traverse it. Missing/uncertain geometry never grants it.
+    -- Read ahead while retaining one final MoveTo goal. Probe geometry without
+    -- making the humanoid stop at the end of every short checked segment.
     local function clearStep(job,goal)
         local ok,result=pcall(function()
-            if type(workspace.Raycast)~='function' or type(workspace.Blockcast)~='function'
-                or type(workspace.GetPartBoundsInBox)~='function'then return end
+            if type(workspace.Raycast)~='function' or type(workspace.Blockcast)~='function'then return end
             local root,h=job.root,job.humanoid;local origin=root.Position
             local hip=finite(h.HipHeight) and math.max(0,h.HipHeight) or 2
             local size=root.Size
@@ -1384,13 +1398,11 @@ return function(api)
             local floorY=origin.Y-offset
             local dx,dz=goal.X-origin.X,goal.Z-origin.Z;local distance=math.sqrt(dx*dx+dz*dz)
             if distance<.05 then return end
-            local length=math.min(6,distance);dx,dz=dx/distance,dz/distance
+            local speed=finite(h.WalkSpeed) and math.max(0,h.WalkSpeed) or 16
+            local length=math.min(math.max(12,math.min(48,speed*1.5)),distance);dx,dz=dx/distance,dz/distance
             local ray=RaycastParams.new();ray.FilterType=Enum.RaycastFilterType.Exclude
             ray.FilterDescendantsInstances={job.character};ray.RespectCanCollide=true;ray.IgnoreWater=false
             ray.CollisionGroup=root.CollisionGroup
-            local overlap=OverlapParams.new();overlap.FilterType=Enum.RaycastFilterType.Exclude
-            overlap.FilterDescendantsInstances={job.character};overlap.RespectCanCollide=true
-            overlap.CollisionGroup=root.CollisionGroup;overlap.MaxParts=1
             local width=math.max(3,size.X+1);local height=math.max(5,size.Y+offset)
             local box=Vector3.new(width,height,width);local previous
             for i=0,math.ceil(length/2)do
@@ -1399,13 +1411,15 @@ return function(api)
                 for _,side in ipairs({0,-width*.5,width*.5})do
                     local hit=workspace:Raycast(Vector3.new(x-dz*side,floorY+2,z+dx*side),Vector3.new(0,-4,0),ray)
                     if not hit or not vector(hit.Position) or not vector(hit.Normal) or hit.Normal.Y<.7
-                        or math.abs(hit.Position.Y-floorY)>.75 or Enum.Material and hit.Material==Enum.Material.Water then return end
+                        or math.abs(hit.Position.Y-floorY)>1.5 or Enum.Material and hit.Material==Enum.Material.Water then return end
                     if side==0 then ground=hit.Position.Y end
                 end
                 local center=Vector3.new(x,ground+.5+height*.5,z)
-                local parts=workspace:GetPartBoundsInBox(CFrame.new(center),box,overlap)
-                if type(parts)~='table' or #parts>0 then return end
-                if previous and workspace:Blockcast(CFrame.new(previous),box,center-previous,ray)then return end
+                if previous then
+                    local hit=workspace:Blockcast(CFrame.new(previous),box,center-previous,ray)
+                    if hit and (not vector(hit.Normal) or hit.Normal.Y<.7 or not vector(hit.Position)
+                        or math.abs(hit.Position.Y-ground)>1.5)then return end
+                end
                 previous=center;floorY=ground
             end
             return Vector3.new(origin.X+dx*length,floorY+offset,origin.Z+dz*length)
@@ -1413,11 +1427,12 @@ return function(api)
         return ok and vector(result) and result or nil
     end
     function W.step(zone,mode,exit)
-        if not W.guard()then api.status('Lobby walking yields to manual input, focus or native readiness');return false end
+        local allowed,reason=W.guard()
+        if not allowed then api.status(reason);return false end
         local _,model,h,root=api.character()
         local goal=mode=='exit' and exit and exit.goal or zone and goalFor(zone,h,root)
         if not vector(root.Position) or not vector(goal)then W.stop(true);api.status('Lobby walking waits for loaded route geometry');return false end
-        if mode=='enter' and W.inside(zone,root.Position)==true or mode=='exit' and near(root.Position,goal,2.5)then
+        if mode=='enter' and W.inside(zone,root.Position,1.5)==true or mode=='exit' and near(root.Position,goal,2.5)then
             W.stop(false);return true
         end
         local job=s.lobbyWalk
@@ -1439,16 +1454,17 @@ return function(api)
             job.failures=job.failures+1;job.retryAt=now()+3
             if type(h.MoveTo)=='function'then pcall(h.MoveTo,h,root.Position)end
         end
-        if not job.points and job.noPath then
+        if not job.points and (not job.attempted or job.noPath and now()>=(job.retryAt or 0))then
+            job.attempted=true
             local point=clearStep(job,goal)
             if point then
-                job.points={{position=point}};job.index=1;job.direct=true;job.lastGoal=nil
-                job.progressAt=now();job.failures=0
+                job.points={{position=goal}};job.index=1;job.direct=true;job.lastGoal=nil
             end
         end
         if job.failures>=3 or now()-job.started>=60 then
             W.stop(true);s.lobbyWalkPauseUntil=now()+5
-            api.status('Lobby walk blocked; waiting before another walking attempt');return false
+            s.lobbyWalkPauseReason='Lobby walk blocked; waiting before another walking attempt'
+            api.status(s.lobbyWalkPauseReason);return false
         end
         if horizontal(root.Position,job.progressPoint)>=1 then job.progressPoint=root.Position;job.progressAt=now()end
         if job.repath or job.moving and now()-job.progressAt>=6 then
@@ -1460,13 +1476,9 @@ return function(api)
             if now()>=(job.retryAt or 0)then query(job,goal)end
             api.status('Finding a walking path to the lobby '..(mode=='exit' and 'exit point' or 'pad'));return false
         end
-        while job.index<=#job.points and near(root.Position,job.points[job.index].position,job.direct and .75 or 2)do job.index=job.index+1 end
+        while not job.direct and job.index<=#job.points and near(root.Position,job.points[job.index].position,2)do job.index=job.index+1 end
         local point=job.points[job.index]
         if not point then
-            if job.direct then
-                disconnect(job);job.direct=nil;job.moving=nil;job.lastGoal=nil
-                api.status('Continuing the checked walking approach to the lobby pad');return false
-            end
             disconnect(job);job.failures=job.failures+1;job.retryAt=now()+1
             api.status('Lobby path ended outside the pad; recalculating without teleporting');return false
         end
@@ -1602,17 +1614,18 @@ end)()
             s.signalsBound = true
             connect(created, function(zone)
                 s.zone, s.zoneOwned, s.partyToken = zone, true, {}
+                s.zoneEntered=nil
                 s.startedZone, s.touchCandidate = nil, nil
                 task.defer(function() if owned() then configureParty() end end)
             end)
             connect(entered, function(zone)
-                if s.zone ~= zone then s.zoneOwned = false end
-                s.zone = zone
+                s.zone,s.zoneOwned,s.zoneEntered,s.partyToken=zone,false,zone,nil
             end)
             connect(exited, function()
                 local oldZone=s.zone
                 s.zone, s.zoneOwned, s.startedZone, s.touchCandidate = nil, false, nil, nil
                 s.partyToken = nil
+                s.zoneEntered=nil
                 local c = controller("PartyCreateController")
                 if c then c.StartRequest = nil end
                 restoreZoneOrigin(oldZone)
@@ -14685,8 +14698,10 @@ end
         local zone = c.Zone or s.zone
         if zone and zone.Parent then
             lobbyWalker.stop(false)
+            if s.zone~=zone then s.zoneOwned=false;s.partyToken=nil end
             s.zone = zone
-            if not s.zoneOwned and c.CreateUI.Visible then s.zoneOwned = true; s.partyToken = {} end
+            if not s.zoneOwned and c.CreateUI.Visible and s.zoneEntered~=zone
+                and not(c.LeavePartyButton and c.LeavePartyButton.Visible)then s.zoneOwned = true; s.partyToken = {} end
             configureParty()
             if not s.zoneOwned then leaveZone(zone); return end
             if (tonumber(zone:GetAttribute("PlayerCount")) or 0) > 1 then leaveZone(zone); return end
@@ -14696,15 +14711,26 @@ end
                 return
             end
             s.partyToken = s.partyToken or {}
-            c.StartRequest = s.partyToken
+            local partyToken=s.partyToken
+            c.StartRequest = partyToken
             request("start", "TeleportManagerService", "CreatedZone", pack(zone, 1, "Earth", false, false), function(result)
                 if result[1] and result[2] then
+                    if s.partyToken~=partyToken or s.zone~=zone or not s.zoneOwned or s.zoneEntered==zone
+                        or c.Zone~=zone then
+                        status('Lobby membership changed during start; rechecking the current queue');return
+                    end
                     s.forceFresh = false
                     pcall(function() saveFresh(false) end)
                     s.startedZone, s.zoneStartedAt = zone, now()
                     waitTransition("start", zone)
                 else status("Solo start rejected; retrying after backoff") end
-            end,function()return openingReady(player)end)
+            end,function(token)
+                local liveParty=controller('PartyCreateController')
+                return s.request==token and s.partyToken==partyToken and s.zone==zone and s.zoneOwned==true
+                    and s.zoneEntered~=zone and liveParty==c and c.Zone==zone and c.CreateUI.Visible==true
+                    and not(c.LeavePartyButton and c.LeavePartyButton.Visible)
+                    and openingReady(player) and lobbyWalker.startAllowed(zone,model,humanoid,root)==true
+            end)
             return
         end
         s.zone, s.zoneOwned = nil, false
