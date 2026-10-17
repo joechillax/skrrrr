@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.77: validate queued native actions, exact claim receipts and revive/placement ownership.
+-- Version 0.78: reserve spare fuel on the drill and avoid depleted support mines.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 77
+    local REVISION = 78
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.77-deep-native-contract-audit"
+    local BUILD = "v0.78-fuel-reserves-and-mine-selection"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -5356,7 +5356,11 @@ end)()
             if D.activeMine()then return D.leaveMine(ctx,plan)end
             if goal or needFuel or needCoins and #Q.sellers(ctx)>0 then
                 ctx.questFundingMine=not goal and (needFuel and 'fuel' or true) or nil
-                return D.entry(ctx)
+                -- Fuel/funding searches belong to the same depth visit policy.
+                -- Reopening a drained native session cannot provide more coal;
+                -- keep finished-session exclusion, the entry radius and the
+                -- visit lease used by the normal depth mineshaft path.
+                return D.entry(ctx,depth and not goal)
             end
         end
         return false
@@ -6551,6 +6555,346 @@ return function(api,Q)
 end
 
 end)()
+    local buildQuestFuelCargo = (function()
+-- Native drill fuel reserves: confirmed drag, physical WeldPart contact, then
+-- DragService.Weld's attached/detached receipts. Never toggle an unknown result.
+return function(api,Q)
+    local M,s,cfg,now={},api.state,api.state.config,api.now
+    local records=s.questFuelCargo or {};s.questFuelCargo=records
+    local unknown=s.questFuelCargoUnknown or setmetatable({}, {__mode='k'});s.questFuelCargoUnknown=unknown
+    local retry=s.questFuelCargoRetry or setmetatable({}, {__mode='k'});s.questFuelCargoRetry=retry
+    local function finite(n)return type(n)=='number' and n==n and math.abs(n)<math.huge end
+    local function live(item)return item and item.Parent and item:IsDescendantOf(workspace)end
+    local function welded(item)return item:GetAttribute('Welded')==true or api.tag(item,'Welded')end
+    local function disconnect(record)
+        if record.connection then pcall(record.connection.Disconnect,record.connection);record.connection=nil end
+    end
+    local function key(item)
+        if not item then return end
+        local identity=item:GetAttribute('SessionSnapshotItemId')
+        if type(identity)=='string' and #identity>0 and #identity<=128 or finite(identity)then
+            return tostring(api.id(item))..':'..type(identity)..':'..tostring(identity)
+        end
+    end
+    local function watch(record)
+        local item=record.item
+        record.connection=item:GetAttributeChangedSignal('Welded'):Connect(function()
+            if item:GetAttribute('Welded')==true then record.seen=true
+            elseif record.seen and not record.detaching then record.state='manual-release';disconnect(record)end
+        end)
+    end
+    function M.observe(ctx)
+        for item,record in pairs(records)do
+            record.key=record.key or key(item)
+            if record.drill~=ctx.drill or record.character~=ctx.character or ctx.drill~=workspace:FindFirstChild('Drill')then
+                if record.drill==ctx.drill and (record.state=='pending' or record.state=='uncertain')then
+                    unknown[item]=true -- Keep its observed identity excluded on this same drill.
+                else
+                if record.state=='pending' or record.state=='uncertain'then unknown[item]=true end
+                disconnect(record);records[item]=nil
+                end
+            elseif record.state=='detached' and not Q.calls.drag and item:GetAttribute('Welded')==false
+                and not api.tag(item,'Welded')then
+                disconnect(record);records[item]=nil
+            end
+        end
+    end
+    function M.reserved(item)
+        local record=records[item]
+        if unknown[item] or record and record.state~='available'then return true end
+        local identity=key(item)
+        if identity then for _,entry in pairs(records)do
+            if entry.key==identity and entry.drill==workspace:FindFirstChild('Drill')then return true end
+        end end
+        return false
+    end
+    local function fuel(item,ctx,stored)
+        local amount=item and tonumber(api.attr(item,'Fuel'))
+        if not live(item) or item.Parent~=workspace:FindFirstChild('Items') or not finite(amount) or amount<=0
+            or Q.protectedRelic(item) or Q.protectedStarter(item) or api.useful(ctx,item)
+            or item:GetAttribute('Robux')==true or item:GetAttribute('ProductId')~=nil or item:GetAttribute('RobuxProductId')~=nil
+            or api.attr(item,'CostCurrency')~=nil and api.attr(item,'CostCurrency')~='Coins'
+            or api.tag(item,'ShopItem') or item:GetAttribute('Welded')~=nil and type(item:GetAttribute('Welded'))~='boolean'
+            or item:GetAttribute('Placed') or item:GetAttribute('CraftedPlaceable') or api.tag(item,'Welded') and not stored
+            or item:FindFirstChild('Health') or not api.part(item)then return false end
+        local rawOwner=item:GetAttribute('OwnerUserId');local owner=tonumber(rawOwner)
+        if rawOwner~=nil and not finite(owner)then return false end
+        if owner and owner~=0 and owner~=api.Players.LocalPlayer.UserId then return false end
+        local class=api.attr(item,'Class');local category=api.attr(item,'Category')
+        if class=='Medkit' or class=='ReviveKit' or class=='Sword' or class=='Pickaxe'
+            or category=='Ammo' or category=='Relic' or item:IsA('Tool')then return false end
+        local humanoid=item:FindFirstChildOfClass('Humanoid')
+        if humanoid and humanoid.Health>0 then return false end
+        return Q.drillSupport.accessible(item) and (stored or not M.reserved(item) and Q.free(item,true))
+    end
+    local function eligible(ctx,plan)
+        local input=game:GetService('UserInputService')
+        if type(input.GetFocusedTextBox)=='function' and input:GetFocusedTextBox()then return false end
+        local hp,maximum=tonumber(ctx.humanoid.Health),tonumber(ctx.humanoid.MaxHealth)
+        if not finite(hp) or not finite(maximum) or maximum<=0 or hp/maximum<=.3 then return false end
+        return Q.enabled(ctx) and not Q.manual() and not api.extractionReady() and not ctx.questHealing
+            and (plan.kind=='depth' and cfg.driveDepth or plan.kind=='fuel')
+            and not Q.drillSupport.inDungeon(ctx) and not ctx.questMineEntry and not ctx.nativeGateMotion
+            and not ctx.questCombat and not ctx.defenseMoving and now()>=(ctx.dodgeUntil or 0)
+            and not s.bringDelivery and not s.lootRequest and not s.equipmentRequest and not s.questCashJob
+            and not ctx.questPlacement and not ctx.questPreviewCancel and not ctx.questStartup
+            and not api.Players.LocalPlayer:GetAttribute('PlacingCraftedPlaceable')
+            and not (ctx.humanoid.MoveDirection and ctx.humanoid.MoveDirection.Magnitude>.05)
+    end
+    local function surface(ctx,p,item)
+        return live(p) and p:IsA('BasePart') and p:IsDescendantOf(ctx.drill) and api.tag(p,'WeldPart')
+            and p.Name~='Furnace' and p~=item and not p:IsDescendantOf(item)
+    end
+    function M.touching(ctx,item)
+        local origin=api.part(item);if not origin then return end
+        local best,distance,foreignDistance
+        local parts=item:IsA('BasePart') and {item} or item:GetDescendants()
+        for _,part in ipairs(parts)do if part:IsA('BasePart') and type(part.GetTouchingParts)=='function'then
+            for _,p in ipairs(part:GetTouchingParts())do
+                if live(p) and p:IsA('BasePart') and api.tag(p,'WeldPart') and p~=item and not p:IsDescendantOf(item)then
+                    local d=(p.Position-origin.Position).Magnitude
+                    if surface(ctx,p,item)then
+                        if not distance or d<distance then best,distance=p,d end
+                    elseif not foreignDistance or d<foreignDistance then foreignDistance=d end
+                end
+            end
+        end end
+        -- Native DragController chooses the nearest touched WeldPart, including
+        -- surfaces outside the drill. Ambiguous foreign contact proves no safe
+        -- drill attachment, even when another piece touches our deck too.
+        if best and (not foreignDistance or foreignDistance>distance+.01)then return best end
+    end
+    local function geometry(item)
+        local bounds,size
+        if item:IsA('BasePart')then bounds,size=item.CFrame,item.Size else bounds,size=item:GetBoundingBox()end
+        if not bounds or not size or not finite(size.X) or not finite(size.Y) or not finite(size.Z)
+            or math.min(size.X,size.Y,size.Z)<=0 or math.max(size.X,size.Y,size.Z)>24 then return end
+        return bounds,size,bounds:ToObjectSpace(item:GetPivot())
+    end
+    local function clear(ctx,item,p,offset,size,pivotOffset)
+        if not surface(ctx,p,item)then return false end
+        local pivot=p.CFrame*offset
+        local bounds=pivot*pivotOffset:Inverse()
+        local seat=ctx.drill:FindFirstChild('DrillPhysicsSeat') or ctx.drill:FindFirstChild('VehicleSeat')
+        local furnace=ctx.drill:FindFirstChild('Furnace')
+        if seat and api.part(seat) and ((bounds.Position-api.part(seat).Position).Magnitude<6
+                or (bounds.Position+Vector3.new(0,3,5)-api.part(seat).Position).Magnitude<=4)
+            or furnace and api.part(furnace) and (bounds.Position-api.part(furnace).Position).Magnitude<size.Magnitude*.5+6 then return false end
+        local params=OverlapParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances={item,p,ctx.character}
+        local inner=Vector3.new(math.max(.05,size.X-.12),math.max(.05,size.Y-.16),math.max(.05,size.Z-.12))
+        for _,part in ipairs(workspace:GetPartBoundsInBox(bounds,inner,params))do
+            if part~=p and not part:IsDescendantOf(item) and not part:IsDescendantOf(ctx.character)then
+                local parent=part
+                while parent.Parent and parent.Parent~=workspace:FindFirstChild('Items') and parent.Parent~=workspace do parent=parent.Parent end
+                if part.CanCollide==true or welded(parent) or M.reserved(parent)then return false end
+            end
+        end
+        return true
+    end
+    function M.placement(ctx,item)
+        local bounds,size,pivotOffset=geometry(item);if not bounds then return end
+        local candidates={}
+        for _,p in ipairs(api.tagged('WeldPart'))do if surface(ctx,p,item) and #candidates<256
+            and p.Size.X>=size.X+.1 and p.Size.Z>=size.Z+.1 then
+            local point=p.CFrame:PointToObjectSpace(bounds.Position)
+            local hx,hz=(p.Size.X-size.X)*.5-.05,(p.Size.Z-size.Z)*.5-.05
+            for ix=-2,2 do for iz=-2,2 do
+                local offset=CFrame.new(math.clamp(point.X+ix*math.max(1,size.X+.35),-hx,hx),
+                    p.Size.Y*.5+size.Y*.5-.06,math.clamp(point.Z+iz*math.max(1,size.Z+.35),-hz,hz))*pivotOffset
+                candidates[#candidates+1]={surface=p,offset=offset,distance=(p.CFrame*offset).Position-bounds.Position}
+            end end
+        end end
+        table.sort(candidates,function(a,b)return a.distance.Magnitude<b.distance.Magnitude end)
+        for i=1,math.min(64,#candidates)do local c=candidates[i]
+            if clear(ctx,item,c.surface,c.offset,size,pivotOffset)then return c.surface,c.offset,size,pivotOffset end
+        end
+    end
+    local function valid(job,plan)
+        return s.questDelivery==job and not job.cancelled and eligible(job.ctx,plan)
+            and job.ctx.character==job.character and job.ctx.drill==job.drill and plan.name==job.class
+            and live(job.surface) and surface(job.ctx,job.surface,job.item) and fuel(job.item,job.ctx,true)
+    end
+    local function ready(job)
+        local ctx=job.ctx
+        Q.stopDrive(ctx)
+        if Q.driveHandoff(ctx) or ctx.drill:GetAttribute('DriverUserId')~=nil and ctx.drill:GetAttribute('DriverUserId')~=0 then return false end
+        if ctx.humanoid.SeatPart or ctx.humanoid.Sit then Q.unseat(ctx);return false end
+        return Q.holdRoute(ctx)
+    end
+    function M.place(job)
+        if not job.owns or not job.ownershipConfirmed or welded(job.item)
+            or not clear(job.ctx,job.item,job.surface,job.offset,job.size,job.pivotOffset)then return false end
+        local goal=job.surface.CFrame*job.offset
+        local center=(goal*job.pivotOffset:Inverse()).Position
+        api.hover(job.ctx);job.ctx.root.CFrame=CFrame.new(center+Vector3.new(0,3,5));api.watch(job.ctx)
+        job.item:PivotTo(goal)
+        local part=api.part(job.item);part.AssemblyLinearVelocity=Vector3.zero;part.AssemblyAngularVelocity=Vector3.zero
+        if not job.constraints then
+            job.constraints={}
+            local function create(class,parent)local object=Instance.new(class);job.constraints[#job.constraints+1]=object
+                object.Name,object.Parent='DTECFuelReserve',parent;return object end
+            local attachment=create('Attachment',part);attachment.CFrame=part.CFrame:ToObjectSpace(job.item:GetPivot())
+            local destination=create('Attachment',job.surface);destination.CFrame=job.offset
+            local align=create('AlignPosition',part);align.Attachment0,align.Attachment1=attachment,destination
+            align.Responsiveness,align.MaxForce,align.RigidityEnabled,align.ReactionForceEnabled=45,45000,false,false
+            local rotation=create('AlignOrientation',part);rotation.Attachment0,rotation.Attachment1=attachment,destination
+            rotation.Responsiveness,rotation.MaxTorque,rotation.RigidityEnabled,rotation.ReactionTorqueEnabled=45,500000,true,false
+        end
+        return true
+    end
+    local function release(job,message)
+        if message then s.questStatus=message end
+        retry[job.item]=now()+30
+        Q.release(job)
+    end
+    local function track(job)
+        local record={item=job.item,key=key(job.item),drill=job.drill,character=job.character,surface=job.surface,offset=job.offset,state='pending'}
+        records[job.item]=record;job.record=record
+        watch(record)
+        return record
+    end
+    local function toggle(job,plan)
+        local record=job.record
+        job.pending=true
+        local sent,token=Q.call('drag','DragService','Weld',{job.item},function(ok,value,_,dispatch)
+            job.pending=nil
+            if dispatch=='not-sent'then
+                if job.mode=='store' and records[job.item]==record then disconnect(record);records[job.item]=nil end
+                release(job);return
+            end
+            if ok and value==(job.mode=='store' and 'attached' or 'detached')then
+                if job.mode=='store'then
+                    record.state='stored';record.seen=record.seen or welded(job.item)
+                    s.stats.questFuelStored=(s.stats.questFuelStored or 0)+1
+                    release(job,'Fuel reserve attached to the native drill; keeping it for later')
+                else
+                    record.state='detached';job.stage='detach-receipt';job.receiptUntil=now()+5
+                    if job.cancelled then release(job)end
+                end
+            else
+                record.state='uncertain';unknown[job.item]=true
+                release(job,'Fuel weld outcome unconfirmed; this item stays reserved without another toggle')
+            end
+        end,function()
+            if not valid(job,plan) or not ready(job) or (api.part(job.item).Position-job.ctx.root.Position).Magnitude>11 then return false end
+            if job.mode=='store'then
+                local allowed=job.owns and not welded(job.item) and M.touching(job.ctx,job.item)==job.surface
+                    and clear(job.ctx,job.item,job.surface,job.offset,job.size,job.pivotOffset)
+                return allowed
+            end
+            local expected=record.surface.CFrame*record.offset
+            if record.state~='stored' or not record.seen or not welded(job.item)
+                or (job.item:GetPivot().Position-expected.Position).Magnitude>3 then return false end
+            record.detaching=true;record.state='pending';return true
+        end)
+        if not sent then job.pending=nil;release(job)else job.weldToken=token end
+    end
+    function M.step(ctx,plan,job)
+        if job.pending then
+            if not valid(job,plan) or now()-job.started>=12 then release(job,'Fuel reserve waits for its original native reply; other work continues')end
+            return true
+        end
+        if not valid(job,plan) or now()-job.started>=12 then release(job);return true end
+        if job.stage=='detach-receipt'then
+            if job.item:GetAttribute('Welded')==false and not api.tag(job.item,'Welded')then
+                disconnect(job.record);records[job.item]=nil;retry[job.item]=nil
+                Q.release(job);s.questStatus='Stored fuel detached; delivering it through the native Furnace next'
+            elseif now()>=job.receiptUntil then
+                job.record.state='uncertain';unknown[job.item]=true;release(job,'Detached fuel attributes remain unconfirmed; no repeated toggle')
+            end
+            return true
+        end
+        if not ready(job)then return true end
+        if job.stage=='approach'then
+            local part=api.part(job.item)
+            if (part.Position-ctx.root.Position).Magnitude>10 then
+                api.hover(ctx);ctx.root.CFrame=CFrame.new(part.Position+Vector3.new(0,3,5));api.watch(ctx);return true
+            end
+            if job.mode=='retrieve'then toggle(job,plan);return true end
+            if not fuel(job.item,ctx,false)then release(job);return true end
+            job.pending=true
+            if not Q.call('drag','DragService','Request',{job.item},function(ok,value,_,dispatch)
+                job.pending=nil;job.owns=dispatch~='not-sent' and (not ok or value==true)
+                job.ownershipConfirmed=ok and value==true
+                if not ok or not job.ownershipConfirmed or not valid(job,plan) or not fuel(job.item,ctx,false)then release(job);return end
+                local p,offset,size,pivotOffset=M.placement(ctx,job.item)
+                if not p then release(job,'No clear drill fuel storage surface remains');return end
+                job.surface,job.offset,job.size,job.pivotOffset=p,offset,size,pivotOffset
+                if not M.place(job)then release(job);return end
+                job.stage='contact';job.contactUntil=now()+2
+            end,function()return valid(job,plan) and ready(job) and fuel(job.item,ctx,false)
+                and (api.part(job.item).Position-ctx.root.Position).Magnitude<=11 end)then job.pending=nil;release(job)end
+        elseif job.stage=='contact'then
+            if not job.owns or welded(job.item)then release(job);return true end
+            local touched=M.touching(ctx,job.item)
+            if touched then
+                job.surface,job.target=touched,touched
+                job.offset=touched.CFrame:ToObjectSpace(job.item:GetPivot())
+                track(job);toggle(job,plan)
+            elseif now()>=job.contactUntil then release(job,'Fuel storage had no real drill contact; no weld sent')
+            elseif (job.item:GetPivot().Position-(job.surface.CFrame*job.offset).Position).Magnitude>2
+                and not job.recovered then job.recovered=true;if not M.place(job)then release(job)end end
+        end
+        return true
+    end
+    local function begin(ctx,plan,item,mode,p,offset,size,pivotOffset,record)
+        if s.questDelivery or Q.calls.drag or Q.calls.shop or Q.calls.cash or not eligible(ctx,plan)then return false end
+        if not api.remote('DragService','Weld') or not api.remote('DragService','Request') or not api.remote('DragService','Cancel')then return false end
+        if not Q.holdRoute(ctx)then return ctx.questOwns==true end
+        local job={kind='fuel-cargo',mode=mode,ctx=ctx,item=item,surface=p,target=p,offset=offset,size=size,pivotOffset=pivotOffset,
+            character=ctx.character,drill=ctx.drill,class=plan.name,stage='approach',started=now(),record=record}
+        s.questDelivery=job;ctx.bringEquipmentLock=job
+        return M.step(ctx,plan,job)
+    end
+    function M.retrieve(ctx,plan)
+        if not eligible(ctx,plan)then return false end
+        local tank,capacity=tonumber(ctx.drill:GetAttribute('Fuel')),tonumber(ctx.drill:GetAttribute('MaxFuel'))
+        if not finite(tank) or not finite(capacity) or capacity<=0 or tank>=capacity
+            or not (Q.refuelActive(ctx,plan) or plan.kind=='fuel' or tank<=capacity*.2)then return false end
+        for item,record in pairs(records)do
+            if record.state=='stored' and record.drill==ctx.drill and record.character==ctx.character and not live(item)
+                and record.key and surface(ctx,record.surface,item)then
+                for _,candidate in ipairs(Q.looseItems())do
+                    if key(candidate)==record.key and candidate:GetAttribute('Welded')==true
+                        and type(candidate.GetAttributeChangedSignal)=='function'
+                        and fuel(candidate,ctx,true) and (candidate:GetPivot().Position-(record.surface.CFrame*record.offset).Position).Magnitude<=3 then
+                        disconnect(record);records[item]=nil;record.item=candidate;record.seen=true;records[candidate]=record
+                        watch(record);item=candidate;break
+                    end
+                end
+            end
+            if record.state=='stored' and record.drill==ctx.drill and record.character==ctx.character
+                and record.seen and welded(item) and live(item) and fuel(item,ctx,true)
+                and surface(ctx,record.surface,item)then
+                return begin(ctx,plan,item,'retrieve',record.surface,record.offset,nil,nil,record)
+            end
+        end
+        return false
+    end
+    function M.store(ctx,plan)
+        if not eligible(ctx,plan) or Q.refuelActive(ctx,plan) or s.questDelivery or Q.calls.drag
+            or type(workspace.GetPartBoundsInBox)~='function'then return false end
+        local tank,capacity=tonumber(ctx.drill:GetAttribute('Fuel')),tonumber(ctx.drill:GetAttribute('MaxFuel'))
+        if not finite(tank) or not finite(capacity) or capacity<=0 or tank<capacity*.8 then return false end
+        local count=0;for _ in pairs(records)do count=count+1 end;if count>=32 then return false end
+        local item,distance
+        for _,candidate in ipairs(Q.looseItems())do
+            if fuel(candidate,ctx,false) and now()>=(retry[candidate] or 0)
+                and type(candidate.GetAttributeChangedSignal)=='function'then
+                local d=(api.part(candidate).Position-ctx.root.Position).Magnitude
+                if d<=120 and (not distance or d<distance)then item,distance=candidate,d end
+            end
+        end
+        if not item then return false end
+        local p,offset,size,pivotOffset=M.placement(ctx,item)
+        if not p or (p.Position-ctx.root.Position).Magnitude>500 then retry[item]=now()+5;return false end
+        return begin(ctx,plan,item,'store',p,offset,size,pivotOffset)
+    end
+    return M
+end
+
+end)()
     local unpackValues = table.unpack or unpack
     local packValues = table.pack or function(...)return {n=select('#',...),...}end
     local calls = s.questCalls or {}; s.questCalls = calls
@@ -7217,7 +7561,7 @@ end)()
         if not job.owns then if s.questDelivery==job then s.questDelivery=nil end; return end
         if manual() then setStatus('Quest release waits for manual drag'); return end
         if job.releaseFailed then return end
-        call('drag','DragService','Cancel',{true},function(ok,value,_,dispatch)
+        call('drag','DragService','Cancel',{job.kind~='fuel-cargo'},function(ok,value,_,dispatch)
             if dispatch=='not-sent'then return end -- The owned lease still needs a later safe release.
             if ok and value~=false then
                 job.owns=false; if s.questDelivery==job then s.questDelivery=nil end
@@ -7259,6 +7603,7 @@ end)()
         end
     end
     local function free(item,allowFuelOre)
+        if Q.fuelCargo and Q.fuelCargo.reserved(item)then return false end
         if not api.free(item) or not api.part(item) or item:GetAttribute('Welded') or api.tag(item,'Welded')
             or item:GetAttribute('Placed') or item:GetAttribute('CraftedPlaceable')
             or api.tag(item,'Ore') and item:FindFirstChild('Health')~=nil
@@ -7461,6 +7806,7 @@ end)()
     end
     local function deliveryStep(ctx,plan)
         local job=s.questDelivery; if not job then return false end
+        if job.kind=='fuel-cargo'then return Q.fuelCargo.step(ctx,plan,job)end
         if job.ctx==ctx and job.kind=='smelt' and job.dropToken and job.dropToken.called
             and Q.drillSupport.processing.receipt(job)then
             job.processingConfirmed=true
@@ -7627,7 +7973,7 @@ end)()
         end
         -- Low positive fuel remains usable; an empty tank without a deliverable
         -- fuel item is handled by preflight without taking the chest route.
-        return false
+        return not item and Q.fuelCargo.retrieve(ctx,plan) or false
     end
     local function holdRoute(ctx)
         if ctx.currentChest or ctx.featureHold or ctx.defenseMoving or now()<(ctx.dodgeUntil or 0)
@@ -7966,6 +8312,7 @@ end)()
                 if not holdRoute(ctx)then return ctx.questOwns==true end
                 if fuel(ctx,plan)then return true end
             end
+            if not s.questDelivery and Q.fuelCargo.retrieve(ctx,plan)then return true end
             if Q.drillSupport.step(ctx,plan)then return true end
             ctx.questOwns=nil;setStatus(string.format('Refuelling %.0f / %.0f until full; %s; chest discovery continues',
                 tank,capacity,s.questMiningProblem or 'searching for loaded coal / a ready mineshaft'))
@@ -8428,6 +8775,7 @@ end)()
         return true,false
     end
     function Q.step(ctx)
+        Q.fuelCargo.observe(ctx)
         Q.drillSupport.upgradePulse(ctx)
         if Q.drillSupport.observeDrivingHealth then Q.drillSupport.observeDrivingHealth(ctx)end
         if Q.drillSupport.observeReturn then Q.drillSupport.observeReturn(ctx)end
@@ -8592,6 +8940,7 @@ end)()
             if Q.cashStep(ctx) then return true end
             if Q.loadout.step(ctx,plan) then return true end
             if cycle.phase~='upgrades' then
+                if cycle.phase=='loot' and Q.fuelCargo.store(ctx,plan)then return true end
                 if Q.collectMoney(ctx) or Q.drillSupport.sellLoose(ctx,plan) then return true end
                 ctx.questChestDue=math.min(ctx.questChestDue or now(),now())
                 local chestBusy,empty=Q.chestTurn(ctx,plan)
@@ -9090,6 +9439,7 @@ end)()
     Q.loadout=buildQuestLoadout(api,Q)
     Q.healing=buildQuestHealing(api,Q)
     Q.drillSupport=buildQuestDrill(api,Q)
+    Q.fuelCargo=buildQuestFuelCargo(api,Q)
     Q.rewards=buildQuestRewards(api,Q)
     Q.inventory=buildQuestInventory(api,Q)
     Q.parasite=buildQuestParasite(api,Q)
@@ -10262,6 +10612,7 @@ end)()
         -- Only accept that base Cost on a recognized top-level loose item;
         -- keep price overrides, paid ancestors and premium markers excluded.
         local container = workspace:FindFirstChild('Items')
+        if quest and quest.fuelCargo and quest.fuelCargo.reserved(item)then return false end
         if not item or item.Parent ~= container or not (item:IsA('Model') or item:IsA('BasePart')) then return false end
         local root = item
         while item and item ~= workspace do
