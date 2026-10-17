@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.79: release unavailable planner movement and freeze native handoff state.
+-- Version 0.80: walk to lobby queue pads without character teleports.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 35) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 79
+    local REVISION = 80
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.79-planner-handoff-and-frozen-state"
+    local BUILD = "v0.80-lobby-walking"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -40,6 +40,7 @@ return function(source)
         for _, connection in ipairs(previous.connections) do pcall(function() connection:Disconnect() end) end
     end
     if previous and previous.fullbright then pcall(previous.fullbright.cleanup)end
+    if previous and previous.lobbyWalker then pcall(previous.lobbyWalker.cleanup);previous.lobbyWalker=nil end
     if previous and previous.gui then pcall(previous.gui.dispose); previous.gui = nil end
     local s = previous and previous.job == job and previous or {}
     s.questInputRelease=s.questInputRelease or previous and previous.questInputRelease
@@ -55,6 +56,7 @@ return function(source)
     s.achievementsLoading = false
     env[KEY] = s
     local owner = s.owner
+    local lobbyWalker
     local Players = game:GetService("Players")
     local RS = game:GetService("ReplicatedStorage")
     local RunService = game:GetService("RunService")
@@ -958,10 +960,16 @@ end
             s.touchParts = nil
         end
     end
-    local function restoreZoneOrigin()
-        local _, model, _, root = character()
-        if root and model == s.zoneOriginCharacter and s.zoneOrigin then
-            pcall(function() root.CFrame = s.zoneOrigin end)
+    local function restoreZoneOrigin(zone)
+        if lobbyWalker then lobbyWalker.leave(zone)end
+    end
+    local function muteZoneTouches(model)
+        s.touchParts=s.touchParts or {}
+        for _,part in ipairs(model:GetDescendants())do
+            if part:IsA('BasePart')then
+                if s.touchParts[part]==nil then s.touchParts[part]=part.CanTouch end
+                part.CanTouch=false
+            end
         end
     end
     local function configureParty()
@@ -1174,7 +1182,264 @@ end
         s.nextAction = now() + 5
         status("Teleport failed; retrying automatically: " .. tostring(reason))
     end
+    local buildLobbyWalk = (function()
+-- Lobby character travel uses native pathfinding and Humanoid:MoveTo only.
+return function(api)
+    local W,s,now={},api.state,api.now
+    local function finite(n)return type(n)=='number' and n==n and math.abs(n)<math.huge end
+    local function vector(v)
+        local ok,x,y,z=pcall(function()return v.X,v.Y,v.Z end)
+        return ok and finite(x) and finite(y) and finite(z)
+    end
+    local function horizontal(a,b)return math.sqrt((a.X-b.X)^2+(a.Z-b.Z)^2)end
+    local function near(a,b,r)return vector(a) and vector(b) and horizontal(a,b)<=r and math.abs(a.Y-b.Y)<=6 end
+    local function isLobby()return game.PlaceId==101906032112547 or workspace:FindFirstChild('Lobby')~=nil end
+    local function current(job,queueEntry)
+        local player,model,h,root=api.character()
+        return api.owned() and game:IsLoaded() and isLobby() and api.enabled() and model and model.Parent and h and root and root.Parent
+            and player.Character==model and finite(h.Health) and h.Health>0 and player:GetAttribute('RejoinDead')~=true
+            and not s.teleporting and not s.departureAt and (not s.request or queueEntry and s.request.kind=='create') and not s.awaiting
+            and not workspace:GetAttribute('InCutScene') and player.GameplayPaused~=true
+            and not h.SeatPart and not h.Sit and root.Anchored~=true
+            and not(type(player:GetAttribute('PendingSessionId'))=='string' and player:GetAttribute('PendingSessionId')~='')
+            and (not job or job.character==model and job.humanoid==h and job.root==root and not job.cancelled)
+    end
+    function W.inside(zone,point)
+        if not zone or not zone.Parent or not vector(point) or not vector(zone.Size)then return end
+        local ok,p=pcall(zone.CFrame.PointToObjectSpace,zone.CFrame,point)
+        if not ok or not vector(p)then return end
+        return math.abs(p.X)<=zone.Size.X*.5 and math.abs(p.Z)<=zone.Size.Z*.5
+            and math.abs(p.Y)<=zone.Size.Y*.5+8
+    end
+    local function disconnect(job)
+        if job and job.blocked then pcall(job.blocked.Disconnect,job.blocked);job.blocked=nil end
+        if job and job.path and type(job.path.Destroy)=='function'then pcall(job.path.Destroy,job.path)end
+        if job then job.path=nil;job.points=nil end
+    end
+    local function settleQuery()
+        local q=s.lobbyWalkQuery;if not q then return true end
+        if not q.settled and q.cancelled and q.thread then
+            pcall(task.cancel,q.thread)
+            if coroutine.status(q.thread)=='dead'then q.settled=true;q.ok=false end
+        end
+        if not q.settled then return false end
+        if q.cancelled or not current(q.job) or s.lobbyWalk~=q.job then
+            if q.path and type(q.path.Destroy)=='function'then pcall(q.path.Destroy,q.path)end
+        else
+            local job=q.job
+            if q.ok then
+                job.path,job.points,job.index=q.path,q.points,1
+                local event=q.path.Blocked
+                if event and type(event.Connect)=='function'then
+                    job.blocked=event:Connect(function(index)
+                        if s.lobbyWalk==job and finite(index) and index>=job.index then job.repath=true end
+                    end)
+                end
+            else
+                if q.path and type(q.path.Destroy)=='function'then pcall(q.path.Destroy,q.path)end
+                job.failures=job.failures+1;job.retryAt=now()+3
+            end
+        end
+        if s.lobbyWalkQuery==q then s.lobbyWalkQuery=nil end
+        return true
+    end
+    function W.stop(restore)
+        local job=s.lobbyWalk
+        if job then
+            job.cancelled=true;disconnect(job)
+            local _,model,h,root=api.character()
+            if job.moving and api.owned() and model==job.character and h==job.humanoid and root==job.root
+                and root.Parent and h.Health>0 and type(h.MoveTo)=='function'then
+                pcall(h.MoveTo,h,root.Position) -- Cancel only this walk's last owned goal.
+            end
+            s.lobbyWalk=nil
+        end
+        local q=s.lobbyWalkQuery
+        if q and (not job or q.job==job)then q.cancelled=true end
+        settleQuery()
+        if restore then api.restoreTouches()end
+    end
+    local function manual()
+        local ok,uis=pcall(game.GetService,game,'UserInputService')
+        if not ok or not uis or type(uis.GetFocusedTextBox)~='function'then return true end
+        local read,focus=pcall(uis.GetFocusedTextBox,uis)
+        if not read or focus then return true end
+        if type(uis.IsKeyDown)=='function'then
+            for _,name in ipairs({'W','A','S','D','Up','Down','Left','Right','Space'})do
+                local key=Enum and Enum.KeyCode and Enum.KeyCode[name]
+                if key then local good,down=pcall(uis.IsKeyDown,uis,key);if not good or down then return true end end
+            end
+        end
+        -- This is the same native PlayerModule control read used by the
+        -- exported TrainComponent. It observes actual thumbstick/gamepad input,
+        -- independently of Humanoid.MoveDirection produced by our MoveTo.
+        local player=api.Players.LocalPlayer
+        local scripts=player:FindFirstChild('PlayerScripts');local module=scripts and scripts:FindFirstChild('PlayerModule')
+        local controls
+        if module then
+            if W.controlsModule~=module then
+                local read=W.controlsRead
+                if not read or read.module~=module or read.settled and not read.controls and now()>=(read.retryAt or math.huge)then
+                    read={module=module};W.controlsRead=read
+                    -- Requiring PlayerModule can yield while native startup is
+                    -- loading. Keep that read off the supervisor thread.
+                    task.spawn(function()
+                        local loaded,value=pcall(require,module)
+                        local got,result=pcall(function()return loaded and value and value:GetControls()end)
+                        read.controls=got and result or nil;read.retryAt=now()+10;read.settled=true
+                    end)
+                end
+                if not read.settled or not read.controls then return true end
+                W.controlsModule,W.controls=module,read.controls
+            end
+            controls=W.controlsModule==module and W.controls
+        end
+        if controls and type(controls.GetMoveVector)=='function'then
+            local good,value=pcall(controls.GetMoveVector,controls)
+            if not good or not vector(value) or math.abs(value.X)>.05 or math.abs(value.Z)>.05 then return true end
+        else
+            local c=api.controller('InputController')
+            if c and (c.Platform=='Mobile' or c.Platform=='Console') or uis.TouchEnabled and not uis.KeyboardEnabled then return true end
+        end
+        return false
+    end
+    function W.guard()
+        settleQuery()
+        if not current(s.lobbyWalk)then W.stop(true);return false end
+        if manual()then
+            local exit=s.lobbyWalkExit;local _,_,_,root=api.character()
+            if exit and exit.zone and root and W.inside(exit.zone,root.Position)==false then s.lobbyWalkExit=nil end
+            s.lobbyWalkPauseUntil=now()+2;W.stop(true);return false
+        end
+        if now()<(s.lobbyWalkPauseUntil or 0)then W.stop(true);return false end
+        return true
+    end
+    function W.entryAllowed(zone,model,h,root)
+        local player,liveModel,liveHumanoid,liveRoot=api.character()
+        return current(nil,true) and model==liveModel and h==liveHumanoid and root==liveRoot and player.Character==model
+            and now()>=(s.lobbyWalkPauseUntil or 0) and not manual()
+            and zone and zone.Parent and zone:IsDescendantOf(workspace) and W.inside(zone,root.Position)==true
+            and (tonumber(zone:GetAttribute('PlayerCount'))or 0)==0 and (tonumber(zone:GetAttribute('State'))or 0)<=1
+    end
+    local function goalFor(zone,h,root)
+        local hip=finite(h.HipHeight) and math.max(0,h.HipHeight) or 2
+        local size=root.Size and root.Size.Y;local height=finite(size) and math.max(1,size)*.5 or 1
+        local ok,goal=pcall(zone.CFrame.PointToWorldSpace,zone.CFrame,Vector3.new(0,zone.Size.Y*.5+hip+height,0))
+        return ok and vector(goal) and goal or nil
+    end
+    local function query(job,goal)
+        if not settleQuery()then return end
+        local q={job=job,started=now()};s.lobbyWalkQuery=q
+        q.thread=task.spawn(function()
+            local ok=pcall(function()
+                local service=game:GetService('PathfindingService')
+                if not service or not current(job) or s.lobbyWalk~=job then return end
+                local path=service:CreatePath({AgentRadius=2,AgentHeight=6,AgentCanJump=true,WaypointSpacing=4})
+                q.path=path;path:ComputeAsync(job.root.Position,goal)
+                if not current(job) or s.lobbyWalk~=job or q.cancelled or path.Status~=Enum.PathStatus.Success then return end
+                local points=path:GetWaypoints()
+                if type(points)~='table' or #points<1 or #points>128 then return end
+                q.points={}
+                for _,point in ipairs(points)do
+                    if not vector(point.Position)then return end
+                    q.points[#q.points+1]={position=point.Position,jump=point.Action==Enum.PathWaypointAction.Jump}
+                end
+                q.ok=true
+            end)
+            if not ok then q.ok=false end
+            q.settled=true
+        end)
+    end
+    function W.step(zone,mode,exit)
+        if not W.guard()then api.status('Lobby walking yields to manual input, focus or native readiness');return false end
+        local _,model,h,root=api.character()
+        local goal=mode=='exit' and exit and exit.goal or zone and goalFor(zone,h,root)
+        if not vector(root.Position) or not vector(goal)then W.stop(true);api.status('Lobby walking waits for loaded route geometry');return false end
+        if mode=='enter' and W.inside(zone,root.Position)==true or mode=='exit' and near(root.Position,goal,2.5)then
+            W.stop(false);return true
+        end
+        local job=s.lobbyWalk
+        if job and (job.zone~=zone or job.mode~=mode or not near(job.goal,goal,2))then W.stop(false);job=nil end
+        if not job then
+            job={character=model,humanoid=h,root=root,zone=zone,mode=mode,goal=goal,started=now(),failures=0,
+                progressAt=now(),progressPoint=root.Position};s.lobbyWalk=job
+        end
+        if not settleQuery()then
+            local q=s.lobbyWalkQuery
+            if now()-q.started>=8 and not q.cancelled then
+                q.cancelled=true;job.failures=job.failures+1;job.retryAt=now()+3;settleQuery()
+            end
+            api.status('Lobby walking: waiting for the owned path computation');return false
+        end
+        if job.failures>=3 or now()-job.started>=60 then
+            W.stop(true);s.lobbyWalkPauseUntil=now()+5
+            api.status('Lobby walk blocked; waiting before another walking attempt');return false
+        end
+        if horizontal(root.Position,job.progressPoint)>=1 then job.progressPoint=root.Position;job.progressAt=now()end
+        if job.repath or job.moving and now()-job.progressAt>=6 then
+            disconnect(job);job.repath=nil;job.moving=nil;job.lastGoal=nil;job.failures=job.failures+1;job.retryAt=now()+1
+            job.progressAt=now()
+            if type(h.MoveTo)=='function'then pcall(h.MoveTo,h,root.Position)end
+        end
+        if not job.points then
+            if now()>=(job.retryAt or 0)then query(job,goal)end
+            api.status('Finding a walking path to the lobby '..(mode=='exit' and 'exit point' or 'pad'));return false
+        end
+        while job.index<=#job.points and near(root.Position,job.points[job.index].position,2)do job.index=job.index+1 end
+        local point=job.points[job.index]
+        if not point then
+            disconnect(job);job.failures=job.failures+1;job.retryAt=now()+1
+            api.status('Lobby path ended outside the pad; recalculating without teleporting');return false
+        end
+        if not current(job) or type(h.MoveTo)~='function'then W.stop(true);return false end
+        api.muteTouches(model)
+        if point~=job.lastGoal or now()>=(job.moveAt or 0)then
+            if point.jump then h.Jump=true end
+            local moved=pcall(h.MoveTo,h,point.position)
+            if not moved then W.stop(true);api.status('Native lobby walking unavailable; waiting without teleporting');return false end
+            job.lastGoal,job.moveAt,job.moving=point,now()+3,true
+        end
+        api.status('Walking to the lobby '..(mode=='exit' and 'exit point' or 'Earth pad'))
+        return false
+    end
+    function W.leave(zone)
+        local _,model,h,root=api.character()
+        if not model or not h or not root or not vector(root.Position)then return end
+        if s.lobbyWalkExit and s.lobbyWalkExit.character==model then return end
+        local origin=s.zoneOriginCharacter==model and s.zoneOrigin
+        local goal=origin and origin.Position
+        if not vector(goal) or zone and W.inside(zone,goal)~=false then
+            if not zone or W.inside(zone,root.Position)==false then return end
+            local ok,value=pcall(zone.CFrame.PointToWorldSpace,zone.CFrame,Vector3.new(zone.Size.X*.5+6,0,0))
+            if not ok or not vector(value)then return end
+            goal=Vector3.new(value.X,root.Position.Y,value.Z)
+        end
+        W.stop(false);s.lobbyWalkExit={character=model,goal=goal,zone=zone}
+        s.zoneOrigin,s.zoneOriginCharacter=nil,nil
+    end
+    function W.exitStep()
+        local exit=s.lobbyWalkExit;if not exit then return true end
+        local _,model=api.character()
+        if exit.character~=model then s.lobbyWalkExit=nil;W.stop(true);return true end
+        if not W.step(exit.zone,'exit',exit)then return false end
+        s.lobbyWalkExit=nil;api.restoreTouches();return true
+    end
+    function W.cleanup()W.stop(true)end
+    return W
+end
+
+end)()
     local features
+    lobbyWalker=buildLobbyWalk({state=s,now=now,owned=owned,Players=Players,character=character,
+        enabled=function()return features and features.enabled()end,controller=controller,status=status,muteTouches=muteZoneTouches,
+        restoreTouches=function()
+            local c=controller('PartyCreateController')
+            -- Keep the original touch/RPC serialization while a queue entry or
+            -- native membership is unresolved. A paused walk is not a receipt.
+            if not s.lobbyWalkExit and not s.touchCandidate and not s.zone and not(c and c.Zone) and not(s.request
+                and (s.request.kind=='create' or s.request.kind=='start' or s.request.kind=='exit-zone'))then restoreZoneTouches()end
+        end})
+    s.lobbyWalker=lobbyWalker
     local function setup(player, packages)
         local shared = child(RS, "Shared")
         for _, descriptor in ipairs({ { "achievements", "Achievements" }, { "itemCategories", "ItemCategories" }, { "itemDatabase", "ItemDatabase" } }) do
@@ -1265,12 +1530,13 @@ end
                 s.zone = zone
             end)
             connect(exited, function()
+                local oldZone=s.zone
                 s.zone, s.zoneOwned, s.startedZone, s.touchCandidate = nil, false, nil, nil
                 s.partyToken = nil
                 local c = controller("PartyCreateController")
                 if c then c.StartRequest = nil end
-                restoreZoneOrigin()
-                task.delay(0.2, function() if owned() then restoreZoneTouches() end end)
+                restoreZoneOrigin(oldZone)
+                task.delay(0.2, function() if owned() and not s.lobbyWalkExit then restoreZoneTouches() end end)
             end)
         end
     end
@@ -14271,20 +14537,20 @@ end
     local function leaveZone(zone)
         request("exit-zone", "TeleportManagerService", "ExitZone", pack(zone), function(result)
             if not result[1] or result[2] == false then return end
-            restoreZoneOrigin()
-            restoreZoneTouches()
+            restoreZoneOrigin(zone)
+            if not s.lobbyWalkExit then restoreZoneTouches()end
             -- Do not assume membership changed until ExitedZone/controller state confirms it.
             waitTransition("exit-zone", zone, 12)
         end)
     end
     local function lobby(player, model, humanoid, root)
         stopFarm()
-        if not alive(player, model, humanoid, root) then status("Waiting for lobby character"); return end
+        if not alive(player, model, humanoid, root) then lobbyWalker.stop(true);status("Waiting for lobby character"); return end
         for _, method in ipairs({ "TouchedZone", "CreatedZone", "ExitZone" }) do
-            if not remote("TeleportManagerService", method) then status("Waiting for lobby action " .. method); return end
+            if not remote("TeleportManagerService", method) then lobbyWalker.stop(true);status("Waiting for lobby action " .. method); return end
         end
         local c = configureParty()
-        if not c or not s.signalsBound then status("Waiting for lobby controller and zone signals"); return end
+        if not c or not s.signalsBound then lobbyWalker.stop(true);status("Waiting for lobby controller and zone signals"); return end
         local pending = player:GetAttribute("PendingSessionId")
         local retry = player:GetAttribute("SessionRejoinRetryAvailable") == true
         if retry ~= s.rejoinRetryFlag then
@@ -14309,8 +14575,10 @@ end
             return
         end
         s.failedSession = nil
+        if not lobbyWalker.exitStep()then return end
         local zone = c.Zone or s.zone
         if zone and zone.Parent then
+            lobbyWalker.stop(false)
             s.zone = zone
             if not s.zoneOwned and c.CreateUI.Visible then s.zoneOwned = true; s.partyToken = {} end
             configureParty()
@@ -14352,23 +14620,21 @@ end
                 selected = zoneObject; break
             end
         end
-        if not selected then status("Waiting for an empty PartyZone"); return end
+        if not selected then lobbyWalker.stop(true);status("Waiting for an empty PartyZone"); return end
         if now() < (s.nextAction or 0) then return end
-        -- Keep the actual character inside the zone, matching the normal touch path.
-        -- Disable local touch callbacks while entering, so only the explicit verified request is sent.
+        -- Walk into the actual native zone before the existing serialized
+        -- queue request. Preserve its touch guard so one entry sends one RPC.
         if s.zoneOriginCharacter ~= model then s.zoneOrigin, s.zoneOriginCharacter = root.CFrame, model end
-        s.touchParts = s.touchParts or {}
-        for _, part in ipairs(model:GetDescendants()) do
-            if part:IsA("BasePart") then
-                if s.touchParts[part] == nil then s.touchParts[part] = part.CanTouch end
-                part.CanTouch = false
-            end
-        end
-        root.CFrame = selected.CFrame * CFrame.new(0, selected.Size.Y / 2 + 3, 0)
+        if not lobbyWalker.step(selected,'enter')then return end
+        muteZoneTouches(model)
         s.touchCandidate, s.touchAt = selected, now()
         request("create", "TeleportManagerService", "TouchedZone", pack(selected), function(result)
             if not result[1] or result[2] == false then s.touchCandidate = nil
             elseif s.touchCandidate == selected then s.touchAt = now() end
+        end,function(token)
+            local currentParty=controller('PartyCreateController')
+            return s.request==token and s.touchCandidate==selected and not s.zone and not(currentParty and currentParty.Zone)
+                and lobbyWalker.entryAllowed(selected,model,humanoid,root)
         end)
     end
     local function returnToLobby()
@@ -14476,6 +14742,7 @@ end
     local function tick()
         loadFresh()
         local player, model, humanoid, root = character()
+        lobbyWalker.guard()
         if not game:IsLoaded() or not player or not child(player, "PlayerGui") then
             status("Waiting for game, LocalPlayer, and PlayerGui"); return
         end
@@ -14543,7 +14810,7 @@ end
             s.churchSave, s.churchMemories = nil, nil
             s.questChurchExit, s.questActivity = nil, nil
             if not features.enabled() then stopFarm(); status("Both farm modes are off"); return end
-            if features.questLobby() then status(s.questStatus or "Waiting for equipped-class startup loadout"); return end
+            if features.questLobby() then lobbyWalker.stop(true);status(s.questStatus or "Waiting for equipped-class startup loadout"); return end
             lobby(player, model, humanoid, root)
             claimRewards(player)
             return
