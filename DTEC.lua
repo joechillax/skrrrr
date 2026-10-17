@@ -1,7 +1,7 @@
 if game.PlaceId ~= 101906032112547 and game.PlaceId ~= 74507545904779 then return end
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.94: restrict all startup features and runtime ownership to verified DTEC places.
+-- Version 0.95: objective-aware Miner smelting and isolated ownership/save/cleanup recovery.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -20,9 +20,9 @@ return function(source)
     if not dtecPlace() then return end
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 94
+    local REVISION = 95
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.94-dtec-only-runtime"
+    local BUILD = "v0.95-miner-smelting-and-recovery"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -109,6 +109,8 @@ return function(api)
             if type(exists)=='function'then
                 local checked,present=pcall(exists,FILE)
                 if not checked or present~=false then return {schema=1,accounts={}},false end
+            else
+                return {schema=1,accounts={}},false -- Unknown read failure cannot authorize replacing an existing document.
             end
             return {schema=1,accounts={}},true
         end
@@ -228,6 +230,7 @@ return function(api)
         parts=setmetatable({}, {__mode='k'});model=nil
     end
     local function apply(part)
+        if not api.owned() then return end
         if model and part:IsA('BasePart') and part:IsDescendantOf(model)then
             if parts[part]==nil then parts[part]=part.CanCollide end
             if part.CanCollide then part.CanCollide=false end
@@ -3096,6 +3099,34 @@ return function(api,Q,D)
     local function finite(v)return type(v)=='number' and v==v and math.abs(v)<math.huge end
     local function live(item)return item and item.Parent and item:IsDescendantOf(workspace)end
     local function status(text)s.questStatus=text end
+    local smeltKeys={Ore_Iron='SmeltIron',Ore_Gold='SmeltGold'}
+    function M.goalInput(plan,id)
+        local key=smeltKeys[id];if not key then return false end
+        for _,goal in ipairs(plan and plan.unmet or {})do if goal.key==key then return true end end
+        return false
+    end
+    function M.hasGoals(plan)return M.goalInput(plan,'Ore_Iron') or M.goalInput(plan,'Ore_Gold')end
+    function M.goalRemaining(plan,id)
+        local key=smeltKeys[id]
+        for _,goal in ipairs(plan and plan.unmet or {})do
+            if key and goal.key==key then return math.max(0,(tonumber(goal.goal) or 1)-(tonumber(goal.count) or 0))end
+        end
+        return 0
+    end
+    function M.goalStock(ctx,plan)
+        if not M.hasGoals(plan)then return end
+        local stock={}
+        for _,tool in ipairs(api.ownedTools(ctx))do
+            local id=api.id(tool)
+            if M.goalInput(plan,id)then stock[id]=(stock[id] or 0)+api.stackCount(tool)end
+        end
+        return stock
+    end
+    function M.stockReady(plan,stock)
+        if not stock or not M.hasGoals(plan)then return false end
+        for id in pairs(smeltKeys)do if M.goalInput(plan,id) and (stock[id] or 0)<M.goalRemaining(plan,id)then return false end end
+        return true
+    end
     local function protected(item,ctx)
         if Q.protectedRelic(item) or (tonumber(api.attr(item,'Fuel')) or 0)>0
             or api.attr(item,'Class')=='Medkit' or api.attr(item,'Class')=='ReviveKit'
@@ -3116,13 +3147,16 @@ return function(api,Q,D)
             or item:FindFirstChild('Health') or api.tag(item,'CraftedPlaceable')then return false end
         local plan=Q.plan(s.classData,s.questCatalog,s.config.driveDepth)
         return plan.kind~='shred' and not ctx.questNeedScrap and D.accessible(item)
+            and (not M.hasGoals(plan) or M.goalInput(plan,api.id(item)))
     end
     function M.carriedOre(item,ctx)
         local player=api.Players.LocalPlayer
+        local plan=Q.plan(s.classData,s.questCatalog,s.config.driveDepth)
         return item and item:IsA('Tool') and recipes[api.id(item)]~=nil and not failed[item]
             and player.Character==ctx.character and (item.Parent==ctx.character or item.Parent==player:FindFirstChild('Backpack'))
             and not protected(item,ctx) and not item:FindFirstChild('Health') and not api.tag(item,'CraftedPlaceable')
-            and Q.plan(s.classData,s.questCatalog,s.config.driveDepth).kind~='shred' and not ctx.questNeedScrap
+            and plan.kind~='shred' and not ctx.questNeedScrap
+            and (not M.hasGoals(plan) or M.goalInput(plan,api.id(item)))
     end
     function M.hasOre(ctx)
         for _,item in ipairs(Q.looseItems())do if M.inputEligible(item,ctx)then return true end end
@@ -3391,7 +3425,9 @@ return function(api,Q,D)
                 if type(c.ApplyState)=='function'then pcall(c.ApplyState,c,value)end
             end
         end,function()
+            local current=Q.plan(s.classData,s.questCatalog,s.config.driveDepth)
             local allowed=Q.enabled(ctx) and not Q.manual() and not api.extractionReady() and not c.PendingCraft
+                and (not M.hasGoals(plan) or current.name==plan.name and current.level==plan.level and M.hasGoals(current))
                 and api.controller('CraftingController')==c and unlockReady(c) and c.CraftSource==job.source and c:CanCraft('Furnace')
                 and craftPrice()==price and (tonumber(c.ScrapCount) or 0)>=price and not ctx.questHealing
                 and not s.questDelivery and not s.bringDelivery and not s.lootRequest and not s.equipmentRequest
@@ -3469,16 +3505,29 @@ return function(api,Q,D)
         if not Q.enabled(ctx) or not Q.activePlan(plan) or ctx.questHealing or Q.manual() or api.extractionReady()
             or s.questDelivery or s.bringDelivery or s.lootRequest or s.equipmentRequest or s.questCalls.drag then return false end
         if ctx.questPlacement and ctx.questPlacement.processingPlacement then return M.placement(ctx,plan)end
-        local item
+        local item,distance
+        local goal=M.hasGoals(plan)
+        local stock=goal and M.goalStock(ctx,plan)
         for _,candidate in ipairs(Q.looseItems())do
-            if M.inputEligible(candidate,ctx) and now()>=(s.questItemRetries[candidate] or 0)then item=candidate;break end
+            local id=api.id(candidate)
+            if (not goal or M.goalInput(plan,id) and (stock[id] or 0)<M.goalRemaining(plan,id)) and M.inputEligible(candidate,ctx)
+                and now()>=(s.questItemRetries[candidate] or 0)then
+                local d=(api.part(candidate).Position-ctx.root.Position).Magnitude
+                if not distance or d<distance then item,distance=candidate,d end
+            end
         end
-        if not item then return false end
+        if not item then
+            if goal and M.hasOre(ctx) and not M.findProcessor(ctx,ctx.root.Position)then
+                Q.special.readCraft(ctx)
+                return M.placement(ctx,plan)
+            end
+            return false
+        end
         local machine=M.findProcessor(ctx,api.part(item).Position)
         if not machine then
             Q.special.readCraft(ctx)
             if M.placement(ctx,plan)then return true end
-            if plan.kind~='depth' or s.config.driveDepth~=true then return false end
+            if not goal and (plan.kind~='depth' or s.config.driveDepth~=true)then return false end
             if not api.hasRoom(ctx,item) or not M.inputEligible(item,ctx)then return false end
             local name,before=api.id(item),0
             for _,tool in ipairs(api.ownedTools(ctx))do if api.id(tool)==name then before=before+1 end end
@@ -3505,7 +3554,6 @@ end)()
         DriveSpeed=140,PowerDrive=100,EngineOverdrive=90,FuelStorage=45,MoneyDrill=60,
         TeamMeleeDamage=100,TeamPickaxeDamage=100,TeamGunDamage=100,TeamExplosiveDamage=100,TeamHealth=70,SackStorage=6,PowerBurst=120}
     local blocked={CartExtension=true,MountedGunner=true,SackStorage=true,LifeSteal=true,HealthRegen=true,MoneyDrill=true}
-    local lastResort={} -- Ordinary ranking keeps the blacklist; complete blocked rolls use the scoped exception below.
     local damage={TeamMeleeDamage=true,TeamPickaxeDamage=true,TeamGunDamage=true,TeamExplosiveDamage=true}
     local ores={Ore_Iron=true,Ore_Gold=true,Ore_Diamond=true,Ore_Emerald=true,Ore_Ruby=true,Ore_Coal=true,Ore_VoidCoal=true,IronBar=true,GoldBar=true}
     local rarity={Common=1,Rare=2,Epic=3,Legendary=4,Mythic=5}
@@ -3747,7 +3795,7 @@ end)()
         if ledger[key]==true and key~=reservedKey then return nil,nil,nil,nil,nil,'reserved' end
         if type(ledger[key])=='number' and now()<ledger[key]then return nil,nil,nil,nil,nil,'retry' end
         local blockedChoice,blockedCost=D.blacklistFallback(ctx,c)
-        local best,score,fallback,fallbackCost,desperate,desperateCost,saving,savingScore
+        local best,score,fallback,fallbackCost,saving,savingScore
         for _,offer in ipairs(options)do
             local free=reward and offer.Type=='ClassReward'
             local cost=D.cost(offer)
@@ -3760,15 +3808,13 @@ end)()
                 local value=D.score(ctx,plan,offer)
                 if value and (not score or value>score)then best,score=offer,value end
                 local name=offer.UpgradeName
-                local known=type(name)=='string' and (weights[name] or lastResort[name] or type(c.DisplayInfo)=='table' and c.DisplayInfo[name])
+                local known=type(name)=='string' and (weights[name] or type(c.DisplayInfo)=='table' and c.DisplayInfo[name])
                 if known and not blocked[name] and D.capAllowed(ctx,offer,c)then
-                    if lastResort[name]then
-                        if not desperateCost or (cost or 0)<desperateCost then desperate,desperateCost=offer,cost or 0 end
-                    elseif not fallbackCost or (cost or 0)<fallbackCost then fallback,fallbackCost=offer,cost or 0 end
+                    if not fallbackCost or (cost or 0)<fallbackCost then fallback,fallbackCost=offer,cost or 0 end
                 end
             end
         end
-        local choice=best or fallback or desperate
+        local choice=best or fallback
             or blockedChoice and (reward or wallet>=blockedCost) and blockedChoice
         -- Keep priority ranking, then spend on the cheapest safe normal card.
         -- An unaffordable preferred card cannot hold an affordable roll hostage.
@@ -3779,7 +3825,7 @@ end)()
     function D.fundingTarget(ctx,plan)
         local cycle=D.depthEconomy(ctx,plan)
         if cycle and cycle.phase=='funding' then return D.depthFundingCoins end
-        local c=api.controller('DrillUpgradeController');local fallback,desperate
+        local c=api.controller('DrillUpgradeController');local fallback
         local wallet=finite(s.questWallet) and s.questWallet or 0
         local chosen,key,_,_,saving
         if c then chosen,key,_,_,saving=D.choose(ctx,plan,c,wallet)end
@@ -3790,15 +3836,14 @@ end)()
         for _,offer in ipairs(c and c.Options or {})do
             local price=D.cost(offer)
             local name=offer.UpgradeName
-            local known=type(name)=='string' and (weights[name] or lastResort[name] or type(c.DisplayInfo)=='table' and c.DisplayInfo[name])
+            local known=type(name)=='string' and (weights[name] or type(c.DisplayInfo)=='table' and c.DisplayInfo[name])
             if offer.Type=='Coins' and finite(price) and price>=0 and known and not blocked[name]
                 and D.capAllowed(ctx,offer,c)then
-                if lastResort[name]then desperate=math.min(desperate or price,price)
-                else fallback=math.min(fallback or price,price)end
+                fallback=math.min(fallback or price,price)
             end
         end
         -- Preserve the user's medical balance above the actual upgrade quote.
-        return math.max(Q.coinTarget(fallback or desperate or 0,false),Q.supplyFundingTarget(ctx,plan))
+        return math.max(Q.coinTarget(fallback or 0,false),Q.supplyFundingTarget(ctx,plan))
     end
     local function sameUpgradeUI(job)
         local c=job.controller
@@ -3955,7 +4000,7 @@ end)()
             and (not api.miningNodeAllowed or api.miningNodeAllowed(node))
             and hp and hp>0 and api.part(node) and (not coal or model:lower():find('coal',1,true)~=nil)
     end
-    function D.goalEligible(node,plan)
+    function D.goalEligible(node,plan,stock)
         if not D.nodeAllowed(node,false) then return false end
         local kind=node:GetAttribute('Ore_Model'):lower()
         local coal=kind:find('coal',1,true)~=nil
@@ -3963,6 +4008,9 @@ end)()
         local ruby=kind:find('ruby',1,true)~=nil
         local gem=diamond or ruby or kind:find('emerald',1,true)~=nil or kind:find('heartgem',1,true)~=nil
         local ore=coal or kind:find('iron',1,true)~=nil or kind:find('gold',1,true)~=nil
+        local input=kind:find('iron',1,true) and 'Ore_Iron' or kind:find('gold',1,true) and 'Ore_Gold'
+        if input and D.processing.goalInput(plan,input)
+            and (not stock or (stock[input] or 0)<D.processing.goalRemaining(plan,input))then return true end
         for _,goal in ipairs(plan.unmet or {})do
             if (goal.key=='MineGems' or goal.key=='SellGems') and gem or goal.key=='MineDiamond' and diamond or goal.key=='MineRuby' and ruby
                 or goal.key=='MineCoal' and coal or goal.key=='MineOres' and ore then return true end
@@ -4641,6 +4689,7 @@ end)()
         local id=api.id(item);local class=api.attr(item,'Class');local category=api.attr(item,'Category')
         local value=tonumber(api.attr(item,'Value'))
         local current=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
+        if D.processing.goalInput(current,id)then return false end
         if current.kind=='depth' and cfg.driveDepth and (id=='Ore_Iron' or id=='Ore_Gold')then return false end
         if category=='Scrap' and (current.kind=='shred' or ctx.questNeedScrap)then return false end
         local fuelValue=tonumber(api.attr(item,'Fuel')) or 0
@@ -4765,16 +4814,16 @@ end)()
         return false
     end
     function D.cleanup(ctx)
-        D.stopDrivingDefense(ctx)
-        D.stopGate(ctx)
-        D.stopMine(ctx)
+        pcall(D.stopDrivingDefense,ctx)
+        pcall(D.stopGate,ctx)
+        pcall(D.stopMine,ctx)
         ctx.questMineExitPickaxe=nil
         ctx.questMineEntry=nil
         ctx.questMineReadyAt=nil
         ctx.questFundingMine=nil
         if not api.extractionReady()then ctx.questMineExit=nil;ctx.questMineChurchFallback=nil end
         if s.questUpgradeJob and s.questUpgradeJob.ctx==ctx then
-            releaseUpgradeUI(s.questUpgradeJob)
+            pcall(releaseUpgradeUI,s.questUpgradeJob)
             s.questUpgradeJob=nil
         end
     end
@@ -5651,6 +5700,7 @@ end)()
     end
     function D.step(ctx,plan)
         local goal=plan.kind=='mining' or plan.objective=='SellGems'
+        local smeltStock=D.processing.goalStock(ctx,plan)
         local depth=(plan.kind=='depth' or plan.kind=='fuel') and cfg.driveDepth
         local activeMine=D.activeMine(ctx)
         local collectAll=activeMine and (depth or ctx.questDepthMine and ctx.questDepthMine.mine==activeMine
@@ -5710,7 +5760,7 @@ end)()
         end
         local mine=ctx.questMineJob
         if mine then
-            if not D.nodeAllowed(mine.node,mine.coal) or not D.accessible(mine.node) or not collectAll and goal and not D.goalEligible(mine.node,plan)
+            if not D.nodeAllowed(mine.node,mine.coal) or not D.accessible(mine.node) or not collectAll and goal and not D.goalEligible(mine.node,plan,smeltStock)
                 or not collectAll and not goal and not needFuel and not needCoins
                 then
                 D.stopMine(ctx);ctx.questOwns=nil;return false
@@ -5810,7 +5860,7 @@ end)()
             if not D.nodeAllowed(node,needFuel and not collectAll)then rejected.loading=rejected.loading+1
             elseif not D.accessible(node)then rejected.unavailable=rejected.unavailable+1
             elseif ctx.questDepthMine and ctx.questDepthMine.blocked[node]then rejected.loading=rejected.loading+1
-            elseif not collectAll and (goal and not D.goalEligible(node,plan) or not goal and not needFuel and not D.moneyNode(node))then rejected.objective=rejected.objective+1
+            elseif not collectAll and (goal and not D.goalEligible(node,plan,smeltStock) or not goal and not needFuel and not D.moneyNode(node))then rejected.objective=rejected.objective+1
             elseif now()<((ctx.questMineRetry or {})[node] or 0)then rejected.retry=rejected.retry+1
             elseif not collectAll and (api.part(node).Position-ctx.root.Position).Magnitude>600 then rejected.distant=rejected.distant+1
             else nodes[#nodes+1]=node end
@@ -5846,6 +5896,9 @@ end)()
                 return true
             end
             if D.activeMine()then return D.leaveMine(ctx,plan)end
+            if D.processing.stockReady(plan,smeltStock)then
+                ctx.questOwns=nil;status('Required smelting ore is carried; scouting for a native processor');return false
+            end
             if goal or needFuel or needCoins and #Q.sellers(ctx)>0 then
                 ctx.questFundingMine=not goal and (needFuel and 'fuel' or true) or nil
                 -- Fuel/funding searches belong to the same depth visit policy.
@@ -7399,7 +7452,7 @@ end)()
     local melee = {MeleeKills=true, MeleeDamage=true, MeleeCrits=true, EnemyKills=true, VampireKills=true,
         CrazyMinerKills=true, BanditMinerKills=true, DarknessEnemyKills=true,GoblinKills=true,GoblinLordKills=true}
     local guns = {GunKills=true, HeadShot=true, ShotgunKills='Shotgun', RifleKills='Rifle'}
-    local mining = {MineCoal=true,MineDiamond=true,MineRuby=true,MineOres=true,MineGems=true}
+    local mining = {MineCoal=true,MineDiamond=true,MineRuby=true,MineOres=true,MineGems=true,SmeltIron=true,SmeltGold=true}
     local sales = {SellGoldItems=true,SellCorpse=true,SellScrap=true,SellGems=true}
     local potions = {UseSpeedPotion='SpeedPotion',UseStrengthPotion='StrengthPotion',UseInvisibilityPotion='InvisibilityPotion',
         UseNightVisionPotion='NightVisionPotion',UseLuckPotion='LuckPotion'}
@@ -7536,7 +7589,7 @@ end)()
             end
         end
         if pending.OpenChest then plan.kind,plan.objective='chests','OpenChest'; return plan end
-        for _,key in ipairs({'MineGems','MineDiamond','MineRuby','MineCoal','MineOres'})do
+        for _,key in ipairs({'MineGems','MineDiamond','MineRuby','MineCoal','MineOres','SmeltIron','SmeltGold'})do
             if pending[key]then plan.kind,plan.objective='mining',key;return plan end
         end
         if pending.TotalDepth and drive then plan.kind,plan.objective='depth','TotalDepth'; return plan end
@@ -9473,6 +9526,7 @@ end)()
             if Q.cashStep(ctx)then return true end
             if Q.activePlan(plan) and not Q.refuelActive(ctx,plan) and Q.collectMoney(ctx)then return true end
         end
+        if Q.drillSupport.processing.hasGoals(plan) and Q.drillSupport.processing.step(ctx,plan)then return true end
         -- New disposable drops get the next safe sale turn, before optional
         -- mining/readiness waits or another chest. Never steal a driver or a
         -- pending native prompt/ownership lane to satisfy the sale preference.
@@ -10474,9 +10528,9 @@ return function(api)
     end
     function M.cleanup(ctx)
         pcall(M.cancel,ctx)
-        M.releaseHover(ctx)
+        pcall(M.releaseHover,ctx)
         local token = ctx.streamRequest
-        if token and token.purpose == 'remembered-item' then M.cancelItemReload(ctx, token)
+        if token and token.purpose == 'remembered-item' then pcall(M.cancelItemReload,ctx, token)
         elseif token and token.thread and coroutine.status(token.thread) ~= 'dead' then pcall(task.cancel, token.thread) end
         ctx.streamRequest = nil
         if ctx.itemReloadRequest then ctx.itemReloadRequest.cancelled = true; ctx.itemReloadRequest = nil end
