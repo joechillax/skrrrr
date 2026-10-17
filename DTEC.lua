@@ -1,6 +1,7 @@
+if game.PlaceId ~= 101906032112547 and game.PlaceId ~= 74507545904779 then return end
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.93: include unused wrench, revive kits, Vampire Key and lanterns in native toolbar cleanup.
+-- Version 0.94: restrict all startup features and runtime ownership to verified DTEC places.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -8,15 +9,20 @@ task.wait(7)
 -- Includes local ending reports, personal Discord delivery, cached discovery, and ranged dodging.
 -- Optional class quests: native combat, mining, sales, shredding, turrets, dungeons, fuel, potions and upgrades.
 -- Quest mode OFF preserves chest-only travel; no healing, mining or team purchases.
--- Every execution waits seven seconds first; this script never queues itself for teleport.
+-- Only DTEC executions wait seven seconds; unrelated places return before startup.
+-- This script never queues itself for teleport.
 -- All additional readiness checks and recovery happen automatically.
 local SOURCE = [======[
 return function(source)
+    local function dtecPlace()
+        return game.PlaceId == 101906032112547 or game.PlaceId == 74507545904779
+    end
+    if not dtecPlace() then return end
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 93
+    local REVISION = 94
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.93-expanded-item-cleanup"
+    local BUILD = "v0.94-dtec-only-runtime"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -206,7 +212,7 @@ end)()
     s.stats.chestStarts = s.stats.chestStarts or 0
     s.claims = s.claims or {}
     s.gemSeen = s.gemSeen or setmetatable({}, { __mode = "k" })
-    local function owned() return env[KEY] == s and s.owner == owner end
+    local function owned() return dtecPlace() and env[KEY] == s and s.owner == owner end
     local buildCharacterNoclip = (function()
 -- Character collision policy shared by lobby, chest-only and quest modes.
 -- Touch transmitters, anchoring, seat joints and world/drill parts are untouched.
@@ -15157,6 +15163,7 @@ end
         return true
     end
     local function tick()
+        if not dtecPlace() then return end
         loadFresh()
         s.noclip.step()
         s.cameraRecovery.step()
@@ -15184,8 +15191,8 @@ end
         if openingReady(player) and features.quest and features.quest.recoverDrive then pcall(features.quest.recoverDrive)end
         updateMetrics(player)
         local live = alive(player, model, humanoid, root)
-        local isLobby = game.PlaceId == 101906032112547 or workspace:FindFirstChild("Lobby")
-        local isPlanet = not isLobby and (game.PlaceId == 74507545904779 or workspace:GetAttribute("IsPlanet") == true)
+        local isLobby = game.PlaceId == 101906032112547
+        local isPlanet = game.PlaceId == 74507545904779
         reports.arrived(isLobby)
         reports.observe(player, isPlanet, live)
         reports.pump()
