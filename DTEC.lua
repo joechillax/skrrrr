@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.85: preserve native queue-pad touches during lobby walking and admission.
+-- Version 0.86: match native public cutscene skip name and runtime ID arguments.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 85
+    local REVISION = 86
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.85-native-queue-touch"
+    local BUILD = "v0.86-native-cutscene-vote"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -14858,7 +14858,7 @@ end
         if now() >= (record.nextAttempt or 0) then
             -- These are the exact two calls made by CutSceneUI.Skip.MouseButton1Click.
             local method = private and "VoteSkipPrivate" or "VoteSkip"
-            local args = private and pack(runtimeId, record.name) or pack(record.name, context)
+            local args = private and pack(runtimeId, record.name) or pack(record.name, runtimeId)
             request("skip-cutscene", "CutSceneService", method, args, function(result)
                 record.voted = accepted(result)
                 record.nextAttempt = now() + 5
