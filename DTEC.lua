@@ -1,6 +1,6 @@
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.89: direct chest returns, single-owner movement and responsive combat/receipt handoffs.
+-- Version 0.90: release borrowed chest claims and confirm local route cancellation before handoffs.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -14,9 +14,9 @@ local SOURCE = [======[
 return function(source)
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 89
+    local REVISION = 90
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.89-chest-movement-handoffs"
+    local BUILD = "v0.90-route-lease-receipts"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -8518,9 +8518,11 @@ end)()
     local function holdRoute(ctx)
         if ctx.currentChest or ctx.featureHold or ctx.defenseMoving or now()<(ctx.dodgeUntil or 0)
             or s.bringDelivery or s.lootRequest or s.equipmentRequest then return false end
-        if not ctx.questOwns then api.cancelTravel(ctx)end
         ctx.questOwns=true
-        return ctx.routeParked==true
+        -- Set the future-write fence before cancelling the current local writer.
+        -- A synchronous cancellation receipt does not need a delayed parked flag.
+        local stopped=api.cancelTravel(ctx)
+        return stopped==true or stopped~=false and ctx.routeParked==true
     end
     local function abandonDrive(ctx,seat,reason)
         Q.stopDrive(ctx);ctx.questDriveRetryAt=now()+30;ctx.questOwns=nil;s.questIdle=true
@@ -9233,9 +9235,21 @@ end)()
     function Q.deliveryChestReady(ctx,job)
         -- Only a positively accepted native drop can share its replication wait
         -- with chest work. Pending/unknown item mutations retain their lane.
-        return job and job.ctx==ctx and (job.kind=='sale' or job.kind=='gold') and not job.shop
+        return job and s.questDelivery==job and job.ctx==ctx and (job.kind=='sale' or job.kind=='gold') and not job.shop
             and job.stage=='receipt' and job.background==true and job.droppedAt~=nil
             and not job.cancelled and not job.owns and not job.pending and not calls.drag and not ctx.bringEquipmentLock
+    end
+    function Q.receiptChestTurn(ctx,plan,job)
+        if not Q.deliveryChestReady(ctx,job)then return false end
+        local held=ctx.questOwns
+        local busy,empty=Q.chestTurn(ctx,plan)
+        -- This receipt observer borrowed a chest turn, not the whole route.
+        -- Empty/due-later checks and completed chests must release that loan.
+        if not held and not(ctx.travel or ctx.currentChest or ctx.questChestTaking or ctx.questChestLease
+            or ctx.questDriving or ctx.questSeating or ctx.questHealing or ctx.questMining or ctx.nativeGateMotion
+            or ctx.questRecovering or ctx.questPotionUsing or ctx.bringEquipmentLock or ctx.featureHold
+            or ctx.defenseMoving or ctx.humanoid.SeatPart or ctx.humanoid.Sit)then ctx.questOwns=nil end
+        return busy,empty
     end
     function Q.chestTurn(ctx,plan)
         local delivery=s.questDelivery;local cash=s.questCashJob
@@ -9460,7 +9474,7 @@ end)()
             if sale and sale.ctx==ctx and (sale.kind=='sale' or sale.kind=='gold') then
                 local busy=deliveryStep(ctx,plan)
                 if busy and not (sale.cancelled and sale.movementReleased) then
-                    if not drivingDue and Q.deliveryChestReady(ctx,sale)then Q.chestTurn(ctx,plan)end
+                    if not drivingDue then Q.receiptChestTurn(ctx,plan,sale)end
                     return true
                 end
             end
@@ -9485,7 +9499,7 @@ end)()
             if s.questDelivery then
                 local sale=s.questDelivery;local busy=deliveryStep(ctx,plan)
                 if busy and not (sale.cancelled and sale.movementReleased) then
-                    if Q.deliveryChestReady(ctx,sale)then Q.chestTurn(ctx,plan)end
+                    Q.receiptChestTurn(ctx,plan,sale)
                     return true
                 end
                 if s.questDelivery then ctx.questOwns=nil;return false end
@@ -10170,21 +10184,26 @@ return function(api)
     function M.cancel(ctx, preserveChestReturn)
         if not preserveChestReturn then ctx.chestDetour=nil end
         local token = ctx.travel
-        if not token then return end
+        if not token then return true end
         token.cancelled = true
-        if token.tween then pcall(function() token.tween:Cancel() end) end
-        ctx.travel = nil
+        if token.tween then
+            local stopped=pcall(function() token.tween:Cancel() end)
+            if not stopped then return false end -- Keep an unconfirmed engine writer reserved.
+        end
+        if ctx.travel==token then ctx.travel=nil end
+        return ctx.travel==nil
     end
     function M.beginChestDetour(ctx)
         -- Chest positioning and route tweens share the same root. Transfer
         -- ownership synchronously, before the recovered chest routine can pose.
-        M.cancel(ctx,true)
+        if not M.cancel(ctx,true)then return false end
         local geometry=api.state.routeGeometry
         if not ctx.chestDetour and geometry and not ctx.dungeon and not ctx.questHealing
             and not ctx.defenseMoving and not ctx.pendingThreat and now()>=(ctx.dodgeUntil or 0)then
             ctx.chestDetour={character=ctx.character,root=ctx.root,drill=ctx.drill,position=point(ctx),
                 start=geometry.start,finishX=geometry.finishX,offset=geometry.offset,scale=geometry.scale}
         end
+        return true
     end
     function M.paused(ctx)
         if ctx.currentChest and coroutine.running()~=ctx.lootThread then return true end
@@ -10198,7 +10217,7 @@ return function(api)
     end
     local function travel(ctx, destination, progress)
         if M.paused(ctx) then return false end
-        M.cancel(ctx)
+        if not M.cancel(ctx)then return false end
         local token = {thread = coroutine.running()}
         ctx.travel = token
         while not token.cancelled and ctx.active and api.owned() do
@@ -10240,7 +10259,11 @@ return function(api)
                 task.wait(0.03)
             end
             if token.cancelled then return false end
-            if token.tween then pcall(function() token.tween:Cancel() end); token.tween = nil end
+            if token.tween then
+                local stopped=pcall(function() token.tween:Cancel() end)
+                if not stopped then token.cancelled=true;return false end
+                token.tween=nil
+            end
             if M.paused(ctx) then M.cancel(ctx); return false end
             ctx.root.CFrame = CFrame.new(goal)
             if progress then progress(goal) end
@@ -10428,7 +10451,7 @@ return function(api)
             if not M.routeReady(ctx,rejoinX)then return false end
             ctx.check()
             if M.paused(ctx)then return false end
-            M.cancel(ctx)
+            if not M.cancel(ctx)then return false end
             ctx.root.CFrame=CFrame.new(M.scanPoint(ctx,rejoinX))
             if ctx.root.AssemblyLinearVelocity then ctx.root.AssemblyLinearVelocity=Vector3.zero end
         else
@@ -14430,7 +14453,7 @@ end
                     local record = chestRecord(entry)
                     if record.locked or record.retired or now() < (record.retryAt or 0) then return "locked" end
                     local attempts = s.stats.promptFires
-                    features.beginChestDetour(ctx)
+                    if not features.beginChestDetour(ctx)then return 'waiting' end
                     ctx.currentChest = record
                     record.healingPosed=nil
                     ctx.chestStarted = now()
@@ -14708,7 +14731,7 @@ end
             local offset = math.min(2, radius / 4)
             local destination = target + Vector3.new(0, offset, offset)
             if ctx.questHealing and not features.healingPointSafe(ctx,destination)then return false end
-            features.beginChestDetour(ctx)
+            if not features.beginChestDetour(ctx)then return false end
             if ((root.CFrame.Position or root.Position) - destination).Magnitude > 0.5 then
                 root.CFrame = CFrame.new(destination)
             end
