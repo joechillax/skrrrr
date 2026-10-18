@@ -1,7 +1,7 @@
 if game.PlaceId ~= 101906032112547 and game.PlaceId ~= 74507545904779 then return end
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 1.00: claim native Engineer starter blueprints and search all eligible placement regions.
+-- Version 1.01: recover selected native Blueprint handlers and finish open SaveGear confirmations.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -20,9 +20,9 @@ return function(source)
     if not dtecPlace() then return end
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 100
+    local REVISION = 101
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v1.00-engineer-blueprint-and-regions"
+    local BUILD = "v1.01-native-confirmation-recovery"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -11586,7 +11586,7 @@ end)()
             end
         end)
     end
-    local function rebindHandler(ctx,tool)
+    local function rebindHandler(ctx,tool,missingBlueprint)
         local c=controller('ToolController');local name=id(tool)
         if not c or type(c.Equip)~='function' or not name or c.ServerEquipId==nil
             or not finite(c.EquipVersion) then return false end
@@ -11615,6 +11615,11 @@ end)()
         local nativeId=native and native.Tool and native.Tool:GetAttribute('ServerToolEquipId')
         local otherCurrent=native and not native._Destroyed and native.Tool and native.Tool.Parent==ctx.character
             and (nativeId==nil or nativeId==c.ServerEquipId)
+        local hotbar=controller('BackpackController')
+        local repairBlueprint=missingBlueprint and native==missingBlueprint and native.Tool==proxy
+            and attr(tool,'Class')=='Blueprint' and attr(proxy,'Class')=='Blueprint'
+            and type(native.BeginPlacement)~='function' and nativeId==record.serverId
+            and hotbar and hotbar.BackpackUI and hotbar.BackpackUI.Visible==true and not hotbar.IsDraggingHotbarItem
         if not ctx.active or not api.owned() or ctx.character~=api.Players.LocalPlayer.Character or ctx.humanoid.Health<=0
             or tool.Parent~=ctx.character and tool.Parent~=api.Players.LocalPlayer:FindFirstChild('Backpack')
             or own and (own.pending or own.uncertain) or s.equipmentRequest or s.lootRequest or s.bringDelivery
@@ -11625,7 +11630,7 @@ end)()
             or s.request or s.awaiting or s.teleporting or s.departureAt or ctx.currentChest or ctx.featureHold or ctx.defenseMoving
             or now()<(ctx.dodgeUntil or 0) or ctx.questPlacement or ctx.questPreviewCancel or ctx.questPotionUsing
             or ctx.questHealAttempt or s.questMedicalDrop or ctx.swingEdit
-            or otherCurrent then return true end
+            or otherCurrent and not repairBlueprint then return true end
         -- Set before native dispatch; a failed constructor or our own version
         -- increment cannot create a reconstruction loop or a server mutation.
         record.attempted=true
@@ -11727,7 +11732,17 @@ end)()
             return nil
         end
         local active = activeFor(ctx, tool)
-        if active then s.equipRecords[tool] = nil; return active end
+        if active then
+            if class=='Blueprint' and type(active.BeginPlacement)~='function'then
+                -- A generic/stale handler is not a usable Blueprint receipt.
+                -- Reconstruct only this explicit server-selected native proxy;
+                -- never toggle EquipTool again to repair a local class.
+                if equipmentSelectionReady()then rebindHandler(ctx,tool,active)end
+                active=activeFor(ctx,tool)
+                if not active or type(active.BeginPlacement)~='function'then return nil end
+            end
+            s.equipRecords[tool] = nil; return active
+        end
         if record and record.accepted and not record.pending and not record.uncertain
             and record.selection and record.nativeSelection==record.selection
             and record.selectionContext==ctx and record.selectionController==controller('ToolController')then
@@ -13721,33 +13736,53 @@ end)()
         end
         return frame, ui
     end
-    local function confirmChurch(ctx, prompt)
-        if not F.extractionReady() or not F.isChurchSavePrompt(prompt) or prompt.Enabled == false then return false end
-        if not tag(prompt, 'FramePrompt') then status('Church SaveGear prompt is waiting for its native FramePrompt tag'); return false end
-        local point = position(prompt)
-        local radius = tonumber(prompt.MaxActivationDistance) or 10
-        if not point or radius <= 0 or api.Players.LocalPlayer.GameplayPaused == true
-            or (ctx.root.Position - point).Magnitude > radius then
-            status('Church confirmation waits for actual prompt range and loaded content'); return false
+    local function saveMutationFree(ctx)
+        local calls=quest.calls;local player=api.Players.LocalPlayer
+        local placement=controller('PlaceablePlacementController');local scene=controller('CutSceneController')
+        if bring.blocksSave() or s.lootRequest or s.equipmentRequest or s.pendingSackDrop or ctx.sackDrop
+            or ctx.bringEquipmentLock or quest.manual() or player.GameplayPaused==true
+            or ctx.nativeGateMotion or ctx.questMineEntry or ctx.questPlacement or ctx.questPreviewCancel
+            or placement and (placement.Active or placement.PendingRequest or placement.PendingCancel)
+            or ctx.questHealAttempt or s.questMedicalDrop or ctx.questPotionUsing or ctx.swingEdit
+            or calls.drag or calls.shop or calls.cash or calls.place or calls.craft or calls.crateClaim
+            or calls.placementCancel or calls.medicalDrop or calls.inventoryDrop
+            or scene and (scene.CurrentCutScene or scene.AbortingCutScene)
+            or ctx.humanoid.MoveDirection and ctx.humanoid.MoveDirection.Magnitude>.01 then return false end
+        for _,record in pairs(s.equipRecords or {})do
+            if record.pending or record.uncertain then return false end
+        end
+        return true
+    end
+    local function confirmChurch(ctx, prompt, visibleFrame)
+        if not F.extractionReady() then return false end
+        local point,radius
+        if not visibleFrame then
+            if not F.isChurchSavePrompt(prompt) or prompt.Enabled == false then return false end
+            if not tag(prompt, 'FramePrompt') then status('Church SaveGear prompt is waiting for its native FramePrompt tag'); return false end
+            point=position(prompt);radius=tonumber(prompt.MaxActivationDistance) or 10
+            if not point or radius <= 0 or api.Players.LocalPlayer.GameplayPaused == true
+                or (ctx.root.Position - point).Magnitude > radius then
+                status('Church confirmation waits for actual prompt range and loaded content'); return false
+            end
         end
         local frame, ui = saveGearFrame()
-        if frame and frame.Visible ~= true and type(ui.ToggleFrame) == 'function' then
+        if not visibleFrame and frame and frame.Visible ~= true and type(ui.ToggleFrame) == 'function' then
             -- Some executor helpers only deliver the server Triggered event.
             -- Reproduce the verified native local FramePrompt UI action too.
             pcall(ui.ToggleFrame, ui, 'SaveGear', true, false, true)
             wait(ctx, 0.1)
         end
         frame = saveGearFrame()
-        if not frame or frame.Visible ~= true then
+        if not frame or frame.Visible ~= true or visibleFrame and frame~=visibleFrame then
             status('Church SaveGear prompt found; waiting for its native confirmation frame'); return false
         end
         -- Revalidate after the UI yield; an option change or correction cannot
         -- turn a delayed local frame into permission for a save elsewhere.
         ctx.check()
-        if not F.extractionReady() or not safeToWork(ctx) or not F.isChurchSavePrompt(prompt)
-            or prompt.Enabled == false or api.Players.LocalPlayer.GameplayPaused == true
-            or (ctx.root.Position - point).Magnitude > radius or s.churchSave then return false end
-        local record = {started = now(), prompt = prompt, point = point}
+        if not F.extractionReady() or not safeToWork(ctx) or not saveMutationFree(ctx)
+            or not visibleFrame and (not F.isChurchSavePrompt(prompt) or prompt.Enabled == false
+                or (ctx.root.Position - point).Magnitude > radius) or s.churchSave then return false end
+        local record = {started = now(), prompt = prompt, point = point, frame=frame}
         local player,character,humanoid,drill=api.Players.LocalPlayer,ctx.character,ctx.humanoid,ctx.drill
         local band=workspace:GetAttribute('InfiniteDepthOffsetMeters')
         s.churchSave = record
@@ -13770,15 +13805,60 @@ end)()
                 and player.GameplayPaused~=true and not humanoid.SeatPart and not humanoid.Sit
                 and not(drag and drag.LockedTarget) and player:GetAttribute('PlacingCraftedPlaceable')~=true
                 and player:GetAttribute('SavedExitTeleportLocked')~=true
-                and F.isChurchSavePrompt(prompt) and prompt.Enabled~=false and tag(prompt,'FramePrompt')
+                and saveMutationFree(ctx)
                 and current==frame and current.Visible==true
-                and position(prompt) and (ctx.root.Position-position(prompt)).Magnitude<=radius
+                and (visibleFrame~=nil or F.isChurchSavePrompt(prompt) and prompt.Enabled~=false and tag(prompt,'FramePrompt')
+                    and position(prompt) and (ctx.root.Position-position(prompt)).Magnitude<=radius)
         end)
         if not issued then s.churchSave = nil; status('Church save request not ready; retrying without a duplicate'); return false end
         record.issued = true
         status('Confirming church SaveGear; awaiting server reply')
         -- The transition request is owned by the supervisor, survives a worker
         -- replacement, and blocks overlapping lobby/start/save requests.
+        return true
+    end
+    function F.confirmVisibleChurch(ctx)
+        local frame=saveGearFrame()
+        if not frame or frame.Visible~=true then
+            ctx.saveFrameAttempt=nil
+            if ctx.featureOperation=='save-confirmation'then release(ctx)end
+            return false
+        end
+        if not F.extractionReady()then
+            if ctx.featureOperation=='save-confirmation'then release(ctx)end
+            return false
+        end
+        if savedChurchState()then return true end
+        local save=s.churchSave
+        if save and (not save.settled or save.accepted)then
+            status('Native SaveGear confirmation pending; no duplicate save is sent');return true
+        end
+        -- A rejected modal is not proof of current altar permission. Resume
+        -- ordinary prompt discovery instead of hammering the same open frame.
+        if ctx.saveFrameAttempt==frame then return false end
+        if save then
+            if now()<(save.retryAt or 0)then return true end
+            s.churchSave=nil
+        end
+        if ctx.currentChest then return true end
+        if ctx.featureHold and ctx.featureOperation~='save-confirmation'
+            and ctx.featureOperation~='church-search' and ctx.featureOperation~='discovery'
+            and ctx.featureOperation~='extract'then return true end
+        ctx.featureHold,ctx.featureOperation=true,'save-confirmation'
+        if not safeToWork(ctx) or not saveMutationFree(ctx)then
+            release(ctx)
+            status('Native SaveGear confirmation waits for the current owned action to settle')
+            return true
+        end
+        if movement.cancel(ctx)~=true then
+            status('Native SaveGear confirmation waits for the active route to stop');return true
+        end
+        if not settleRareDrop(ctx) or not settleGear(ctx)then return true end
+        ctx.churchReload=nil
+        -- The verified native Purchase button sends SaveGear with no arguments.
+        -- Its exact loaded frame is sufficient; no new prompt or route scan.
+        if confirmChurch(ctx,nil,frame)then ctx.saveFrameAttempt=frame end
+        release(ctx)
         return true
     end
     local function revisitChurch(ctx)
@@ -14174,6 +14254,7 @@ end)()
                             and not s.questCashJob and safeToWork(ctx) then upgradeGear(ctx) end
                         return
                     end
+                    if F.confirmVisibleChurch(ctx)then return end
                     F.watcher(ctx)
                     if not safeToWork(ctx) then release(ctx); return end
                     if not ctx.defenseThread and F.dodge(ctx) then return end
