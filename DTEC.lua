@@ -1,7 +1,7 @@
 if game.PlaceId ~= 101906032112547 and game.PlaceId ~= 74507545904779 then return end
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 1.01: recover selected native Blueprint handlers and finish open SaveGear confirmations.
+-- Version 1.02: use the native hotbar and separate confirmed selection effects from pending transport.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -20,9 +20,9 @@ return function(source)
     if not dtecPlace() then return end
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 101
+    local REVISION = 102
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v1.01-native-confirmation-recovery"
+    local BUILD = "v1.02-native-selection-receipts"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -11586,6 +11586,20 @@ end)()
             end
         end)
     end
+    local function nativeSelectionEffect(ctx,tool,record)
+        local c=controller('ToolController');local active=c and c.ActiveTool
+        local proxy=active and active.Tool
+        return record and record.selection and record.nativeSelection==record.selection
+            and record.selectionContext==ctx and record.selectionController==c
+            and c.ServerEquipId~=nil and active and not active._Destroyed
+            and proxy and proxy.Parent==ctx.character and attr(proxy,'Tool')==true
+            and proxy:GetAttribute('ServerToolEquipId')==c.ServerEquipId
+            and ownedTool(ctx,tool) and activeFor(ctx,tool)==active
+    end
+    local function selectedTransport(ctx,record,token)
+        return token and record and record.requestToken==token and token.kind=='equip-weapon'
+            and token.method=='ToolService.EquipTool' and token.farm==ctx and token.character==ctx.character
+    end
     local function rebindHandler(ctx,tool,missingBlueprint)
         local c=controller('ToolController');local name=id(tool)
         if not c or type(c.Equip)~='function' or not name or c.ServerEquipId==nil
@@ -11615,14 +11629,17 @@ end)()
         local nativeId=native and native.Tool and native.Tool:GetAttribute('ServerToolEquipId')
         local otherCurrent=native and not native._Destroyed and native.Tool and native.Tool.Parent==ctx.character
             and (nativeId==nil or nativeId==c.ServerEquipId)
-        local hotbar=controller('BackpackController')
+        local hotbar=controller('HotbarController')
         local repairBlueprint=missingBlueprint and native==missingBlueprint and native.Tool==proxy
             and attr(tool,'Class')=='Blueprint' and attr(proxy,'Class')=='Blueprint'
             and type(native.BeginPlacement)~='function' and nativeId==record.serverId
             and hotbar and hotbar.BackpackUI and hotbar.BackpackUI.Visible==true and not hotbar.IsDraggingHotbarItem
+        local selectionKnown=repairBlueprint and nativeSelectionEffect(ctx,tool,own)
         if not ctx.active or not api.owned() or ctx.character~=api.Players.LocalPlayer.Character or ctx.humanoid.Health<=0
             or tool.Parent~=ctx.character and tool.Parent~=api.Players.LocalPlayer:FindFirstChild('Backpack')
-            or own and (own.pending or own.uncertain) or s.equipmentRequest or s.lootRequest or s.bringDelivery
+            or own and (own.pending or own.uncertain) and not selectionKnown
+            or s.equipmentRequest and not(selectionKnown and selectedTransport(ctx,own,s.equipmentRequest))
+            or s.lootRequest or s.bringDelivery
             or calls.drag or calls.cash or ctx.bringEquipmentLock or quest and quest.manual()
             or ctx.questDriving or ctx.questSeating or ctx.humanoid.SeatPart or ctx.humanoid.Sit
             or ctx.questMineEntry or ctx.nativeGateMotion or workspace:GetAttribute('InCutScene') or workspace:GetAttribute('InfiniteRebasing')
@@ -11741,7 +11758,10 @@ end)()
                 active=activeFor(ctx,tool)
                 if not active or type(active.BeginPlacement)~='function'then return nil end
             end
-            s.equipRecords[tool] = nil; return active
+            if not(record and (record.pending or record.uncertain) and nativeSelectionEffect(ctx,tool,record))then
+                s.equipRecords[tool] = nil
+            end
+            return active
         end
         if record and record.accepted and not record.pending and not record.uncertain
             and record.selection and record.nativeSelection==record.selection
@@ -11855,6 +11875,9 @@ end)()
             record.pending=nil;record.notDispatched=true
             if recovery then record.accepted=acceptedBefore;record.emptyRecovery=nil;record.settledAt=now() end
         end
+        -- Keep the transport reservation separate from the native effect. A
+        -- matching ToolChanged receipt can prove selection before its RPC returns.
+        record.requestToken=issued and s.equipmentRequest or nil
     end
     local function wait(ctx, seconds)
         ctx.featurePulse = now()
@@ -13739,18 +13762,29 @@ end)()
     local function saveMutationFree(ctx)
         local calls=quest.calls;local player=api.Players.LocalPlayer
         local placement=controller('PlaceablePlacementController');local scene=controller('CutSceneController')
-        if bring.blocksSave() or s.lootRequest or s.equipmentRequest or s.pendingSackDrop or ctx.sackDrop
-            or ctx.bringEquipmentLock or quest.manual() or player.GameplayPaused==true
-            or ctx.nativeGateMotion or ctx.questMineEntry or ctx.questPlacement or ctx.questPreviewCancel
-            or placement and (placement.Active or placement.PendingRequest or placement.PendingCancel)
-            or ctx.questHealAttempt or s.questMedicalDrop or ctx.questPotionUsing or ctx.swingEdit
-            or calls.drag or calls.shop or calls.cash or calls.place or calls.craft or calls.crateClaim
-            or calls.placementCancel or calls.medicalDrop or calls.inventoryDrop
-            or scene and (scene.CurrentCutScene or scene.AbortingCutScene)
-            or ctx.humanoid.MoveDirection and ctx.humanoid.MoveDirection.Magnitude>.01 then return false end
-        for _,record in pairs(s.equipRecords or {})do
-            if record.pending or record.uncertain then return false end
+        if bring.blocksSave()then return false,'item ownership cleanup' end
+        if s.lootRequest then return false,'item pickup reply' end
+        if s.pendingSackDrop or ctx.sackDrop then return false,'sack pickup receipt' end
+        if ctx.bringEquipmentLock then return false,'delivery equipment lock' end
+        if quest.manual()then return false,'manual drag or placement' end
+        if player.GameplayPaused==true then return false,'native loading pause' end
+        if ctx.nativeGateMotion or ctx.questMineEntry then return false,'dungeon transition' end
+        if ctx.questPlacement or ctx.questPreviewCancel then return false,'owned placement cleanup' end
+        if placement and (placement.Active or placement.PendingRequest or placement.PendingCancel)then return false,'native placement preview' end
+        if ctx.questHealAttempt or s.questMedicalDrop or ctx.questPotionUsing then return false,'medical or potion receipt' end
+        if ctx.swingEdit then return false,'native tool packet' end
+        for _,key in ipairs({'drag','shop','cash','place','craft','crateClaim','placementCancel','medicalDrop','inventoryDrop'})do
+            if calls[key]then return false,'pending '..key end
         end
+        if scene and (scene.CurrentCutScene or scene.AbortingCutScene)then return false,'native cutscene' end
+        if ctx.humanoid.MoveDirection and ctx.humanoid.MoveDirection.Magnitude>.01 then return false,'manual movement' end
+        local transport=s.equipmentRequest;local matched=not transport
+        for tool,record in pairs(s.equipRecords or {})do
+            local effect=nativeSelectionEffect(ctx,tool,record)
+            if (record.pending or record.uncertain) and not effect then return false,'equipment selection receipt' end
+            if effect and selectedTransport(ctx,record,transport)then matched=true end
+        end
+        if not matched then return false,'equipment transport reply' end
         return true
     end
     local function confirmChurch(ctx, prompt, visibleFrame)
@@ -13845,11 +13879,16 @@ end)()
             and ctx.featureOperation~='church-search' and ctx.featureOperation~='discovery'
             and ctx.featureOperation~='extract'then return true end
         ctx.featureHold,ctx.featureOperation=true,'save-confirmation'
-        if not safeToWork(ctx) or not saveMutationFree(ctx)then
+        local free,blocker=saveMutationFree(ctx)
+        if not safeToWork(ctx) or not free then
             release(ctx)
-            status('Native SaveGear confirmation waits for the current owned action to settle')
+            local reason=not safeToWork(ctx) and (ctx.humanoid.SeatPart or ctx.humanoid.Sit) and 'seat detachment'
+                or not safeToWork(ctx) and 'run or movement transition' or blocker
+            s.churchSaveBlocker=reason
+            status('Native SaveGear waits: '..reason)
             return true
         end
+        s.churchSaveBlocker=nil
         if movement.cancel(ctx)~=true then
             status('Native SaveGear confirmation waits for the active route to stop');return true
         end
