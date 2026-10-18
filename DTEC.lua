@@ -1,7 +1,7 @@
 if game.PlaceId ~= 101906032112547 and game.PlaceId ~= 74507545904779 then return end
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.98: share partial map snapshots without blocking and bound native chest discovery work.
+-- Version 0.99: bound Engineer starter selection and resume protected normal lobby entry.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -20,9 +20,9 @@ return function(source)
     if not dtecPlace() then return end
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 98
+    local REVISION = 99
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.98-nonblocking-map-progress"
+    local BUILD = "v0.99-bounded-engineer-startup"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2342,6 +2342,16 @@ return function(api,Q)
         if id and owned[id]then result[#result+1]=id end
         return result
     end
+    local function normalRun(job,reason)
+        -- Starter-only selection is an optimization. An unavailable receipt
+        -- must not lock all lobby travel forever. Continue the ordinary quest
+        -- run with native selected gear; quickReturn still checks actual
+        -- carried gear and requests a church save before any unsafe restart.
+        -- Keep every uncertain toggle reserved; never replay it to force entry.
+        job.done=true;job.normalRun=true;job.fallbackReason=reason
+        s.questStatus='Starter loadout '..reason..'; continuing a normal protected quest run'
+        return false
+    end
     function L.lobby()
         if not cfg.classQuest or not api.owned() or not lobby() then return false end
         local desiredPlan=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
@@ -2367,6 +2377,11 @@ return function(api,Q)
         local preview=Q.plan(s.classData,s.questCatalog,cfg.driveDepth)
         local fast=Q.special and Q.special.fastPlacement(preview)
         if job.done then return false end
+        if fast and (job.selectionRejected or now()-job.started>=15)then
+            local c=api.controller('BackpackController')
+            if c and (c.EquipPending or 0)>0 then return true end -- Yield to native/manual selection.
+            return normalRun(job,job.selectionRejected and 'rejected' or 'unconfirmed')
+        end
         if job.failed or now()-job.started>=20 then
             if not fast then return false end
             if job.equipped then job.loaded=true;job.failed=nil end
@@ -2413,12 +2428,22 @@ return function(api,Q)
             end
             if contains(job.equipped,id)~=wanted and not job.attempted[id]then
                 if s.questCalls.loadoutSwap then return true end
-                local issued=Q.call('loadoutSwap','LobbyBackpackService','SetEquipped',{id},function(ok,accepted,equipped)
+                local revision=c and c.EquippedRevision
+                local issued=Q.call('loadoutSwap','LobbyBackpackService','SetEquipped',{id},function(ok,accepted,equipped,dispatch)
+                    if dispatch=='not-sent'then job.attempted[id]=nil;return end
+                    if ok and accepted==false then job.selectionRejected=true end
                     if ok and accepted and type(equipped)=='table' then
                         job.equipped=equipped
-                        if c and type(c.SetEquipped)=='function' then pcall(c.SetEquipped,c,equipped)end
-                        s.questStatus=contains(equipped,id) and 'Quest startup gear confirmed: '..id or 'Startup gear not selected: '..id
-                    else s.questStatus='Startup gear unconfirmed: '..id..'; no repeat toggle' end
+                        -- A late reply cannot repaint another character/place,
+                        -- owner, class job or a newer manual backpack selection.
+                        if not job.normalRun and api.owned() and lobby() and s.questLoadout==job then
+                            if c and c==api.controller('BackpackController') and c.EquippedRevision==revision
+                                and (c.EquipPending or 0)==0 and type(c.SetEquipped)=='function'then pcall(c.SetEquipped,c,equipped)end
+                            s.questStatus=contains(equipped,id) and 'Quest startup gear confirmed: '..id or 'Startup gear not selected: '..id
+                        end
+                    elseif not job.normalRun and api.owned() and lobby() and s.questLoadout==job then
+                        s.questStatus='Startup gear unconfirmed: '..id..'; no repeat toggle'
+                    end
                 end,function()return cfg.classQuest and api.owned() and lobby() and s.questLoadout==job
                     and contains(job.equipped,id)~=wanted and (not c or (c.EquipPending or 0)==0) end)
                 if issued then job.attempted[id]=true end
