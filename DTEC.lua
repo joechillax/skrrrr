@@ -1,7 +1,7 @@
 if game.PlaceId ~= 101906032112547 and game.PlaceId ~= 74507545904779 then return end
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.97: keep equipped retaliation active during item waits and retreat from nearby damage.
+-- Version 0.98: share partial map snapshots without blocking and bound native chest discovery work.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -20,9 +20,9 @@ return function(source)
     if not dtecPlace() then return end
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 97
+    local REVISION = 98
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.97-standing-damage-defense"
+    local BUILD = "v0.98-nonblocking-map-progress"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -13167,7 +13167,8 @@ end)()
             end
         end
         if not best then return false end
-        movement.cancel(ctx);movement.hover(ctx);ctx.root.CFrame=CFrame.new(best);ctx.questHealPoint=best;return true
+        if movement.cancel(ctx)~=true then return false,'route cancellation pending' end
+        movement.hover(ctx);ctx.root.CFrame=CFrame.new(best);ctx.questHealPoint=best;return true
     end
     function F.clearMedicalSearch(ctx,search)
         if search and search.streamToken then movement.cancelItemReload(ctx,search.streamToken);search.streamToken=nil end
@@ -13241,7 +13242,8 @@ end)()
                 movement.prefetchAt(ctx,surveyOrigin)
                 local point=healingFloor(ctx,surveyOrigin)
                 if point then
-                    movement.cancel(ctx);movement.hover(ctx);ctx.root.CFrame=CFrame.new(point);ctx.questHealPoint=point
+                    if movement.cancel(ctx)~=true then return true,'waiting for actual route cancellation before surveying',false end
+                    movement.hover(ctx);ctx.root.CFrame=CFrame.new(point);ctx.questHealPoint=point
                     movement.prefetchAt(ctx,point-Vector3.new(0,100,0));ctx.worldRefreshAt=0
                     cache.surveyPoint=point;cache.surveyHoldUntil=now()+3
                     return true,'surveying loaded safe tunnel for a medical shop',true
@@ -13270,7 +13272,8 @@ end)()
             end
         end
         if target then
-            movement.cancel(ctx);movement.hover(ctx);ctx.root.CFrame=CFrame.new(pose);ctx.questHealPoint=pose
+            if movement.cancel(ctx)~=true then return true,'waiting for actual route cancellation before approaching medical stock',false end
+            movement.hover(ctx);ctx.root.CFrame=CFrame.new(pose);ctx.questHealPoint=pose
             cache.target,cache.targetUntil=target,now()+3;movement.prefetchAt(ctx,position(target))
             ctx.worldRefreshAt=0;return true,'searching medical stock at a verified shop',true
         end
@@ -14461,17 +14464,12 @@ end
         local taskApi = {}
         local function readWorld()
             local function live(item)return item==workspace or item and item.Parent and item:IsDescendantOf(workspace)end
-            -- This lock protects a READ-ONLY snapshot, not character movement.
-            -- Parking its producer for quest movement makes a quest consumer
-            -- wait forever for the very producer it has parked.
-            while ctx.worldReading do
-                if ctx.worldReader and coroutine.status(ctx.worldReader)=='dead' then
-                    ctx.worldReading,ctx.worldReader=nil,nil
-                    break
-                end
-                ctx.check();task.wait(0.03)
+            -- A second reader consumes published identities without waiting on
+            -- the producer. The original queue/owner still determines completion.
+            if ctx.worldReading and ctx.worldReader and coroutine.status(ctx.worldReader)=='dead' then
+                ctx.worldReading,ctx.worldReader=nil,nil
             end
-            if ctx.worldScan or not ctx.worldObjects or now() >= (ctx.worldRefreshAt or 0) then
+            if not ctx.worldReading and (ctx.worldScan or not ctx.worldObjects or now() >= (ctx.worldRefreshAt or 0)) then
                 ctx.worldReading = true
                 local reader=coroutine.running();ctx.worldReader=reader;ctx.worldReadPulse=now()
                 local scan=ctx.worldScan
@@ -14479,7 +14477,7 @@ end
                     scan={list={},queue={workspace},cursor=1,seen=setmetatable({[workspace]=true}, {__mode='k'}),published=0};ctx.worldScan=scan
                 end
                 local ok, complete = pcall(function()
-                    local visited,steps,nextYield,started=0,0,100,now()
+                    local visited,steps,nextYield,started=0,0,500,now()
                     while scan.children or scan.cursor<=#scan.queue do
                         if not scan.children then
                             local parent=scan.queue[scan.cursor];scan.cursor=scan.cursor+1
@@ -14495,11 +14493,12 @@ end
                             else scan.children=nil end
                         end
                         steps=steps+1
-                        -- Yield per inspected child, as the earlier loot reader
-                        -- did. Queue entry/exit bookkeeping is not another item.
+                        -- Publish at most1000 inspected children per slice. A
+                        -- frame yield keeps the UI responsive without adding
+                        -- thirty milliseconds after every hundred identities.
                         if visited>=nextYield then
-                            nextYield=visited+100
-                            ctx.worldReadPulse=now();ctx.check();task.wait(0.03)
+                            nextYield=visited+500
+                            ctx.worldReadPulse=now();ctx.check();task.wait(0)
                             -- Publish a partial snapshot and resume this same queue
                             -- next time. Large maps cannot monopolize a quest pulse
                             -- or lose all scan progress to the worker watchdog.
@@ -14589,8 +14588,38 @@ end
             elseif id == 9164528 then
                 wrapped = function(...)
                     if ctx.worldScan or not ctx.candidates or ctx.chestsDirty or now() >= (ctx.cacheAt or 0) then
-                        readWorld()
-                        ctx.candidates = fn(...)
+                        local snapshot=readWorld()
+                        local models=ctx.chestFinderModels or setmetatable({}, {__mode='k'})
+                        local scan=ctx.worldScan
+                        if scan then
+                            local progress=ctx.chestFinderScan
+                            if not progress or progress.scan~=scan then
+                                progress=setmetatable({scan=scan,cursor=1},{__mode='v'});ctx.chestFinderScan=progress
+                            end
+                            for i=progress.cursor,#scan.list do
+                                local item=scan.list[i]
+                                if item:IsA('Model')then models[item]=true end
+                            end
+                            progress.cursor=#scan.list+1
+                        else
+                            models=setmetatable({}, {__mode='k'})
+                            for _,item in ipairs(snapshot)do if item:IsA('Model')then models[item]=true end end
+                            ctx.chestFinderScan=nil
+                        end
+                        ctx.chestFinderModels=models
+                        local view={thread=coroutine.running(),objects={}}
+                        for item in pairs(models)do
+                            if item.Parent and item:IsDescendantOf(workspace)then view.objects[#view.objects+1]=item
+                            else models[item]=nil end
+                        end
+                        -- The recovered finder selects Models. Preserve its
+                        -- exact rules, but omit thousands of irrelevant parts.
+                        -- Scope this input override to this exact finder call.
+                        ctx.chestFinderView=view
+                        local result=pack(pcall(fn,...))
+                        if ctx.chestFinderView==view then ctx.chestFinderView=nil end
+                        if not result[1]then error(result[2],0)end
+                        ctx.candidates=result[2]
                         ctx.cacheAt, ctx.chestsDirty = now() + (workspace.DescendantAdded and 30 or 2), false
                     end
                     local list, pending = {}, false
@@ -14857,7 +14886,8 @@ end
         -- uses a yielded snapshot plus streaming additions instead of allocating
         -- all descendants on each chest scan.
         ctx.env.workspace = setmetatable({GetDescendants = function()
-            local objects=ctx.worldObjects or readWorld()
+            local view=ctx.chestFinderView
+            local objects=view and view.thread==coroutine.running() and view.objects or ctx.worldObjects or readWorld()
             if not ctx.currentChest then return objects end
             -- The recovered interaction repeats a nearby-chest search after
             -- moving. Keep that search on the chosen chest, so a closer locked,
