@@ -1,7 +1,7 @@
 if game.PlaceId ~= 101906032112547 and game.PlaceId ~= 74507545904779 then return end
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.95: objective-aware Miner smelting and isolated ownership/save/cleanup recovery.
+-- Version 0.96: prioritize empty quest-gun ammo checkout and resume funded resupply promptly.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -20,9 +20,9 @@ return function(source)
     if not dtecPlace() then return end
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 95
+    local REVISION = 96
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.95-miner-smelting-and-recovery"
+    local BUILD = "v0.96-priority-ammo-resupply"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -3663,7 +3663,8 @@ end)()
         return true
     end
     function D.paidUpgradeWindow(ctx,cycle)
-        return not Q.manual() and (not cycle or cycle.phase~='funding' and not cycle.fundingExplore)
+        return not Q.manual() and not Q.ammoNeed(ctx,Q.plan(s.classData,s.questCatalog,cfg.driveDepth))
+            and (not cycle or cycle.phase~='funding' and not cycle.fundingExplore)
     end
     function D.upgradePulse(ctx)
         if not Q.enabled(ctx) or ctx.character~=api.Players.LocalPlayer.Character
@@ -3892,6 +3893,10 @@ end)()
                     if balance~=nil and callback and medicalEpoch==(ctx.questMedicalCheckoutEpoch or 0)then callback(balance,observedAt,version)end
                 else info('wallet read unavailable; purchases paused')end
             end,function()return Q.enabled(ctx) and not api.extractionReady()end)
+        end
+        if Q.ammoNeed(ctx,plan) and not(c and c.ActiveClassReward)then
+            D.settleUpgrade(ctx)
+            info('required ammunition first');readWallet();return
         end
         if not c or type(c.Options)~='table' then info('waiting for native upgrade cards');readWallet();return end
         local function refreshCards()
@@ -9292,6 +9297,32 @@ end)()
         end
         return requiredClass and api.findTool(ctx,requiredClass) or nil,true
     end
+    function Q.ammoNeed(ctx,plan)
+        if not plan or plan.kind~='combat' then return end
+        local tool=Q.preferred(ctx)
+        local class=tool and api.attr(tool,'Class')
+        local id=class=='Revolver' and 'Pistol_Ammo' or (class=='Rifle' or class=='Shotgun') and class..'_Ammo'
+        if id and (tonumber(api.attr(tool,'Ammo')) or 0)<=0
+            and (tonumber(api.Players.LocalPlayer:GetAttribute(id)) or 0)<=0 then return id end
+    end
+    function Q.ammoStep(ctx,plan)
+        local id=Q.ammoNeed(ctx,plan)
+        if not id or not enabled(ctx) or manual() or ctx.questHealing or api.extractionReady()
+            or ctx.questStartup or ctx.questRecovering or ctx.nativeGateMotion or ctx.questMineEntry then return false end
+        -- Finish an existing native owner first; never overlap or discard an
+        -- unknown Buy/drag just because the combat weapon is empty.
+        local job=s.questDelivery
+        if job then
+            if job.ctx~=ctx then return false end
+            local busy=deliveryStep(ctx,plan)
+            return busy and not(job.cancelled and job.movementReleased)
+        end
+        if now()<(ctx.questSupplyAt or 0) or not Q.supplyReady(ctx,id)then return false end
+        if not holdRoute(ctx)then return ctx.questOwns==true end
+        ctx.questCombat=nil;ctx.combatTarget=nil
+        setStatus('Refilling quest gun: '..id)
+        return Q.supply(ctx,plan,id)
+    end
     function Q.deliveryChestReady(ctx,job)
         -- Only a positively accepted native drop can share its replication wait
         -- with chest work. Pending/unknown item mutations retain their lane.
@@ -9516,6 +9547,7 @@ end)()
             if Q.special.quickReturn(ctx)then ctx.questOwns=true;return true end
             return Q.special.placement(ctx,plan)
         end
+        if Q.ammoStep(ctx,plan)then return true end
         if Q.drillSupport.drivingDefense and Q.drillSupport.drivingDefense(ctx,plan)then return true end
         if Q.drillSupport.threat(ctx,plan)then return true end
         -- Collect native sale proceeds before another sale can monopolize the
@@ -9876,6 +9908,15 @@ end)()
         if purchase and purchase.buySent then
             if Q.purchaseReceipt(purchase) and purchase.cancelled then release(purchase)end
             if stock(item)then return false end -- Never issue another Buy for this stock identity.
+        end
+        local need=s.questSupplyFunding
+        if need and need.item==item and need.id:sub(-5)=='_Ammo' and enabled(need.ctx)
+            and now()<need.expires and now()-(s.questWalletAt or -math.huge)<3
+            and Q.ammoNeed(need.ctx,Q.plan(s.classData,s.questCatalog,cfg.driveDepth))==need.id
+            and Q.canSpend(s.questWallet,need.price,false) then
+            -- A proven insufficient-balance rejection sent no Buy. A fresh
+            -- native wallet can reopen checkout; prices are quoted again.
+            retries[item]=nil
         end
         return now()>=(retries[item] or 0)
     end
