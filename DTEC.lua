@@ -1,7 +1,7 @@
 if game.PlaceId ~= 101906032112547 and game.PlaceId ~= 74507545904779 then return end
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.96: prioritize empty quest-gun ammo checkout and resume funded resupply promptly.
+-- Version 0.97: keep equipped retaliation active during item waits and retreat from nearby damage.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -20,9 +20,9 @@ return function(source)
     if not dtecPlace() then return end
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 96
+    local REVISION = 97
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.96-priority-ammo-resupply"
+    local BUILD = "v0.97-standing-damage-defense"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -13457,6 +13457,12 @@ end)()
                 if not floor or floor.Normal.Y < 0.65 then clear = false
                 elseif origin.Y - floor.Position.Y <= 12 then candidate = floor.Position + Vector3.new(0, 3, 0) end
                 if clear and workspace:Raycast(candidate, Vector3.new(0, 4, 0), rayParams) then clear = false end
+                if clear and threat.melee then
+                    clear=floor.Instance and floor.Instance.Parent and floor.Instance:IsA('BasePart')
+                        and floor.Instance.CanCollide==true and F.medicalLocationAllowed(ctx,floor.Instance)
+                    local mine=quest.drillSupport.activeMine(ctx)
+                    if clear and mine and quest.drillSupport.contains(mine,candidate,0)~=true then clear=false end
+                end
             end
             if clear and (not ctx.questHealing or F.healingPointSafe(ctx,candidate))then
                 local offset = candidate - point
@@ -13467,6 +13473,80 @@ end)()
         return best
     end
     F.escapePosition = escapePosition
+    local function meleeRetreatReady(ctx)
+        local player=api.Players.LocalPlayer
+        local scene=controller('CutSceneController')
+        local calls=quest.calls
+        local job=s.questDelivery
+        return F.enabled() and safeToWork(ctx) and api.owned() and s.farm==ctx
+            and player.Character==ctx.character and ctx.root.Parent and ctx.drill.Parent and ctx.humanoid.Health>0
+            and player.GameplayPaused~=true and not quest.manual() and not quest.driveHandoff(ctx)
+            and (not ctx.humanoid.MoveDirection or ctx.humanoid.MoveDirection.Magnitude<=.01)
+            and not(scene and (scene.CurrentCutScene or scene.AbortingCutScene))
+            and not ctx.bringEquipmentLock and not s.bringDelivery and not s.lootRequest and not s.equipmentRequest
+            and not ctx.nativeGateMotion and not ctx.questMineEntry and not ctx.questPlacement and not ctx.questPreviewCancel
+            and not ctx.questHealAttempt and not s.questMedicalDrop and not ctx.questPotionUsing and not ctx.swingEdit
+            and not calls.drag and not calls.shop and not calls.cash and not calls.place and not calls.craft
+            and not calls.placementCancel and not calls.medicalDrop and not calls.inventoryDrop
+            and not(job and job.ctx==ctx and (job.owns or job.pending or not job.movementReleased))
+            and not ctx.defenseMoving and now()>=(ctx.dodgeUntil or 0)
+    end
+    function F.meleeRetreat(ctx)
+        -- Actual health loss plus a loaded, permitted hostile in contact range
+        -- is enough to leave danger while an optional item worker is waiting.
+        -- This is not an enemy chase, an inferred kill or a fabricated hit.
+        local hp,maximum=ctx.humanoid.Health,ctx.humanoid.MaxHealth
+        local band=workspace:GetAttribute('InfiniteDepthOffsetMeters')
+        local watch=ctx.meleeHealth
+        if not watch or watch.character~=ctx.character or watch.humanoid~=ctx.humanoid or watch.root~=ctx.root
+            or watch.drill~=ctx.drill or watch.band~=band then
+            ctx.meleeHealth={character=ctx.character,humanoid=ctx.humanoid,root=ctx.root,drill=ctx.drill,
+                band=band,health=hp,maximum=maximum};return false
+        end
+        local baseline=watch.health
+        if finite(maximum) and finite(watch.maximum) and maximum<watch.maximum then baseline=math.min(baseline,maximum)end
+        watch.health,watch.maximum=hp,maximum
+        if not finite(hp) or hp<=0 or not meleeRetreatReady(ctx) then watch.hit=nil;return false end
+        local function closeEnemy(npc,range)
+            local p=npc and part(npc)
+            return p and F.enemyAlive(npc) and F.questTargetAllowed(ctx,npc)
+                and (p.Position-ctx.root.Position).Magnitude<=range and p.Position or nil
+        end
+        if finite(baseline) and hp<baseline then
+            local nearest,distance
+            for _,npc in ipairs(F.enemies())do
+                local point=closeEnemy(npc,18)
+                local d=point and (point-ctx.root.Position).Magnitude
+                if d and (not distance or d<distance)then nearest,distance=npc,d end
+            end
+            watch.hit=nearest and {npc=nearest,expires=now()+1} or nil
+        end
+        local hit=watch.hit
+        local origin=hit and closeEnemy(hit.npc,18)
+        if not hit or now()>=hit.expires or not origin then watch.hit=nil;return false end
+        if coroutine.running()~=ctx.defenseThread or not RaycastParams or type(workspace.Raycast)~='function'then return false end
+        local destination=escapePosition(ctx,{npc=hit.npc,origin=origin,radius=28,melee=true})
+        if not destination then return false end
+        -- Do not evade one enemy straight into another loaded hostile.
+        for _,npc in ipairs(F.enemies())do
+            local point=closeEnemy(npc,60)
+            if point and (point-destination).Magnitude<18 then return false end
+        end
+        ctx.defenseMoving=true
+        if movement.cancel(ctx)~=true then ctx.defenseMoving=nil;return false end
+        ctx.defenseMoving=nil
+        if not meleeRetreatReady(ctx) or watch~=ctx.meleeHealth or watch.character~=ctx.character
+            or watch.humanoid~=ctx.humanoid or watch.root~=ctx.root or watch.drill~=ctx.drill or not closeEnemy(hit.npc,18)
+            or band~=workspace:GetAttribute('InfiniteDepthOffsetMeters')then return false end
+        ctx.defenseMoving=true
+        if ctx.currentChest then ctx.defenseAbort=true end
+        ctx.dodgeUntil=now()+.25
+        ctx.root.CFrame=CFrame.new(destination)
+        if ctx.root.AssemblyLinearVelocity then ctx.root.AssemblyLinearVelocity=Vector3.zero end
+        watch.hit=nil;ctx.defenseMoving=nil
+        status('Moving out of nearby melee damage; native combat and loot resume')
+        return true
+    end
     function F.dodge(ctx)
         local threat = F.observeThreat(ctx)
         if not threat or not safeToWork(ctx) then return false end
@@ -13481,7 +13561,7 @@ end)()
         -- Cancel the current tween before taking movement ownership. The route and
         -- feature worker yield at their next check instead of writing over the dodge.
         ctx.defenseMoving = true
-        movement.cancel(ctx)
+        if movement.cancel(ctx)~=true then ctx.defenseMoving=nil;return false end
         if ctx.currentChest then ctx.defenseAbort = true end
         if threat.source then ctx.attackCues[threat.source] = threat.token end
         ctx.pendingThreat = nil
@@ -13500,7 +13580,9 @@ end)()
         ctx.defenseThread = task.spawn(function()
             ctx.defenseThread = coroutine.running()
             while ctx.active and api.owned() and s.farm == ctx do
-                local ok, why = pcall(F.dodge, ctx)
+                local ok, why = pcall(function()
+                    if not F.meleeRetreat(ctx)then F.dodge(ctx)end
+                end)
                 if not ok then
                     ctx.defenseMoving = nil
                     status('Defense recovering: ' .. tostring(why))
@@ -14191,9 +14273,8 @@ end
             local scene = controller("CutSceneController")
             if workspace:GetAttribute("InCutScene") or workspace:GetAttribute("InfiniteRebasing")
                 or (scene and (scene.CurrentCutScene or scene.AbortingCutScene))
-                or s.request or s.awaiting or s.departureAt
-                or ctx.featureHold then
-                notice(ctx.featureHold and "Waiting for the current item operation" or "Waiting for the current game transition")
+                or s.request or s.awaiting or s.departureAt then
+                notice("Waiting for the current game transition")
                 combat.holdUntil, combat.burstUntil = nil, nil
                 return
             end
@@ -14254,6 +14335,9 @@ end
             end
             if not ready then
                 if ctx.bringEquipmentLock then return end -- Native tool changes cancel drag ownership.
+                -- A movement lease alone must not silence an already equipped
+                -- weapon. Changing tools still waits for the item worker.
+                if ctx.featureHold then notice("Waiting for the item operation before changing weapons");return end
                 -- A weapon change destroys the current native handler. Do not
                 -- take medical/mining equipment merely to prepare idle combat.
                 -- Inspect actual permitted hit geometry before requesting equip.
