@@ -1,7 +1,7 @@
 if game.PlaceId ~= 101906032112547 and game.PlaceId ~= 74507545904779 then return end
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 0.99: bound Engineer starter selection and resume protected normal lobby entry.
+-- Version 1.00: claim native Engineer starter blueprints and search all eligible placement regions.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -20,9 +20,9 @@ return function(source)
     if not dtecPlace() then return end
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 99
+    local REVISION = 100
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v0.99-bounded-engineer-startup"
+    local BUILD = "v1.00-engineer-blueprint-and-regions"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -2459,7 +2459,6 @@ return function(api,Q)
         return api.findOwned(ctx,id)~=nil
     end
     function L.step(ctx,plan)
-        if Q.special and Q.special.fastPlacement(plan)then ctx.questStartup=nil;return false end
         if not cfg.classQuest or lobby() or api.Players.LocalPlayer:GetAttribute('InitialInventoryLoaded')~=true
             or api.extractionReady() then return false end
         local c=api.controller('CrateController')
@@ -6154,26 +6153,33 @@ return function(api,Q)
     end
     function S.positionPreview(ctx,c,job)
         local regions=api.tagged('CraftPartRegion');local root=ctx.drill
-        local attempts=job.pose or 0
-        local candidate
-        for _,part in ipairs(regions)do
-            if live(part) and part:IsA('BasePart') and part:IsDescendantOf(root)then
-                if c.Item and c.Item:GetAttribute('BackOfDrillOnly')==true then
-                    local pivot=root:GetPivot()
-                    if pivot:PointToObjectSpace(part.Position).Z>=0 then candidate=part;break end
-                else candidate=part;break end
-            end
+        local candidates,seen={},{}
+        local back=c.Item and c.Item:GetAttribute('BackOfDrillOnly')==true
+        local function add(part)
+            if seen[part] or not live(part) or not part:IsA('BasePart') or not part:IsDescendantOf(root)then return end
+            if back and root:GetPivot():PointToObjectSpace(part.Position).Z<0 then return end
+            seen[part]=true;candidates[#candidates+1]=part
         end
-        if not candidate then
-            for _,part in ipairs(root:GetDescendants())do
-                if part.Name=='CraftPartRegion' and part:IsA('BasePart')then candidate=part;break end
-            end
+        for _,part in ipairs(regions)do add(part)end
+        for _,part in ipairs(root:GetDescendants())do if part.Name=='CraftPartRegion'then add(part)end end
+        job.pose=(job.pose or 0)+1
+        job.poseLimit=math.min(45,math.max(3,#candidates*9))
+        if #candidates==0 then return false end
+        local band=workspace:GetAttribute('InfiniteDepthOffsetMeters')
+        local search=ctx.questPlacementSearch
+        if not search or search.drill~=root or search.band~=band or search.recipe~=job.recipe then
+            search={drill=root,band=band,recipe=job.recipe,cursor=0};ctx.questPlacementSearch=search
         end
-        if not candidate then return false end
-        job.pose=attempts+1
+        -- Visit every region's center before trying offsets. A furnace or a
+        -- blocked first deck must not hide a clear second region. Continue the
+        -- bounded search across cancelled previews instead of restarting it.
+        local attempts=search.cursor;search.cursor=attempts+1
+        local candidate=candidates[attempts%#candidates+1]
+        local offsets={{0,0},{-1,0},{1,0},{0,-1},{0,1},{-1,-1},{1,-1},{-1,1},{1,1}}
+        local offset=offsets[math.floor(attempts/#candidates)%#offsets+1]
         local half=candidate.Size*.5
-        local x=((attempts%3)-1)*math.max(0,half.X-3)
-        local z=(math.floor(attempts/3)%3-1)*math.max(0,half.Z-3)
+        local x=offset[1]*math.max(0,half.X-3)
+        local z=offset[2]*math.max(0,half.Z-3)
         local point=candidate.CFrame:PointToWorldSpace(Vector3.new(x,half.Y+3,z))
         local forward=candidate.CFrame.LookVector or Vector3.new(0,0,-1)
         api.hover(ctx);ctx.root.CFrame=CFrame.lookAt(point-forward*7,point)
@@ -6228,7 +6234,7 @@ return function(api,Q)
                 c.ValidRegion=nil;c.PlacementOffset=nil
             end
             if not c.ValidRegion or not c.PlacementOffset then
-                if job.pose and job.pose>=9 then
+                if job.pose and job.pose>=(job.poseLimit or 9)then
                     ctx.questOwns=nil;ctx.questPlacementRetry=now()+15;S.cancelPreview(ctx)
                     status('No collision-valid turret space; cancelled the owned preview before retrying');return false
                 end
@@ -6260,7 +6266,7 @@ return function(api,Q)
             return true
         end
         if s.questCraftJob then return S.craft(ctx,plan)end
-        if not c or c.Active or c.PendingRequest or c.PendingCancel or calls.place or calls.craft or calls.placementCancel or Q.manual() or s.questDelivery or s.bringDelivery or s.lootRequest
+        if not c or c.Active or c.PendingRequest or c.PendingCancel or calls.place or calls.craft or calls.crateClaim or calls.placementCancel or Q.manual() or s.questDelivery or s.bringDelivery or s.lootRequest
             or now()<(ctx.questPlacementRetry or 0)then return false end
         local tool=S.blueprint(ctx)
         if not tool then return S.craft(ctx,plan)end
@@ -9570,6 +9576,13 @@ end)()
             and Q.drillSupport.processing.placement(ctx,plan)then return true end
         if Q.special.fastPlacement(plan)then
             if Q.special.quickReturn(ctx)then ctx.questOwns=true;return true end
+            -- Starter blueprints can still be in the native startup crate.
+            -- The fast plan's desired list contains only those blueprints;
+            -- never skip their claim or substitute saved Void equipment.
+            if not ctx.questPlacement and not ctx.questPreviewCancel and not Q.special.blueprint(ctx)then
+                if Q.loadout.step(ctx,plan)then return true end
+                if s.questCalls.crateRead or s.questCalls.crateClaim then return false end
+            end
             return Q.special.placement(ctx,plan)
         end
         if Q.ammoStep(ctx,plan)then return true end
