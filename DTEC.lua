@@ -1,7 +1,7 @@
 if game.PlaceId ~= 101906032112547 and game.PlaceId ~= 74507545904779 then return end
 task.wait(7)
 -- DTEC JoeJoe Automation.lua: put this complete file in the executor's auto-execute folder.
--- Version 1.02: use the native hotbar and separate confirmed selection effects from pending transport.
+-- Version 1.03: continue native scrap collection after the sale quota is complete.
 -- Claims owned startup items once; sells disposable loot and raw mined gems for Coins.
 -- Quest limits: church save at 20 minutes (depth: 45) or 1.5 minutes idle; remembers streamed-out churches.
 -- Results include the Roblox account username; ordinary return does not save carried loot.
@@ -20,9 +20,9 @@ return function(source)
     if not dtecPlace() then return end
     local env = (getgenv and getgenv()) or _G
     local KEY = "__ChestFarmAutoLoop_20261009"
-    local REVISION = 102
+    local REVISION = 103
     local VERSION = string.format("%.2f", REVISION / 100)
-    local BUILD = "v1.02-native-selection-receipts"
+    local BUILD = "v1.03-independent-scrap-collection"
     local job = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
     local previous = env[KEY]
     if previous and previous.job == job and previous.thread
@@ -4733,7 +4733,7 @@ end)()
         if snapshot and snapshot(item) or not snapshot and api.useful(ctx,item)then return false end
         local gem=s.itemCategories and s.itemCategories.Gems and s.itemCategories.Gems[id]==true
         if objective=='SellCorpse'then return category=='Corpse' end
-        if objective=='SellScrap'then return category=='Scrap' end
+        if objective=='SellScrap' or objective=='CollectScrap'then return category=='Scrap' end
         if objective=='SellGems'then return gem end
         if ores[id] or gem then return true end
         -- Corpse and ordinary non-returnable valuables are native item categories.
@@ -7489,7 +7489,9 @@ end)()
         CrazyMinerKills=true, BanditMinerKills=true, DarknessEnemyKills=true,GoblinKills=true,GoblinLordKills=true}
     local guns = {GunKills=true, HeadShot=true, ShotgunKills='Shotgun', RifleKills='Rifle'}
     local mining = {MineCoal=true,MineDiamond=true,MineRuby=true,MineOres=true,MineGems=true,SmeltIron=true,SmeltGold=true}
-    local sales = {SellGoldItems=true,SellCorpse=true,SellScrap=true,SellGems=true}
+    -- CollectScrap shares the native scrap handling/disposal path. Its own
+    -- replicated count, not the sell quota or item value, decides completion.
+    local sales = {SellGoldItems=true,SellCorpse=true,SellScrap=true,SellGems=true,CollectScrap=true}
     local potions = {UseSpeedPotion='SpeedPotion',UseStrengthPotion='StrengthPotion',UseInvisibilityPotion='InvisibilityPotion',
         UseNightVisionPotion='NightVisionPotion',UseLuckPotion='LuckPotion'}
     local upgradeGoals = {BuyDriveSpeed='DriveSpeed',BuyEngineOverdrive='EngineOverdrive'}
@@ -7629,7 +7631,7 @@ end)()
             if pending[key]then plan.kind,plan.objective='mining',key;return plan end
         end
         if pending.TotalDepth and drive then plan.kind,plan.objective='depth','TotalDepth'; return plan end
-        for _,key in ipairs({'SellCorpse','SellScrap','SellGems'})do
+        for _,key in ipairs({'SellCorpse','SellScrap','SellGems','CollectScrap'})do
             if pending[key]then plan.kind,plan.objective='sale',key;return plan end
         end
         if pending.ContributeFuel then plan.kind,plan.objective='fuel','ContributeFuel';return plan end
