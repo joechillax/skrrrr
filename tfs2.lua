@@ -595,22 +595,24 @@ function runtime.restoreRecoil()
 end
 function runtime.updateRecoil()
     if not config.NoRecoil then runtime.restoreRecoil() return end
-    if runtime.recoilPatch then return end
-    local scripts=LocalPlayer:FindFirstChild("PlayerScripts")
-    local gui=scripts and scripts:FindFirstChild("GuiManager")
-    local main=gui and gui:FindFirstChild("MainGui")
-    local object=main and main:FindFirstChild("CharGui")
-    if not object then runtime.modifierStatus="No recoil: CharGui unavailable" return end
-    local ok,module=pcall(require,object)
-    if not ok or type(module)~="table" or type(module.AddRecoil)~="function" then
-        runtime.modifierStatus="No recoil: AddRecoil unavailable";return
+    local object=runtime.moduleObject and runtime.moduleObject("CharGui")
+    local patch=runtime.recoilPatch
+    if patch then
+        if patch.object==object and patch.module.AddRecoil==patch.wrapper then return end
+        runtime.restoreRecoil()
     end
+    if not object then runtime.modifierStatus="No recoil: CharGui unavailable" return end
+    local cached=runtime.gameModules and runtime.gameModules.CharGui
+    if not cached or cached.module~=object or not cached.value then
+        runtime.modifierStatus="No recoil: waiting for bounded CharGui dependency loading";return
+    end
+    local module=cached.value
     local original=module.AddRecoil
     local wrapper=function(...)
         if runtime.active and config.NoRecoil then return end
         return original(...)
     end
-    runtime.recoilPatch={module=module,original=original,wrapper=wrapper}
+    runtime.recoilPatch={object=object,module=module,original=original,wrapper=wrapper}
     module.AddRecoil=wrapper
     runtime.modifierStatus="No recoil: recoil callback installed"
 end
@@ -622,10 +624,11 @@ end)
 local rangeManager, rangeMods
 runtime.gameModules={}
 function runtime.moduleObject(name)
-    if name=="ShopPurchase" then
+    if name=="ShopPurchase" or name=="CharGui" then
         local scripts=LocalPlayer:FindFirstChild("PlayerScripts")
         local gui=scripts and scripts:FindFirstChild("GuiManager")
         local main=gui and gui:FindFirstChild("MainGui")
+        if name=="CharGui" then return main and main:FindFirstChild("CharGui") end
         local shop=main and main:FindFirstChild("ShopGui")
         return shop and shop:FindFirstChild("ShopPurchase")
     end
@@ -636,16 +639,17 @@ function runtime.moduleObject(name)
     local modules=game:GetService("ReplicatedStorage"):FindFirstChild("ModuleScripts")
     return modules and modules:FindFirstChild(name)
 end
-runtime.dependencyNames={"CharacterManager","ModOperations","Utility","ShopModule","ShopPurchase","LookPosManager","RotationManager","NetworkManager","AchievementManager","AtlasManager"}
+runtime.dependencyNames={"CharacterManager","ModOperations","Utility","ShopModule","ShopPurchase","LookPosManager","RotationManager","NetworkManager","AchievementManager","AtlasManager","ReplicatedWeapon","CharGui"}
 runtime.dependencyMethods={CharacterManager={"GetValue"},ModOperations={"GetModStats"},Utility={"RoundPrice","GetStructureRepairInfo"},
     ShopModule={"UpgradeTool"},ShopPurchase={"BuyStructure","RepairStructure"},LookPosManager={"UpdateLocalLookPos"},
-    RotationManager={"RenderStepped"},NetworkManager={"PassDataA","GetPlayerNetworkData"},AchievementManager={"GetProgress"},AtlasManager={}}
+    RotationManager={"RenderStepped"},NetworkManager={"PassDataA","GetPlayerNetworkData"},AchievementManager={"GetProgress"},AtlasManager={},ReplicatedWeapon={},CharGui={"AddRecoil"}}
 function runtime.refreshDependencies()
     for _,name in ipairs(runtime.dependencyNames) do
         if not runtime.active or runtime.stopping then return end
         local object=runtime.moduleObject(name);local cached=runtime.gameModules[name]
         if not cached or cached.module~=object then
             runtime.cancelJob("Dependency:"..name,"Module replaced")
+            if name=="CharGui" then runtime.restoreRecoil() end
             if name=="CharacterManager" or name=="ModOperations" then
                 if runtime.op then runtime.cleanupStep("Native module replacement",runtime.op.cleanup) end
                 if name=="CharacterManager" then rangeManager=nil else rangeMods=nil end
@@ -677,6 +681,20 @@ function runtime.moduleValue(name)
     local cached=runtime.gameModules[name]
     assert(cached and cached.module==runtime.moduleObject(name) and cached.value,name.." is not ready; automatic dependency retry is active")
     return cached.value
+end
+function runtime.toolComplete(tool,owned)
+    if not tool then return false end
+    local object=runtime.moduleObject("ReplicatedWeapon")
+    if not object then return true end -- Older clients and offline fixtures lack this validator.
+    local cached=runtime.gameModules.ReplicatedWeapon
+    if not cached or cached.module~=object or not cached.value then return false end
+    local manager=cached.value
+    local method=owned and manager.AreOwnedToolsComplete or manager.IsToolComplete
+    if type(method)~="function" then return true end
+    local ok,ready
+    if owned then ok,ready=pcall(method,manager,LocalPlayer,tool.Name)
+    else ok,ready=pcall(method,manager,tool) end
+    return ok and ready==true
 end
 runtime.refreshDependencies()
 assert(runtime.active and runtime.slot.current==runtime,"Initialization cancelled during dependency loading")
@@ -717,6 +735,7 @@ local function withinRange(origin, point, limit)
 end
 
 local function gunReady(tool, current)
+    if not runtime.toolComplete(tool) then return false end
     if tool.Enabled == false then return false end
     if readValue(tool, "Reloading") == true then return false end
     local clip = readValue(current, "Clip")
@@ -1317,12 +1336,21 @@ if not runtime.slot.original then
     end))
 end
 runtime.penetrationRays=setmetatable({}, {__mode="k"})
+function runtime.reflectionDirection(ray,ignored)
+    local previous=type(ignored)=="table" and runtime.penetrationRays[ignored]
+    if not previous or not previous.normal or os.clock()-previous.at>.25 then return end
+    local direction=previous.originalUnit-2*previous.originalUnit:Dot(previous.normal)*previous.normal
+    if (ray.Origin-(previous.point+previous.normal*.05)).Magnitude<=.01
+        and ray.Direction.Magnitude<=previous.length+.01 and (ray.Direction.Unit-direction).Magnitude<=.0001 then
+        return previous.direction-2*previous.direction:Dot(previous.normal)*previous.normal
+    end
+end
 function runtime.penetrationDirection(ray,ignored)
     if type(ignored)~="table" then return end
     local previous=runtime.penetrationRays[ignored]
     if not previous then return end
     -- GunScript reuses this list, adds the previous victim and advances to its impact.
-    if os.clock()-previous.at<=.25 and table.find(ignored,previous.model)
+    if previous.model and os.clock()-previous.at<=.25 and table.find(ignored,previous.model)
         and (ray.Origin-previous.point).Magnitude<=.01
         and ray.Direction.Magnitude<=previous.length+.01
         and (ray.Direction.Unit-previous.originalUnit).Magnitude<=.0001 then
@@ -1341,7 +1369,13 @@ function runtime.rememberPenetration(original,args,result)
         if not model or model.Parent==zombiesFolder then break end
         model=model.Parent
     end
-    if not model or model.Parent~=zombiesFolder then return end
+    if not model or model.Parent~=zombiesFolder then
+        local normal=result[3]
+        if typeof(normal)=="Vector3" and normal.Magnitude>.001 then
+            runtime.penetrationRays[ignored]={point=point,normal=normal.Unit,at=os.clock(),originalUnit=original[1].Direction.Unit,direction=args[1].Direction.Unit,length=args[1].Direction.Magnitude}
+        end
+        return
+    end
     runtime.penetrationRays[ignored]={model=model,point=point,at=os.clock(),
         originalUnit=original[1].Direction.Unit,direction=args[1].Direction.Unit,length=args[1].Direction.Magnitude}
 end
@@ -1384,7 +1418,7 @@ runtime.slot.handler = function(self, ...)
         if not runtime.isEquippedGunCaller() then return end
         local ray = original[1]
         if typeof(ray) ~= "Ray" or ray.Direction.Magnitude<=0.001 then return end
-        local continuation=runtime.penetrationDirection(ray,original[2])
+        local continuation=runtime.reflectionDirection(ray,original[2]) or runtime.penetrationDirection(ray,original[2])
         if config.Triggerbot and not continuation then runtime.ensureFireTarget() end
         local targetPosition = (config.SilentAim or config.Triggerbot) and os.clock()-cachedAt<=0.15 and cachedPosition or nil
         if not continuation and not targetPosition and config.NoSpread and not config.Triggerbot then
@@ -1493,6 +1527,7 @@ table.insert(runtime.connections,{Disconnect=function() runtime.clearGunCallback
 function runtime.gunCallbacks()
     local tool=equippedGun()
     if not tool then runtime.invalidateGunCallbacks();return end
+    if not runtime.toolComplete(tool) then runtime.invalidateGunCallbacks();return end
     if type(getconnections)~="function" or type(getfenv)~="function" then return end
     local gun=tool:FindFirstChild("GunScript")
     if not gun then return end
@@ -2068,7 +2103,7 @@ function runtime.refillStep()
     local humanoid=character and character:FindFirstChildOfClass("Humanoid")
     local root=character and character:FindFirstChild("HumanoidRootPart")
     local tool=equippedGun()
-    if not humanoid or humanoid.Health<=0 or not root or not runtime.refillNeeded(tool) then return end
+    if not humanoid or humanoid.Health<=0 or not root or not runtime.toolComplete(tool) or not runtime.refillNeeded(tool) then return end
     if tool.Enabled==false or readValue(tool,"Reloading")==true or reloadState.key then return end
     local playerGui=LocalPlayer:FindFirstChild("PlayerGui")
     if playerGui and playerGui:FindFirstChild("MenuGui") then return end
@@ -2334,6 +2369,7 @@ function runtime.consumableContext(name)
     local backpack = LocalPlayer:FindFirstChild("Backpack")
     local tool = character:FindFirstChild(name) or (backpack and backpack:FindFirstChild(name))
     assert(tool and tool:IsA("Tool") and tool:FindFirstChild("ConsumableScript"), "Selected consumable is not in your inventory.")
+    assert(runtime.toolComplete(tool),"Consumable values are still loading.")
     local charges = LocalPlayer:FindFirstChild("Charges")
     local entry = charges and charges:FindFirstChild(name)
     local amount = readValue(entry, "Amount")
@@ -2870,6 +2906,10 @@ function state.restoreHipADS()
 end
 function state.hipADSStep()
     local tool=equippedGun()
+    if tool and not runtime.toolComplete(tool) then
+        if state.hipADS.tool then state.restoreHipADS() end
+        return
+    end
     local _,humanoid=alive()
     if not humanoid or humanoid.Health<=0 then tool=nil end
     local a=state.hipADS
@@ -3186,7 +3226,7 @@ function state.achievementStep()
             runtime.checkJob()
             if not e.AutoClaimAchievements then return end
             if data.Achievements[key]==true then state.achievementResults[key]=nil
-            elseif not state.achievementResults[key] then
+            elseif not state.achievementResults[key] and atlas.value.AchievementAtlas[key].IsDisplayOnly~=true then
                 local ok,progress,maximum=pcall(manager.value.GetProgress,manager.value,LocalPlayer.UserId,key)
                 runtime.checkJob()
                 if ok and finite(progress) and finite(maximum) and maximum>0 and progress>=maximum then
@@ -3471,15 +3511,21 @@ function state.upgradeCost(tool,upgrade)
     else error("Unsupported upgrade price operator") end
     local perks,other=child(LocalPlayer,"PlayerPerks"),child(tool,"OtherValues")
     local multiplier=1+(readValue(perks,"WeaponUpgradePrice") or 0)
-    if child(perks,"SecondaryPrice") and child(other,"SecondaryPrice") then multiplier=multiplier*(1-(readValue(perks,"SecondaryPrice")*.05+.45)) end
     if perks and child(other,"DamagePrice") then multiplier=multiplier*1.5 end
+    local armsCost=math.floor(math.floor(cost+.5)*multiplier+.5)
+    local armsValue=readValue(other,"ArmsDealValue")
+    if child(perks,"SecondaryPrice") and child(other,"SecondaryPrice") then
+        local utility=gameModule("Utility")
+        if not finite(armsValue) or type(utility.CanArmsDealUpgrade)~="function" then error("Arms Deal value/eligibility data unavailable") end
+        if utility:CanArmsDealUpgrade(LocalPlayer,tool,armsValue,armsCost) then multiplier=multiplier*(1-(readValue(perks,"SecondaryPrice")*.05+.6)) end
+    end
     cost=math.floor(cost*multiplier+.5)
     if readValue(child(storage(),"Values"),"Difficulty")==5 then
         local utility=gameModule("Utility")
         cost=utility:RoundPrice(cost*utility:CareerMulti(readValue(other,"PriceBuy")),"Upgrade")
     end
     assert(type(cost)=="number" and cost==cost and cost>=0 and cost<math.huge,"Invalid upgrade cost")
-    return cost
+    return cost,armsValue and armsCost or nil
 end
 function state.upgradeAllowed(folder,upgrade,shopUpgrade)
     local requirement=readValue(upgrade,"UpgradeReq")
@@ -3546,7 +3592,104 @@ function state.failUpgrade(kind,name,identity,reason)
     notice("Upgrade paused for "..tostring(name)..": "..tostring(reason)..". Partial local changes may exist; this data will not be applied again.")
     if runtime.active then warn("[Combat Assistant] "..state.message) end
 end
+-- October 27 protocol: (group, upgrade, quoted cost, click id), answered by
+-- UpgradeStructureResult(id, accepted, authoritative level, balance).
+-- Keep positive numeric ids in a separate range from routine native menu clicks.
+state.structurePending=runtime.slot.structurePending
+function state.structureCurrent(record)
+    return record and record.server==game.JobId and record.player==LocalPlayer
+        and record.map==child(Workspace,"Map") and record.round==runtime.roundIdentity()
+        and (typeof(record.owned)~="Instance" or record.owned.Parent~=nil)
+        and child(child(record.owned,"Upgrades"),record.upgrade.Name)==record.upgrade
+end
+function state.clearStructure(record)
+    state.releaseSpending(record)
+    if state.structurePending==record then state.structurePending=nil end
+    if runtime.slot.structurePending==record then runtime.slot.structurePending=nil end
+end
+function state.structureTick()
+    local record=state.structurePending
+    if not record then return end
+    if not state.structureCurrent(record) then state.clearStructure(record);return end
+    if not record.uncertain and os.clock()>=record.deadline then
+        record.uncertain=true;state.releaseSpending(record)
+        notice("Upgrade result unknown: "..record.name.." / "..record.upgrade.Name.."; duplicate upgrades held")
+    end
+end
+function state.structureResult(id,accepted,level)
+    local record=state.structurePending
+    if not record or id~=record.id then return end
+    if not state.structureCurrent(record) then state.clearStructure(record);return end
+    if type(accepted)~="boolean" then return end
+    if level~=nil and (not finite(level) or level%1~=0 or level<record.upgrade.MinValue or level>record.upgrade.MaxValue) then return end
+    if level==nil then
+        record.uncertain=true;state.releaseSpending(record)
+        notice("Upgrade reply omitted its authoritative level; duplicate upgrades held")
+        return
+    end
+    -- The native listener reconciles the reported balance, including outstanding
+    -- manual-menu costs. Do not overwrite that adjustment with a raw balance.
+    record.upgrade.Value=level
+    if not record.structure and record.character==LocalPlayer.Character and (not accepted or level~=record.before+1) then
+        state.failUpgrade("shopUpgradeFaults",record.name,child(record.owned,"Upgrades"),"Server rejected/corrected player upgrade after native local effects; waiting for fresh upgrade data")
+    else notice((accepted and "Upgrade confirmed: " or "Upgrade rejected: ")..record.name.." / "..record.upgrade.Name) end
+    state.clearStructure(record)
+    if state.farm then state.farm.wake() end
+end
+function state.watchStructureResults()
+    local event=child(child(storage(),"RemoteEvents"),"UpgradeStructureResult")
+    if state.structureEvent==event then return end
+    if state.structureConnection then state.structureConnection:Disconnect();state.structureConnection=nil end
+    state.structureEvent=event
+    if event and event:IsA("RemoteEvent") and event.OnClientEvent then
+        state.structureConnection=event.OnClientEvent:Connect(function(...)
+            -- Reconcile real acknowledgements even while applying a profile.
+            if runtime.active then
+                local ok,err=pcall(state.structureResult,...)
+                if not ok then notice("Upgrade confirmation error: "..tostring(err)) end
+            end
+        end)
+    end
+end
+table.insert(runtime.connections,{Disconnect=function()
+    if state.structureConnection then state.structureConnection:Disconnect();state.structureConnection=nil end
+end})
+state.watchStructureResults();state.structureTick()
+connect(RunService.Heartbeat,function()
+    if os.clock()<(state.structurePollAt or 0) then return end
+    state.structurePollAt=os.clock()+.2;state.watchStructureResults();state.structureTick()
+end)
+function state.requestStructure(name,structure,owned,upgrade,cost,event,module)
+    state.structureTick();if state.structurePending then return false end
+    state.watchStructureResults()
+    if not state.structureConnection then notice("Waiting for native upgrade result listener");return false end
+    runtime.slot.structureSequence=(runtime.slot.structureSequence or 1000000000)+1
+    local record={id=runtime.slot.structureSequence,name=name,structure=structure,owned=owned,upgrade=upgrade,before=upgrade.Value,
+        server=game.JobId,player=LocalPlayer,character=LocalPlayer.Character,map=child(Workspace,"Map"),round=runtime.roundIdentity(),
+        deadline=os.clock()+runtime.limits.responseSeconds}
+    state.structurePending=record;runtime.slot.structurePending=record
+    -- Transfer the wrapper's spending lock. Its later completion cannot release
+    -- this request's ownership before the server reply (or local timeout).
+    state.spendingOwner=record;state.spendingBusy=true
+    local ok,err=pcall(function()
+        runtime.checkJob();upgrade.Value=upgrade.Value+1
+        if not structure then module:UpgradeStructurePlayer(LocalPlayer,name,upgrade,cost) end
+        runtime.checkJob()
+        LocalPlayer.ReplicatedMoney.Value=LocalPlayer.ReplicatedMoney.Value-cost
+        record.dispatched=true
+        event:FireServer(name,upgrade.Name,cost,record.id)
+    end)
+    if not ok then
+        record.uncertain=true;state.releaseSpending(record)
+        if not record.dispatched then state.failUpgrade("shopUpgradeFaults",name,child(owned,"Upgrades"),err);state.clearStructure(record)
+        else notice("Upgrade dispatch uncertain: "..tostring(err)) end
+        return false
+    end
+    notice("Upgrade sent; awaiting server result: "..name.." / "..upgrade.Name)
+    return true
+end
 function state.upgradeShop(name,structure,owned,budget,selected)
+    state.structureTick();if state.structurePending then return false end
     local folder=child(owned,"Upgrades")
     if not folder then return false end
     if state.upgradeBlocked("shopUpgradeFaults",name,folder) then return false end
@@ -3559,6 +3702,11 @@ function state.upgradeShop(name,structure,owned,budget,selected)
                 local event=child(child(storage(),"RemoteEvents"),"UpgradeStructurePlayer")
                 assert(event and event:IsA("RemoteEvent"),"UpgradeStructurePlayer unavailable")
                 local module=gameModule("ShopModule")
+                local nativeWeapon=runtime.gameModules.ReplicatedWeapon
+                if runtime.moduleObject("ReplicatedWeapon") and (not nativeWeapon or not nativeWeapon.value) then notice("Waiting for native shop protocol data");return false end
+                if child(child(storage(),"RemoteEvents"),"UpgradeStructureResult") or (nativeWeapon and nativeWeapon.value and type(nativeWeapon.value.IsToolComplete)=="function") then
+                    return state.requestStructure(name,structure,owned,upgrade,cost,event,module)
+                end
                 local epoch=state.epoch or 0
                 -- ShopGui increments this before updating effects; both structure and player upgrades use this remote.
                 local sent=false
@@ -3935,7 +4083,8 @@ function state.upgradeTool(name,upgradeName,farmOwned)
     if not tool or not upgrade or upgrade.Value>=upgrade.MaxValue or not state.upgradeAllowed(toolUpgrades(name),upgrade) then return false end
     local backgear=child(child(LocalPlayer,"Backgear"),name)
     if not backgear then notice("Waiting for backgear: "..name);return false end
-    local cost=state.upgradeCost(tool,upgrade)
+    if not runtime.toolComplete(tool,true) then notice("Waiting for complete tool/backgear values: "..name);return false end
+    local cost,armsCost=state.upgradeCost(tool,upgrade)
     if cost>availableMoney() then return false end
     local character,humanoid=alive()
     if not humanoid or runtime.consumableBusy or runtime.refillBusy or reloadState.key or readValue(tool,"Reloading")==true then return false end
@@ -3959,6 +4108,12 @@ function state.upgradeTool(name,upgradeName,farmOwned)
         local price=child(child(tool,"OtherValues"),"PriceValue")
         local backPrice=child(child(backgear,"OtherValues"),"PriceValue")
         if price and backPrice and price.Value>=0 then price.Value=price.Value+cost;backPrice.Value=backPrice.Value+cost end
+        if armsCost then
+            for _,item in ipairs({tool,backgear}) do
+                local field=child(child(item,"OtherValues"),"ArmsDealValue")
+                if field then field.Value=field.Value+armsCost end
+            end
+        end
     end)
     if wasEquipped and runtime.active and LocalPlayer.Character==character and humanoid.Health>0 and not character:FindFirstChildOfClass("Tool") and tool.Parent==child(LocalPlayer,"Backpack") then
         pcall(function() humanoid:EquipTool(tool) end)
@@ -4093,7 +4248,7 @@ function farm.healingPrice(template,utility,manager)
     local perks=child(LocalPlayer,"PlayerPerks")
     local multiplier=1
     local secondary=readValue(perks,"SecondaryPrice")
-    if secondary~=nil and utility:CheckArmsDealDiscount(LocalPlayer,template) then multiplier=1+(-.875+secondary*-.025) end
+    if secondary~=nil and utility:CheckArmsDealDiscount(LocalPlayer,template) then multiplier=1+(-.6+secondary*-.05) end
     if child(perks,"DamagePrice") and not manager:IsEquipment(template) and base>0 then multiplier=multiplier*1.5 end
     local sell=readValue(perks,"SellValue")
     if sell~=nil then multiplier=multiplier*(1-(sell*.05+.1)) end
@@ -4215,6 +4370,7 @@ function farm.unlimitedOwned()
     local u=farm.unlimited();return u and type(u.Value)=="number" and u.Value>(u.MinValue or 0) or false
 end
 function farm.confirmed()
+    if state.structurePending then farm.waitStatus("server structure/player upgrade confirmation");return false end
     if farm.purchaseUnknown then
         if farm.purchaseUnknown.round==runtime.roundIdentity() then farm.fault=farm.purchaseUnknown.reason
         else farm.purchaseUnknown=nil;farm.fault=nil end
@@ -4764,6 +4920,7 @@ function farm.preflight()
         if perks and child(perks,"StarterPistol") then farm.acquireC96() else farm.waitStatus(reason) end;return false
     end
     farm.c96Attempt=nil
+    if not runtime.toolComplete(tools.C96,true) then farm.waitStatus("C96/backgear values still loading");return false end
     local folder=toolUpgrades("C96")
     if not folder or not farm.unlimited() then farm.waitStatus("C96 Unlimited Ammo upgrade data");return false end
     for _,name in ipairs({"CharacterManager","Utility","ShopModule","ShopPurchase"}) do
@@ -5890,7 +6047,7 @@ function state.spending(supportOnly)
     state.maintenanceUnknown=state.maintenanceUnknown or {}
     local epoch=state.epoch or 0;local character=LocalPlayer.Character;local map=child(Workspace,"Map");local round=runtime.roundIdentity()
     local job=runtime.startJob("Maintenance",runtime.limits.responseSeconds,function()
-        return runtime.active and state.epoch==epoch and LocalPlayer.Character==character and child(Workspace,"Map")==map
+        return runtime.active and (state.epoch or 0)==epoch and LocalPlayer.Character==character and child(Workspace,"Map")==map
     end,function(job)
         local ok,err=pcall(function()
             for offset=1,#actions do
@@ -6096,7 +6253,7 @@ runtime.initializeExtensions = nil
 runtime.capabilityLabel=runtime.label(menuGroup,"Feature readiness: checking dependencies")
 function runtime.showReadiness()
     local messages={}
-    for _,name in ipairs({"CharacterManager","ModOperations","Utility","ShopModule","ShopPurchase"}) do
+    for _,name in ipairs({"CharacterManager","ModOperations","Utility","ShopModule","ShopPurchase","ReplicatedWeapon"}) do
         local cached=runtime.gameModules[name]
         if not cached or not cached.value or cached.module~=runtime.moduleObject(name) then messages[#messages+1]=name..": "..tostring(cached and cached.error or "waiting for module") end
     end
