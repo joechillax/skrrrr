@@ -333,6 +333,7 @@ runtime.extraSpecs = {
     ClosePriority={false}, CloseDistance={60,20,200},
     MeleeAura={false}, ThrowMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position"}}, LureMode={"Most crowded",{"Most crowded","Nearest safe group","Cursor position","Boss–Enemy Spawn"}},
     AutoDonate={false}, DonatePlayer={""}, DonateAmount={100,1,10000}, DonateInterval={10,1,60},
+    AutoPrestige={false}, FarmAutoPrestige={false},
     AutoRefillAmmo={false}, AutoVote={false}, VoteMap={""}, AutoSkip={false}, 
     HipFireADS={false}, AutoShopMoney={false}, AutoPurchase={false}, Purchases={{}}, AutoRepair={false}, Repairs={{}},
     AutoReplenish={false}, Replenish={{}}, ActionInterval={3,.2,30}, MoneyReserve={0,0,100000},
@@ -2018,6 +2019,19 @@ end
 runtime.slot.quarantine=runtime.slot.quarantine or {}
 function runtime.quarantineCurrent(record)
     if record.server~=game.JobId or record.player~=LocalPlayer then return false end
+    if record.progression then
+        local data=runtime.nativeData();local info=record.progression
+        if not data then return true end
+        if record.key=="PrestigePerk" then return not (type(data.Prestige)=="number" and data.Prestige>info.prestige) end
+        if record.key:sub(1,11)=="PerkUnlock:" then
+            local level=data.PerkLevels and data.PerkLevels[info.perk]
+            return not (type(level)=="table" and type(level[1])=="number" and level[1]>info.level)
+        end
+        if record.key:sub(1,10)=="PerkEquip:" then
+            local folder=LocalPlayer:FindFirstChild("PlayerPerks");local perk=folder and folder:FindFirstChild(info.perk)
+            return not (perk and readValue(perk,"PerkSlot")==info.slot)
+        end
+    end
     if record.key=="TransferMoney" then return true end
     if record.key=="AchievementClaim" then
         local data=runtime.nativeData();return not (record.achievement and data and data.Achievements and data.Achievements[record.achievement]==true)
@@ -2032,7 +2046,7 @@ end
 function runtime.preserveOperations()
     for key,operation in pairs(runtime.operations) do
         local values=game:GetService("ReplicatedStorage"):FindFirstChild("Values")
-        local record={key=key,achievement=operation.achievement,server=game.JobId,player=LocalPlayer,map=Workspace:FindFirstChild("Map"),
+        local record={key=key,achievement=operation.achievement,progression=operation.progression,server=game.JobId,player=LocalPlayer,map=Workspace:FindFirstChild("Map"),
             character=LocalPlayer.Character,wave=readValue(values,"LocalWave")}
         -- The token is an identity only; do not retain runtime callbacks in the shared slot.
         record.token=operation.identity
@@ -2075,11 +2089,15 @@ function runtime.operationTick()
     runtime.roundIdentity();runtime.jobTick()
     for key,record in pairs(runtime.slot.quarantine) do if not runtime.quarantineCurrent(record) then runtime.slot.quarantine[key]=nil end end
     for key,operation in pairs(runtime.operations) do
+        if operation.progression and not runtime.quarantineCurrent({key=key,progression=operation.progression,server=game.JobId,player=LocalPlayer}) then
+            runtime.finishOperation(operation)
+        else
         local ok,valid=pcall(operation.valid)
         if not runtime.active or not ok or not valid then
             runtime.expireOperation(operation,"Context changed before the response")
             if runtime.operations[key]==operation then runtime.operations[key]=nil end
         elseif os.clock()>=operation.deadline then runtime.expireOperation(operation,"Response overdue; result remains unknown") end
+        end
     end
 end
 connect(RunService.Heartbeat,function()
@@ -3020,6 +3038,7 @@ function state.vote()
     notice("Map vote requested: "..e.VoteMap)
 end
 function state.skip()
+    if state.prestigeHeld and state.prestigeHeld() then notice("Ready-up paused for auto prestige / perk restoration");return false end
     if e.Autofarm and state.farm and state.farm.resetVoteHeld and state.farm.resetVoteHeld() then return false end
     local values=child(storage(),"Values")
     assert(readValue(values,"Vote")==true,"Skip voting is closed by the game")
@@ -3064,6 +3083,7 @@ end
 function state.stop()
     state.epoch=(state.epoch or 0)+1
     for key,value in pairs(e) do if type(value)=="boolean" then e[key]=false end end
+    runtime.cancelJob("PerkProgression","Automatic progression paused")
     config.SilentAim,config.Triggerbot,config.NoSpread,config.NoRecoil,config.HeadshotConversion=false,false,false,false,false
     local step=runtime.cleanupStep
     step("ADS",state.restoreHipADS)
@@ -4855,6 +4875,7 @@ function farm.resumeCharacter()
     triggerToggle:SetValue(false);releaseHeld()
 end
 function farm.ongoingSkip()
+    if state.prestigeHeld and state.prestigeHeld() then return end
     if farm.resetVoteHeld and farm.resetVoteHeld() then return end
     local values=child(storage(),"Values")
     local currentWave=readValue(values,"LocalWave")
@@ -4942,6 +4963,7 @@ function farm.step()
         else farm.stop();farm.begin() end
     end
     farm.lastWave=wave
+    if state.prestigeHeld and state.prestigeHeld() then farm.status("Auto prestige: "..state.prestige.message);return end
     for _,key in ipairs(conflicts) do if e[key] then e[key]=false;if ui[key] then ui[key]:SetValue(false) end end end
     if farm.voteMap() then triggerToggle:SetValue(false);releaseHeld();farm.cancelWalk();return end
     if not farm.supported() then
@@ -5802,6 +5824,7 @@ function farm.reconcileVote()
     state.skipLastResult=nil
 end
 function farm.voteStatus()
+    if state.prestigeHeld and state.prestigeHeld() then return "Ready-up paused: "..state.prestige.message end
     local values=child(storage(),"Values")
     local wave=readValue(values,"LocalWave")
     if not e.Autofarm then return "Autofarm ready-up: off" end
@@ -5928,6 +5951,7 @@ function farm.confirmWave30Death(attempt)
     farm.resetMessage="Scheduled reset: death confirmed; recovering to Ammo Box."
 end
 function farm.resetTick()
+    if state.prestigeHeld and state.prestigeHeld() then return false end
     if not runtime.active or not e.Autofarm or not farm.active or not farm.supported() then return false end
     local values=child(storage(),"Values")
     if (readValue(values,"VotingTime") or 0)>0 or (readValue(values,"LocalLives") or 1)<=0 then return false end
@@ -6020,6 +6044,7 @@ function state.upgradeShopMoney()
     return state.upgradeShop("Shop",true,owned,availableMoney(),{MoneyUpgrade=true})
 end
 function state.spending(supportOnly)
+    if state.prestigeHeld and state.prestigeHeld() then return end
     if state.spendingBusy or os.clock()<(state.spendAt or 0) then return end
     local _,humanoid=alive();if not humanoid or runtime.consumableBusy or runtime.refillBusy then return end
     state.spendAt=os.clock()+e.ActionInterval
@@ -6083,6 +6108,380 @@ connect(RunService.Heartbeat,function()
     end
     if os.clock()>=state.catalogAt then state.catalogAt=os.clock()+3;local ok,err=pcall(state.refresh);if not ok then notice(err) end end
     if state.displayed~=state.message then state.displayed=state.message;state.status:SetText(state.message) end
+end)
+-- Player progression uses native perk IDs and replicated confirmation, never a
+-- guessed reset response. Presets remember occupied slots, including elite slots.
+local prestige={message="Off",maxLevel=50,next=0,loaded=false}
+state.prestige=prestige
+prestige.userId=tonumber(LocalPlayer.UserId) or 0
+prestige.shared=runtime.slot.perkProgression
+if not prestige.shared or prestige.shared.GameId~=runtime.configGameId or prestige.shared.UserId~=prestige.userId then
+    prestige.shared={GameId=runtime.configGameId,UserId=prestige.userId}
+    runtime.slot.perkProgression=prestige.shared
+end
+function prestige.enabled() return e.AutoPrestige or (e.Autofarm and e.FarmAutoPrestige) end
+function prestige.atlas()
+    local cached=runtime.gameModules.AtlasManager
+    return cached and cached.value and cached.value.PerkAtlas
+end
+function prestige.level(data,name)
+    local value=data and data.PerkLevels and data.PerkLevels[name]
+    return type(value)=="table" and finite(value[1]) and value[1] or nil
+end
+function prestige.validPreset(preset)
+    if type(preset)~="table" then return false end
+    local seen,count={},0
+    for slot,name in pairs(preset) do
+        local number=type(slot)=="string" and tonumber(slot)
+        if not number or number%1~=0 or number<1 or number>12 or tostring(number)~=slot or type(name)~="string" or #name<1 or #name>100 or name:find("%c") or seen[name] then return false end
+        seen[name]=true;count=count+1
+    end
+    return count>0 and count<=12
+end
+function prestige.validCycle(cycle)
+    if type(cycle)~="table" or not prestige.validPreset(cycle.preset) or type(cycle.perk)~="string" or #cycle.perk>100
+        or not finite(cycle.before) or cycle.before<0 or cycle.before%1~=0 or type(cycle.id)~="string" or #cycle.id>150
+        or not ({preparing=true,prestiging=true,restoring=true,returning=true})[cycle.phase] then return false end
+    local pending=cycle.pending
+    if pending then
+        if type(pending)~="table" or not ({PrestigePerk=true,LevelPerk=true,EquipPerk=true})[pending.kind]
+            or type(pending.perk)~="string" or #pending.perk>100 or type(pending.dispatched)~="boolean"
+            or not finite(pending.beforeLevel) or pending.beforeLevel<0 or pending.beforeLevel>4 or not finite(pending.at) then return false end
+        if pending.kind=="EquipPerk" and (not finite(pending.slot) or pending.slot%1~=0 or pending.slot<1 or pending.slot>12 or cycle.preset[tostring(pending.slot)]~=pending.perk) then return false end
+        if pending.kind=="PrestigePerk" and pending.perk~=cycle.perk then return false end
+        if pending.kind=="LevelPerk" then
+            local saved=false;for _,name in pairs(cycle.preset) do if name==pending.perk then saved=true end end
+            if not saved or pending.beforeLevel~=0 then return false end
+        end
+    end
+    return true
+end
+function prestige.path()
+    return runtime.configRoot.."/AutoPrestige-"..tostring(prestige.userId)..".json"
+end
+function prestige.persist()
+    prestige.shared.loaded=true
+    if type(writefile)~="function" or prestige.userId<=0 or runtime.configGameId<=0 then prestige.storage="preset held in memory";return end
+    local ok=pcall(function()
+        runtime.ensureConfigFolder()
+        writefile(prestige.path(),HttpService:JSONEncode({Version=1,GameId=runtime.configGameId,UserId=prestige.userId,
+            preset=prestige.shared.preset,cycle=prestige.shared.cycle,waitLevelReset=prestige.shared.waitLevelReset}))
+    end)
+    prestige.storage=ok and "preset saved locally" or "preset held in memory; save unavailable"
+end
+function prestige.load()
+    if prestige.loaded then return end;prestige.loaded=true
+    if prestige.shared.loaded or prestige.shared.cycle then return end
+    if type(isfile)~="function" or type(readfile)~="function" or prestige.userId<=0 or runtime.configGameId<=0 then return end
+    local ok,value=pcall(function()
+        if not isfile(prestige.path()) then return end
+        local data=HttpService:JSONDecode(readfile(prestige.path()))
+        assert(type(data)=="table" and data.Version==1 and data.GameId==runtime.configGameId and data.UserId==prestige.userId,"Saved prestige preset belongs to another game/player")
+        assert(data.preset==nil or prestige.validPreset(data.preset),"Invalid saved perk slots")
+        assert(data.cycle==nil or prestige.validCycle(data.cycle),"Invalid saved prestige transaction")
+        assert(data.waitLevelReset==nil or (finite(data.waitLevelReset) and data.waitLevelReset>=0 and data.waitLevelReset%1==0),"Invalid prestige generation")
+        return data
+    end)
+    if not ok then prestige.fileError=tostring(value);return end
+    prestige.shared.loaded=true
+    if value then
+        prestige.shared.preset=value.preset;prestige.shared.cycle=value.cycle;prestige.shared.waitLevelReset=value.waitLevelReset
+        local cycle=value.cycle
+        if cycle and cycle.pending then
+            cycle.pending.at=os.clock()
+            if not cycle.pending.dispatched then cycle.pending=nil;if cycle.phase=="prestiging" then cycle.phase="preparing" end end
+        end
+    end
+end
+function prestige.snapshot(data,atlas)
+    local folder=child(LocalPlayer,"PlayerPerks")
+    if not folder or type(readValue(folder,"PerksLocked"))~="boolean" then return nil,"waiting for perk replication" end
+    local preset,seen={},{}
+    for _,perk in ipairs(folder:GetChildren()) do
+        if atlas[perk.Name] and (child(perk,"PerkSlot") or child(perk,"PerkLevel")) then
+            local slot=readValue(perk,"PerkSlot");local level=readValue(perk,"PerkLevel")
+            if not finite(slot) or slot%1~=0 or slot<1 or slot>12 or not finite(level) or not prestige.level(data,perk.Name) then return nil,"waiting for complete perk/slot values" end
+            if preset[tostring(slot)] or seen[perk.Name] then return nil,"duplicate perk/slot data; waiting for reconciliation" end
+            preset[tostring(slot)]=perk.Name;seen[perk.Name]=true
+        end
+    end
+    return preset
+end
+function prestige.slots(data)
+    local slots={};local levels={0,5,15,30}
+    for slot=1,4 do slots[slot]=data.Prestige>=1 or data.Level>=levels[slot] end
+    slots[5]=data.Achievements and data.Achievements.Hard30==true or false
+    slots[6]=data.Achievements and data.Achievements.Nightmare30==true or false
+    local manager=runtime.gameModules.AchievementManager
+    if not manager or not manager.value or type(manager.value.GetEliteSlots)~="function" then return nil,"waiting for native elite-slot eligibility" end
+    local results=table.pack(pcall(manager.value.GetEliteSlots,manager.value,LocalPlayer.UserId))
+    if not results[1] then return nil,"native elite-slot data unavailable" end
+    for slot=7,12 do
+        if type(results[slot-5])~="boolean" then return nil,"elite-slot state not confirmed" end
+        slots[slot]=results[slot-5]
+    end
+    return slots
+end
+function prestige.skillLock(preset,atlas,slots)
+    if readValue(child(LocalPlayer,"PlayerPerks"),"PerksLocked")~=true then return false end
+    local difficulty=readValue(child(storage(),"Values"),"Difficulty")
+    for slot,name in pairs(preset) do
+        local perk=atlas[name]
+        if not (slot=="11" and slots[11]==false) and perk and perk.LockSkill==true and (difficulty~=5 or not perk.CareerLock) then return true end
+    end
+    return false
+end
+function prestige.canEdit()
+    return readValue(LocalPlayer,"InsideShop")==true or readValue(LocalPlayer,"Alive")==false
+end
+function prestige.enterShop()
+    if prestige.canEdit() then farm.cancelWalk();return true end
+    local minutes=game:GetService("Lighting"):GetMinutesAfterMidnight()
+    local region=child(child(storage(),"ShopRegions"),"MainShopRegion")
+    if e.Autofarm and farm.active and minutes>=360 and minutes<1080 and region then
+        prestige.message="Entering shop for prestige / saved perks";farm.walk(region.Position,prestige.message)
+    else prestige.message="Waiting for shop/spawn access to prestige and restore perks" end
+    return false
+end
+function prestige.choose(data,atlas,preset)
+    -- Prefer an unfinished equipped perk, then any unfinished native atlas perk.
+    for slot=1,12 do local name=preset[tostring(slot)];local level=name and prestige.level(data,name)
+        if level and level>=0 and level<4 then return name end
+    end
+    local names={};for name,perk in pairs(atlas) do
+        local level=prestige.level(data,name)
+        if type(perk)=="table" and perk.DevName==name and level and level>=0 and level<4 then names[#names+1]=name end
+    end
+    table.sort(names);return names[1]
+end
+function prestige.data()
+    local data=runtime.nativeData();local atlas=prestige.atlas()
+    if not data or not finite(data.Level) or not finite(data.Prestige) or type(data.PerkLevels)~="table" or type(atlas)~="table" then return nil,nil,"waiting for native player/perk data" end
+    return data,atlas
+end
+function prestige.observe()
+    if prestige.shared.cycle then
+        local cycle=prestige.shared.cycle
+        if not prestige.enabled() and cycle.phase=="preparing" and not cycle.pending then
+            prestige.shared.cycle=nil;prestige.persist();return false
+        end
+        return true
+    end
+    if not prestige.enabled() then return false end
+    prestige.load()
+    if prestige.fileError then prestige.message="Saved preset could not be read: "..prestige.fileError;return true end
+    if prestige.shared.cycle then return true end
+    local data,atlas,why=prestige.data()
+    if not data then prestige.message=why;return false end
+    if prestige.shared.waitLevelReset then
+        if data.Prestige~=prestige.shared.waitLevelReset or data.Level<prestige.maxLevel then prestige.shared.waitLevelReset=nil;prestige.persist()
+        else prestige.message="Prestige confirmed; waiting for level reset before another prestige";return false end
+    end
+    if data.Level<prestige.maxLevel then prestige.message=(prestige.lastResult and (prestige.lastResult.."\n") or "").."Waiting for player level 50 (current "..tostring(data.Level)..")";return false end
+    local preset; preset,why=prestige.snapshot(data,atlas)
+    if not preset or not prestige.validPreset(preset) then prestige.message=why or "Equip a preset before enabling auto prestige";return false end
+    local candidate=prestige.choose(data,atlas,preset)
+    if not candidate then prestige.message="All native perks are already level 4; no prestige requested";return false end
+    local slots;slots,why=prestige.slots(data)
+    if not slots then prestige.message=why;return false end
+    if slots[11]==false and not preset["11"] and prestige.shared.preset and prestige.shared.preset["11"] then
+        local name=prestige.shared.preset["11"]
+        local moved=false;for _,current in pairs(preset) do if current==name then moved=true end end
+        if not moved and atlas[name] and prestige.level(data,name)~=nil then preset["11"]=name end
+    end
+    if prestige.skillLock(preset,atlas,slots) then prestige.message="Waiting for the game's locked-perk state to clear; farming continues";return false end
+    local values=child(storage(),"Values")
+    if state.skipBusy or runtime.operations.VoteSkip or (readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==true) then
+        prestige.message="Waiting for the current ready-up result before prestige";return false
+    end
+    if state.spendingBusy or farm.inFlight or runtime.refillBusy or runtime.consumableBusy or runtime.action or state.structurePending then prestige.message="Waiting for current purchases/items before prestige";return false end
+    local fingerprint="";for slot=1,12 do fingerprint=fingerprint..slot..":"..(preset[tostring(slot)] or "")..";" end
+    if fingerprint~=prestige.fingerprint then prestige.fingerprint=fingerprint;prestige.stableAt=os.clock();prestige.message="Checking stable perk slots before prestige";return true end
+    if os.clock()-(prestige.stableAt or os.clock())<.25 then return true end
+    local cycle={id=tostring(prestige.userId)..":"..tostring(data.Prestige)..":"..tostring(os.clock()),before=data.Prestige,perk=candidate,preset=preset,phase="preparing"}
+    prestige.shared.cycle=cycle;prestige.shared.preset=preset;prestige.persist()
+    farm.cancelWalk();releaseHeld()
+    prestige.message="Preparing prestige: "..candidate
+    return true
+end
+function state.prestigeHeld()
+    if not runtime.active then return false end
+    local ok,held=pcall(prestige.observe)
+    if not ok then prestige.message="Prestige check paused: "..tostring(held);return prestige.shared.cycle~=nil or prestige.enabled() end
+    return held
+end
+function prestige.key(pending)
+    return pending.kind=="PrestigePerk" and "PrestigePerk" or (pending.kind=="LevelPerk" and "PerkUnlock:"..pending.perk or "PerkEquip:"..tostring(pending.slot))
+end
+function prestige.finishPending(cycle)
+    local pending=cycle.pending;if not pending then return end
+    local key=prestige.key(pending);local operation=runtime.operations[key]
+    if operation and operation.progression and operation.progression.cycle==cycle.id then runtime.finishOperation(operation) end
+    local saved=runtime.slot.quarantine[key]
+    if saved and saved.progression and saved.progression.cycle==cycle.id then runtime.slot.quarantine[key]=nil end
+    cycle.pending=nil;prestige.persist()
+end
+function prestige.confirmed(cycle,pending,data,current)
+    if pending.kind=="PrestigePerk" then return data.Prestige>cycle.before and prestige.level(data,pending.perk)==4 end
+    if pending.kind=="LevelPerk" then local level=prestige.level(data,pending.perk);return level and level>pending.beforeLevel end
+    return current and current[tostring(pending.slot)]==pending.perk
+end
+function prestige.request(cycle,kind,name,slot,data)
+    if cycle.pending then return end
+    local requestKey=prestige.key({kind=kind,perk=name,slot=slot})
+    local previous=runtime.slot.quarantine[requestKey]
+    if runtime.operations[requestKey] or (previous and runtime.quarantineCurrent(previous)) then prestige.message="Earlier "..kind.." result is unresolved; duplicate held";return end
+    local folder=kind=="EquipPerk" and "RemoteEvents" or "RemoteFunctions"
+    local event=child(child(storage(),folder),kind)
+    if not event or not event:IsA(kind=="EquipPerk" and "RemoteEvent" or "RemoteFunction") then prestige.message=kind.." unavailable; no request sent";return end
+    local pending={kind=kind,perk=name,slot=slot,beforeLevel=prestige.level(data,name),at=os.clock(),dispatched=false}
+    cycle.pending=pending;if kind=="PrestigePerk" then cycle.phase="prestiging" end
+    prestige.persist()
+    local epoch=state.epoch or 0
+    local function unsent()
+        if cycle.pending==pending and not pending.dispatched then cycle.pending=nil;if kind=="PrestigePerk" then cycle.phase="preparing" end;prestige.persist() end
+    end
+    local job=runtime.startJob("PerkProgression",runtime.limits.responseSeconds,function()
+        return runtime.active and prestige.enabled() and not runtime.loadingProfile and (state.epoch or 0)==epoch and prestige.shared.cycle==cycle and cycle.pending==pending
+    end,function()
+        local latest,atlas=prestige.data();local slots=latest and prestige.slots(latest)
+        if not latest or not slots or not prestige.canEdit() then unsent();return end
+        local edited=kind=="PrestigePerk" and cycle.preset or {[tostring(slot)]=name}
+        if prestige.skillLock(edited,atlas,slots) then unsent();return end
+        local level=prestige.level(latest,name)
+        if kind=="PrestigePerk" and (latest.Level<prestige.maxLevel or latest.Prestige~=cycle.before or not level or level<0 or level>=4) then unsent();return end
+        if kind=="LevelPerk" and (prestige.level(latest,name)~=0 or not finite(latest.PerkPoints) or latest.PerkPoints<1) then unsent();return end
+        if kind=="EquipPerk" then
+            local current=prestige.snapshot(latest,atlas)
+            if not current or slots[slot]~=true or (prestige.level(latest,name) or 0)<=0 or current[tostring(slot)]==name then unsent();return end
+        end
+        local key=prestige.key(pending)
+        local operation=runtime.startOperation(key,runtime.limits.responseSeconds,function()
+            local fresh=runtime.nativeData()
+            return runtime.active and not (fresh and prestige.confirmed(cycle,pending,fresh,kind=="EquipPerk" and select(1,prestige.snapshot(fresh,prestige.atlas() or {})) or nil))
+        end,function() pending.unknown=true end)
+        if not operation then unsent();prestige.message="Earlier "..kind.." result is unresolved; duplicate held";return end
+        operation.progression={cycle=cycle.id,perk=name,level=pending.beforeLevel,prestige=cycle.before,slot=slot}
+        runtime.checkJob();pending.dispatched=true;pending.at=os.clock();prestige.persist()
+        local ok=pcall(function()
+            if kind=="EquipPerk" then return remote(folder,kind,"FireServer",name,slot) end
+            return remote(folder,kind,"InvokeServer",name)
+        end)
+        pending.unknown=not ok
+        -- Native prestige/level callers do not define a success return contract.
+        -- Replicated prestige, perk level and slot placement confirm progress.
+    end,function(reason)
+        if pending.dispatched then pending.unknown=true else unsent() end
+        prestige.message=kind.." paused: "..tostring(reason)
+    end)
+    if not job then unsent();prestige.message="Waiting for local progression worker" end
+end
+function prestige.tick()
+    local held=state.prestigeHeld();local cycle=prestige.shared.cycle
+    if not held or not cycle then return end
+    if not prestige.enabled() then prestige.message="Paused transaction: enable auto prestige to finish restoring saved perks";return end
+    local data,atlas,why=prestige.data()
+    if not data then prestige.message=why;return end
+    if not prestige.validCycle(cycle) or not atlas[cycle.perk] then prestige.message="Saved prestige transaction is invalid for the current perk atlas";return end
+    for _,name in pairs(cycle.preset) do if not atlas[name] then prestige.message="Saved perk unavailable in this game version: "..name;return end end
+    local slots;slots,why=prestige.slots(data)
+    if not slots then prestige.message=why;return end
+    local current;current,why=prestige.snapshot(data,atlas)
+    if not current then prestige.message=why;return end
+    local pending=cycle.pending
+    if pending then
+        local mutation=pending.slot==11 or (cycle.preset["11"]==pending.perk and pending.kind=="LevelPerk")
+        if prestige.confirmed(cycle,pending,data,current) then
+            prestige.finishPending(cycle)
+            if pending.kind=="PrestigePerk" then
+                if data.Level>=prestige.maxLevel then prestige.shared.waitLevelReset=data.Prestige end
+                cycle.phase="restoring";prestige.persist()
+            end
+        elseif mutation and slots[11]==false then
+            -- Ignore a lost mutation slot without pretending an in-flight RPC
+            -- was rejected. Its operation keeps its own duplicate guard.
+            runtime.cancelJob("PerkProgression","Mutation slot 11 is locked")
+            cycle.pending=nil;cycle.skippedMutation=true;prestige.persist()
+        else
+            prestige.message=pending.kind..": waiting for "..pending.perk..((pending.unknown or os.clock()-pending.at>=runtime.limits.responseSeconds) and " (unconfirmed; no duplicate request)" or " confirmation")
+            return
+        end
+    end
+    if cycle.phase=="preparing" or cycle.phase=="prestiging" then
+        if data.Prestige>cycle.before then
+            if prestige.level(data,cycle.perk)~=4 then prestige.message="Waiting for selected prestige perk replication";return end
+            cycle.phase="restoring";prestige.persist()
+        elseif prestige.skillLock(cycle.preset,atlas,slots) then
+            prestige.shared.cycle=nil;prestige.persist();prestige.message="Waiting for locked perks; farming continues";return
+        elseif prestige.level(data,cycle.perk)==nil or prestige.level(data,cycle.perk)==4 then
+            prestige.message="Waiting for selected perk / prestige counter replication";return
+        elseif not prestige.canEdit() then
+            prestige.enterShop()
+            return
+        else farm.cancelWalk();prestige.message="Prestiging "..cycle.perk;prestige.request(cycle,"PrestigePerk",cycle.perk,nil,data);return end
+    end
+    if cycle.phase=="restoring" then
+        for slot=1,12 do
+            local name=cycle.preset[tostring(slot)]
+            if name then
+                if slot==11 and slots[11]==false then cycle.skippedMutation=true
+                elseif slots[slot]~=true then prestige.message="Saved perk slot "..slot.." is locked; waiting";return
+                else
+                    local level=prestige.level(data,name)
+                    if level==nil then prestige.message="Waiting for saved perk level: "..name;return end
+                    if level==0 or current[tostring(slot)]~=name then
+                        if prestige.skillLock({[tostring(slot)]=name},atlas,slots) then prestige.message="Saved perk is currently locked by the game: "..name;return end
+                        if not prestige.enterShop() then return end
+                    end
+                    if level==0 then
+                        if not finite(data.PerkPoints) or data.PerkPoints<1 then prestige.message="Need 1 earned perk point to unlock saved perk: "..name;return end
+                        prestige.message="Unlocking saved perk: "..name;prestige.request(cycle,"LevelPerk",name,slot,data);return
+                    elseif current[tostring(slot)]~=name then
+                        prestige.message="Restoring slot "..slot..": "..name;prestige.request(cycle,"EquipPerk",name,slot,data);return
+                    end
+                end
+            end
+        end
+        cycle.phase="returning";prestige.persist()
+    end
+    if cycle.phase=="returning" then
+        for slot,name in pairs(cycle.preset) do
+            if not (slot=="11" and slots[11]==false) and (current[slot]~=name or (prestige.level(data,name) or 0)<=0) then
+                cycle.phase="restoring";prestige.persist();prestige.message="Rechecking changed perk slots before resuming";return
+            end
+        end
+        if e.Autofarm and farm.active and farm.supported() and (farm.positionReached or farm.stage>=5 or farm.recovering) then
+            prestige.message="Saved perks confirmed; returning to Ammo Box"
+            if farm.recovering and farm.recovering<=2 then
+                if farm.leave(farm.recovering) then farm.recovering=farm.recovering+1 end
+                return
+            end
+            if not farm.preflight() or not farm.equipC96() or not farm.holdAmmoBox() then return end
+            farm.recovering=nil
+        end
+        if e.Autofarm and farm.stage<5 then farm.forwardDone=false end
+        prestige.shared.cycle=nil;prestige.persist();farm.wake()
+        prestige.message="Saved perks restored"..(cycle.skippedMutation and "; locked mutation slot 11 skipped" or "")
+        prestige.lastResult=prestige.message
+        prestige.fingerprint=nil
+    end
+end
+local prestigeGroup=automation:AddLeftGroupbox("Auto prestige & saved perks")
+control(prestigeGroup,"AutoPrestige","Auto prestige at player level 50")
+runtime.label(prestigeGroup,"Opt-in progression reset. Chooses a perk below level 4, remembers exact occupied slots, then restores them. Uses earned points only to unlock missing saved perks. Locked mutation slot 11 is skipped.",true)
+prestige.label=runtime.label(prestigeGroup,prestige.message,true)
+local farmPrestigeGroup=runtime.extensionTabs.Autofarm:AddRightGroupbox("Auto prestige")
+control(farmPrestigeGroup,"FarmAutoPrestige","Auto prestige during autofarm")
+runtime.label(farmPrestigeGroup,"Pauses ready-up, purchases and scheduled resets during prestige/restoration. Established farms return to the Ammo Box; startup keeps normal spawn/early-wave steps. Native perk locks are respected.",true)
+prestige.farmLabel=runtime.label(farmPrestigeGroup,prestige.message,true)
+connect(RunService.Heartbeat,function()
+    if os.clock()<prestige.next then return end;prestige.next=os.clock()+.2
+    local ok,err=pcall(prestige.tick)
+    if not ok then prestige.message="Auto prestige paused: "..tostring(err) end
+    local text=prestige.message
+    if not prestige.enabled() and not prestige.shared.cycle then text="Off" end
+    if text~="Off" and prestige.storage then text=text.."\n"..prestige.storage end
+    if prestige.displayed~=text then prestige.label:SetText(text);prestige.farmLabel:SetText(text);prestige.displayed=text end
 end)
 local op={wrappers={},any=false}
 runtime.op=op
