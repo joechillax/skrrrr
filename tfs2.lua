@@ -6222,15 +6222,6 @@ function prestige.slots(data)
     end
     return slots
 end
-function prestige.skillLock(preset,atlas,slots)
-    if readValue(child(LocalPlayer,"PlayerPerks"),"PerksLocked")~=true then return false end
-    local difficulty=readValue(child(storage(),"Values"),"Difficulty")
-    for slot,name in pairs(preset) do
-        local perk=atlas[name]
-        if not (slot=="11" and slots[11]==false) and perk and perk.LockSkill==true and (difficulty~=5 or not perk.CareerLock) then return true end
-    end
-    return false
-end
 function prestige.canEdit()
     return readValue(LocalPlayer,"InsideShop")==true or readValue(LocalPlayer,"Alive")==false
 end
@@ -6289,7 +6280,9 @@ function prestige.observe()
         local moved=false;for _,current in pairs(preset) do if current==name then moved=true end end
         if not moved and atlas[name] and prestige.level(data,name)~=nil then preset["11"]=name end
     end
-    if prestige.skillLock(preset,atlas,slots) then prestige.message="Waiting for the game's locked-perk state to clear; farming continues";return false end
+    -- PerksLocked/LockSkill marks existing loadout restrictions in the UI.
+    -- Native prestige/unlock/equip callers do not gate their requests on it;
+    -- it can remain true across nights and must not stall this controller.
     local values=child(storage(),"Values")
     if state.skipBusy or runtime.operations.VoteSkip or (readValue(values,"Vote")==true and readValue(LocalPlayer,"Voted")==true) then
         prestige.message="Waiting for the current ready-up result before prestige";return false
@@ -6346,8 +6339,6 @@ function prestige.request(cycle,kind,name,slot,data)
     end,function()
         local latest,atlas=prestige.data();local slots=latest and prestige.slots(latest)
         if not latest or not slots or not prestige.canEdit() then unsent();return end
-        local edited=kind=="PrestigePerk" and cycle.preset or {[tostring(slot)]=name}
-        if prestige.skillLock(edited,atlas,slots) then unsent();return end
         local level=prestige.level(latest,name)
         if kind=="PrestigePerk" and (latest.Level<prestige.maxLevel or latest.Prestige~=cycle.before or not level or level<0 or level>=4) then unsent();return end
         if kind=="LevelPerk" and (prestige.level(latest,name)~=0 or not finite(latest.PerkPoints) or latest.PerkPoints<1) then unsent();return end
@@ -6411,8 +6402,6 @@ function prestige.tick()
         if data.Prestige>cycle.before then
             if prestige.level(data,cycle.perk)~=4 then prestige.message="Waiting for selected prestige perk replication";return end
             cycle.phase="restoring";prestige.persist()
-        elseif prestige.skillLock(cycle.preset,atlas,slots) then
-            prestige.shared.cycle=nil;prestige.persist();prestige.message="Waiting for locked perks; farming continues";return
         elseif prestige.level(data,cycle.perk)==nil or prestige.level(data,cycle.perk)==4 then
             prestige.message="Waiting for selected perk / prestige counter replication";return
         elseif not prestige.canEdit() then
@@ -6430,7 +6419,6 @@ function prestige.tick()
                     local level=prestige.level(data,name)
                     if level==nil then prestige.message="Waiting for saved perk level: "..name;return end
                     if level==0 or current[tostring(slot)]~=name then
-                        if prestige.skillLock({[tostring(slot)]=name},atlas,slots) then prestige.message="Saved perk is currently locked by the game: "..name;return end
                         if not prestige.enterShop() then return end
                     end
                     if level==0 then
@@ -6472,7 +6460,7 @@ runtime.label(prestigeGroup,"Opt-in progression reset. Chooses a perk below leve
 prestige.label=runtime.label(prestigeGroup,prestige.message,true)
 local farmPrestigeGroup=runtime.extensionTabs.Autofarm:AddRightGroupbox("Auto prestige")
 control(farmPrestigeGroup,"FarmAutoPrestige","Auto prestige during autofarm")
-runtime.label(farmPrestigeGroup,"Pauses ready-up, purchases and scheduled resets during prestige/restoration. Established farms return to the Ammo Box; startup keeps normal spawn/early-wave steps. Native perk locks are respected.",true)
+runtime.label(farmPrestigeGroup,"Pauses ready-up, purchases and scheduled resets during prestige/restoration. Established farms return to the Ammo Box; startup keeps normal spawn/early-wave steps. Waits for shop/spawn access and confirms saved slots.",true)
 prestige.farmLabel=runtime.label(farmPrestigeGroup,prestige.message,true)
 connect(RunService.Heartbeat,function()
     if os.clock()<prestige.next then return end;prestige.next=os.clock()+.2
