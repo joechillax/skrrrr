@@ -17,6 +17,20 @@ assert(scripts, "PlayerScripts unavailable; wait for the lobby")
 -- Prefer already-running module tables; requiring in an executor environment
 -- alone does not establish that the game's own module cache is being edited.
 local liveModules = {}
+local profileCandidateScore, profileCandidateFreshness = -1, -1
+local function profileScore(value)
+    local score, freshness = 0, 0
+    if type(rawget(value, "view")) == "function" then
+        local ok, view = pcall(value.view)
+        if ok and type(view) == "table" then
+            score = 100
+            if type(view.owned) == "table" then score = score + math.min(100, #view.owned) end
+            if type(view.rewards) == "table" then freshness = tonumber(view.rewards.at) or 0 end
+        end
+    end
+    for _, name in ipairs({"owns", "unlockMove", "onUnlocked"}) do if type(rawget(value, name)) == "function" then score = score + 1 end end
+    return score, freshness
+end
 if type(getgc) == "function" then
     local ok, values = pcall(getgc, true)
     if ok then
@@ -27,7 +41,20 @@ if type(getgc) == "function" then
                 if type(rawget(v, "bind")) == "function" and type(rawget(v, "queue")) == "function"
                     and type(rawget(v, "lobby")) == "function" and type(rawget(v, "hover")) == "function" then liveModules.OnlineClient = v end
                 if type(rawget(v, "card")) == "function" and type(rawget(v, "keyUnlocked")) == "function"
-                    and type(rawget(v, "gems")) == "function" then liveModules.ProfileClient = v end
+                    and type(rawget(v, "gems")) == "function" then
+                    local score, freshness = profileScore(v)
+                    if score > profileCandidateScore or (score == profileCandidateScore and freshness > profileCandidateFreshness) then
+                        liveModules.ProfileClient = v; profileCandidateScore, profileCandidateFreshness = score, freshness
+                    end
+                end
+                if type(rawget(v, "list")) == "table" and type(rawget(v, "isPlayable")) == "function"
+                    and type(rawget(v, "main")) == "table" then
+                    local old = liveModules.Fighters
+                    if not old or #v.main > #old.main then liveModules.Fighters = v end
+                end
+                if type(rawget(v, "canUnlock")) == "function" and type(rawget(v, "hasSlot")) == "function"
+                    and type(rawget(v, "slotOf")) == "function" and type(rawget(v, "isUnlocked")) == "function"
+                    and type(rawget(v, "AWAKEN_PRICE")) == "table" then liveModules.Gems = v end
                 if type(rawget(v, "onPauseLeave")) == "function" and type(rawget(v, "ownsRenderer")) == "function"
                     and type(rawget(v, "isPvp")) == "function" and type(rawget(v, "resume")) == "function"
                     and type(rawget(v, "active")) == "boolean" then
@@ -95,7 +122,8 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.14-approach-guard",
+    Version = "4.15-awakening-profile",
+    AwakenDiagnostics = {},
     InputCalls = 0,
     LiveInputFound = liveModules.PlayerInput ~= nil,
     LiveOnlineFound = liveModules.OnlineClient ~= nil,
@@ -329,6 +357,7 @@ function logger:index()
         local encoded = Http:JSONEncode({version = Bot.Version,
             file = self.path, active = self.active, matchId = self.id, summary = self.stats,
             capped = self.full == true, bytes = self.bytes, slots = Bot.LogSlots,
+            awakening = {status = Bot.AwakenStatus, diagnostics = Bot.AwakenDiagnostics, error = Bot.AwakenError},
             slot = self.slot, sequence = self.sequence})
         writefile(self.folder .. "/latest.json", encoded)
         writefile(self.path:gsub("%.jsonl$", ".summary.json"), encoded)
@@ -1626,7 +1655,8 @@ local function awakenTick()
     unlocker.nextPoll = now + 2
     if not Profile or not Gems or not Fighters or type(Fighters.list) ~= "table"
         or type(Profile.view) ~= "function" or type(Profile.owns) ~= "function"
-        or type(Profile.unlockMove) ~= "function" or type(Gems.canUnlock) ~= "function" then
+        or type(Profile.unlockMove) ~= "function" or type(Profile.gems) ~= "function"
+        or type(Gems.canUnlock) ~= "function" or type(Gems.isUnlocked) ~= "function" or type(Gems.slotOf) ~= "function" then
         Bot.AwakenStatus = "unavailable"; return
     end
     local view = Profile.view()
@@ -1645,13 +1675,49 @@ local function awakenTick()
     if now < unlocker.retryAt then return end
     local gems = tonumber(Profile.gems()) or 0
     local available = math.max(0, gems - math.max(0, tonumber(Bot.AwakenGemReserve) or 0))
-    local candidates, needsGems = {}, false
+    local candidates, needsGems, ids, collection = {}, false, {}, {}
+    for _, id in pairs(type(view.owned) == "table" and view.owned or {}) do
+        if type(id) == "string" then collection[id] = true; ids[id] = true end
+    end
     for id, def in pairs(Fighters.list) do
-        if type(id) == "string" and Rarity.tierOf(id) >= 10 and Profile.owns(id) then
-            local ready, reason, cost = Gems.canUnlock(view.abilities, available, id, "awaken", def, view.passives)
+        if type(id) == "string" then ids[id] = true
+        elseif type(def) == "table" and type(def.name) == "string" then ids[def.name] = true end
+    end
+    local diagnostics = {gems = gems, available = available, ownedMythicPlus = 0, unlocked = 0,
+        noAwakening = 0, affordable = 0, needsGems = 0, errors = 0, ownershipFallbacks = 0, checks = {},
+        sources = {profile = liveModules.ProfileClient and "live" or "require",
+            gems = liveModules.Gems and "live" or "require", fighters = liveModules.Fighters and "live" or "require"}}
+    Bot.AwakenDiagnostics = diagnostics
+    for id in pairs(ids) do
+        local ownedOk, owned = pcall(Profile.owns, id)
+        if Rarity.tierOf(id) >= 10 and ((ownedOk and owned == true) or collection[id]) then
+            diagnostics.ownedMythicPlus = diagnostics.ownedMythicPlus + 1
+            if not (ownedOk and owned == true) then diagnostics.ownershipFallbacks = diagnostics.ownershipFallbacks + 1 end
+            local def = Fighters.list[id]
+            local success, ready, reason, cost = pcall(Gems.canUnlock, view.abilities, available, id, "awaken", def, view.passives)
+            -- The collection view is authoritative ownership data. If a second
+            -- module cache has only base definitions, resolve this owned ID from
+            -- FighterDefs before deciding that it has no Awakening.
+            if not success or reason == "fighter" or reason == "none" then
+                local root = Shared:FindFirstChild("FighterDefs")
+                local actual = root and load(root, id, false)
+                if type(actual) == "table" then
+                    success, ready, reason, cost = pcall(Gems.canUnlock, view.abilities, available, id, "awaken", actual, view.passives)
+                end
+            end
+            diagnostics.checks[id] = {reason = success and (reason or (ready and "ready" or "unknown")) or "error",
+                cost = type(cost) == "number" and cost or nil, ownership = collection[id] and "profile collection" or "owns helper"}
+            if not success then
+                diagnostics.errors = diagnostics.errors + 1
+                diagnostics.checks[id].error = tostring(ready)
+                ready, reason = false, "error"
+            end
             if ready and type(cost) == "number" and cost >= 0 and cost <= available then
                 candidates[#candidates + 1] = {id = id, cost = cost}
-            elseif reason == "gems" then needsGems = true end
+                diagnostics.affordable = diagnostics.affordable + 1
+            elseif reason == "gems" then needsGems = true; diagnostics.needsGems = diagnostics.needsGems + 1
+            elseif reason == "done" then diagnostics.unlocked = diagnostics.unlocked + 1
+            elseif reason == "none" or reason == "fighter" then diagnostics.noAwakening = diagnostics.noAwakening + 1 end
         end
     end
     table.sort(candidates, function(a, b)
@@ -1663,7 +1729,14 @@ local function awakenTick()
         return a.id < b.id
     end)
     local chosen = candidates[1]
-    if not chosen then Bot.AwakenStatus = needsGems and "waiting for gems" or "no eligible unlocks"; return end
+    if not chosen then
+        if needsGems then Bot.AwakenStatus = "waiting for gems / " .. tostring(gems)
+        elseif diagnostics.ownedMythicPlus == 0 then Bot.AwakenStatus = "no owned Mythic+ in profile"
+        elseif diagnostics.errors > 0 then Bot.AwakenStatus = "eligibility error; see awakening logs"
+        else Bot.AwakenStatus = tostring(diagnostics.ownedMythicPlus) .. " owned / " .. tostring(diagnostics.unlocked)
+            .. " unlocked / " .. tostring(diagnostics.noAwakening) .. " without Awakening" end
+        return
+    end
     unlocker.pending = {id = chosen.id, cost = chosen.cost, at = now}
     Bot.AwakenStatus = "unlocking " .. chosen.id .. " / " .. chosen.cost .. " gems"
     local ok, err = pcall(Profile.unlockMove, chosen.id, "form")
@@ -1922,11 +1995,11 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.14 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.15 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.14] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.15] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
