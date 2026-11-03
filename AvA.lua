@@ -84,6 +84,8 @@ local Profile = load(scripts, "ProfileClient", false)
 local Rewards = load(Shared, "Rewards", false)
 local Gems = load(Shared, "Gems", false)
 local Fighters = load(Shared, "Fighters", false)
+local CombatRules = load(Shared, "CombatRules", false)
+local GroundRules = CombatRules and CombatRules.C or {}
 local Http = game:GetService("HttpService")
 local Bot = {
     Enabled = true,
@@ -122,7 +124,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.16-lobby-recovery",
+    Version = "4.17-ground-followups",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -340,7 +342,9 @@ local actorKeys = {"name", "idx", "state", "moveBase", "moveSeq", "key", "kt", "
     "chainEnd", "moveHit", "moveBlocked", "hbuf", "hbufT", "invuln", "invis", "kdT", "cbInvT",
     "evInvT", "dashT", "dashN", "dashMax", "dashCd", "dashCdLen", "dashAt", "dashFwd", "dashHit", "stunT",
     "airJumps", "airDashes", "guard", "guardMax", "guardLockT", "blockStunT",
-    "dashInvT", "keyHold", "botSeat", "dummy", "tutorBot", "switchable", "form", "lifeLost"}
+    "dashInvT", "keyHold", "botSeat", "dummy", "tutorBot", "switchable", "form", "lifeLost",
+    "downT", "kdGetup", "otgT0", "otgWin", "otgN", "otgOff", "otgFlBy", "otgFlCls",
+    "dcStr", "dcLoop", "dcCap", "dcBy", "dcHoldTo", "reviveInvT"}
 local function controlMode(actor)
     if actor.botSeat or actor.dummy or actor.tutorBot then return "bot" end
     if actor.human then return "full" end
@@ -587,15 +591,19 @@ local function escapeKind(sim, me, key)
     if def and def.comboBreaker then return "breaker" end
     if not rising and (reason == "breaker" or reason == "transform") then return reason end
 end
-local function hittable(sim, foe)
-    return not (foe.ko or (foe.hp and foe.hp <= 0) or foe.invuln or foe.invis
-        or foe.state == "down" or foe.state == "ko"
-        or (tonumber(foe.kdT) or 0) > (sim.t or 0)
+local function protectedTarget(sim, foe)
+    return foe.ko or (foe.hp and foe.hp <= 0) or foe.invuln or foe.invis or foe.clash or foe.state == "ko"
         or (tonumber(foe.cbInvT) or 0) > (sim.t or 0)
         or (tonumber(foe.evInvT) or 0) > (sim.t or 0)
+        or (tonumber(foe.reviveInvT) or 0) > (sim.t or 0)
         or ((foe.dashT or 0) > 0 and (foe.dashInvT or 0) > (sim.t or 0))
+        or (foe.state == "move" and (foe.moveBase == "GetUpKD" or foe.moveBase == "GetUp"))
+end
+local function hittable(sim, foe)
+    return not (protectedTarget(sim, foe) or foe.state == "down"
+        or (tonumber(foe.kdT) or 0) > (sim.t or 0)
         or (foe.grounded and foe.state == "tumble")
-        or (foe.state == "move" and (foe.moveBase == "GetUpKD" or foe.moveBase == "GetUp")))
+        )
 end
 local function lockedState(me)
     return me.state == "stun" or me.state == "tumble" or me.state == "down"
@@ -654,25 +662,39 @@ local function moveInfo(sim, me, id, key)
                 cacheKey ~= "skill" and cacheKey or nil)}
         entry.projectileReach = projectileReach
         local startup, duration, activeSeen, targetTeleport, approachSpeed, armoredApproach = 0, 0, false, false, 0, false
+        local groundDamage, firstActiveDuration, approachTo, firstProjectileSpeed, firstHitDelay = false, 0, nil, 0, 0
         for _, k in ipairs(def.keys or {}) do
             local active = k.hit or k.grab
+            if k.hit then groundDamage = true end
             for _, fx in pairs(k.fx or {}) do
                 if fx[1] == "proj" or fx[1] == "strike" or fx[1] == "whip" or fx[1] == "release" then active = true end
+                if fx[1] == "proj" or fx[1] == "strike" or fx[1] == "whip" then groundDamage = true end
+                if not activeSeen and fx[1] == "proj" and type(fx[2]) == "string" then
+                    local projectile = sim:_projDef(me, fx[2])
+                    if type(projectile) == "table" and not projectile.beam then firstProjectileSpeed = tonumber(projectile.speed) or 0 end
+                elseif not activeSeen and (fx[1] == "strike" or fx[1] == "whip") and type(fx[2]) == "table" then
+                    firstHitDelay = math.max(firstHitDelay, tonumber(fx[2].delay) or 0)
+                end
                 if fx[1] == "teleport" and (fx[2] == "around" or fx[2] == "behind" or fx[2] == "target") then targetTeleport = true end
             end
             local time = (tonumber(k.dur) or tonumber(k.t) or 0.05) + (tonumber(k.hold) or 0)
             if not activeSeen and type(k.vel) == "table" and (tonumber(k.vel[1]) or 0) >= 10 then
                 approachSpeed = math.max(approachSpeed, k.vel[1])
+                if type(k.untilClose) == "number" then approachTo = k.untilClose end
                 if (tonumber(k.armor) or 0) > 0 then armoredApproach = true end
             end
+            if active and not activeSeen then firstActiveDuration = tonumber(k.dur) or 0.05 end
             if active then activeSeen = true end
             if not activeSeen then startup = startup + time end
             duration = duration + time
         end
         entry.startup = startup
         entry.duration = duration
+        entry.needsTarget = activeSeen
         entry.targetTeleport = targetTeleport and activeSeen
         entry.approachSpeed, entry.armoredApproach = approachSpeed, armoredApproach and activeSeen
+        entry.groundDamage, entry.firstActiveDuration, entry.approachTo = groundDamage, firstActiveDuration, approachTo
+        entry.firstProjectileSpeed, entry.firstHitDelay = firstProjectileSpeed, firstHitDelay
         cache[cacheKey] = entry
     end
     local range = def.range or {0, 4}
@@ -683,10 +705,53 @@ local function moveInfo(sim, me, id, key)
         if hi <= 4 then hi = Bot.RangedFallback end
     end
     return {def = def, features = entry.features, cat = entry.cat,
-        lo = range[1] or 0, hi = hi, startup = entry.startup, duration = entry.duration,
+        lo = entry.approachTo and 0 or (range[1] or 0), hi = hi, startup = entry.startup, duration = entry.duration,
         protectedStartup = def.keys and def.keys[1] and def.keys[1].invuln == true,
         targetTeleport = entry.targetTeleport, approachSpeed = entry.approachSpeed,
-        armoredApproach = entry.armoredApproach, ranged = ranged}
+        armoredApproach = entry.armoredApproach, ranged = ranged, groundDamage = entry.groundDamage,
+        needsTarget = entry.needsTarget,
+        firstActiveDuration = entry.firstActiveDuration, approachTo = entry.approachTo,
+        firstProjectileSpeed = entry.firstProjectileSpeed, firstHitDelay = entry.firstHitDelay}
+end
+local function groundFollowup(sim, me, foe, info, key, lead, distance)
+    if key == "ult" or key == "form" or foe.state ~= "down" or protectedTarget(sim, foe)
+        or foe.kdGetup or not info.groundDamage or info.features.grab or info.def.basic then return false, "protected/unsupported" end
+    if not me.grounded and not (info.def.otg == true and not info.ranged) then return false, "air geometry" end
+    if (tonumber(foe.kdT) or 0) > (sim.t or 0) then return false, "knockdown protection" end
+    local tempo = info.def.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
+    local startup = info.startup * tempo
+    if info.approachTo and info.approachSpeed > 0 then
+        startup = math.max(startup, math.max(0, distance - info.approachTo) / info.approachSpeed)
+    end
+    local impact = lead + startup + (info.firstActiveDuration or 0) * tempo + (info.firstHitDelay or 0)
+    if (info.firstProjectileSpeed or 0) > 0 then impact = impact + math.max(0, distance - 1) / info.firstProjectileSpeed end
+    -- Runtime read-only predicates decide ownership/caps; a proxy clock checks
+    -- arrival/impact without advancing the live simulation or its fighter state.
+    local function query(name, after, ...)
+        if type(sim[name]) ~= "function" then return false end
+        local future = setmetatable({t = (sim.t or 0) + after}, {__index = sim})
+        local ok, result = pcall(sim[name], future, ...)
+        return ok and result == true
+    end
+    local arrival = lead + 1 / 60
+    local downLeft = tonumber(foe.downT)
+    if not downLeft or downLeft <= arrival then return false, "standing before input arrives" end
+    if query("_otgDown", arrival, foe) then
+        if not query("_otgOk", arrival, me, foe, "move", nil) then return false, "ground cap/window closed" end
+        -- Tagged OTG moves ask the game to extend its floor hold on start. Other
+        -- attacks must fit the existing hold/window through their first hit.
+        if info.def.otg ~= true and (downLeft <= impact or not query("_otgOk", impact, me, foe, "move", nil)) then
+            return false, "ground window too short"
+        end
+        if info.def.otg == true and (sim.t or 0) + impact > (foe.otgT0 or 0)
+            + (foe.otgWin or GroundRules.OTG_WIN or 1.25) + (GroundRules.OTG_SKILL_EXT or 0.8) then
+            return false, "OTG extension too short"
+        end
+        return true, info.def.otg == true and "native OTG hold" or "native ground window"
+    end
+    if query("_dcDown", arrival, foe) and foe.dcBy == me.idx and not foe.dcCap
+        and downLeft > impact then return true, "owned down combo" end
+    return false, "ground window closed"
 end
 local function threat(sim, me)
     local soon, projectile, unblockable, blockDir, source = math.huge, false, false, nil, nil
@@ -982,6 +1047,8 @@ local function decide(manual)
         end
     end
     local bestKey, bestScore, desired = nil, 0, 1.8
+    local groundOptions = {}
+    Bot.Snapshot.groundFollowups = {}
     local fullOpponent = foe.human == true and not (foe.botSeat or foe.dummy or foe.tutorBot)
     local foeTeleportETA, foeApproaches = math.huge, {}
     if fullOpponent and (foe.state == "neutral" or foe.state == "block") then
@@ -1015,8 +1082,15 @@ local function decide(manual)
                 local f, cat, score = info.features, info.cat, 0
                 local ranged = info.ranged
                 local startup = info.startup * (info.def.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1)
+                if info.approachTo and info.approachSpeed > 0 then
+                    startup = math.max(startup, math.max(0, distance - info.approachTo) / info.approachSpeed)
+                end
                 local horizon = lead + startup
-                local stunOpening = foe.state == "stun" and (tonumber(foe.stunT) or 0) >= horizon + 1 / 60
+                local groundOpening, groundReason = false, nil
+                if not targetHittable then groundOpening, groundReason = groundFollowup(sim, me, foe, info, key, lead, distance) end
+                groundOptions[key] = groundOpening
+                if foe.state == "down" then Bot.Snapshot.groundFollowups[key] = {eligible = groundOpening, reason = groundReason} end
+                local stunOpening = groundOpening or (foe.state == "stun" and (tonumber(foe.stunT) or 0) >= horizon + 1 / 60)
                 local predictedDistance = math.abs(dx + ((foe.vx or 0) - (me.vx or 0)) * horizon)
                 local inRange = predictedDistance >= info.lo and predictedDistance <= info.hi
                     and math.abs(foe.y - me.y) < (ranged and 4 or 3)
@@ -1032,8 +1106,9 @@ local function decide(manual)
                 elseif cat == "evade" then
                     if imminent then score = 9 end
                 elseif key == "form" or cat == "buff" or cat == "summon" then
-                    if not danger and (foe.hp or 0) > 10 then score = key == "form" and 6 or 2 end
-                elseif inRange and targetHittable and not foeCounter
+                    if not danger and (foe.hp or 0) > 10 and (key == "form" or not info.needsTarget
+                        or targetHittable or groundOpening) then score = key == "form" and 6 or 2 end
+                elseif inRange and (targetHittable or groundOpening) and not foeCounter
                     and guardReady(sim, me, foe, key == "ult" and "ult" or "move", horizon) then
                     score = 2 + math.min(2, (f.dmg or 0) / 30)
                     if stunOpening then score = score + 2 end
@@ -1077,10 +1152,16 @@ local function decide(manual)
     Bot.Snapshot.foeTeleportReady = foeTeleportETA < math.huge
     Bot.Snapshot.foeArmoredApproachReady = #foeApproaches > 0
     local closeDash, dashFollow = false, false
+    local groundChoice = bestKey and groundOptions[bestKey]
+    if groundChoice then
+        local info = moveInfo(sim, me, slots[bestKey], bestKey)
+        desired = math.max(1.6, math.min(3, info.hi * 0.6))
+        Bot.Snapshot.groundFollowupKey = bestKey
+    end
     if Bot.Movement == "manual" then
         for _, key in ipairs({"x", "down", "jump", "dash", "block", "light"}) do out[key] = manual and manual[key] or out[key] end
     else
-        if not targetHittable then desired = math.max(desired, Bot.ProtectedSpacing) end
+        if not targetHittable and not groundChoice then desired = math.max(desired, Bot.ProtectedSpacing) end
         local projectedGap = (dx + ((foe.vx or 0) - (me.vx or 0)) * lead) * dir
         Bot.Snapshot.spacingProjectedGap = projectedGap
         Bot.Snapshot.spacingDesired = desired
@@ -2088,11 +2169,11 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.16 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.17 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.16] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.17] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
