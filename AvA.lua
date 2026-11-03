@@ -122,8 +122,11 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.15-awakening-profile",
+    Version = "4.16-lobby-recovery",
     AwakenDiagnostics = {},
+    RecoveryStatus = "watching",
+    RecoveryCount = 0,
+    LobbyRecoveryDelay = 15,
     InputCalls = 0,
     LiveInputFound = liveModules.PlayerInput ~= nil,
     LiveOnlineFound = liveModules.OnlineClient ~= nil,
@@ -160,9 +163,13 @@ local pendingAttack, defenseKind = nil, nil
 local opponentCPU = nil
 local matchController = liveModules.MatchController
 local skipState, lastControllerScan = nil, -100
-local ignoredSessions = setmetatable({}, {__mode = "k"})
-local retiredMatches, retiredOrder = {}, {}
+if type(memory.ignoredSessions) ~= "table" then memory.ignoredSessions = setmetatable({}, {__mode = "k"}) end
+if type(memory.sessionMatches) ~= "table" then memory.sessionMatches = setmetatable({}, {__mode = "k"}) end
+local ignoredSessions, sessionMatches = memory.ignoredSessions, memory.sessionMatches
+memory.retiredMatches, memory.retiredOrder = memory.retiredMatches or {}, memory.retiredOrder or {}
+local retiredMatches, retiredOrder = memory.retiredMatches, memory.retiredOrder
 local lobbyUpdatedAt = -100
+local matchEventAt = os.clock()
 local function status(s) Bot.Status = s end
 local function resetCombat()
     nextSkill, nextDodge, nextJump, nextSwitch, nextLight = 0, 0, 0, 0, 0
@@ -177,8 +184,25 @@ local function resetCombat()
 end
 local function validSession(v)
     return type(v) == "table" and not ignoredSessions[v] and rawget(v, "dead") == false
+        and not retiredMatches[sessionMatches[v]]
         and type(rawget(v, "r")) == "table" and type(rawget(v, "side")) == "number"
         and type(rawget(v, "nc")) == "table" and type(v.r.sim) == "table"
+end
+local function retireMatch(id, current, sweepUnknown)
+    if id and not retiredMatches[id] then
+        retiredMatches[id] = true; retiredOrder[#retiredOrder + 1] = id
+        if #retiredOrder > 400 then retiredMatches[table.remove(retiredOrder, 1)] = nil end
+    end
+    if current and (not sessionMatches[current] or sessionMatches[current] == id) then ignoredSessions[current] = true end
+    for value, owner in pairs(sessionMatches) do if owner == id then ignoredSessions[value] = true end end
+    if sweepUnknown and type(getgc) == "function" then
+        local ok, values = pcall(getgc, true)
+        if ok then
+            for _, value in pairs(values) do
+                if validSession(value) and (not sessionMatches[value] or sessionMatches[value] == id) then ignoredSessions[value] = true end
+            end
+        end
+    end
 end
 local function discover()
     if session and validSession(session) then return session end
@@ -189,16 +213,31 @@ local function discover()
     if type(getgc) == "function" then
         local ok, values = pcall(getgc, true)
         if ok then
+            local bestScore = -math.huge
             for _, value in pairs(values) do
-                if validSession(value) then session = value; resetCombat(); break end
+                if validSession(value) and (not matchId or not sessionMatches[value] or sessionMatches[value] == matchId) then
+                    local score = tonumber(value.lastStepT) or 0
+                    if matchController and type(matchController.ownsRenderer) == "function" then
+                        local owned, result = pcall(matchController.ownsRenderer, matchController, value.r)
+                        if owned and result then score = score + 1e9 end
+                    end
+                    if score > bestScore then session, bestScore = value, score end
+                end
             end
+            if session then resetCombat() end
         end
     end
     return session
 end
 bindWrapper = function(...)
     local result = originalBind(...)
-    if alive and validSession(result) then session = result; resetCombat() end
+    local info = select(2, ...)
+    local id = type(info) == "table" and (info.matchId or (type(info.match) == "table" and info.match.matchId)) or matchId
+    if alive and type(result) == "table" then
+        sessionMatches[result] = id
+        if retiredMatches[id] then ignoredSessions[result] = true
+        elseif validSession(result) then session = result; resetCombat() end
+    end
     return result
 end
 Online.bind = bindWrapper
@@ -358,6 +397,7 @@ function logger:index()
             file = self.path, active = self.active, matchId = self.id, summary = self.stats,
             capped = self.full == true, bytes = self.bytes, slots = Bot.LogSlots,
             awakening = {status = Bot.AwakenStatus, diagnostics = Bot.AwakenDiagnostics, error = Bot.AwakenError},
+            recovery = {status = Bot.RecoveryStatus, count = Bot.RecoveryCount, state = Bot.SessionState},
             slot = self.slot, sequence = self.sequence})
         writefile(self.folder .. "/latest.json", encoded)
         writefile(self.path:gsub("%.jsonl$", ".summary.json"), encoded)
@@ -1317,10 +1357,7 @@ local function leaveExcluded()
 end
 local function finishSkip(reason, current)
     local id = matchId
-    if id and not retiredMatches[id] then
-        retiredMatches[id] = true; retiredOrder[#retiredOrder + 1] = id
-        if #retiredOrder > 100 then retiredMatches[table.remove(retiredOrder, 1)] = nil end
-    end
+    retireMatch(id, current, true)
     if current then ignoredSessions[current] = true end
     if session then ignoredSessions[session] = true end
     logger:line("skip_recovered", {matchId = id, reason = reason})
@@ -1342,7 +1379,7 @@ local function skipTick(current)
         if not matchId and current and controller and controller.active == false and not controller.trainingActive
             and selfLobbyStatus() == "free" then
             ignoredSessions[current] = true; session = nil; busy = false
-            status("Lobby confirmed; joining Quick Match")
+            status(Bot.AutoJoin and "Lobby confirmed; joining Quick Match" or "Lobby confirmed; auto join off")
             return nil
         end
         return current
@@ -1358,6 +1395,50 @@ local function skipTick(current)
     end
     if os.clock() >= skipState.retryAt and skipState.tries < 3 then leaveExcluded() end
     status(skipState.tries >= 3 and "Waiting for skipped match to return to lobby" or "Leaving skipped opponent; checking lobby")
+    return current
+end
+local lobbyWatch = {nextPoll = 0, progressAt = os.clock()}
+local function lobbyRecoveryTick(current, uiBlocked)
+    local now = os.clock()
+    local sim = current and current.r.sim
+    if current ~= lobbyWatch.current or (sim and (sim.frame ~= lobbyWatch.frame or sim.t ~= lobbyWatch.simTime)) then
+        lobbyWatch.current, lobbyWatch.frame, lobbyWatch.simTime = current, sim and sim.frame, sim and sim.t
+        lobbyWatch.progressAt = now
+    end
+    if now < lobbyWatch.nextPoll then return current end
+    lobbyWatch.nextPoll = now + 2
+    local serverState = selfLobbyStatus()
+    local controller = controllerForSkip()
+    local freshLobby = lobbyUpdatedAt >= matchEventAt and now - lobbyUpdatedAt <= 10
+    local recentInput = now - lastGoodSample < 4
+    local progressing = sim and now - lobbyWatch.progressAt < 4
+    Bot.SessionState = {matchId = matchId, busy = busy, queued = queued, phase = sim and sim.phase,
+        server = serverState, lobbyFresh = freshLobby, controllerActive = controller and controller.active,
+        inputAge = now - lastGoodSample, progressAge = now - lobbyWatch.progressAt, matchEventAge = now - matchEventAt}
+    if blockedMatch or uiBlocked or (controller and controller.trainingActive) or (current and current.r.paused)
+        or (sim and sim.phase == "fight" and progressing and recentInput) then return current end
+    if not busy and not current then return current end
+    local delay = math.max(5, tonumber(Bot.LobbyRecoveryDelay) or 15)
+    if serverState == "free" and freshLobby and now - matchEventAt >= delay
+        and ((controller and controller.active == false) or (not progressing and not recentInput)) then
+        local oldId = matchId
+        logger:line("lobby_recovered", {matchId = oldId, phase = sim and sim.phase, server = serverState,
+            reason = "fresh server-free lobby and inactive renderer/input"})
+        logger:finish("confirmed lobby recovery")
+        retireMatch(oldId, current, true)
+        busy, queued, queueRequested, ending, drafting = false, false, false, false, false
+        matchId, matchNumber, lastDeal, session = nil, nil, nil, nil
+        opponentId, opponentCPU, mySide, outcomeRecorded = nil, nil, nil, false
+        rematchAnswered, rematchWaitUntil, rematchAutoAccepted = false, 0, false
+        dealGeneration = dealGeneration + 1; lastQueue = now; matchEventAt = now; resetCombat()
+        Bot.RecoveryCount = Bot.RecoveryCount + 1; Bot.RecoveryStatus = "recovered confirmed lobby"
+        status(Bot.AutoJoin and "Lobby recovered; waiting for Quick Match" or "Lobby recovered; auto join off")
+        return nil
+    end
+    if busy and not current and now - matchEventAt >= delay then
+        Bot.RecoveryStatus = "waiting for fresh lobby confirmation"
+        status("Waiting for renderer / checking lobby")
+    end
     return current
 end
 local function observeOpponent(info)
@@ -1426,6 +1507,8 @@ local function deal(info)
     observeOpponent(info)
     if blockedMatch or staleEvent(info) then return end
     lastDeal, drafting = info, true
+    matchEventAt = os.clock()
+    Bot.RecoveryStatus = "watching"
     rematchWaitUntil = 0; rematchAutoAccepted = false
     logger:line("draft", {round = info.round, handSize = #info.hand})
     ending = false
@@ -1471,6 +1554,9 @@ on("match", function(info)
         observeOpponent(info); return
     end
     if logger.active then logger:finish("next match announcement") end
+    if matchId ~= eventMatchId(info) then retireMatch(matchId, session, false); session = nil end
+    matchEventAt = os.clock()
+    Bot.RecoveryStatus = "watching"
     busy = true; queued = false; ending = false
     queueRequested = false
     skipState = nil
@@ -1496,6 +1582,7 @@ on("start", function(info)
     observeOpponent(info)
     if staleEvent(info) then return end
     busy = true; queued = false; drafting = false; dealGeneration = dealGeneration + 1
+    matchEventAt = os.clock()
     rematchWaitUntil = 0; rematchAutoAccepted = false
     resetCombat(); status(blockedMatch and "Skipping previous loss" or "Round starting")
     logger.roundNumber = type(info) == "table" and info.round or nil
@@ -1538,13 +1625,18 @@ on("closed", function(id)
     if type(id) == "string" and matchId and id ~= matchId then return end
     if type(id) == "number" and matchNumber and id ~= matchNumber then return end
     if blockedMatch then finishSkip("closed acknowledgement", session); return end
+    logger:line("closed_event", {matchId = matchId, eventId = (type(id) == "string" or type(id) == "number") and id or nil})
     logger:finish("closed")
+    retireMatch(matchId or id, session, true)
     busy = false; queued = false; ending = false; drafting = false
     queueRequested = false
     matchId = nil; matchNumber = nil; lastDeal = nil; session = nil
     blockedMatch, opponentId, skipState = false, nil, nil
     rematchAnswered, rematchWaitUntil, rematchAutoAccepted = false, 0, false
     dealGeneration = dealGeneration + 1; lastQueue = os.clock()
+    matchEventAt = os.clock(); resetCombat()
+    Bot.RecoveryStatus = "closed session retired"
+    status(Bot.AutoJoin and "Match closed; waiting for Quick Match" or "Match closed; auto join off")
 end)
 on("rematch", function(mine, theirs)
     if not mine and not theirs then rematchAnswered = false; rematchWaitUntil = 0; rematchAutoAccepted = false; return end
@@ -1979,6 +2071,7 @@ task.spawn(function()
                 inResults = true
             end
             local current = skipTick(discover())
+            current = lobbyRecoveryTick(current, inPopup or inResults)
             if current and current.r.sim.phase ~= "done" then busy = true end
             if Bot.AutoJoin and not inPopup and not inResults and not busy and not queued and os.clock() - lastQueue >= 8 then
                 lastQueue = os.clock()
@@ -1995,11 +2088,11 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.15 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.16 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.15] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.16] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
