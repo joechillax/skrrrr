@@ -95,7 +95,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.13-pressure-timing",
+    Version = "4.14-approach-guard",
     InputCalls = 0,
     LiveInputFound = liveModules.PlayerInput ~= nil,
     LiveOnlineFound = liveModules.OnlineClient ~= nil,
@@ -273,7 +273,7 @@ local actorKeys = {"name", "idx", "state", "moveBase", "moveSeq", "key", "kt", "
     "chainEnd", "moveHit", "moveBlocked", "hbuf", "hbufT", "invuln", "invis", "kdT", "cbInvT",
     "evInvT", "dashT", "dashN", "dashMax", "dashCd", "dashCdLen", "dashAt", "dashFwd", "dashHit", "stunT",
     "airJumps", "airDashes", "guard", "guardMax", "guardLockT", "blockStunT",
-    "dashInvT", "keyHold", "botSeat", "dummy", "tutorBot", "switchable", "form"}
+    "dashInvT", "keyHold", "botSeat", "dummy", "tutorBot", "switchable", "form", "lifeLost"}
 local function controlMode(actor)
     if actor.botSeat or actor.dummy or actor.tutorBot then return "bot" end
     if actor.human then return "full" end
@@ -390,14 +390,27 @@ function logger:start(id)
     self.buffer = {}; self.bytes = 0; self.full = false; self.active = true
     self.move = nil; self.lastMe = nil; self.lastFoe = nil; self.lastSim = nil; self.lastSample = -100
     self.stats = {samples = 0, inputs = {}, damageTaken = 0, damageDealt = 0,
+        selfHpCost = 0, opponentSelfHpCost = 0, combatDamageTaken = 0, combatDamageDealt = 0,
         movesWithHit = 0, movesBlocked = 0, observedNoHit = 0, outcome = "unknown", rounds = {},
         opponentCPU = opponentCPU, opponentControlSamples = {}}
     self.roundSeen = {}; self.roundNumber = nil
     self.roundBaseTaken, self.roundBaseDealt = 0, 0
+    self.roundBaseSelfCost, self.roundBaseOpponentCost = 0, 0
     Bot.LogFile = self.path; Bot.LogStatus = "recording"
     self:line("match_start", {version = Bot.Version, matchId = self.id, opponentId = opponentId, opponentCPU = opponentCPU,
         slot = self.slot, sequence = self.sequence})
     self:flush(true)
+end
+local function estimatedHpCost(actor, beforeHp, beforeLifeLost, beforeSeq, beforeKey, drop)
+    local cost = 0
+    if (actor.lifeLost or 0) > (beforeLifeLost or 0) then
+        cost = math.max(0, beforeHp - math.max(1, (actor.maxHp or beforeHp) - actor.lifeLost))
+    end
+    if actor.moveSeq ~= beforeSeq or actor.key ~= beforeKey then
+        local key = actor.move and actor.move.keys and actor.move.keys[actor.key or 1]
+        if key then cost = cost + math.max(0, tonumber(key.selfDmg) or 0) end
+    end
+    return math.min(drop, cost)
 end
 function logger:sample(out)
     if not Bot.AutoLogs or not self.available or blockedMatch then return end
@@ -425,6 +438,14 @@ function logger:sample(out)
         local dealt = math.max(0, (self.lastFoeHp or foe.hp) - foe.hp)
         self.stats.damageTaken = self.stats.damageTaken + taken
         self.stats.damageDealt = self.stats.damageDealt + dealt
+        local selfCost = estimatedHpCost(me, self.lastHp or me.hp, self.lastLifeLost, self.lastSeq, self.lastKey, taken)
+        local opponentCost = estimatedHpCost(foe, self.lastFoeHp or foe.hp, self.lastFoeLifeLost, self.lastFoeSeq, self.lastFoeKey, dealt)
+        self.stats.selfHpCost = self.stats.selfHpCost + selfCost
+        self.stats.opponentSelfHpCost = self.stats.opponentSelfHpCost + opponentCost
+        self.stats.combatDamageTaken = self.stats.damageTaken - self.stats.selfHpCost
+        self.stats.combatDamageDealt = self.stats.damageDealt - self.stats.opponentSelfHpCost
+        if selfCost > 0 or opponentCost > 0 then self:line("hp_cost", {simTime = sim.t, selfCost = selfCost,
+            opponentCost = opponentCost, attribution = "lifeLost/key selfDmg estimate"}) end
         if taken > 0 or dealt > 0 then changed = true end
     elseif self.move then self:endMove("round changed") end
     if self.move and (me.state ~= "move" or me.moveSeq ~= self.move.seq) then self:endMove(me.state) end
@@ -438,6 +459,8 @@ function logger:sample(out)
     self.lastSim, self.lastMe, self.lastFoe = sim, me, foe
     self.lastTime, self.lastHp, self.lastFoeHp = sim.t, me.hp, foe.hp
     self.lastSeq, self.lastState = me.moveSeq, me.state
+    self.lastKey, self.lastLifeLost = me.key, me.lifeLost
+    self.lastFoeKey, self.lastFoeSeq, self.lastFoeLifeLost = foe.key, foe.moveSeq, foe.lifeLost
     self.lastPhase = sim.phase
     self.lastInputMode = Bot.InputMode
     if not pressed and not changed and os.clock() - self.lastSample < Bot.LogInterval then return end
@@ -561,7 +584,7 @@ local function moveInfo(sim, me, id, key)
             cat = Kind.classify(sim:_moveName(me, id), "", "", def, proj,
                 cacheKey ~= "skill" and cacheKey or nil)}
         entry.projectileReach = projectileReach
-        local startup, duration, activeSeen, targetTeleport = 0, 0, false, false
+        local startup, duration, activeSeen, targetTeleport, approachSpeed, armoredApproach = 0, 0, false, false, 0, false
         for _, k in ipairs(def.keys or {}) do
             local active = k.hit or k.grab
             for _, fx in pairs(k.fx or {}) do
@@ -569,6 +592,10 @@ local function moveInfo(sim, me, id, key)
                 if fx[1] == "teleport" and (fx[2] == "around" or fx[2] == "behind" or fx[2] == "target") then targetTeleport = true end
             end
             local time = (tonumber(k.dur) or tonumber(k.t) or 0.05) + (tonumber(k.hold) or 0)
+            if not activeSeen and type(k.vel) == "table" and (tonumber(k.vel[1]) or 0) >= 10 then
+                approachSpeed = math.max(approachSpeed, k.vel[1])
+                if (tonumber(k.armor) or 0) > 0 then armoredApproach = true end
+            end
             if active then activeSeen = true end
             if not activeSeen then startup = startup + time end
             duration = duration + time
@@ -576,6 +603,7 @@ local function moveInfo(sim, me, id, key)
         entry.startup = startup
         entry.duration = duration
         entry.targetTeleport = targetTeleport and activeSeen
+        entry.approachSpeed, entry.armoredApproach = approachSpeed, armoredApproach and activeSeen
         cache[cacheKey] = entry
     end
     local range = def.range or {0, 4}
@@ -588,7 +616,8 @@ local function moveInfo(sim, me, id, key)
     return {def = def, features = entry.features, cat = entry.cat,
         lo = range[1] or 0, hi = hi, startup = entry.startup, duration = entry.duration,
         protectedStartup = def.keys and def.keys[1] and def.keys[1].invuln == true,
-        targetTeleport = entry.targetTeleport, ranged = ranged}
+        targetTeleport = entry.targetTeleport, approachSpeed = entry.approachSpeed,
+        armoredApproach = entry.armoredApproach, ranged = ranged}
 end
 local function threat(sim, me)
     local soon, projectile, unblockable, blockDir, source = math.huge, false, false, nil, nil
@@ -617,14 +646,30 @@ local function threat(sim, me)
             local dist = math.abs(foe.x - me.x)
             local range = move.range or {0, 4}
             local closing = math.max(0, ((foe.vx or 0) - (me.vx or 0)) * (me.x >= foe.x and 1 or -1))
-            if dist <= (range[2] or 4) + 1.4 + closing * 0.35 and math.abs(foe.y - me.y) < 4 then
+            local targetWarp = false
+            for i = foe.key or 1, #move.keys do
+                for _, fx in ipairs(move.keys[i].fx or {}) do
+                    if fx[1] == "teleport" and (fx[2] == "around" or fx[2] == "behind" or fx[2] == "through") then targetWarp = true end
+                end
+            end
+            local attackX, relocated = foe.x, false
+            if targetWarp or (dist <= (range[2] or 4) + 1.4 + closing * 0.35 and math.abs(foe.y - me.y) < 4) then
                 for i = foe.key or 1, #move.keys do
                     local k = move.keys[i]
                     local active, ranged, flight = k.hit or k.grab or k.needsGrab, false, 0
                     local cannotBlock = move.unblockable or k.grab or k.needsGrab or (type(k.hit) == "table"
                         and (k.hit.grab or k.hit.unblockable))
                     for _, fx in pairs(k.fx or {}) do
-                        if fx[1] == "proj" then
+                        if fx[1] == "teleport" and i > (foe.key or 1) then
+                            local offset
+                            if fx[2] == "around" then offset = tonumber(fx[3]) or 0
+                            elseif fx[2] == "behind" then offset = -(me.facing or 1) * (tonumber(fx.dist) or 2)
+                            elseif fx[2] == "through" then offset = (me.x >= attackX and 1 or -1) * (tonumber(fx.dist) or 2.6) end
+                            if offset then
+                                if sim.halfW and math.abs(me.x + offset) > sim.halfW - 1 then offset = -offset end
+                                attackX, relocated = me.x + offset, true
+                            end
+                        elseif fx[1] == "proj" then
                             active, ranged = true, true
                             if type(fx[2]) == "string" then
                                 local p = sim:_projDef(foe, fx[2])
@@ -653,7 +698,7 @@ local function threat(sim, me)
                     end
                     if active then
                         consider(eta + flight, ranged, cannotBlock and true or false,
-                            foe.x >= me.x and 1 or -1, "move")
+                            attackX >= me.x and 1 or -1, relocated and "teleport attack" or "move")
                         break
                     end
                     local duration = (tonumber(k.dur) or tonumber(k.t) or 0.1) + (tonumber(k.hold) or 0)
@@ -823,6 +868,7 @@ local function decide(manual)
     Bot.Snapshot.dashInputPending = pendingDash ~= nil
     Bot.Snapshot.attackInputPending = attackPending
     Bot.Snapshot.threatSource = threatSource
+    Bot.Snapshot.blockDirection = blockDir
     Bot.Snapshot.threatUnblockable = unblockable
     Bot.Snapshot.foeControl = controlMode(foe)
     Bot.Snapshot.dashOpener = dashOpener and (dashOpener.followAt and "J queued" or (dashOpener.confirmed and "hit confirmed" or "Q queued")) or nil
@@ -868,7 +914,7 @@ local function decide(manual)
     end
     local bestKey, bestScore, desired = nil, 0, 1.8
     local fullOpponent = foe.human == true and not (foe.botSeat or foe.dummy or foe.tutorBot)
-    local foeTeleportETA = math.huge
+    local foeTeleportETA, foeApproaches = math.huge, {}
     if fullOpponent and (foe.state == "neutral" or foe.state == "block") then
         for _, key in ipairs({"x1", "x2", "x3"}) do
             local id = sim:_pressMove(foe, key)
@@ -876,6 +922,10 @@ local function decide(manual)
             if info and info.targetTeleport and canUse(sim, foe, key) then
                 local tempo = info.def.fixedTime and 1 or tonumber(foe.def and foe.def.tempo) or 1
                 foeTeleportETA = math.min(foeTeleportETA, info.startup * tempo)
+            end
+            if info and info.armoredApproach and canUse(sim, foe, key) then
+                local tempo = info.def.fixedTime and 1 or tonumber(foe.def and foe.def.tempo) or 1
+                foeApproaches[#foeApproaches + 1] = {startup = info.startup * tempo, speed = info.approachSpeed}
             end
         end
     end
@@ -936,8 +986,13 @@ local function decide(manual)
                     local commitment = lead + (info.duration or startup)
                     local walkReach = 3 + math.max(8, tonumber(foe.spd) or 10) * 1.1 * commitment
                         + ((foe.dashN or 0) > 0 and 3.5 or 0)
+                    local armoredPunish = false
+                    for _, approach in ipairs(foeApproaches) do
+                        local reachTime = math.max(0, distance - 3) / math.max(1, approach.speed + (info.approachSpeed or 0))
+                        if math.max(approach.startup, reachTime) <= commitment then armoredPunish = true; break end
+                    end
                     if eta <= horizon + 0.06 or (fullOpponent and (foe.state == "neutral" or foe.state == "block")
-                        and ((foeTeleportETA < commitment) or ((info.duration or 0) > 0.65 and distance < walkReach))) then score = 0 end
+                        and (armoredPunish or (foeTeleportETA < commitment) or ((info.duration or 0) > 0.65 and distance < walkReach))) then score = 0 end
                 end
                 if score > bestScore then bestScore, bestKey = score, key end
             end
@@ -951,6 +1006,7 @@ local function decide(manual)
     if whiffOpening or chainPressure or (foe.state == "stun" and (foe.stunT or 0) > lead + 0.2) then desired = 1.8 end
     Bot.Snapshot.whiffOpening = whiffOpening and true or false
     Bot.Snapshot.foeTeleportReady = foeTeleportETA < math.huge
+    Bot.Snapshot.foeArmoredApproachReady = #foeApproaches > 0
     local closeDash, dashFollow = false, false
     if Bot.Movement == "manual" then
         for _, key in ipairs({"x", "down", "jump", "dash", "block", "light"}) do out[key] = manual and manual[key] or out[key] end
@@ -1066,6 +1122,12 @@ local function decide(manual)
         and not usingDefense and not protectedSelf
     local holdRecovery = recoveryGuard and (me.state == "neutral" or (me.state == "block" and me.facing == blockDir))
         and not usingDefense and not protectedSelf
+    local turnGuard = Bot.PredictBlock and guardSafe and me.grounded and me.state == "block"
+        and me.facing ~= blockDir and not unblockable and eta < lead + 0.45 and not usingDefense and not protectedSelf
+    if turnGuard then
+        out.block = false; out.x = blockDir; out.dash = nil; out.jump = nil
+        for _, key in ipairs({"x1", "x2", "x3", "ult", "form", "light"}) do out[key] = nil end
+    end
     if predictBlock or holdRecovery then
         out.block = true; out.x = blockDir; out.dash = nil; out.jump = nil; out.light = nil
         usingDefense = true
@@ -1073,11 +1135,12 @@ local function decide(manual)
     Bot.Snapshot.predictBlock = predictBlock and true or false
     Bot.Snapshot.approachPressure = approachPressure and true or false
     Bot.Snapshot.recoveryGuard = holdRecovery and true or false
+    Bot.Snapshot.turnGuard = turnGuard and true or false
     if imminent and not usingDefense and canCancel and not protectedSelf then
         if now >= nextDodge and dashReady
             and (me.grounded or (me.airDashes or 0) < (me.mvt == "swing" and 2 or 1)) then
             out.dash = true
-            out.x = (threatSource == "zone" or threatSource == "delayed effect") and -blockDir or -dir
+            out.x = (threatSource == "zone" or threatSource == "delayed effect" or threatSource == "teleport attack") and -blockDir or -dir
             nextDodge = now + 0.55
         elseif now >= nextJump and (me.grounded or (me.airJumps or 0) < 1) then
             out.jump = true; nextJump = now + 0.3
@@ -1136,7 +1199,7 @@ local function decide(manual)
     elseif dashOpener and (postedDefense or out.dash or out.jump or out.block) then dashOpener = nil end
     Bot.Snapshot.action = out.dash and (closeDash and "dash opener" or (out.x == dir and "approach dash" or "evade dash"))
         or (out.light and "J") or (bestKey and out[bestKey] and bestKey)
-        or (holdRecovery and "recovery guard") or (predictBlock and "predictive block") or (out.block and "block") or "position"
+        or (holdRecovery and "recovery guard") or (predictBlock and "predictive block") or (out.block and "block") or (turnGuard and "turn guard") or "position"
     status("Fighting / " .. Bot.Movement .. (out[bestKey or ""] and (" / " .. bestKey) or ""))
     return out
 end
@@ -1293,6 +1356,12 @@ local function observeOpponent(info)
 end
 local function recordOutcome(info)
     if outcomeRecorded or blockedMatch or type(info) ~= "table" then return end
+    if logger.stats then logger.stats.terminal = flat(info, {"winner", "result", "outcome", "reason", "forfeit", "kind", "code", "detail"}) end
+    local rounds = logger.stats and logger.stats.rounds
+    local lastRound = rounds and rounds[#rounds]
+    local forfeit = info.forfeit == true or info.result == "forfeit" or info.reason == "forfeit"
+        or (lastRound and lastRound.result == "forfeit") or false
+    if logger.stats then logger.stats.forfeit = forfeit end
     local loss, win = false, false
     if mySide and type(info.winner) == "number" then
         if info.winner == 0 then
@@ -1313,11 +1382,11 @@ local function recordOutcome(info)
     logger:line("outcome", {outcome = loss and "loss" or "win", opponentId = opponentId})
     if loss then
         memory.losses = (memory.losses or 0) + 1
-        memory.defenseMargin = math.min(0.12, (memory.defenseMargin or 0) + 0.02)
+        if not forfeit then memory.defenseMargin = math.min(0.12, (memory.defenseMargin or 0) + 0.02) end
         if opponentId then memory.lost[tostring(opponentId)] = true end
     else
         memory.wins = (memory.wins or 0) + 1
-        if logger.stats and logger.stats.opponentControlSamples and (logger.stats.opponentControlSamples.full or 0) > 0 then
+        if not forfeit and logger.stats and logger.stats.opponentControlSamples and (logger.stats.opponentControlSamples.full or 0) > 0 then
             memory.defenseMargin = math.max(0, (memory.defenseMargin or 0) - 0.005)
         end
     end
@@ -1403,6 +1472,8 @@ on("start", function(info)
     logger.roundNumber = type(info) == "table" and info.round or nil
     logger.roundBaseTaken = logger.stats and logger.stats.damageTaken or 0
     logger.roundBaseDealt = logger.stats and logger.stats.damageDealt or 0
+    logger.roundBaseSelfCost = logger.stats and logger.stats.selfHpCost or 0
+    logger.roundBaseOpponentCost = logger.stats and logger.stats.opponentSelfHpCost or 0
     logger:line("round_start", flat(info, {"round", "side", "seat", "matchId"}))
 end)
 on("end", function(info)
@@ -1425,6 +1496,10 @@ on("end", function(info)
         hp = me and me.hp, maxHp = me and me.maxHp, opponentHp = foe and foe.hp, opponentMaxHp = foe and foe.maxHp,
         damageTaken = math.max(0, logger.stats.damageTaken - logger.roundBaseTaken),
         damageDealt = math.max(0, logger.stats.damageDealt - logger.roundBaseDealt)}
+    row.selfHpCost = math.max(0, logger.stats.selfHpCost - logger.roundBaseSelfCost)
+    row.opponentSelfHpCost = math.max(0, logger.stats.opponentSelfHpCost - logger.roundBaseOpponentCost)
+    row.combatDamageTaken = math.max(0, row.damageTaken - row.selfHpCost)
+    row.combatDamageDealt = math.max(0, row.damageDealt - row.opponentSelfHpCost)
     logger.stats.rounds[#logger.stats.rounds + 1] = row
     if #logger.stats.rounds > 32 then table.remove(logger.stats.rounds, 1) end
     logger:line("round_result", row); logger:flush(true)
@@ -1847,11 +1922,11 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.13 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.14 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.13] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.14] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
