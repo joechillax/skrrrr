@@ -89,13 +89,13 @@ local Bot = {
     DraftPriorities = {[12] = {Hakari = 100}, [10] = {Nanami = 100}},
     MinGuardToBlock = 30,
     LogSlots = 200,
-    LogMaxBytes = 4 * 1024 * 1024,
+    LogMaxBytes = 8 * 1024 * 1024, -- longer PvP sets previously lost their last rounds at 4 MiB
     LogInterval = 0.1,
     LogStatus = "initializing",
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.12-autojoin-gate",
+    Version = "4.13-pressure-timing",
     InputCalls = 0,
     LiveInputFound = liveModules.PlayerInput ~= nil,
     LiveOnlineFound = liveModules.OnlineClient ~= nil,
@@ -419,6 +419,7 @@ function logger:sample(out)
     local sameRound = self.lastSim == sim and self.lastMe == me and self.lastFoe == foe
         and (sim.t or 0) >= (self.lastTime or 0)
     local changed = not sameRound or (me.moveSeq ~= self.lastSeq) or me.state ~= self.lastState or sim.phase ~= self.lastPhase
+        or Bot.InputMode ~= self.lastInputMode
     if sameRound then
         local taken = math.max(0, (self.lastHp or me.hp) - me.hp)
         local dealt = math.max(0, (self.lastFoeHp or foe.hp) - foe.hp)
@@ -438,6 +439,7 @@ function logger:sample(out)
     self.lastTime, self.lastHp, self.lastFoeHp = sim.t, me.hp, foe.hp
     self.lastSeq, self.lastState = me.moveSeq, me.state
     self.lastPhase = sim.phase
+    self.lastInputMode = Bot.InputMode
     if not pressed and not changed and os.clock() - self.lastSample < Bot.LogInterval then return end
     self.lastSample = os.clock(); self.stats.samples = self.stats.samples + 1
     local mode = controlMode(foe)
@@ -450,7 +452,8 @@ function logger:sample(out)
     end
     self:line("sample", {phase = sim.phase, frame = sim.frame, simTime = sim.t, delay = current.nc.delay,
         me = actorLog(me), foe = actorLog(foe), input = out, queries = queries,
-        decision = Bot.Snapshot, status = Bot.Status, enabled = Bot.Enabled})
+        decision = Bot.Snapshot, status = Bot.Status, enabled = Bot.Enabled, inputMode = Bot.InputMode,
+        manualGraceRemaining = math.max(0, Bot.ManualGrace - (os.clock() - lastManual))})
 end
 
 local function canUse(sim, me, key)
@@ -513,6 +516,16 @@ local function guardReady(sim, me, foe, kind, horizon)
     return ok and type(waitTime) == "number" and waitTime <= horizon
 end
 local infoCache = setmetatable({}, {__mode = "k"})
+local function moveRemaining(me)
+    if me.state ~= "move" or not me.move then return 0 end
+    local tempo = me.move.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
+    local left = math.max(0, (me.keyDur or 0) + (me.keyHold or 0) - (me.kt or 0))
+    for i = (me.key or 1) + 1, #(me.move.keys or {}) do
+        local k = me.move.keys[i]
+        left = left + ((tonumber(k.dur) or 0) + (tonumber(k.hold) or 0)) * tempo
+    end
+    return left
+end
 local function moveInfo(sim, me, id, key)
     if not id then return end
     local def = sim:_moveDef(me, id)
@@ -548,16 +561,21 @@ local function moveInfo(sim, me, id, key)
             cat = Kind.classify(sim:_moveName(me, id), "", "", def, proj,
                 cacheKey ~= "skill" and cacheKey or nil)}
         entry.projectileReach = projectileReach
-        local startup = 0
+        local startup, duration, activeSeen, targetTeleport = 0, 0, false, false
         for _, k in ipairs(def.keys or {}) do
             local active = k.hit or k.grab
             for _, fx in pairs(k.fx or {}) do
                 if fx[1] == "proj" or fx[1] == "strike" or fx[1] == "whip" or fx[1] == "release" then active = true end
+                if fx[1] == "teleport" and (fx[2] == "around" or fx[2] == "behind" or fx[2] == "target") then targetTeleport = true end
             end
-            if active then break end
-            startup = startup + (tonumber(k.dur) or tonumber(k.t) or 0.05) + (tonumber(k.hold) or 0)
+            local time = (tonumber(k.dur) or tonumber(k.t) or 0.05) + (tonumber(k.hold) or 0)
+            if active then activeSeen = true end
+            if not activeSeen then startup = startup + time end
+            duration = duration + time
         end
         entry.startup = startup
+        entry.duration = duration
+        entry.targetTeleport = targetTeleport and activeSeen
         cache[cacheKey] = entry
     end
     local range = def.range or {0, 4}
@@ -568,7 +586,9 @@ local function moveInfo(sim, me, id, key)
         if hi <= 4 then hi = Bot.RangedFallback end
     end
     return {def = def, features = entry.features, cat = entry.cat,
-        lo = range[1] or 0, hi = hi, startup = entry.startup, ranged = ranged}
+        lo = range[1] or 0, hi = hi, startup = entry.startup, duration = entry.duration,
+        protectedStartup = def.keys and def.keys[1] and def.keys[1].invuln == true,
+        targetTeleport = entry.targetTeleport, ranged = ranged}
 end
 local function threat(sim, me)
     local soon, projectile, unblockable, blockDir, source = math.huge, false, false, nil, nil
@@ -847,6 +867,18 @@ local function decide(manual)
         end
     end
     local bestKey, bestScore, desired = nil, 0, 1.8
+    local fullOpponent = foe.human == true and not (foe.botSeat or foe.dummy or foe.tutorBot)
+    local foeTeleportETA = math.huge
+    if fullOpponent and (foe.state == "neutral" or foe.state == "block") then
+        for _, key in ipairs({"x1", "x2", "x3"}) do
+            local id = sim:_pressMove(foe, key)
+            local info = moveInfo(sim, foe, id, key)
+            if info and info.targetTeleport and canUse(sim, foe, key) then
+                local tempo = info.def.fixedTime and 1 or tonumber(foe.def and foe.def.tempo) or 1
+                foeTeleportETA = math.min(foeTeleportETA, info.startup * tempo)
+            end
+        end
+    end
     local hp = me.hp / math.max(1, me.maxHp)
     local foeCounter = false
     if foe.move and foe.state == "move" then
@@ -854,6 +886,10 @@ local function decide(manual)
         foeCounter = k and (k.counter ~= nil or k.reflect ~= nil) or false
     end
     for _, key in ipairs({"x1", "x2", "x3", "ult", "form"}) do
+        -- The kit's useful spacing does not disappear when its projectile goes
+        -- on cooldown. Otherwise a ranged cast is followed by walking into J.
+        local kitInfo = key ~= "ult" and key ~= "form" and moveInfo(sim, me, slots[key], key)
+        if kitInfo and kitInfo.ranged then desired = math.max(desired, math.min(8, kitInfo.hi * 0.62)) end
         if key ~= reservedKey and canUse(sim, me, key) then
             local info = moveInfo(sim, me, slots[key], key)
             if info then
@@ -895,10 +931,26 @@ local function decide(manual)
                 -- an unforced punish. Keep such casts for range or confirmed stun.
                 if cat ~= "counter" and cat ~= "evade" and key ~= "form" and not f.invuln
                     and distance < 4 and not stunOpening and startup > lead + 0.3 then score = 0 end
+                local offensive = cat ~= "counter" and cat ~= "evade" and cat ~= "heal" and key ~= "form" and key ~= "ult"
+                if offensive and not info.protectedStartup and not stunOpening then
+                    local commitment = lead + (info.duration or startup)
+                    local walkReach = 3 + math.max(8, tonumber(foe.spd) or 10) * 1.1 * commitment
+                        + ((foe.dashN or 0) > 0 and 3.5 or 0)
+                    if eta <= horizon + 0.06 or (fullOpponent and (foe.state == "neutral" or foe.state == "block")
+                        and ((foeTeleportETA < commitment) or ((info.duration or 0) > 0.65 and distance < walkReach))) then score = 0 end
+                end
                 if score > bestScore then bestScore, bestKey = score, key end
             end
         end
     end
+    local foeKey = foe.move and foe.move.keys and foe.move.keys[foe.key or 1]
+    local whiffOpening = targetHittable and foe.state == "move" and eta == math.huge
+        and moveRemaining(foe) > lead + 0.15 and distance <= 6 and not foeCounter
+        and not (foeKey and (foeKey.armor or foeKey.invuln))
+    local chainPressure = me.state == "move" and me.move and me.move.basic == "light" and me.moveHit and foe.state == "stun"
+    if whiffOpening or chainPressure or (foe.state == "stun" and (foe.stunT or 0) > lead + 0.2) then desired = 1.8 end
+    Bot.Snapshot.whiffOpening = whiffOpening and true or false
+    Bot.Snapshot.foeTeleportReady = foeTeleportETA < math.huge
     local closeDash, dashFollow = false, false
     if Bot.Movement == "manual" then
         for _, key in ipairs({"x", "down", "jump", "dash", "block", "light"}) do out[key] = manual and manual[key] or out[key] end
@@ -940,13 +992,21 @@ local function decide(manual)
         local futureDx = dx + (foe.vx or 0) * basicHorizon - (me.vx or 0) * lead
         local safeReach = math.max(0.5, math.min(basicReach - 0.1, Bot.MaxBasicRange))
         local chainOpportunity = comboWindow or earlyChain
-        local freeToPunch = me.state == "neutral" or me.state == "block" or chainOpportunity
+        local recoveryLeft = moveRemaining(me)
+        local confirmedRecovery = me.state == "move" and me.grounded and not lightMove
+            and (me.moveHit or (me.moveBase == "DashPunch" and me.dashHit))
+            and not (me.move and me.move.ultimate) and not me.thenMove and not me.grabWait
+        local recoveryBuffer = confirmedRecovery and recoveryLeft <= lead + 0.16
+            and foe.state == "stun" and (foe.stunT or 0) > math.max(lead, recoveryLeft) + startup * tempo + 1 / 60
+        local freeToPunch = me.state == "neutral" or me.state == "block" or chainOpportunity or recoveryBuffer
+        local stunFits = foe.state ~= "stun" or chainOpportunity
+            or (foe.stunT or 0) > math.max(lead, recoveryBuffer and recoveryLeft or 0) + startup * tempo + 1 / 60
         local freshChain = chainOpportunity and me.moveSeq ~= nil and me.moveSeq ~= lastLightSeq
         local neutralPress = not chainOpportunity and now >= nextLight
         if not danger and not attackPending and not dashWaiting and not defensePending and targetHittable and distance < basicReach and math.abs(futureDx) < safeReach
             and math.abs(me.y - foe.y) < 3
             and guardReady(sim, me, foe, "punch", lead)
-            and not foeCounter and freeToPunch
+            and not foeCounter and freeToPunch and stunFits
             and (freshChain or neutralPress) then
             out.light = true; nextLight = now + math.max(0.09, lead + 0.03)
             lastLightSeq = me.moveSeq
@@ -956,6 +1016,8 @@ local function decide(manual)
         Bot.Snapshot.basicPredictedDistance = math.abs(futureDx)
         Bot.Snapshot.basicSafeReach = safeReach
         Bot.Snapshot.earlyChain = earlyChain and true or false
+        Bot.Snapshot.recoveryBuffer = recoveryBuffer and true or false
+        Bot.Snapshot.recoveryLeft = recoveryLeft
         local bestInfo = bestKey and moveInfo(sim, me, slots[bestKey], bestKey)
         local meleeChoice = not bestKey or (bestInfo and not bestInfo.ranged and bestInfo.cat == "punch" and bestScore < 5)
         if Bot.CloseDashOpener and not attackPending and not dashOpener and not danger and not foeCounter and not defensePending
@@ -1056,7 +1118,7 @@ local function decide(manual)
     if Bot.Movement ~= "manual" then
         local press = out.light and "light" or (bestKey and out[bestKey] and bestKey)
         if press then pendingAttack = {me = me, seq = me.moveSeq, at = combatClock,
-            untilT = combatClock + lead + 0.12, key = press} end
+            untilT = combatClock + math.max(lead, out.light and moveRemaining(me) or 0) + 0.12, key = press} end
     end
     if out.dash and Bot.Movement ~= "manual" then
         pendingDash = {me = me, at = combatClock, untilT = combatClock + lead + 0.3,
@@ -1084,13 +1146,18 @@ sampleWrapper = function(...)
     Bot.Snapshot = nil
     lastGoodSample = os.clock()
     Bot.InputCalls = Bot.InputCalls + 1
+    Bot.InputMode = not Bot.Enabled and "paused" or (UIS:GetFocusedTextBox() and "typing"
+        or (os.clock() - lastManual < Bot.ManualGrace and "manual" or "autoplay"))
     if alive and Bot.Enabled and not UIS:GetFocusedTextBox() and os.clock() - lastManual >= Bot.ManualGrace then
         local ok, result = pcall(decide, manual)
         if not ok then
+            Bot.InputMode = "error"
             if Bot.LastError ~= tostring(result) then warn("[QuickMatchAuto] " .. tostring(result)) end
             Bot.LastError = tostring(result)
             status("Error; check QuickMatchAuto.LastError")
         else out = result or manual end
+    elseif alive and Bot.Enabled then
+        status(Bot.InputMode == "typing" and "Typing / normal input" or "Manual combat input / temporary override")
     end
     if alive then
         local ok, err = pcall(logger.sample, logger, out)
@@ -1698,6 +1765,22 @@ function Bot.Stop()
     gui:Destroy()
     status("Unloaded")
 end
+local function combatInput(input)
+    local code = input.KeyCode
+    if Input.PRESS and Input.PRESS[code] or Input.PAD and Input.PAD[code] then return true end
+    for _, map in ipairs({Input.KB_HOLD or {}, Input.PAD_HOLD or {}}) do
+        for _, codes in pairs(map) do
+            for _, value in ipairs(codes) do if code == value then return true end end
+        end
+    end
+    -- Compatibility fallback for environments that expose only sampler/hold.
+    if Input.KB_HOLD == nil then
+        for _, name in ipairs({"A", "D", "S", "F", "W", "Space", "Up", "Down", "Left", "Right", "Q", "J", "V", "C", "X", "One", "Two", "Three"}) do
+            if code == Enum.KeyCode[name] then return true end
+        end
+    end
+    return false
+end
 connections[#connections + 1] = UIS.InputBegan:Connect(function(input, processed)
     if UIS:GetFocusedTextBox() then return end
     if input.KeyCode == Enum.KeyCode.F6 then
@@ -1721,8 +1804,7 @@ connections[#connections + 1] = UIS.InputBegan:Connect(function(input, processed
         if not Bot.AutoJoin then resultSeen = nil end
         status(Bot.AutoJoin and "Automatic matchmaking enabled" or "Auto join off; join matches manually")
     elseif input.KeyCode == Enum.KeyCode.F8 then Bot.Stop()
-    elseif not processed and (input.UserInputType == Enum.UserInputType.Keyboard
-        or input.UserInputType == Enum.UserInputType.MouseButton1) then
+    elseif not processed and combatInput(input) then
         lastManual = os.clock()
     end
 end)
@@ -1765,11 +1847,11 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.12 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.13 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.12] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.13] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
