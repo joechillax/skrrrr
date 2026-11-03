@@ -5,6 +5,7 @@
 -- This uses the game's networked input path, never edits simulated HP/cooldowns.
 
 local env = getgenv and getgenv() or _G
+local previousAutoJoin = env.QuickMatchAuto and env.QuickMatchAuto.AutoJoin
 if env.QuickMatchAuto and env.QuickMatchAuto.Stop then env.QuickMatchAuto.Stop() end
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -59,7 +60,7 @@ local Fighters = load(Shared, "Fighters", false)
 local Http = game:GetService("HttpService")
 local Bot = {
     Enabled = true,
-    AutoJoin = true,
+    AutoJoin = previousAutoJoin ~= false, -- default on; retain F7 choice across re-execution
     Movement = "custom", -- "manual" lets you steer; both use full CONTROL mode
     HealBelow = 0.78,
     SkillGap = 0.22,
@@ -94,7 +95,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.11-threat-audit",
+    Version = "4.12-autojoin-gate",
     InputCalls = 0,
     LiveInputFound = liveModules.PlayerInput ~= nil,
     LiveOnlineFound = liveModules.OnlineClient ~= nil,
@@ -122,6 +123,7 @@ local lastGoodSample = os.clock()
 local previousHp, previousSelf, nextEscape, lastLightSeq = nil, nil, 0, nil
 local opponentId, blockedMatch, outcomeRecorded, mySide = nil, false, false, nil
 local rematchAnswered, rematchWaitUntil = false, 0
+local rematchAutoAccepted = false
 local defenseUntil = 0
 local dashOpener, nextCloseDash = nil, 0
 local recoveryGuardUntil = 0
@@ -1167,7 +1169,7 @@ local function finishSkip(reason, current)
     busy, queued, ending, drafting = false, false, false, false
     queueRequested = false
     blockedMatch, opponentId, mySide, rematchAnswered = false, nil, nil, false
-    rematchWaitUntil = 0
+    rematchWaitUntil = 0; rematchAutoAccepted = false
     matchId, matchNumber, lastDeal, session, skipState = nil, nil, nil, nil, nil
     dealGeneration = dealGeneration + 1; lastQueue = os.clock(); resetCombat()
     Bot.ControlState = "lobby"
@@ -1259,7 +1261,7 @@ local function deal(info)
     observeOpponent(info)
     if blockedMatch or staleEvent(info) then return end
     lastDeal, drafting = info, true
-    rematchWaitUntil = 0
+    rematchWaitUntil = 0; rematchAutoAccepted = false
     logger:line("draft", {round = info.round, handSize = #info.hand})
     ending = false
     busy, queued = true, false
@@ -1309,7 +1311,7 @@ on("match", function(info)
     skipState = nil
     opponentId, blockedMatch, outcomeRecorded, mySide = nil, false, false, nil
     opponentCPU = nil
-    rematchAnswered, rematchWaitUntil = false, 0
+    rematchAnswered, rematchWaitUntil, rematchAutoAccepted = false, 0, false
     matchId = eventMatchId(info)
     matchNumber = type(info) == "table" and type(info.id) == "number" and info.id or nil
     observeOpponent(info)
@@ -1329,7 +1331,7 @@ on("start", function(info)
     observeOpponent(info)
     if staleEvent(info) then return end
     busy = true; queued = false; drafting = false; dealGeneration = dealGeneration + 1
-    rematchWaitUntil = 0
+    rematchWaitUntil = 0; rematchAutoAccepted = false
     resetCombat(); status(blockedMatch and "Skipping previous loss" or "Round starting")
     logger.roundNumber = type(info) == "table" and info.round or nil
     logger.roundBaseTaken = logger.stats and logger.stats.damageTaken or 0
@@ -1370,13 +1372,14 @@ on("closed", function(id)
     queueRequested = false
     matchId = nil; matchNumber = nil; lastDeal = nil; session = nil
     blockedMatch, opponentId, skipState = false, nil, nil
-    rematchAnswered, rematchWaitUntil = false, 0
+    rematchAnswered, rematchWaitUntil, rematchAutoAccepted = false, 0, false
     dealGeneration = dealGeneration + 1; lastQueue = os.clock()
 end)
 on("rematch", function(mine, theirs)
-    if not mine and not theirs then rematchAnswered = false; rematchWaitUntil = 0; return end
-    if Bot.Enabled and not rematchAnswered and type(Online.rematch) == "function" then
+    if not mine and not theirs then rematchAnswered = false; rematchWaitUntil = 0; rematchAutoAccepted = false; return end
+    if Bot.Enabled and Bot.AutoJoin and not rematchAnswered and type(Online.rematch) == "function" then
         if Bot.AcceptRematches and theirs then
+            rematchAutoAccepted = true
             rematchAnswered = true; rematchWaitUntil = os.clock() + 15
             Online.rematch(true); status("Rematch accepted; waiting for draft")
         elseif not Bot.AcceptRematches then
@@ -1543,7 +1546,9 @@ end
 local function resultButton()
     local screen = playerGui:FindFirstChild("Results")
     if not screen or not visible(screen) then return end
-    local button = screen:FindFirstChild("Btn_newOpponent", true) or screen:FindFirstChild("Btn_lobby", true)
+    -- Returning through Lobby leaves all automatic queue requests behind F7's
+    -- gate; New Opponent also schedules a queue inside the game's own callback.
+    local button = screen:FindFirstChild("Btn_lobby", true) or screen:FindFirstChild("Btn_newOpponent", true)
     if button and visible(button) then return button end
 end
 local function fireButton(button, allowResultsFallback)
@@ -1578,7 +1583,8 @@ local function fireButton(button, allowResultsFallback)
                 if type(value) == "table" and type(rawget(value, "onNewOpponent")) == "function"
                     and type(rawget(value, "onLobby")) == "function"
                     and (not matchId or rawget(value, "matchId") == matchId) then
-                    pcall(value.onNewOpponent)
+                    local callback = button.Name == "Btn_lobby" and value.onLobby or value.onNewOpponent
+                    pcall(callback)
                     if not resultButton() then return true end
                 end
             end
@@ -1651,11 +1657,16 @@ local function resultsTick()
             end
         end
     end
+    if not Bot.AutoJoin then
+        resultSeen = nil
+        status("Auto join off; choose next match manually")
+        return true
+    end
     if os.clock() < rematchWaitUntil then status("Rematch accepted; waiting for draft"); return true end
     if not resultSeen then resultSeen = os.clock() end
     if os.clock() - resultSeen >= 2 and os.clock() - resultAttempt >= 3 then
         resultAttempt = os.clock()
-        if fireButton(button) then resultPending = true; status("New Opponent selected; checking transition")
+        if fireButton(button) then resultPending = true; status("Results navigation selected; checking transition")
         else status("Results handler unavailable; check LastError"); Bot.LastError = "Cannot activate Results button: getconnections/getgc callback unavailable" end
     end
     return true
@@ -1702,6 +1713,12 @@ connections[#connections + 1] = UIS.InputBegan:Connect(function(input, processed
         if not Bot.AutoJoin and (queued or queueRequested) then
             Online.queue(false, "classic"); queued = false; queueRequested = false
         end
+        if not Bot.AutoJoin and rematchAutoAccepted then
+            rematchAutoAccepted = false; rematchAnswered = false; rematchWaitUntil = 0
+            local ok, err = pcall(Online.rematch, false)
+            if not ok then Bot.LastError = tostring(err) end
+        end
+        if not Bot.AutoJoin then resultSeen = nil end
         status(Bot.AutoJoin and "Automatic matchmaking enabled" or "Auto join off; join matches manually")
     elseif input.KeyCode == Enum.KeyCode.F8 then Bot.Stop()
     elseif not processed and (input.UserInputType == Enum.UserInputType.Keyboard
@@ -1748,11 +1765,11 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.11 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.12 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.11] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.12] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
