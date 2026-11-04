@@ -132,7 +132,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.28-ranked-update",
+    Version = "4.29-ranked-response",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -227,7 +227,7 @@ local originalSample, originalBind = Input.sample, Online.bind
 local sampleWrapper, bindWrapper
 local lastManual, lastScan, lastQueue = -100, -100, -100
 local nextSkill, nextDodge, nextJump, nextSwitch, nextLight = 0, 0, 0, 0, 0
-local nextUltimate = 0
+local nextUltimate, pendingUltimateFrame = 0, nil
 local pendingJump, busy, queued, dealGeneration = nil, false, false, 0
 local queueRequested = false
 local lastDeal, drafting, ending, matchId = nil, false, false, nil
@@ -255,7 +255,7 @@ local matchEventAt = os.clock()
 local function status(s) Bot.Status = s end
 local function resetCombat()
     nextSkill, nextDodge, nextJump, nextSwitch, nextLight = 0, 0, 0, 0, 0
-    nextUltimate = 0
+    nextUltimate, pendingUltimateFrame = 0, nil
     pendingJump = nil
     previousHp, previousSelf, nextEscape, lastLightSeq = nil, nil, 0, nil
     defenseUntil = 0
@@ -898,7 +898,7 @@ local function ultimateOpportunity(sim, me, foe, id, info, lead, eta, foeCounter
     if type(sim._ultReach) ~= "function" then return false, "reach query unavailable" end
     if checkMethod(sim, "_ultBlocked", foe) then return false, "native target restriction" end
     local ok, reach = pcall(sim._ultReach, sim, me, id, foe)
-    if not ok or reach ~= "in" then return false, "outside cast range", reach end
+    if not ok or (reach ~= "in" and reach ~= "approach") then return false, "outside cast range", reach end
     local tempo = info.def.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
     local startup = info.startup * tempo
     local function predictedReach(after, impact)
@@ -919,12 +919,19 @@ local function ultimateOpportunity(sim, me, foe, id, info, lead, eta, foeCounter
     end
     -- A protected cinematic that stops the caster invalidates the current movement forecast.
     local predictionWindow = info.protectedStartup and info.stopsOnCast and math.min(startup, 0.35) or startup
+    local recoveryRequired = info.protectedStartup and startup == 0 and lead - 4 / 60 or lead + 0.08
+    local closingWindow = reach == "approach" and lead >= 0.2 and me.state == "neutral" and eta == math.huge
+        and ((foe.state == "move" and moveRemaining(foe) > recoveryRequired)
+            or (foe.state == "stun" and (foe.stunT or 0) > recoveryRequired))
+    if reach ~= "in" and not (closingWindow and predictedReach(lead * 0.75)) then
+        return false, "outside cast range", reach
+    end
     if not predictedReach(lead) or not predictedReach(lead + predictionWindow, true) then
         return false, "target leaving cast range", reach
     end
     local confirmed = foe.state == "stun" and (foe.stunT or 0) >= lead + startup + 1 / 60
     if eta < lead + 0.1 and not confirmed and not info.protectedStartup then return false, "defend before casting", reach end
-    return true, "ready in confirmed range", reach
+    return true, closingWindow and "closing into cast range" or "ready in confirmed range", reach
 end
 local function groundFollowup(sim, me, foe, info, key, lead, distance)
     local gettingUp = foe.state == "move" and (foe.moveBase == "GetUpKD" or foe.moveBase == "GetUp")
@@ -1258,11 +1265,18 @@ local function decide(manual)
     blockDir = blockDir or dir
     local lead = math.min(0.35, math.max(0, tonumber(current.nc.delay) or 6) / 60 + 1 / 60)
     local combatClock = type(sim.t) == "number" and sim.t or now
-    if pendingAttack and (pendingAttack.me ~= me or trapped or combatClock < pendingAttack.at
+    local nativeUltimatePending = me.ultApp ~= nil or (me.hbuf == "ult" and (me.hbufT or 0) >= combatClock)
+    if pendingUltimateFrame and type(sim.frame) == "number" and sim.frame > pendingUltimateFrame + 1 then
+        -- The submitted frame has been simulated. If V did not start or enter
+        -- the game's input buffer, the next legal opening can use a fresh frame.
+        nextUltimate, pendingUltimateFrame = 0, nil
+        if pendingAttack and pendingAttack.key == "ult" then pendingAttack = nil end
+    end
+    if pendingAttack and (pendingAttack.me ~= me or (trapped and not pendingAttack.recoveryLight) or combatClock < pendingAttack.at
         or me.moveSeq ~= pendingAttack.seq or combatClock > pendingAttack.untilT) then pendingAttack = nil end
     -- Arrival commitments prevent unrelated offense from replacing an earlier
     -- buffered press. A newly observed threat still gets defensive priority.
-    local attackPending = pendingAttack ~= nil
+    local attackPending = pendingAttack ~= nil or nativeUltimatePending
     local dashReady, dashAvailable, dashReserve, dashRechargeIn = dashBudget(me, combatClock)
     local offensiveDashReady = dashReady and dashAvailable > dashReserve and combatClock >= nextOffensiveDash
     local blockAllowed = not checkMethod(sim, "_statusHas", me, "noBlock")
@@ -1274,7 +1288,11 @@ local function decide(manual)
     end
     local guardSafe = blockAllowed and type(me.guard) == "number" and me.guard >= guardRequired
         and (me.guardLockT == nil or me.guardLockT <= combatClock)
-    if Bot.RecoveryGuard and trapped and me.grounded and guardSafe and distance <= 4.2 and not unblockable then
+    local foeStunLeft = foe.state == "stun" and (tonumber(foe.stunT) or 0) or 0
+    local safeRecovery = targetHittable and foeStunLeft > lead + 0.1 and eta > lead + 0.28 + (memory.defenseMargin or 0)
+    if safeRecovery then
+        recoveryGuardUntil = 0
+    elseif Bot.RecoveryGuard and trapped and me.grounded and guardSafe and distance <= 4.2 and not unblockable then
         recoveryGuardUntil = combatClock + lead + 0.18
     end
     local recoveryGuard = Bot.RecoveryGuard and guardSafe and me.grounded and not unblockable
@@ -1367,6 +1385,26 @@ local function decide(manual)
             out[escapeKey] = true; nextEscape = combatClock + math.max(0.12, lead + 0.04)
             Bot.Snapshot.action = "escape:" .. escapeKey
             status("Breaking combo / " .. escapeKey)
+        elseif Bot.Movement ~= "manual" and safeRecovery and me.state == "stun" and me.grounded
+            and (tonumber(me.stunT) or math.huge) <= lead - 2 / 60 and not attackPending
+            and not (me.locks and me.locks.light) and (me.ult or 0) < 100
+            and (not me.hbuf or (me.hbufT or 0) <= combatClock) then
+            local basicId = controls.ground.light
+            if type(sim._basicFor) == "function" then basicId = sim:_basicFor(me, "light", controls.ground) or basicId end
+            local basic = moveInfo(sim, me, basicId, "light")
+            local tempo = basic and basic.def.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
+            local impact = lead + (basic and basic.startup or 0.06) * tempo
+            local reach = math.min(Bot.MaxBasicRange, basic and basic.hi - 0.1 or 2.5)
+            local gap = math.abs(dx + (foe.vx or 0) * impact - (me.vx or 0) * math.max(0, me.stunT))
+            if not (basic and basic.shot) and math.max(distance, gap) < reach and math.abs(foe.y - me.y) < 3
+                and foeStunLeft > impact + 2 / 60 and guardReady(sim, me, foe, "punch", lead) then
+                out.light, out.x = true, dir
+                pendingAttack = {me = me, seq = me.moveSeq, at = combatClock, untilT = combatClock + lead + 0.12,
+                    key = "light", recoveryLight = true}
+                nextLight = now + lead
+                Bot.Snapshot.action = "recovery J"
+                status("Fighting / recovery J")
+            end
         elseif recoveryGuard and not escapeKey then
             out.block = true; out.x = dir
             Bot.Snapshot.action = "recovery guard"; Bot.Snapshot.recoveryGuard = true
@@ -1446,7 +1484,13 @@ local function decide(manual)
             hasRangedKit = true
         end
         local ready, readyReason, comboHold = canUse(sim, me, key)
-        if key == "ult" and combatClock < nextUltimate then ready, readyReason = false, "awaiting ultimate result" end
+        if key == "ult" then
+            if nativeUltimatePending then
+                ready, readyReason = false, "native ultimate buffer active"
+            elseif combatClock < nextUltimate then
+                ready, readyReason = false, "awaiting ultimate result"
+            end
+        end
         if key == "ult" then
             Bot.Snapshot.ultimate = {ready = ready, reason = readyReason or "checking opportunity", move = slots.ult}
             if Bot.PrioritizeUltimate and (ready or readyReason == "awaiting ultimate result") then
@@ -1833,7 +1877,10 @@ local function decide(manual)
         if (bestScore < 9 or bestKey == "ult") and Bot.Movement ~= "manual" then
             out.x = bestKey == "ult" and arenaUlt and 0 or dir
         end
-        if bestKey == "ult" then nextUltimate = combatClock + math.max(0.35, lead + 0.2) end
+        if bestKey == "ult" then
+            nextUltimate = combatClock + math.max(0.35, lead + 0.2)
+            pendingUltimateFrame = type(ownKnown) == "number" and inputFrame or nil
+        end
         nextSkill = now + Bot.SkillGap
     end
     if out.light and Bot.Movement ~= "manual" then out.x = dir end
@@ -2861,7 +2908,7 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.28 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.29 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nF9 mode: " .. (Bot.MatchMode == "ranked" and "Ranked" or "Quick Match")
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
@@ -2870,4 +2917,4 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.28] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload; F9 mode.")
+warn("[QuickMatchAuto v4.29] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload; F9 mode.")
