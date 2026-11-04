@@ -126,7 +126,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.24-runtime-ultimate-range",
+    Version = "4.25-pvp-openings",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -737,7 +737,7 @@ local function moveInfo(sim, me, id, key)
         local openingBeatsGuard = def.unblockable == true
         local openingPulseRadius
         local jumpsBeforeHit = false
-        for _, k in ipairs(def.keys or {}) do
+        for index, k in ipairs(def.keys or {}) do
             local active = k.hit or k.grab
             if k.hit then groundDamage = true end
             if k.hit and not k.hit.shot and not activeSeen then firstDirectHit = k.hit end
@@ -762,6 +762,11 @@ local function moveInfo(sim, me, id, key)
                     if def.otg == true or def.hitDown == true then groundDamage = true end
                     if not activeSeen then firstHitDelay = math.max(firstHitDelay, tonumber(fx[2].delay) or (fx[1] == "sprout" and 0.3 or 0)) end
                 end
+                if not activeSeen and fx[1] == "sprout" and type(fx[2]) == "table"
+                    and (not fx[2].at or fx[2].at == "target") and fx[2].hit and fx[2].hit.grab
+                    and not fx[2].follow then
+                    entry.targetTrap = {delay = tonumber(fx[2].delay) or 0.3, radius = tonumber(fx[2].r) or 0.9}
+                end
                 if not activeSeen and fx[1] == "proj" and type(fx[2]) == "string" then
                     local projectile = sim:_projDef(me, fx[2])
                     if type(projectile) == "table" and not projectile.beam then firstProjectileSpeed = tonumber(projectile.speed) or 0 end
@@ -783,7 +788,7 @@ local function moveInfo(sim, me, id, key)
                 if (tonumber(k.armor) or 0) > 0 then armoredApproach = true end
             end
             if active and not activeSeen then firstActiveDuration = tonumber(k.dur) or 0.05 end
-            if active then activeSeen = true end
+            if active then activeSeen = true; entry.lastActiveKey = index end
             if not activeSeen then startup = startup + time end
             duration = duration + time
         end
@@ -820,7 +825,8 @@ local function moveInfo(sim, me, id, key)
         openingPulseRadius = entry.openingPulseRadius,
         firstActiveDuration = entry.firstActiveDuration, approachTo = entry.approachTo,
         firstDirectHit = entry.firstDirectHit,
-        firstProjectileSpeed = entry.firstProjectileSpeed, firstHitDelay = entry.firstHitDelay}
+        firstProjectileSpeed = entry.firstProjectileSpeed, firstHitDelay = entry.firstHitDelay,
+        targetTrap = entry.targetTrap, lastActiveKey = entry.lastActiveKey}
 end
 local function arenaWideUltimate(sim, id, info)
     if Combat and Combat.ULT_ANYWHERE and Combat.ULT_ANYWHERE[id] then return true end
@@ -1301,7 +1307,7 @@ local function decide(manual)
         end
     end
     local bestKey, bestScore, desired = nil, 0, 1.8
-    local bestPriority, ultimateGoal = 0, nil
+    local bestPriority, bestPunish, ultimateGoal = 0, nil, nil
     local arenaUlt = false
     local hasRangedKit, rangedOpportunity = false, false
     local spacingReason = "melee"
@@ -1330,6 +1336,20 @@ local function decide(manual)
         local k = foe.move.keys[foe.key or 1]
         foeCounter = k and (k.counter or k.reflect) and true or false
     end
+    local recoveryWindow = 0
+    if fullOpponent and targetHittable and not foeCounter and eta == math.huge and distance <= 6
+        and foe.state == "move" and foe.move and not foe.moveHit and not foe.moveBlocked
+        and not checkMethod(sim, "_cancelOk", foe) then
+        local info = moveInfo(sim, foe, foe.moveBase, "skill")
+        local frame = foe.move.keys and foe.move.keys[foe.key or 1]
+        if info and info.def == foe.move and info.lastActiveKey and (foe.key or 1) > info.lastActiveKey
+            and frame and not frame.armor and not frame.invuln then
+            -- Only count the observed key's remaining time. Later keys may allow a cancel.
+            recoveryWindow = math.max(0, (foe.keyDur or 0) + (foe.keyHold or 0) - (foe.kt or 0))
+        end
+    end
+    Bot.Snapshot.punishWindow = recoveryWindow > 0 and recoveryWindow or nil
+    Bot.Snapshot.openingBlocked = {}
     for _, key in ipairs({"x1", "x2", "x3", "ult", "form"}) do
         -- A ranged move on cooldown does not set the spacing for the whole kit.
         local kitInfo = key ~= "ult" and key ~= "form" and moveInfo(sim, me, slots[key], key)
@@ -1356,6 +1376,10 @@ local function decide(manual)
                     startup = math.max(startup, math.max(0, distance - info.approachTo) / info.approachSpeed)
                 end
                 local horizon = lead + startup
+                local impact = horizon + (info.firstHitDelay or 0)
+                if (info.firstProjectileSpeed or 0) > 0 and (not info.firstDirectHit or distance > 4) then
+                    impact = impact + math.max(0, distance - 1) / info.firstProjectileSpeed
+                end
                 local groundOpening, groundReason = false, nil
                 if not targetHittable then groundOpening, groundReason = groundFollowup(sim, me, foe, info, key, lead, distance) end
                 groundOptions[key] = groundOpening
@@ -1406,10 +1430,28 @@ local function decide(manual)
                 if cat ~= "counter" and cat ~= "evade" and key ~= "form" and not protectedCast
                     and distance < 4 and not stunOpening and startup > lead + 0.3 then score = 0 end
                 local offensive = cat ~= "counter" and cat ~= "evade" and cat ~= "heal" and key ~= "form" and key ~= "ult"
-                if offensive and not info.protectedStartup and not stunOpening then
+                local trap = info.targetTrap
+                if score > 0 and fullOpponent and offensive and trap and not groundOpening
+                    and not (foe.state == "stun" and (foe.stunT or 0) >= horizon + trap.delay + 1 / 60)
+                    and (not foe.grounded or math.abs(foe.vx or 0) * trap.delay > trap.radius) then
+                    score = 0
+                    Bot.Snapshot.openingBlocked[key] = "target moving out of trap"
+                end
+                if score > 0 and offensive and not info.protectedStartup and not stunOpening then
                     local commitment = lead + (info.duration or startup)
                     local walkReach = 3 + math.max(8, tonumber(foe.spd) or 10) * 1.1 * commitment
                         + ((foe.dashN or 0) > 0 and 3.5 or 0)
+                    if fullOpponent and foe.state == "neutral" and foe.dashFwd and (foe.dashT or 0) > 0 then
+                        local dashTime = math.min(foe.dashT, impact)
+                        local walkSpeed = math.max(8, tonumber(foe.spd) or 10)
+                        local closing = math.max(0, -(foe.vx or 0) * dir)
+                        local contactReach = 3 + closing * dashTime + walkSpeed * (impact - dashTime + 1 / 60)
+                            + ((foe.dashN or 0) > 0 and 3.5 or 0)
+                        if closing > 0 and impact > lead + 0.25 and distance <= contactReach then
+                            score = 0
+                            Bot.Snapshot.openingBlocked[key] = "dash can reach before attack"
+                        end
+                    end
                     local armoredPunish = false
                     for _, approach in ipairs(foeApproaches) do
                         local reachTime = math.max(0, distance - 3) / math.max(1, approach.speed + (info.approachSpeed or 0))
@@ -1440,8 +1482,11 @@ local function decide(manual)
                     if key == "ult" then priority = 2
                     elseif score >= 9 or (f.heal and hp < 0.35) then priority = 3 end
                 end
-                if priority > bestPriority or (priority == bestPriority and score > bestScore) then
-                    bestPriority, bestScore, bestKey = priority, score, key
+                local punish = priority == 1 and offensive and info.needsTarget and impact + 1 / 60 < recoveryWindow and impact or nil
+                if priority > bestPriority or (priority == bestPriority and
+                    ((punish and (not bestPunish or punish < bestPunish))
+                        or (punish == bestPunish and score > bestScore))) then
+                    bestPriority, bestScore, bestKey, bestPunish = priority, score, key, punish
                 end
             end
         end
@@ -1555,6 +1600,11 @@ local function decide(manual)
             and (freshChain or neutralPress) then
             out.light = true; nextLight = now + math.max(0.09, lead + 0.03)
             lastLightSeq = me.moveSeq
+            if bestPriority <= 1 and bestKey ~= "ult" and bestScore < 9 and basicHorizon + 1 / 60 < recoveryWindow
+                and (not bestPunish or basicHorizon < bestPunish) then
+                bestKey = nil
+                Bot.Snapshot.punishKey = "J"
+            end
             dashFollow = dashOpener and dashOpener.confirmed and not dashOpener.followAt
                 and foe.state == "stun" and type(foe.stunT) == "number" and foe.stunT > basicHorizon + 1 / 60
         end
@@ -1699,6 +1749,8 @@ local function decide(manual)
         or (out.light and "J") or (bestKey and out[bestKey] and bestKey)
         or (holdRecovery and "recovery guard") or (predictBlock and "predictive block") or (out.block and "block") or (turnGuard and "turn guard") or "position"
     if Bot.Snapshot.ultimate.eligible then Bot.Snapshot.ultimate.posted = out.ult == true end
+    if Bot.Snapshot.punishKey == "J" and not out.light then Bot.Snapshot.punishKey = nil end
+    if bestPunish and bestKey and out[bestKey] then Bot.Snapshot.punishKey = bestKey end
     status("Fighting / " .. Bot.Movement .. (out[bestKey or ""] and (" / " .. bestKey) or ""))
     return out
 end
@@ -2564,7 +2616,7 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.24 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.25 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
@@ -2572,4 +2624,4 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.24] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.25] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
