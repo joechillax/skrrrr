@@ -126,7 +126,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.25-pvp-openings",
+    Version = "4.26-pvp-commitments",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -787,7 +787,10 @@ local function moveInfo(sim, me, id, key)
                 if type(k.untilClose) == "number" then approachTo = k.untilClose end
                 if (tonumber(k.armor) or 0) > 0 then armoredApproach = true end
             end
-            if active and not activeSeen then firstActiveDuration = tonumber(k.dur) or 0.05 end
+            if active and not activeSeen then
+                firstActiveDuration = tonumber(k.dur) or 0.05
+                entry.firstActiveProtected = k.invuln == true
+            end
             if active then activeSeen = true; entry.lastActiveKey = index end
             if not activeSeen then startup = startup + time end
             duration = duration + time
@@ -807,6 +810,7 @@ local function moveInfo(sim, me, id, key)
         cache[cacheKey] = entry
     end
     local range = def.range or {0, 4}
+    local opening = def.keys and def.keys[1]
     local hi = math.max(range[2] or 4, 1.5)
     local ranged = (entry.features.proj or 0) > 0 or entry.features.beam or entry.shot
     if ranged and (not entry.jumpsBeforeHit or entry.shot) then
@@ -817,13 +821,15 @@ local function moveInfo(sim, me, id, key)
     return {def = def, features = entry.features, cat = entry.cat,
         lo = entry.approachTo and 0 or (range[1] or 0), hi = hi, startup = entry.startup, duration = entry.duration,
         protectedStartup = def.keys and def.keys[1] and def.keys[1].invuln == true,
+        stopsOnCast = opening and opening.vel and opening.vel[1] == 0 and not opening.keepVel,
         targetTeleport = entry.targetTeleport, approachSpeed = entry.approachSpeed,
         armoredApproach = entry.armoredApproach, ranged = ranged, groundDamage = entry.groundDamage,
         needsTarget = entry.needsTarget,
         shot = entry.shot,
         openingBeatsGuard = entry.openingBeatsGuard,
         openingPulseRadius = entry.openingPulseRadius,
-        firstActiveDuration = entry.firstActiveDuration, approachTo = entry.approachTo,
+        firstActiveDuration = entry.firstActiveDuration, firstActiveProtected = entry.firstActiveProtected,
+        approachTo = entry.approachTo,
         firstDirectHit = entry.firstDirectHit,
         firstProjectileSpeed = entry.firstProjectileSpeed, firstHitDelay = entry.firstHitDelay,
         targetTrap = entry.targetTrap, lastActiveKey = entry.lastActiveKey}
@@ -846,11 +852,9 @@ local function ultimateOpportunity(sim, me, foe, id, info, lead, eta, foeCounter
     if not ok or reach ~= "in" then return false, "outside cast range", reach end
     local tempo = info.def.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
     local startup = info.startup * tempo
-    local opening = info.def.keys and info.def.keys[1]
-    local stopsOnCast = opening and opening.vel and opening.vel[1] == 0 and not opening.keepVel
     local function predictedReach(after, impact)
         local own, target = copyFields(me), copyFields(foe)
-        local drift = stopsOnCast and math.min(after, lead) or after
+        local drift = info.stopsOnCast and math.min(after, lead) or after
         own.x, own.y = me.x + (me.vx or 0) * drift, me.y + (me.vy or 0) * drift
         target.x, target.y = foe.x + (foe.vx or 0) * after, foe.y + (foe.vy or 0) * after
         local halfW = tonumber(sim.halfW)
@@ -865,7 +869,7 @@ local function ultimateOpportunity(sim, me, foe, id, info, lead, eta, foeCounter
         return success and value == "in"
     end
     -- A protected cinematic that stops the caster invalidates the current movement forecast.
-    local predictionWindow = info.protectedStartup and stopsOnCast and math.min(startup, 0.35) or startup
+    local predictionWindow = info.protectedStartup and info.stopsOnCast and math.min(startup, 0.35) or startup
     if not predictedReach(lead) or not predictedReach(lead + predictionWindow, true) then
         return false, "target leaving cast range", reach
     end
@@ -951,11 +955,12 @@ local function defenseKeyAt(info, me, afterInput)
 end
 local function threat(sim, me)
     local soon, projectile, unblockable, blockDir, source = math.huge, false, false, nil, nil
-    local minorZone
-    local function consider(eta, ranged, cannotBlock, direction, kind)
+    local minorZone, targetedUltimate
+    local function consider(eta, ranged, cannotBlock, direction, kind, isTargetedUltimate)
         if eta < soon or (cannotBlock == true and not unblockable and eta <= soon + 1 / 60) then
             soon, projectile, unblockable, blockDir, source = math.max(0, eta), ranged == true,
                 cannotBlock == true, direction, kind
+            targetedUltimate = isTargetedUltimate
         end
     end
     for _, foe in pairs(sim.fighters) do
@@ -1015,7 +1020,8 @@ local function threat(sim, me)
                             if i > (foe.key or 1) and not k.needsGrab and not hit.zone
                                 and (not hit.near or dist <= hit.near) then
                                 consider(eta + (tonumber(hit.delay) or 0), false,
-                                    cannotBlock or hit.grab or hit.unblockable, -(foe.facing or 1), "targeted strike")
+                                    cannotBlock or hit.grab or hit.unblockable, -(foe.facing or 1), "targeted strike",
+                                    hit.ult == true or move.ultimate == true)
                             end
                         elseif fx[1] == "strike" or fx[1] == "whip" or fx[1] == "release" then
                             active = true
@@ -1098,7 +1104,7 @@ local function threat(sim, me)
             end
         end
     end
-    return soon, projectile, unblockable, blockDir, source, minorZone
+    return soon, projectile, unblockable, blockDir, source, minorZone, targetedUltimate
 end
 local function closeDashReach(me, foe, dir, lead, sim)
     if type(me.def) ~= "table" or type(foe.def) ~= "table"
@@ -1172,7 +1178,7 @@ local function decide(manual)
         memory.defenseMargin = math.min(0.12, (memory.defenseMargin or 0) + 0.015)
     end
     previousSelf, previousHp = me, me.hp
-    local eta, isProjectile, unblockable, blockDir, threatSource, minorZone = threat(sim, me)
+    local eta, isProjectile, unblockable, blockDir, threatSource, minorZone, targetedUltimate = threat(sim, me)
     local targetedStrike = threatSource == "targeted strike"
     blockDir = blockDir or dir
     local lead = math.min(0.35, math.max(0, tonumber(current.nc.delay) or 6) / 60 + 1 / 60)
@@ -1238,6 +1244,7 @@ local function decide(manual)
     Bot.Snapshot.dashInputPending = pendingDash ~= nil
     Bot.Snapshot.attackInputPending = attackPending
     Bot.Snapshot.threatSource = threatSource
+    Bot.Snapshot.threatBypassesDash = targetedUltimate or nil
     Bot.Snapshot.minorZone = minorZone
     Bot.Snapshot.blockDirection = blockDir
     Bot.Snapshot.threatUnblockable = unblockable
@@ -1315,6 +1322,7 @@ local function decide(manual)
     Bot.Snapshot.groundFollowups = {}
     Bot.Snapshot.skillReadiness = {}
     local fullOpponent = foe.human == true and not (foe.botSeat or foe.dummy or foe.tutorBot)
+    local foeRecovery = fullOpponent and foe.state == "move" and eta == math.huge and moveRemaining(foe) or nil
     local foeTeleportETA, foeApproaches = math.huge, {}
     if fullOpponent and (foe.state == "neutral" or foe.state == "block") then
         for _, key in ipairs({"x1", "x2", "x3"}) do
@@ -1386,7 +1394,8 @@ local function decide(manual)
                 if not targetHittable then Bot.Snapshot.groundFollowups[key] = {eligible = groundOpening, reason = groundReason} end
                 local stunOpening = groundOpening or (foe.state == "stun" and (foe.clNoStunT or 0) <= combatClock
                     and math.max(tonumber(foe.stunT) or 0, tonumber(comboHold) or 0) >= horizon + 1 / 60)
-                local predictedDistance = math.abs(dx + ((foe.vx or 0) - (me.vx or 0)) * horizon)
+                local ownDrift = info.stopsOnCast and lead or horizon
+                local predictedDistance = math.abs(dx + (foe.vx or 0) * horizon - (me.vx or 0) * ownDrift)
                 local inRange = predictedDistance >= info.lo and predictedDistance <= info.hi
                     and math.abs(foe.y - me.y) < (ranged and 4 or 3)
                 if f.heal and hp >= Bot.HealBelow then
@@ -1437,16 +1446,23 @@ local function decide(manual)
                     score = 0
                     Bot.Snapshot.openingBlocked[key] = "target moving out of trap"
                 end
+                local commitment = lead + (info.duration or startup)
+                local walkSpeed = math.max(8, tonumber(foe.spd) or 10)
+                local dashReach = (foe.dashN or 0) > 0 and 3.5 or 0
+                if score > 0 and offensive and not stunOpening and foeRecovery and ranged
+                    and not info.firstActiveProtected and not info.openingBeatsGuard
+                    and (info.duration or 0) > 0.65 and impact >= foeRecovery
+                    and distance < 3 + walkSpeed * 1.1 * (commitment - foeRecovery) + dashReach then
+                    score = 0
+                    Bot.Snapshot.openingBlocked[key] = "opponent recovers before attack"
+                end
                 if score > 0 and offensive and not info.protectedStartup and not stunOpening then
-                    local commitment = lead + (info.duration or startup)
-                    local walkReach = 3 + math.max(8, tonumber(foe.spd) or 10) * 1.1 * commitment
-                        + ((foe.dashN or 0) > 0 and 3.5 or 0)
+                    local walkReach = 3 + walkSpeed * 1.1 * commitment + dashReach
                     if fullOpponent and foe.state == "neutral" and foe.dashFwd and (foe.dashT or 0) > 0 then
                         local dashTime = math.min(foe.dashT, impact)
-                        local walkSpeed = math.max(8, tonumber(foe.spd) or 10)
                         local closing = math.max(0, -(foe.vx or 0) * dir)
                         local contactReach = 3 + closing * dashTime + walkSpeed * (impact - dashTime + 1 / 60)
-                            + ((foe.dashN or 0) > 0 and 3.5 or 0)
+                            + dashReach
                         if closing > 0 and impact > lead + 0.25 and distance <= contactReach then
                             score = 0
                             Bot.Snapshot.openingBlocked[key] = "dash can reach before attack"
@@ -1678,7 +1694,7 @@ local function decide(manual)
     Bot.Snapshot.approachPressure = approachPressure and true or false
     Bot.Snapshot.recoveryGuard = holdRecovery and true or false
     Bot.Snapshot.turnGuard = turnGuard and true or false
-    local dashCoversStrike = not targetedStrike or (eta >= lead and eta - lead < 0.14
+    local dashCoversStrike = not targetedStrike or (not targetedUltimate and eta >= lead and eta - lead < 0.14
         and (me.mvt == "blink" or (me.cls and me.cls.dashInv) or (me.def and me.def.dashInv)))
     if imminent and not usingDefense and canCancel and not protectedSelf then
         if now >= nextDodge and dashReady
@@ -2616,7 +2632,7 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.25 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.26 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
@@ -2624,4 +2640,4 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.25] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.26] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
