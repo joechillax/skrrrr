@@ -1,6 +1,6 @@
 -- Quick Match automation for the supplied 80007766855741 game export.
 -- Execute in the live game after the lobby loads. No external downloads.
--- F6: pause/resume autoplay; F7: automatic matchmaking on/off; F8: unload.
+-- F6: pause/resume; F7: auto join on/off; F8: unload; F9: Quick Match/Ranked.
 -- Auto-unlocks Awakening for every owned eligible fighter (gem reserve defaults to 0).
 -- This uses the game's networked input path, never edits simulated HP/cooldowns.
 
@@ -40,6 +40,8 @@ if type(getgc) == "function" then
                     and type(rawget(v, "PRESS")) == "table" and type(rawget(v, "hold")) == "function" then liveModules.PlayerInput = v end
                 if type(rawget(v, "bind")) == "function" and type(rawget(v, "queue")) == "function"
                     and type(rawget(v, "lobby")) == "function" and type(rawget(v, "hover")) == "function" then liveModules.OnlineClient = v end
+                if type(rawget(v, "arrivedForMatch")) == "function" and type(rawget(v, "queue")) == "function"
+                    and type(rawget(v, "connected")) == "function" and type(rawget(v, "back")) == "function" then liveModules.RankedClient = v end
                 if type(rawget(v, "card")) == "function" and type(rawget(v, "keyUnlocked")) == "function"
                     and type(rawget(v, "gems")) == "function" then
                     local score, freshness = profileScore(v)
@@ -78,6 +80,9 @@ local Shared = RS:WaitForChild("Shared", 20)
 assert(Shared, "Shared modules unavailable")
 local Input = load(scripts, "PlayerInput", true)
 local Online = load(scripts, "OnlineClient", true)
+local Ranked = load(scripts, "RankedClient", false)
+local RankConfig = load(Shared, "RankConfig", false)
+local Flags = load(Shared, "Flags", false)
 local Rarity = load(Shared, "Rarity", true)
 local Kind = load(Shared, "MoveKind", true)
 local Profile = load(scripts, "ProfileClient", false)
@@ -91,6 +96,7 @@ local Http = game:GetService("HttpService")
 local Bot = {
     Enabled = true,
     AutoJoin = previousAutoJoin ~= false, -- default on; retain F7 choice across re-execution
+    MatchMode = "quick",
     Movement = "custom", -- "manual" lets you steer; both use full CONTROL mode
     HealBelow = 0.78,
     SkillGap = 0.22,
@@ -126,7 +132,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.27-pvp-contact",
+    Version = "4.28-ranked-update",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -141,18 +147,55 @@ local Bot = {
 -- Keep script configuration/macros across replacement; runtime sessions and
 -- pending input are rebuilt. The old awakening option is an alias for the new
 -- all-owned scope, so existing enable/disable macros continue to work.
-if type(previousBot) == "table" then
-    for _, key in ipairs({"Movement", "HealBelow", "SkillGap", "ManualGrace", "RangedFallback", "ReserveDashCharges",
+do
+    local keys = {"Enabled", "AutoJoin", "MatchMode", "AutoAwakenAll", "Movement", "HealBelow", "SkillGap",
+        "ManualGrace", "RangedFallback", "ReserveDashCharges",
         "ReserveDashFraction", "OffensiveDashGap", "MaxApproachDashDistance", "ReserveBreaker", "AvoidLostOpponents",
         "AcceptRematches", "SkipPopups", "MaxBasicRange", "AutoLogs", "ClearOldVersionLogs", "AutoClaimPlaytime",
         "AwakenGemReserve", "PredictBlock", "CloseDashOpener", "RecoveryGuard", "ProtectedSpacing", "DraftPriorities",
-        "MinGuardToBlock", "LogSlots", "LogMaxBytes", "LogInterval", "LobbyRecoveryDelay", "PrioritizeUltimate"}) do
-        if previousBot[key] ~= nil then Bot[key] = previousBot[key] end
+        "MinGuardToBlock", "LogSlots", "LogMaxBytes", "LogInterval", "LobbyRecoveryDelay", "PrioritizeUltimate"}
+    local path = "QuickMatchAutoSettings_" .. tostring(player.UserId) .. ".json"
+    local saved
+    local function restore(source)
+        if type(source) ~= "table" then return end
+        for _, key in ipairs(keys) do
+            local value = source[key]
+            if key == "DraftPriorities" and type(value) == "table" then
+                local tiers = {}
+                for tier, priorities in pairs(value) do
+                    local index = tonumber(tier)
+                    if index and type(priorities) == "table" then tiers[index] = priorities end
+                end
+                Bot[key] = tiers
+            elseif key == "MatchMode" then
+                if value == "quick" or value == "ranked" then Bot[key] = value end
+            elseif key == "Movement" then
+                if value == "manual" or value == "custom" then Bot[key] = value end
+            elseif type(value) == type(Bot[key]) and key ~= "DraftPriorities"
+                and not (key == "Enabled" and source.Status == "Unloaded") then Bot[key] = value end
+        end
     end
-    if previousBot.Status ~= "Unloaded" and type(previousBot.Enabled) == "boolean" then Bot.Enabled = previousBot.Enabled end
-    local previousAwaken = previousBot.AutoAwakenAll
-    if previousAwaken == nil then previousAwaken = previousBot.AutoAwakenMythicPlus end
-    if type(previousAwaken) == "boolean" then Bot.AutoAwakenAll = previousAwaken end
+    if type(readfile) == "function" and type(Http.JSONDecode) == "function" then
+        local ok, value = pcall(function() return Http:JSONDecode(readfile(path)) end)
+        if ok then restore(value) end
+    end
+    restore(previousBot)
+    if type(previousBot) == "table" and previousBot.AutoAwakenAll == nil
+        and type(previousBot.AutoAwakenMythicPlus) == "boolean" then Bot.AutoAwakenAll = previousBot.AutoAwakenMythicPlus end
+    function Bot.SaveSettings()
+        if type(writefile) ~= "function" or type(readfile) ~= "function"
+            or type(Http.JSONEncode) ~= "function" or type(Http.JSONDecode) ~= "function" then return false end
+        local ok, err = pcall(function()
+            local data, tiers = {}, {}
+            for _, key in ipairs(keys) do data[key] = Bot[key] end
+            for tier, priorities in pairs(Bot.DraftPriorities) do tiers[tostring(tier)] = priorities end
+            data.DraftPriorities = tiers
+            local encoded = Http:JSONEncode(data)
+            if encoded ~= saved then writefile(path, encoded); saved = encoded end
+        end)
+        Bot.SettingsError = not ok and tostring(err) or nil
+        return ok
+    end
 end
 setmetatable(Bot, {__index = function(self, key)
     if key == "AutoAwakenMythicPlus" then return rawget(self, "AutoAwakenAll") end
@@ -175,6 +218,11 @@ local memory = env.QuickMatchMemory[memoryKey]
 Bot.Memory = memory
 env.QuickMatchAuto = Bot
 local alive, connections, session = true, {}, nil
+local ranked = {state = "off", retryAt = 0, returnAt = 0}
+if Ranked and type(Ranked.arrivedForMatch) == "function" then
+    local ok, value = pcall(Ranked.arrivedForMatch)
+    ranked.arena = ok and value == true
+end
 local originalSample, originalBind = Input.sample, Online.bind
 local sampleWrapper, bindWrapper
 local lastManual, lastScan, lastQueue = -100, -100, -100
@@ -503,13 +551,13 @@ function logger:start(id)
     self.stats = {samples = 0, inputs = {}, damageTaken = 0, damageDealt = 0,
         selfHpCost = 0, opponentSelfHpCost = 0, combatDamageTaken = 0, combatDamageDealt = 0,
         movesWithHit = 0, movesBlocked = 0, observedNoHit = 0, ultimateStarts = 0, outcome = "unknown", rounds = {},
-        opponentCPU = opponentCPU, opponentControlSamples = {}}
+        opponentCPU = opponentCPU, opponentControlSamples = {}, matchMode = ranked.arena and "ranked" or "quick"}
     self.roundSeen = {}; self.roundNumber = nil
     self.roundBaseTaken, self.roundBaseDealt = 0, 0
     self.roundBaseSelfCost, self.roundBaseOpponentCost = 0, 0
     Bot.LogFile = self.path; Bot.LogStatus = "recording"
     self:line("match_start", {version = Bot.Version, matchId = self.id, opponentId = opponentId, opponentCPU = opponentCPU,
-        slot = self.slot, sequence = self.sequence})
+        slot = self.slot, sequence = self.sequence, matchMode = self.stats.matchMode})
     self:flush(true)
 end
 local function estimatedHpCost(actor, beforeHp, beforeLifeLost, beforeSeq, beforeKey, drop)
@@ -747,6 +795,7 @@ local function moveInfo(sim, me, id, key)
                 local projectile = proj(k.hit.shot)
                 if not activeSeen and type(projectile) == "table" and not projectile.beam then firstProjectileSpeed = tonumber(projectile.speed) or 0 end
                 if not activeSeen and type(projectile) == "table" and projectile.unblockable then openingBeatsGuard = true end
+                if not activeSeen and type(projectile) == "table" then entry.shotNoStun = projectile.shotNoStun == true end
             end
             for _, fx in pairs(k.fx or {}) do
                 local pulse = fx[1] == "pulse" and type(fx[2]) == "table" and not fx[2].statusOnly
@@ -825,7 +874,7 @@ local function moveInfo(sim, me, id, key)
         targetTeleport = entry.targetTeleport, approachSpeed = entry.approachSpeed,
         armoredApproach = entry.armoredApproach, ranged = ranged, groundDamage = entry.groundDamage,
         needsTarget = entry.needsTarget,
-        shot = entry.shot,
+        shot = entry.shot, shotNoStun = entry.shotNoStun,
         openingBeatsGuard = entry.openingBeatsGuard,
         openingPulseRadius = entry.openingPulseRadius,
         firstActiveDuration = entry.firstActiveDuration, firstActiveProtected = entry.firstActiveProtected,
@@ -992,16 +1041,18 @@ local function threat(sim, me)
             local dist = math.abs(foe.x - me.x)
             local range = move.range or {0, 4}
             local closing = math.max(0, ((foe.vx or 0) - (me.vx or 0)) * (me.x >= foe.x and 1 or -1))
-            local targetWarp, remoteStrike = false, false
+            local targetWarp, remoteStrike, ultimatePulse = false, false, false
             for i = foe.key or 1, #move.keys do
                 for _, fx in ipairs(move.keys[i].fx or {}) do
                     if fx[1] == "teleport" and (fx[2] == "around" or fx[2] == "behind" or fx[2] == "through") then targetWarp = true end
                     if fx[1] == "strike" and type(fx[2]) == "table" and fx[2].ignoreDist then remoteStrike = true end
+                    if move.ultimate and fx[1] == "pulse" and i > (foe.key or 1) and type(fx[2]) == "table"
+                        and not fx[2].statusOnly and (tonumber(fx[2].dmg) or 0) > 0 then ultimatePulse = true end
                 end
             end
             local attackX, relocated = foe.x, false
             local nearby = targetWarp or (dist <= (range[2] or 4) + 1.4 + closing * 0.35 and math.abs(foe.y - me.y) < 4)
-            if nearby or remoteStrike then
+            if nearby or remoteStrike or ultimatePulse then
                 for i = foe.key or 1, #move.keys do
                     local k = move.keys[i]
                     local active, ranged, flight = k.hit or k.grab or k.needsGrab, false, 0
@@ -1038,6 +1089,13 @@ local function threat(sim, me)
                             local h = type(fx[2]) == "table" and fx[2] or {}
                             cannotBlock = cannotBlock or h.grab or h.unblockable
                                 or (fx[1] == "whip" and h.unblockable ~= false)
+                        elseif ultimatePulse and fx[1] == "pulse" and i > (foe.key or 1) and type(fx[2]) == "table" then
+                            local hit = fx[2]
+                            local radius = tonumber(hit.r) or 4
+                            if not hit.statusOnly and (tonumber(hit.dmg) or 0) > 0
+                                and (me.x - attackX) ^ 2 + (me.y - foe.y) ^ 2 <= radius ^ 2 then
+                                consider(eta, false, hit.unblockable or hit.grab, attackX >= me.x and 1 or -1, "ultimate pulse")
+                            end
                         elseif nearby and (fx[1] == "sprout" or fx[1] == "zone") and type(fx[2]) == "table" then
                             local z = fx[2]
                             if type(z.hit) == "table" then
@@ -1132,6 +1190,13 @@ local function closeDashReach(me, foe, dir, lead, sim)
         1.2 * (me.spd or 0)) * (sim and type(sim._dashFinish) == "function" and 1.2 or 1)
     local closing = speed - (foe.vx or 0) * dir
     return closing > 0 and math.max(0, gap - reach) / closing <= math.min(0.16, duration * 0.7)
+end
+local function dashRechargeLength(sim, me)
+    if type(sim._dashCdLen) == "function" then
+        local ok, value = pcall(sim._dashCdLen, sim, me)
+        if ok and type(value) == "number" and value > 0 then return value end
+    end
+    return tonumber(me.dashCdLen) or 2
 end
 local function dashBudget(me, t)
     local charges = math.max(0, math.floor(tonumber(me.dashN) or 0))
@@ -1619,6 +1684,7 @@ local function decide(manual)
         local startup = basicInfo and basicInfo.startup or 0.06
         local tempo = basicDef and basicDef.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
         local basicHorizon = lead + startup * tempo
+        local shotWithoutStun = basicInfo and basicInfo.shotNoStun
         local futureDx = dx + (foe.vx or 0) * basicHorizon - (me.vx or 0) * lead
         local safeReach = math.max(0.5, math.min(basicReach - 0.1,
             basicInfo and basicInfo.shot and basicInfo.hi - 0.1 or Bot.MaxBasicRange))
@@ -1644,7 +1710,8 @@ local function decide(manual)
             and (freshChain or neutralPress) then
             out.light = true; nextLight = now + math.max(0.09, lead + 0.03)
             lastLightSeq = me.moveSeq
-            if bestPriority <= 1 and bestKey ~= "ult" and bestScore < 9 and basicHorizon + 1 / 60 < recoveryWindow
+            if not (shotWithoutStun and bestKey) and bestPriority <= 1 and bestKey ~= "ult" and bestScore < 9
+                and basicHorizon + 1 / 60 < recoveryWindow
                 and (not bestPunish or basicHorizon < bestPunish) then
                 bestKey = nil
                 Bot.Snapshot.punishKey = "J"
@@ -1779,7 +1846,7 @@ local function decide(manual)
         pendingDash = {me = me, at = combatClock, untilT = combatClock + lead + 0.3,
             previousAt = me.dashAt or -100, before = tonumber(me.dashN) or 0}
         if closeDash or out.x == dir then
-            nextOffensiveDash = combatClock + math.max(Bot.OffensiveDashGap, tonumber(me.dashCdLen) or 2)
+            nextOffensiveDash = combatClock + math.max(Bot.OffensiveDashGap, dashRechargeLength(sim, me))
         end
     end
     if closeDash and out.dash and out.x == dir then
@@ -1976,7 +2043,7 @@ local function observeOpponent(info)
         if logger.active and logger.stats then logger.stats.opponentCPU = opponentCPU end
     end
     if type(opp) == "table" and opp.cpu ~= true and tonumber(opp.id) and tonumber(opp.id) > 0 then opponentId = tonumber(opp.id) end
-    if Bot.Enabled and Bot.AvoidLostOpponents and opponentId and memory.lost[tostring(opponentId)] then
+    if Bot.Enabled and not ranked.arena and Bot.AvoidLostOpponents and opponentId and memory.lost[tostring(opponentId)] then
         if not blockedMatch then
             blockedMatch = true; dealGeneration = dealGeneration + 1
             skipState = {id = matchId, since = os.clock(), tries = 0, retryAt = 0}
@@ -2083,6 +2150,61 @@ local function on(event, callback)
     slot.callback = wrapper; ownedOnlineSlots[event] = wrapper
 end
 on("queue", function(value) queued = value == true; if not queued then queueRequested = false end end)
+if Ranked and type(Ranked.on) == "function" then
+    memory.rankedDispatch = memory.rankedDispatch or setmetatable({}, {__mode = "k"})
+    local slots = memory.rankedDispatch[Ranked] or {}
+    memory.rankedDispatch[Ranked] = slots
+    ranked.handlers = slots
+    local function onRanked(event, callback)
+        if not slots[event] then
+            local slot = {}
+            slots[event] = slot
+            Ranked.on(event, function(info) if slot.callback then slot.callback(info) end end)
+        end
+        slots[event].callback = function(info) if alive then callback(info) end end
+    end
+    onRanked("q", function(info)
+        if type(info) ~= "table" then return end
+        if info.state == "off" then
+            ranked.state = "off"
+            ranked.retryAt = os.clock() + math.max(8, tonumber(info.seconds) or 0)
+            if Bot.MatchMode == "ranked" and not ranked.arena then
+                status("Ranked queue idle" .. (type(info.reason) == "string" and " / " .. info.reason or ""))
+            end
+        elseif ranked.state ~= "cancelling" and (info.state == "searching" or info.state == "found"
+            or info.state == "retrying" or info.state == "teleporting") then
+            ranked.state = info.state
+            if info.state == "teleporting" then Bot.SaveSettings() end
+            if Bot.MatchMode == "ranked" then status("Ranked / " .. info.state) end
+        end
+    end)
+    onRanked("arena", function(info)
+        if type(info) ~= "table" then return end
+        if info.phase == "waiting" or info.phase == "live" then
+            ranked.arena, ranked.state, ranked.finishedAt, ranked.returnAt = true, "off", nil, 0
+            if info.phase == "waiting" then status("Ranked arena / waiting for opponent") end
+        elseif info.phase == "over" then
+            ranked.arena, ranked.finishedAt = true, ranked.finishedAt or os.clock()
+        end
+    end)
+    onRanked("cancelled", function()
+        ranked.state = "off"
+        if ranked.arena then ranked.finishedAt = ranked.finishedAt or os.clock() end
+    end)
+    onRanked("return", function(info)
+        if type(info) == "table" and info.mode == "local" then
+            if not ranked.arena or (info.matchId and matchId and info.matchId ~= matchId) then return end
+            logger:finish("ranked local return")
+            retireMatch(matchId, session, true)
+            busy, queued, queueRequested, ending, drafting = false, false, false, false, false
+            matchId, matchNumber, lastDeal, session = nil, nil, nil, nil
+            dealGeneration = dealGeneration + 1
+            resetCombat()
+            ranked.arena, ranked.finishedAt, ranked.state = false, nil, "off"
+            ranked.retryAt = os.clock() + 8
+        end
+    end)
+end
 on("lobby", function() lobbyUpdatedAt = os.clock() end)
 on("away", function(count, limit)
     Bot.AwayWarnings = tonumber(count) or 1; Bot.AwayLimit = tonumber(limit) or 3
@@ -2091,6 +2213,9 @@ on("away", function(count, limit)
 end)
 on("match", function(info)
     if retiredMatches[eventMatchId(info)] then return end
+    if type(info) == "table" and info.ranked == true then
+        ranked.arena, ranked.finishedAt, ranked.state, ranked.returnAt = true, nil, "off", 0
+    end
     if eventMatchId(info) ~= nil and eventMatchId(info) == matchId and busy then
         observeOpponent(info); return
     end
@@ -2182,7 +2307,8 @@ on("closed", function(id)
 end)
 on("rematch", function(mine, theirs)
     if not mine and not theirs then rematchAnswered = false; rematchWaitUntil = 0; rematchAutoAccepted = false; return end
-    if Bot.Enabled and Bot.AutoJoin and not rematchAnswered and type(Online.rematch) == "function" then
+    if Bot.Enabled and Bot.AutoJoin and Bot.MatchMode == "quick" and not ranked.arena
+        and not rematchAnswered and type(Online.rematch) == "function" then
         if Bot.AcceptRematches and theirs then
             rematchAutoAccepted = true
             rematchAnswered = true; rematchWaitUntil = os.clock() + 15
@@ -2194,6 +2320,7 @@ on("rematch", function(mine, theirs)
 end)
 on("matchOver", function(info)
     if staleEvent(info) then return end
+    if ranked.arena then ranked.finishedAt = ranked.finishedAt or os.clock() end
     recordOutcome(info)
     logger:finish("results")
     dealGeneration = dealGeneration + 1
@@ -2502,6 +2629,7 @@ local function popupsTick()
     return blocking
 end
 local function resultsTick()
+    if ranked.arena then return ranked.finishedAt ~= nil end
     local button = resultButton()
     if not button then
         if resultPending then
@@ -2528,6 +2656,10 @@ local function resultsTick()
         status("Auto join off; choose next match manually")
         return true
     end
+    if Bot.MatchMode == "ranked" and button.Name ~= "Btn_lobby" then
+        status("Choose Lobby to switch to Ranked")
+        return true
+    end
     if os.clock() < rematchWaitUntil then status("Rematch accepted; waiting for draft"); return true end
     if not resultSeen then resultSeen = os.clock() end
     if os.clock() - resultSeen >= 2 and os.clock() - resultAttempt >= 3 then
@@ -2542,7 +2674,7 @@ gui.Name = "QuickMatchAutoStatus"
 gui.ResetOnSpawn = false
 gui.DisplayOrder = 100000
 local label = Instance.new("TextLabel")
-label.Size = UDim2.fromOffset(470, 96)
+label.Size = UDim2.fromOffset(470, 110)
 label.Position = UDim2.fromOffset(12, 80)
 label.BackgroundColor3 = Color3.fromRGB(21, 25, 35)
 label.BackgroundTransparency = 0.12
@@ -2552,8 +2684,68 @@ label.TextSize = 14
 label.TextWrapped = true
 label.Parent = gui
 gui.Parent = playerGui
+function ranked.cancel()
+    if not Ranked or ranked.state == "off" or ranked.state == "cancelling" or ranked.arena then return end
+    local ok, err = pcall(Ranked.queue, false)
+    if ok then ranked.state, ranked.requestAt = "cancelling", os.clock()
+    else Bot.LastError = tostring(err) end
+end
+local function cancelMatchmaking()
+    if queued or queueRequested then
+        local ok, err = pcall(Online.queue, false, "classic")
+        if not ok then Bot.LastError = tostring(err) end
+        queued, queueRequested = false, false
+    end
+    ranked.cancel()
+end
+function Bot.SetMatchMode(mode)
+    if mode ~= "quick" and mode ~= "ranked" then return false end
+    if Bot.MatchMode ~= mode then
+        cancelMatchmaking()
+        Bot.MatchMode = mode
+        resultSeen = nil
+        if rematchAutoAccepted then
+            rematchAutoAccepted, rematchAnswered, rematchWaitUntil = false, false, 0
+            pcall(Online.rematch, false)
+        end
+    end
+    local saved = Bot.SaveSettings()
+    status((mode == "ranked" and "Ranked selected" or "Quick Match selected") .. (saved and "" or " / settings storage unavailable"))
+    return saved
+end
+function ranked.tick(blocked)
+    if ranked.arena then
+        if Bot.AutoJoin and Ranked and ranked.finishedAt and os.clock() >= ranked.finishedAt + 3
+            and os.clock() >= ranked.returnAt and Bot.SaveSettings() then
+            ranked.returnAt = os.clock() + 12
+            local ok, err = pcall(Ranked.back)
+            if ok then status("Returning from Ranked") else Bot.LastError = tostring(err) end
+        end
+        return true
+    end
+    if (ranked.state == "request" or ranked.state == "cancelling") and os.clock() - ranked.requestAt >= 12 then
+        ranked.state = "off"
+    end
+    if Bot.MatchMode ~= "ranked" then return ranked.state ~= "off" end
+    if not Bot.AutoJoin or blocked or ranked.state ~= "off" or os.clock() < ranked.retryAt then return true end
+    ranked.retryAt = os.clock() + 8
+    if not Ranked or not ranked.handlers or not RankConfig or RankConfig.ENABLED ~= true or (Flags and Flags.MATCH_V2 ~= true) then
+        status("Ranked unavailable in this game build")
+    elseif type(Ranked.connected) ~= "function" or not Ranked.connected() then
+        status("Waiting for Ranked connection")
+    elseif not Bot.SaveSettings() then
+        status("Ranked waiting / settings storage unavailable")
+    else
+        ranked.state, ranked.requestAt = "request", os.clock()
+        local ok, err = pcall(Ranked.queue, true)
+        if ok then status("Joining Ranked")
+        else ranked.state = "off"; Bot.LastError = tostring(err); status("Ranked queue error") end
+    end
+    return true
+end
 function Bot.Stop()
     if not alive then return end
+    Bot.SaveSettings()
     alive = false; Bot.Enabled = false; dealGeneration = dealGeneration + 1
     local cancelQueue = (queued or queueRequested) and Bot.AutoJoin
     queued, queueRequested = false, false; resetCombat()
@@ -2571,9 +2763,11 @@ function Bot.Stop()
             local slot = onlineSlots[event]
             if slot and slot.callback == wrapper then slot.callback = nil end
         end
+        for _, slot in pairs(ranked.handlers or {}) do slot.callback = nil end
     end)
     for _, conn in ipairs(connections) do cleanup("disconnect", function() conn:Disconnect() end) end
     if cancelQueue then cleanup("queue cancel", function() Online.queue(false, "classic") end) end
+    cleanup("ranked cancel", ranked.cancel)
     cleanup("UI destroy", function() gui:Destroy() end)
     status("Unloaded")
 end
@@ -2598,16 +2792,14 @@ connections[#connections + 1] = UIS.InputBegan:Connect(function(input, processed
     if input.KeyCode == Enum.KeyCode.F6 then
         Bot.Enabled = not Bot.Enabled
         dealGeneration = dealGeneration + 1
-        if not Bot.Enabled and (queued or queueRequested) and Bot.AutoJoin then
-            Online.queue(false, "classic"); queued = false; queueRequested = false
-        end
+        if not Bot.Enabled and Bot.AutoJoin then cancelMatchmaking() end
+        Bot.SaveSettings()
         if Bot.Enabled then observeOpponent({}) end
         if Bot.Enabled and drafting and lastDeal then deal(lastDeal) end
     elseif input.KeyCode == Enum.KeyCode.F7 then
         Bot.AutoJoin = not Bot.AutoJoin
-        if not Bot.AutoJoin and (queued or queueRequested) then
-            Online.queue(false, "classic"); queued = false; queueRequested = false
-        end
+        if not Bot.AutoJoin then cancelMatchmaking() end
+        Bot.SaveSettings()
         if not Bot.AutoJoin and rematchAutoAccepted then
             rematchAutoAccepted = false; rematchAnswered = false; rematchWaitUntil = 0
             local ok, err = pcall(Online.rematch, false)
@@ -2616,12 +2808,19 @@ connections[#connections + 1] = UIS.InputBegan:Connect(function(input, processed
         if not Bot.AutoJoin then resultSeen = nil end
         status(Bot.AutoJoin and "Automatic matchmaking enabled" or "Auto join off; join matches manually")
     elseif input.KeyCode == Enum.KeyCode.F8 then Bot.Stop()
+    elseif input.KeyCode == Enum.KeyCode.F9 then Bot.SetMatchMode(Bot.MatchMode == "ranked" and "quick" or "ranked")
     elseif not processed and combatInput(input) then
         lastManual = os.clock()
     end
 end)
+if player.OnTeleport then
+    connections[#connections + 1] = player.OnTeleport:Connect(function()
+        if alive then Bot.SaveSettings(); pcall(logger.flush, logger, true) end
+    end)
+end
 task.spawn(function()
     while alive do
+        Bot.SaveSettings()
         if Bot.Enabled then
             local okAwaken, awakenError = pcall(awakenTick)
             if not okAwaken then
@@ -2643,9 +2842,11 @@ task.spawn(function()
                 inResults = true
             end
             local current = skipTick(discover())
-            current = lobbyRecoveryTick(current, inPopup or inResults)
+            if not ranked.arena then current = lobbyRecoveryTick(current, inPopup or inResults) end
             if current and current.r.sim.phase ~= "done" then busy = true end
-            if Bot.AutoJoin and not inPopup and not inResults and not busy and not queued and os.clock() - lastQueue >= 8 then
+            local blocked = inPopup or inResults or busy or queued or queueRequested
+            local handledRanked = ranked.tick(blocked)
+            if not handledRanked and Bot.AutoJoin and not inPopup and not inResults and not busy and not queued and os.clock() - lastQueue >= 8 then
                 lastQueue = os.clock()
                 queueRequested = true
                 local ok, err = pcall(function()
@@ -2660,12 +2861,13 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.27 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.28 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
+            .. "\nF9 mode: " .. (Bot.MatchMode == "ranked" and "Ranked" or "Quick Match")
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
             .. (Bot.AwayWarnings > 0 and ("\nAway: " .. Bot.AwayWarnings .. "/" .. Bot.AwayLimit .. " / keep Roblox focused") or "")
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.27] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.28] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload; F9 mode.")
