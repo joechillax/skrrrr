@@ -84,6 +84,7 @@ local Profile = load(scripts, "ProfileClient", false)
 local Rewards = load(Shared, "Rewards", false)
 local Gems = load(Shared, "Gems", false)
 local Fighters = load(Shared, "Fighters", false)
+local Combat = load(Shared, "Combat", false)
 local CombatRules = load(Shared, "CombatRules", false)
 local GroundRules = CombatRules and CombatRules.C or {}
 local Http = game:GetService("HttpService")
@@ -125,7 +126,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.22-defense-timing",
+    Version = "4.23-arena-ultimates",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -734,6 +735,7 @@ local function moveInfo(sim, me, id, key)
         local startup, duration, activeSeen, targetTeleport, approachSpeed, armoredApproach = 0, 0, false, false, 0, false
         local groundDamage, firstActiveDuration, approachTo, firstProjectileSpeed, firstHitDelay, firstDirectHit, hasShot = false, 0, nil, 0, 0, nil, false
         local openingBeatsGuard = def.unblockable == true
+        local openingPulseRadius
         local jumpsBeforeHit = false
         for _, k in ipairs(def.keys or {}) do
             local active = k.hit or k.grab
@@ -751,6 +753,9 @@ local function moveInfo(sim, me, id, key)
                     and (tonumber(fx[2].dmg) or 0) > 0
                 if fx[1] == "proj" or fx[1] == "strike" or fx[1] == "whip" or fx[1] == "release" or pulse then active = true end
                 if pulse and not activeSeen and (fx[2].guardBreak or fx[2].unblockable) then openingBeatsGuard = true end
+                if pulse and not activeSeen then
+                    openingPulseRadius = math.max(openingPulseRadius or 0, tonumber(fx[2].r) or 4)
+                end
                 if fx[1] == "proj" or fx[1] == "strike" or fx[1] == "whip" then groundDamage = true end
                 if (fx[1] == "zone" or fx[1] == "sprout") and type(fx[2]) == "table" and fx[2].hit then
                     active = true
@@ -792,6 +797,7 @@ local function moveInfo(sim, me, id, key)
         entry.firstDirectHit = firstDirectHit
         entry.shot, entry.projectileReach = hasShot, projectileReach
         entry.openingBeatsGuard = openingBeatsGuard
+        entry.openingPulseRadius = openingPulseRadius
         entry.jumpsBeforeHit = jumpsBeforeHit
         cache[cacheKey] = entry
     end
@@ -811,11 +817,18 @@ local function moveInfo(sim, me, id, key)
         needsTarget = entry.needsTarget,
         shot = entry.shot,
         openingBeatsGuard = entry.openingBeatsGuard,
+        openingPulseRadius = entry.openingPulseRadius,
         firstActiveDuration = entry.firstActiveDuration, approachTo = entry.approachTo,
         firstDirectHit = entry.firstDirectHit,
         firstProjectileSpeed = entry.firstProjectileSpeed, firstHitDelay = entry.firstHitDelay}
 end
-local function ultimateOpportunity(sim, me, foe, id, info, lead, eta, foeCounter)
+local function arenaWideUltimate(sim, id, info)
+    if Combat and Combat.ULT_ANYWHERE and Combat.ULT_ANYWHERE[id] then return true end
+    local halfW = tonumber(sim.halfW)
+    return halfW and info.openingPulseRadius and info.openingPulseRadius >= 2 * halfW
+        and info.def.range and (tonumber(info.def.range[2]) or 0) >= 2 * halfW
+end
+local function ultimateOpportunity(sim, me, foe, id, info, lead, eta, foeCounter, arenaWide)
     if not hittable(sim, foe) or foe.state == "held" then return false, "target protected" end
     if foeCounter then return false, "opponent counter" end
     if foe.state == "block" and not info.openingBeatsGuard then return false, "opponent guarding" end
@@ -828,17 +841,25 @@ local function ultimateOpportunity(sim, me, foe, id, info, lead, eta, foeCounter
     local startup = info.startup * tempo
     local opening = info.def.keys and info.def.keys[1]
     local stopsOnCast = opening and opening.vel and opening.vel[1] == 0 and not opening.keepVel
-    local function predictedReach(after)
+    local function predictedReach(after, impact)
         local own, target = copyFields(me), copyFields(foe)
         local drift = stopsOnCast and math.min(after, lead) or after
         own.x, own.y = me.x + (me.vx or 0) * drift, me.y + (me.vy or 0) * drift
         target.x, target.y = foe.x + (foe.vx or 0) * after, foe.y + (foe.vy or 0) * after
+        local halfW = tonumber(sim.halfW)
+        if halfW and halfW > 0 then
+            own.x = math.max(-halfW, math.min(halfW, own.x))
+            target.x = math.max(-halfW, math.min(halfW, target.x))
+        end
+        if impact and arenaWide and info.openingPulseRadius then
+            return (target.x - own.x) ^ 2 + (target.y - own.y) ^ 2 <= info.openingPulseRadius ^ 2
+        end
         local success, value = pcall(sim._ultReach, sim, own, id, target)
         return success and value == "in"
     end
     -- A protected cinematic that stops the caster invalidates the current movement forecast.
     local predictionWindow = info.protectedStartup and stopsOnCast and math.min(startup, 0.35) or startup
-    if not predictedReach(lead) or not predictedReach(lead + predictionWindow) then
+    if not predictedReach(lead) or not predictedReach(lead + predictionWindow, true) then
         return false, "target leaving cast range", reach
     end
     local confirmed = foe.state == "stun" and (foe.stunT or 0) >= lead + startup + 1 / 60
@@ -1126,6 +1147,18 @@ local function decide(manual)
     local dx = foe.x - me.x
     local dir = dx >= 0 and 1 or -1
     local distance = math.abs(dx)
+    local nc = current.nc
+    local inputFrame = type(sim.frame) == "number" and sim.frame + (tonumber(nc.delay) or 6)
+    local ownKnown = nc.known and nc.known[nc.side or current.side]
+    if inputFrame and type(ownKnown) == "number" and inputFrame <= ownKnown then
+        -- Netplay can only carry presses across these frames. Re-evaluate before
+        -- committing an action at the first frame that can accept fresh input.
+        Bot.Snapshot = {action = "input frame already filled", selfState = me.state, foeState = foe.state,
+            distance = distance, threatETA = -1, inputFrame = inputFrame, ownKnown = ownKnown,
+            ultimate = {ready = false, reason = "input frame already filled"}}
+        status("Waiting for fresh input frame")
+        return Bot.Movement == "manual" and manual or out
+    end
     local targetHittable = hittable(sim, foe)
     local trapped = lockedState(me)
     if previousSelf == me and previousHp and me.hp < previousHp and trapped then
@@ -1268,6 +1301,7 @@ local function decide(manual)
     end
     local bestKey, bestScore, desired = nil, 0, 1.8
     local bestPriority, ultimateGoal = 0, nil
+    local arenaUlt = false
     local hasRangedKit, rangedOpportunity = false, false
     local spacingReason = "melee"
     local groundOptions = {}
@@ -1303,7 +1337,13 @@ local function decide(manual)
         end
         local ready, readyReason, comboHold = canUse(sim, me, key)
         if key == "ult" and combatClock < nextUltimate then ready, readyReason = false, "awaiting ultimate result" end
-        if key == "ult" then Bot.Snapshot.ultimate = {ready = ready, reason = readyReason or "checking opportunity"} end
+        if key == "ult" then
+            Bot.Snapshot.ultimate = {ready = ready, reason = readyReason or "checking opportunity", move = slots.ult}
+            if Bot.PrioritizeUltimate and (ready or readyReason == "awaiting ultimate result") then
+                local info = moveInfo(sim, me, slots.ult, key)
+                arenaUlt = info and arenaWideUltimate(sim, slots.ult, info) or false
+            end
+        end
         if key ~= reservedKey and ready then
             Bot.Snapshot.skillReadiness[key] = readyReason or "ready"
             local info = moveInfo(sim, me, slots[key], key)
@@ -1378,8 +1418,9 @@ local function decide(manual)
                         and (armoredPunish or (foeTeleportETA < commitment) or ((info.duration or 0) > 0.65 and distance < walkReach))) then score = 0 end
                 end
                 if key == "ult" then
-                    local eligible, reason, reach = ultimateOpportunity(sim, me, foe, slots[key], info, lead, eta, foeCounter)
-                    Bot.Snapshot.ultimate = {ready = true, eligible = eligible and score > 0, reason = reason, reach = reach}
+                    local eligible, reason, reach = ultimateOpportunity(sim, me, foe, slots[key], info, lead, eta, foeCounter, arenaUlt)
+                    Bot.Snapshot.ultimate = {ready = true, eligible = eligible and score > 0, reason = reason,
+                        reach = reach, move = slots.ult, arenaWide = arenaUlt}
                     if eligible and score <= 0 then Bot.Snapshot.ultimate.reason = "waiting for a safe skill window" end
                     if not eligible then score = 0 end
                     if Bot.PrioritizeUltimate and reason == "outside cast range" and reach == "approach"
@@ -1427,6 +1468,12 @@ local function decide(manual)
     Bot.Snapshot.foeTeleportReady = foeTeleportETA < math.huge
     Bot.Snapshot.foeArmoredApproachReady = #foeApproaches > 0
     local closeDash, dashFollow = false, false
+    local holdArenaRange = arenaUlt and not danger and not foeCounter and distance > 3
+        and (not bestKey or bestKey == "ult") and (me.state == "neutral" or me.state == "block")
+    if holdArenaRange then
+        local ok, reach = pcall(sim._ultReach, sim, me, slots.ult, foe)
+        holdArenaRange = ok and reach == "in"
+    end
     local groundChoice = bestKey and groundOptions[bestKey]
     if groundChoice then
         local info = moveInfo(sim, me, slots[bestKey], bestKey)
@@ -1453,7 +1500,12 @@ local function decide(manual)
         elseif distance < desired - 0.45 and projectedGap < desired - 0.15 then out.x = -dir end
         if leaveCorner and distance > 2.8 and not attackPending then out.x = centerDir end
         if dashOpener and not danger then out.x = dir end
-        if me.state == "neutral" and me.grounded and foe.y - me.y > 3 and now >= nextJump then
+        if holdArenaRange then
+            out.x = 0
+            Bot.Snapshot.spacingDesired = distance
+            Bot.Snapshot.spacingReason = "hold ultimate range"
+        end
+        if not holdArenaRange and me.state == "neutral" and me.grounded and foe.y - me.y > 3 and now >= nextJump then
             out.jump = true; nextJump = now + 0.65
         end
         if me.state == "wall" and now >= nextJump then
@@ -1511,7 +1563,8 @@ local function decide(manual)
         Bot.Snapshot.recoveryLeft = recoveryLeft
         local bestInfo = bestKey and moveInfo(sim, me, slots[bestKey], bestKey)
         local meleeChoice = not bestKey or (bestInfo and not bestInfo.ranged and bestInfo.cat == "punch" and bestScore < 5)
-        if Bot.CloseDashOpener and not attackPending and not dashOpener and not danger and not foeCounter and not defensePending
+        if Bot.CloseDashOpener and not holdArenaRange and not attackPending and not dashOpener
+            and not danger and not foeCounter and not defensePending
             and targetHittable and me.state == "neutral" and me.grounded and foe.grounded
             and foe.state == "neutral" and (foe.dashT or 0) <= 0
             and (me.dashT or 0) <= 0 and me.facing == dir
@@ -1522,7 +1575,7 @@ local function decide(manual)
             out.dash = true; out.x = dir; closeDash = true
         end
         -- Chase only when no attack is ready to land; preserve an escape charge.
-        if targetHittable and not danger and not foeCounter and me.state == "neutral"
+        if targetHittable and not danger and not foeCounter and not holdArenaRange and me.state == "neutral"
             and distance > math.max(6, desired + 3) and distance <= Bot.MaxApproachDashDistance and now >= nextDodge
             and offensiveDashReady and not attackPending
             and (me.grounded or (me.airDashes or 0) < 1) and bestKey == nil and not out.light
@@ -1614,7 +1667,9 @@ local function decide(manual)
         end
     elseif bestKey and out[bestKey] then
         -- Full-control skills can use facing for aim; don't cast while facing away.
-        if (bestScore < 9 or bestKey == "ult") and Bot.Movement ~= "manual" then out.x = dir end
+        if (bestScore < 9 or bestKey == "ult") and Bot.Movement ~= "manual" then
+            out.x = bestKey == "ult" and arenaUlt and 0 or dir
+        end
         if bestKey == "ult" then nextUltimate = combatClock + math.max(0.35, lead + 0.2) end
         nextSkill = now + Bot.SkillGap
     end
@@ -2507,7 +2562,7 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.22 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.23 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
@@ -2515,4 +2570,4 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.22] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.23] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
