@@ -132,7 +132,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.29-ranked-response",
+    Version = "4.30-rush-timing",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -735,6 +735,13 @@ local function guardReady(sim, me, foe, kind, horizon)
     return ok and type(waitTime) == "number" and waitTime <= horizon
 end
 local infoCache = setmetatable({}, {__mode = "k"})
+local function contactLunge(key)
+    local speed = key.keepVel and key.vel and tonumber(key.vel[1])
+    if speed and speed >= 10 and type(key.untilClose) == "number" and key.untilClose >= 0
+        and key.hit and not key.hit.shot then
+        return speed, tonumber(key.maxT) or 0.6
+    end
+end
 local function moveRemaining(me)
     if me.state ~= "move" or not me.move then return 0 end
     local tempo = me.move.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
@@ -839,6 +846,8 @@ local function moveInfo(sim, me, id, key)
             if active and not activeSeen then
                 firstActiveDuration = tonumber(k.dur) or 0.05
                 entry.firstActiveProtected = k.invuln == true
+                local speed, duration = contactLunge(k)
+                if k.invuln and speed then entry.protectedLunge = {speed = speed, duration = duration} end
             end
             if active then activeSeen = true; entry.lastActiveKey = index end
             if not activeSeen then startup = startup + time end
@@ -873,6 +882,7 @@ local function moveInfo(sim, me, id, key)
         stopsOnCast = opening and opening.vel and opening.vel[1] == 0 and not opening.keepVel,
         targetTeleport = entry.targetTeleport, approachSpeed = entry.approachSpeed,
         armoredApproach = entry.armoredApproach, ranged = ranged, groundDamage = entry.groundDamage,
+        protectedLunge = entry.protectedLunge,
         needsTarget = entry.needsTarget,
         shot = entry.shot, shotNoStun = entry.shotNoStun,
         openingBeatsGuard = entry.openingBeatsGuard,
@@ -1048,8 +1058,9 @@ local function threat(sim, me)
             local dist = math.abs(foe.x - me.x)
             local range = move.range or {0, 4}
             local closing = math.max(0, ((foe.vx or 0) - (me.vx or 0)) * (me.x >= foe.x and 1 or -1))
-            local targetWarp, remoteStrike, ultimatePulse = false, false, false
+            local targetWarp, remoteStrike, ultimatePulse, lunging = false, false, false, false
             for i = foe.key or 1, #move.keys do
+                if contactLunge(move.keys[i]) then lunging = true end
                 for _, fx in ipairs(move.keys[i].fx or {}) do
                     if fx[1] == "teleport" and (fx[2] == "around" or fx[2] == "behind" or fx[2] == "through") then targetWarp = true end
                     if fx[1] == "strike" and type(fx[2]) == "table" and fx[2].ignoreDist then remoteStrike = true end
@@ -1059,7 +1070,7 @@ local function threat(sim, me)
             end
             local attackX, relocated = foe.x, false
             local nearby = targetWarp or (dist <= (range[2] or 4) + 1.4 + closing * 0.35 and math.abs(foe.y - me.y) < 4)
-            if nearby or remoteStrike or ultimatePulse then
+            if nearby or remoteStrike or ultimatePulse or lunging then
                 for i = foe.key or 1, #move.keys do
                     local k = move.keys[i]
                     local active, ranged, flight = k.hit or k.grab or k.needsGrab, false, 0
@@ -1119,7 +1130,23 @@ local function threat(sim, me)
                             end
                         end
                     end
-                    if nearby and active then
+                    local lungeSpeed, lungeTime = contactLunge(k)
+                    if lungeSpeed and not k.needsGrab then
+                        local facing = foe.facing or 1
+                        local windup = math.max(0, eta)
+                        local inProgress = i == (foe.key or 1)
+                        local remaining = lungeTime - (inProgress and (foe.kt or 0) or 0)
+                        local drift = ((me.vx or 0) - (foe.vx or 0)) * facing * windup
+                        local gap = (me.x - foe.x) * facing + drift
+                        local speed = inProgress and (foe.vx or 0) * facing or lungeSpeed
+                        local closingSpeed = speed - (me.vx or 0) * facing
+                        local reach = math.max(tonumber(k.untilClose) or 0, (tonumber(k.hit.r) or 0.8) + 1)
+                        local contact = gap <= reach and 0 or (closingSpeed > 0 and (gap - reach) / closingSpeed or math.huge)
+                        if gap >= -0.5 and contact <= remaining and math.abs(me.y - foe.y) < 4 then
+                            consider(windup + contact, false, cannotBlock and true or false, -facing, "lunge contact")
+                        end
+                        break
+                    elseif nearby and active then
                         consider(eta + flight, ranged, cannotBlock and true or false,
                             attackX >= me.x and 1 or -1, relocated and "teleport attack" or "move")
                         break
@@ -1445,9 +1472,11 @@ local function decide(manual)
                 local tempo = info.def.fixedTime and 1 or tonumber(foe.def and foe.def.tempo) or 1
                 foeTeleportETA = math.min(foeTeleportETA, info.startup * tempo)
             end
-            if info and info.armoredApproach and canUse(sim, foe, key) then
+            local protectedLunge = info and info.protectedLunge
+            if info and (info.armoredApproach or (protectedLunge and lead >= 0.2)) and canUse(sim, foe, key) then
                 local tempo = info.def.fixedTime and 1 or tonumber(foe.def and foe.def.tempo) or 1
-                foeApproaches[#foeApproaches + 1] = {startup = info.startup * tempo, speed = info.approachSpeed}
+                foeApproaches[#foeApproaches + 1] = {startup = info.startup * tempo,
+                    speed = info.approachSpeed, protectedLunge = protectedLunge}
             end
             local opening = info and info.def.keys and info.def.keys[1]
             if distance <= 6 and foe.state == "block" and opening and opening.counter and (opening.onCounter or info.def.onCounter)
@@ -1601,8 +1630,16 @@ local function decide(manual)
                     end
                     local armoredPunish = false
                     for _, approach in ipairs(foeApproaches) do
-                        local reachTime = math.max(0, distance - 3) / math.max(1, approach.speed + (info.approachSpeed or 0))
-                        if math.max(approach.startup, reachTime) <= commitment then armoredPunish = true; break end
+                        local rush = approach.protectedLunge
+                        local reachTime = math.max(0, distance - 3) / math.max(1,
+                            (rush and rush.speed or approach.speed) + (info.approachSpeed or 0))
+                        if rush then
+                            if reachTime <= rush.duration and approach.startup + reachTime <= math.max(commitment, impact) then
+                                armoredPunish = true
+                                Bot.Snapshot.openingBlocked[key] = "protected lunge can punish"
+                                break
+                            end
+                        elseif math.max(approach.startup, reachTime) <= commitment then armoredPunish = true; break end
                     end
                     if eta <= horizon + 0.06 or (fullOpponent and (foe.state == "neutral" or foe.state == "block")
                         and (armoredPunish or (foeTeleportETA < commitment) or ((info.duration or 0) > 0.65 and distance < walkReach))) then score = 0 end
@@ -1835,7 +1872,8 @@ local function decide(manual)
     Bot.Snapshot.turnGuard = turnGuard and true or false
     local dashCoversStrike = not targetedStrike or (not targetedUltimate and eta >= lead and eta - lead < 0.14
         and (me.mvt == "blink" or (me.cls and me.cls.dashInv) or (me.def and me.def.dashInv)))
-    if imminent and not usingDefense and canCancel and not protectedSelf then
+    local lungeArrivesFirst = threatSource == "lunge contact" and eta < lead
+    if imminent and not lungeArrivesFirst and not usingDefense and canCancel and not protectedSelf then
         if now >= nextDodge and dashReady
             and dashCoversStrike
             and (me.grounded or (me.airDashes or 0) < (me.mvt == "swing" and 2 or 1)) then
@@ -2908,7 +2946,7 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.29 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.30 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nF9 mode: " .. (Bot.MatchMode == "ranked" and "Ranked" or "Quick Match")
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
@@ -2917,4 +2955,4 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.29] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload; F9 mode.")
+warn("[QuickMatchAuto v4.30] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload; F9 mode.")
