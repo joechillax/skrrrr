@@ -1,12 +1,12 @@
 -- Quick Match automation for the supplied 80007766855741 game export.
 -- Execute in the live game after the lobby loads. No external downloads.
 -- F6: pause/resume autoplay; F7: automatic matchmaking on/off; F8: unload.
--- Auto-unlocks owned Mythic+ Awakening with available gems (reserve defaults to 0).
+-- Auto-unlocks Awakening for every owned eligible fighter (gem reserve defaults to 0).
 -- This uses the game's networked input path, never edits simulated HP/cooldowns.
 
 local env = getgenv and getgenv() or _G
-local previousAutoJoin = env.QuickMatchAuto and env.QuickMatchAuto.AutoJoin
-if env.QuickMatchAuto and env.QuickMatchAuto.Stop then env.QuickMatchAuto.Stop() end
+local previousBot = env.QuickMatchAuto
+local previousAutoJoin = previousBot and previousBot.AutoJoin
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
@@ -107,7 +107,8 @@ local Bot = {
     AutoLogs = true,
     ClearOldVersionLogs = true,
     AutoClaimPlaytime = true,
-    AutoAwakenMythicPlus = true,
+    AutoAwakenAll = true,
+    PrioritizeUltimate = true,
     AwakenGemReserve = 0,
     AwakenStatus = "initializing",
     PredictBlock = true,
@@ -124,7 +125,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.18-combat-update",
+    Version = "4.19-ultimate-all-awaken",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -136,6 +137,33 @@ local Bot = {
     LiveOnlineFound = liveModules.OnlineClient ~= nil,
     ControlState = "unknown",
 }
+-- Keep script configuration/macros across replacement; runtime sessions and
+-- pending input are rebuilt. The old awakening option is an alias for the new
+-- all-owned scope, so existing enable/disable macros continue to work.
+if type(previousBot) == "table" then
+    for _, key in ipairs({"Movement", "HealBelow", "SkillGap", "ManualGrace", "RangedFallback", "ReserveDashCharges",
+        "ReserveDashFraction", "OffensiveDashGap", "MaxApproachDashDistance", "ReserveBreaker", "AvoidLostOpponents",
+        "AcceptRematches", "SkipPopups", "MaxBasicRange", "AutoLogs", "ClearOldVersionLogs", "AutoClaimPlaytime",
+        "AwakenGemReserve", "PredictBlock", "CloseDashOpener", "RecoveryGuard", "ProtectedSpacing", "DraftPriorities",
+        "MinGuardToBlock", "LogSlots", "LogMaxBytes", "LogInterval", "LobbyRecoveryDelay", "PrioritizeUltimate"}) do
+        if previousBot[key] ~= nil then Bot[key] = previousBot[key] end
+    end
+    if previousBot.Status ~= "Unloaded" and type(previousBot.Enabled) == "boolean" then Bot.Enabled = previousBot.Enabled end
+    local previousAwaken = previousBot.AutoAwakenAll
+    if previousAwaken == nil then previousAwaken = previousBot.AutoAwakenMythicPlus end
+    if type(previousAwaken) == "boolean" then Bot.AutoAwakenAll = previousAwaken end
+end
+setmetatable(Bot, {__index = function(self, key)
+    if key == "AutoAwakenMythicPlus" then return rawget(self, "AutoAwakenAll") end
+end, __newindex = function(self, key, value)
+    if key == "AutoAwakenMythicPlus" then rawset(self, "AutoAwakenAll", value)
+    else rawset(self, key, value) end
+end})
+-- Required modules are available before replacing the working instance.
+if previousBot and type(previousBot.Stop) == "function" then
+    local ok, err = pcall(previousBot.Stop)
+    if not ok then Bot.PreviousStopError = tostring(err); warn("[QuickMatchAuto] Previous cleanup: " .. tostring(err)) end
+end
 -- Survives script re-execution in this executor, not reconnects or teleports.
 if type(env.QuickMatchMemory) ~= "table" then env.QuickMatchMemory = {} end
 local memoryKey = tostring(game.PlaceId or "unknown")
@@ -150,6 +178,7 @@ local originalSample, originalBind = Input.sample, Online.bind
 local sampleWrapper, bindWrapper
 local lastManual, lastScan, lastQueue = -100, -100, -100
 local nextSkill, nextDodge, nextJump, nextSwitch, nextLight = 0, 0, 0, 0, 0
+local nextUltimate = 0
 local pendingJump, busy, queued, dealGeneration = nil, false, false, 0
 local queueRequested = false
 local lastDeal, drafting, ending, matchId = nil, false, false, nil
@@ -177,6 +206,7 @@ local matchEventAt = os.clock()
 local function status(s) Bot.Status = s end
 local function resetCombat()
     nextSkill, nextDodge, nextJump, nextSwitch, nextLight = 0, 0, 0, 0, 0
+    nextUltimate = 0
     pendingJump = nil
     previousHp, previousSelf, nextEscape, lastLightSeq = nil, nil, 0, nil
     defenseUntil = 0
@@ -693,14 +723,17 @@ local function moveInfo(sim, me, id, key)
         entry.projectileReach = projectileReach
         local startup, duration, activeSeen, targetTeleport, approachSpeed, armoredApproach = 0, 0, false, false, 0, false
         local groundDamage, firstActiveDuration, approachTo, firstProjectileSpeed, firstHitDelay, firstDirectHit, hasShot = false, 0, nil, 0, 0, nil, false
+        local openingUnblockable = def.unblockable == true
         for _, k in ipairs(def.keys or {}) do
             local active = k.hit or k.grab
             if k.hit then groundDamage = true end
             if k.hit and not k.hit.shot and not activeSeen then firstDirectHit = k.hit end
+            if not activeSeen and (k.grab or (k.hit and (k.hit.unblockable or k.hit.grab))) then openingUnblockable = true end
             if k.hit and type(k.hit.shot) == "string" then
                 hasShot = true
                 local projectile = proj(k.hit.shot)
                 if not activeSeen and type(projectile) == "table" and not projectile.beam then firstProjectileSpeed = tonumber(projectile.speed) or 0 end
+                if not activeSeen and type(projectile) == "table" and projectile.unblockable then openingUnblockable = true end
             end
             for _, fx in pairs(k.fx or {}) do
                 if fx[1] == "proj" or fx[1] == "strike" or fx[1] == "whip" or fx[1] == "release" then active = true end
@@ -713,8 +746,10 @@ local function moveInfo(sim, me, id, key)
                 if not activeSeen and fx[1] == "proj" and type(fx[2]) == "string" then
                     local projectile = sim:_projDef(me, fx[2])
                     if type(projectile) == "table" and not projectile.beam then firstProjectileSpeed = tonumber(projectile.speed) or 0 end
+                    if type(projectile) == "table" and projectile.unblockable then openingUnblockable = true end
                 elseif not activeSeen and (fx[1] == "strike" or fx[1] == "whip") and type(fx[2]) == "table" then
                     firstHitDelay = math.max(firstHitDelay, tonumber(fx[2].delay) or 0)
+                    if fx[2].unblockable or fx[2].grab then openingUnblockable = true end
                 end
                 if fx[1] == "teleport" and (fx[2] == "around" or fx[2] == "behind" or fx[2] == "target") then targetTeleport = true end
             end
@@ -738,6 +773,7 @@ local function moveInfo(sim, me, id, key)
         entry.firstProjectileSpeed, entry.firstHitDelay = firstProjectileSpeed, firstHitDelay
         entry.firstDirectHit = firstDirectHit
         entry.shot, entry.projectileReach = hasShot, projectileReach
+        entry.openingUnblockable = openingUnblockable
         cache[cacheKey] = entry
     end
     local range = def.range or {0, 4}
@@ -755,9 +791,33 @@ local function moveInfo(sim, me, id, key)
         armoredApproach = entry.armoredApproach, ranged = ranged, groundDamage = entry.groundDamage,
         needsTarget = entry.needsTarget,
         shot = entry.shot,
+        openingUnblockable = entry.openingUnblockable,
         firstActiveDuration = entry.firstActiveDuration, approachTo = entry.approachTo,
         firstDirectHit = entry.firstDirectHit,
         firstProjectileSpeed = entry.firstProjectileSpeed, firstHitDelay = entry.firstHitDelay}
+end
+local function ultimateOpportunity(sim, me, foe, id, info, lead, eta, foeCounter)
+    if not hittable(sim, foe) or foe.state == "held" then return false, "target protected" end
+    if foeCounter then return false, "opponent counter" end
+    if foe.state == "block" and not info.openingUnblockable then return false, "opponent guarding" end
+    if (me.dashT or 0) > 0 then return false, "finishing movement" end
+    if type(sim._ultReach) ~= "function" then return false, "reach query unavailable" end
+    if checkMethod(sim, "_ultBlocked", foe) then return false, "native target restriction" end
+    local ok, reach = pcall(sim._ultReach, sim, me, id, foe)
+    if not ok or reach ~= "in" then return false, "outside cast range", reach end
+    local tempo = info.def.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
+    local startup = info.startup * tempo
+    local function predictedReach(after)
+        local own, target = copyFields(me), copyFields(foe)
+        own.x, own.y = me.x + (me.vx or 0) * after, me.y + (me.vy or 0) * after
+        target.x, target.y = foe.x + (foe.vx or 0) * after, foe.y + (foe.vy or 0) * after
+        local success, value = pcall(sim._ultReach, sim, own, id, target)
+        return success and value == "in"
+    end
+    if not predictedReach(lead) or not predictedReach(lead + startup) then return false, "target leaving cast range", reach end
+    local confirmed = foe.state == "stun" and (foe.stunT or 0) >= lead + startup + 1 / 60
+    if eta < lead + 0.1 and not confirmed and not info.protectedStartup then return false, "defend before casting", reach end
+    return true, "ready in confirmed range", reach
 end
 local function groundFollowup(sim, me, foe, info, key, lead, distance)
     local gettingUp = foe.state == "move" and (foe.moveBase == "GetUpKD" or foe.moveBase == "GetUp")
@@ -1139,6 +1199,7 @@ local function decide(manual)
         end
     end
     local bestKey, bestScore, desired = nil, 0, 1.8
+    local bestPriority, ultimateGoal = 0, nil
     local groundOptions = {}
     Bot.Snapshot.groundFollowups = {}
     Bot.Snapshot.skillReadiness = {}
@@ -1170,6 +1231,8 @@ local function decide(manual)
         local kitInfo = key ~= "ult" and key ~= "form" and moveInfo(sim, me, slots[key], key)
         if kitInfo and kitInfo.ranged then desired = math.max(desired, math.min(8, kitInfo.hi * 0.62)) end
         local ready, readyReason, comboHold = canUse(sim, me, key)
+        if key == "ult" and combatClock < nextUltimate then ready, readyReason = false, "awaiting ultimate result" end
+        if key == "ult" then Bot.Snapshot.ultimate = {ready = ready, reason = readyReason or "checking opportunity"} end
         if key ~= reservedKey and ready then
             Bot.Snapshot.skillReadiness[key] = readyReason
             local info = moveInfo(sim, me, slots[key], key)
@@ -1204,22 +1267,20 @@ local function decide(manual)
                 elseif key == "form" or cat == "buff" or cat == "summon" then
                     if not danger and (foe.hp or 0) > 10 and (key == "form" or not info.needsTarget
                         or targetHittable or groundOpening) then score = key == "form" and 6 or 2 end
-                elseif inRange and (targetHittable or groundOpening) and not foeCounter
+                elseif (inRange or key == "ult") and (targetHittable or groundOpening) and not foeCounter
                     and guardReady(sim, me, foe, key == "ult" and "ult" or "move", horizon) then
                     score = 2 + math.min(2, (f.dmg or 0) / 30)
                     if stunOpening then score = score + 2 end
                     score = score - startup * 1.5
                     if foe.state == "block" and not info.def.unblockable and not f.grab then score = score * 0.35 end
-                    if key == "ult" then
-                        local ok, reach = pcall(sim._ultReach, sim, me, slots[key], foe)
-                        if not ok or reach ~= "in" then score = 0 else score = score + 3 end
-                    end
+                    if key == "ult" then score = score + 3 end
                     if danger and not f.invuln then score = score * 0.3 end
                 end
-                if attackPending and score < 9 then score = 0 end
+                if attackPending and (score < 9 or key == "ult") then score = 0 end
                 -- A long startup at point blank range gives neutral opponents
                 -- an unforced punish. Keep such casts for range or confirmed stun.
-                if cat ~= "counter" and cat ~= "evade" and key ~= "form" and not f.invuln
+                local protectedCast = key == "ult" and info.protectedStartup or (key ~= "ult" and f.invuln)
+                if cat ~= "counter" and cat ~= "evade" and key ~= "form" and not protectedCast
                     and distance < 4 and not stunOpening and startup > lead + 0.3 then score = 0 end
                 local offensive = cat ~= "counter" and cat ~= "evade" and cat ~= "heal" and key ~= "form" and key ~= "ult"
                 if offensive and not info.protectedStartup and not stunOpening then
@@ -1234,7 +1295,25 @@ local function decide(manual)
                     if eta <= horizon + 0.06 or (fullOpponent and (foe.state == "neutral" or foe.state == "block")
                         and (armoredPunish or (foeTeleportETA < commitment) or ((info.duration or 0) > 0.65 and distance < walkReach))) then score = 0 end
                 end
-                if score > bestScore then bestScore, bestKey = score, key end
+                if key == "ult" then
+                    local eligible, reason, reach = ultimateOpportunity(sim, me, foe, slots[key], info, lead, eta, foeCounter)
+                    Bot.Snapshot.ultimate = {ready = true, eligible = eligible and score > 0, reason = reason, reach = reach}
+                    if eligible and score <= 0 then Bot.Snapshot.ultimate.reason = "waiting for a safe skill window" end
+                    if not eligible then score = 0 end
+                    if Bot.PrioritizeUltimate and reason == "outside cast range" and reach == "approach"
+                        and targetHittable and not danger and not foeCounter and me.state == "neutral"
+                        and (not f.heal or hp < Bot.HealBelow) then
+                        ultimateGoal = math.max(0.65, (info.def.range and tonumber(info.def.range[2]) or 4) - 0.35)
+                    end
+                end
+                local priority = score > 0 and 1 or 0
+                if Bot.PrioritizeUltimate and score > 0 then
+                    if key == "ult" then priority = 2
+                    elseif score >= 9 or (f.heal and hp < 0.35) then priority = 3 end
+                end
+                if priority > bestPriority or (priority == bestPriority and score > bestScore) then
+                    bestPriority, bestScore, bestKey = priority, score, key
+                end
             end
         end
     end
@@ -1244,6 +1323,8 @@ local function decide(manual)
         and not (foeKey and (foeKey.armor or foeKey.invuln))
     local chainPressure = me.state == "move" and me.move and me.move.basic == "light" and me.moveHit and foe.state == "stun"
     if whiffOpening or chainPressure or (foe.state == "stun" and (foe.stunT or 0) > lead + 0.2) then desired = 1.8 end
+    if ultimateGoal and Bot.Movement ~= "manual" then desired = ultimateGoal end
+    Bot.Snapshot.ultimateApproach = ultimateGoal
     Bot.Snapshot.whiffOpening = whiffOpening and true or false
     Bot.Snapshot.foeTeleportReady = foeTeleportETA < math.huge
     Bot.Snapshot.foeArmoredApproachReady = #foeApproaches > 0
@@ -1341,14 +1422,15 @@ local function decide(manual)
             out.dash = true; out.x = dir; nextDodge = now + 0.5
         end
     end
-    if bestKey and not defensePending and (not dashWaiting and not dashFollow or bestScore >= 9)
-        and (now >= nextSkill or bestScore >= 9) then
+    local ultimateMayPost = bestKey == "ult" and not pendingDash and not attackPending
+    if bestKey and not defensePending and (not dashWaiting and not dashFollow or bestScore >= 9 or ultimateMayPost)
+        and (now >= nextSkill or bestScore >= 9 or ultimateMayPost) then
         out[bestKey] = true
         out.light = nil
         -- Defensive skills must not be cancelled by movement on the same frame.
         out.jump = nil
     end
-    local postedDefense = bestKey and out[bestKey] and bestScore >= 9
+    local postedDefense = bestKey and bestKey ~= "ult" and out[bestKey] and bestScore >= 9
     if postedDefense then defenseUntil = combatClock + lead + 0.06; defenseKind = "skill" end
     local usingDefense = postedDefense or defensePending
     if usingDefense then out.jump = nil; out.light = nil end
@@ -1421,7 +1503,8 @@ local function decide(manual)
         end
     elseif bestKey and out[bestKey] then
         -- Full-control skills can use facing for aim; don't cast while facing away.
-        if bestScore < 9 and Bot.Movement ~= "manual" then out.x = dir end
+        if (bestScore < 9 or bestKey == "ult") and Bot.Movement ~= "manual" then out.x = dir end
+        if bestKey == "ult" then nextUltimate = combatClock + math.max(0.35, lead + 0.2) end
         nextSkill = now + Bot.SkillGap
     end
     if out.light and Bot.Movement ~= "manual" then out.x = dir end
@@ -1721,8 +1804,18 @@ local function deal(info)
         end
     end)
 end
+if type(memory.onlineDispatch) ~= "table" then memory.onlineDispatch = setmetatable({}, {__mode = "k"}) end
+local onlineSlots = memory.onlineDispatch[Online]
+if type(onlineSlots) ~= "table" then onlineSlots = {}; memory.onlineDispatch[Online] = onlineSlots end
+local ownedOnlineSlots = {}
 local function on(event, callback)
-    Online.on(event, function(...) if alive then callback(...) end end)
+    local slot = onlineSlots[event]
+    if not slot then
+        slot = {}; onlineSlots[event] = slot
+        Online.on(event, function(...) if slot.callback then slot.callback(...) end end)
+    end
+    local wrapper = function(...) if alive then callback(...) end end
+    slot.callback = wrapper; ownedOnlineSlots[event] = wrapper
 end
 on("queue", function(value) queued = value == true; if not queued then queueRequested = false end end)
 on("lobby", function() lobbyUpdatedAt = os.clock() end)
@@ -1909,6 +2002,12 @@ end
 -- Permanent Awakening unlocks, explicitly requested by the user. One server
 -- request at a time; wait for the profile to reflect it before spending again.
 local unlocker = {nextPoll = 0, retryAt = 0}
+if Profile and type(Profile.onChange) == "function" then
+    local ok, conn = pcall(Profile.onChange, function()
+        if alive then unlocker.nextPoll = 0 end
+    end)
+    if ok and conn and type(conn.Disconnect) == "function" then connections[#connections + 1] = conn end
+end
 if Profile and type(Profile.onUnlocked) == "function" then
     local ok, conn = pcall(Profile.onUnlocked, function(info)
         local pending = unlocker.pending
@@ -1916,6 +2015,7 @@ if Profile and type(Profile.onUnlocked) == "function" then
         if info.key and Gems and Gems.slotOf(info.key) ~= "awaken" then return end
         if info.ok then
             pending.ack = true; Bot.AwakenStatus = "unlocked " .. pending.id .. "; syncing"
+            unlocker.nextPoll = 0
         else
             unlocker.pending = nil; unlocker.retryAt = os.clock() + 10
             Bot.AwakenStatus = "retry: " .. tostring(info.reason or "server rejected")
@@ -1925,12 +2025,12 @@ if Profile and type(Profile.onUnlocked) == "function" then
     if ok and conn and type(conn.Disconnect) == "function" then connections[#connections + 1] = conn end
 end
 local function awakenTick()
-    if not Bot.AutoAwakenMythicPlus then Bot.AwakenStatus = "off"; return end
+    if not Bot.AutoAwakenAll then Bot.AwakenStatus = "off"; return end
     local now = os.clock()
     if now < unlocker.nextPoll then return end
     unlocker.nextPoll = now + 2
     if not Profile or not Gems or not Fighters or type(Fighters.list) ~= "table"
-        or type(Profile.view) ~= "function" or type(Profile.owns) ~= "function"
+        or type(Profile.view) ~= "function"
         or type(Profile.unlockMove) ~= "function" or type(Profile.gems) ~= "function"
         or type(Gems.canUnlock) ~= "function" or type(Gems.isUnlocked) ~= "function" or type(Gems.slotOf) ~= "function" then
         Bot.AwakenStatus = "unavailable"; return
@@ -1959,15 +2059,19 @@ local function awakenTick()
         if type(id) == "string" then ids[id] = true
         elseif type(def) == "table" and type(def.name) == "string" then ids[def.name] = true end
     end
-    local diagnostics = {gems = gems, available = available, ownedMythicPlus = 0, unlocked = 0,
+    local diagnostics = {gems = gems, available = available, ownedCount = 0, ownedMythicPlus = 0, scope = "all owned", unlocked = 0,
         noAwakening = 0, affordable = 0, needsGems = 0, errors = 0, ownershipFallbacks = 0, checks = {},
         sources = {profile = liveModules.ProfileClient and "live" or "require",
             gems = liveModules.Gems and "live" or "require", fighters = liveModules.Fighters and "live" or "require"}}
     Bot.AwakenDiagnostics = diagnostics
     for id in pairs(ids) do
-        local ownedOk, owned = pcall(Profile.owns, id)
-        if Rarity.tierOf(id) >= 10 and ((ownedOk and owned == true) or collection[id]) then
-            diagnostics.ownedMythicPlus = diagnostics.ownedMythicPlus + 1
+        local ownedOk, owned = false, false
+        if type(Profile.owns) == "function" then ownedOk, owned = pcall(Profile.owns, id) end
+        local isOwned = type(view.owned) == "table" and collection[id]
+            or (type(view.owned) ~= "table" and ownedOk and owned == true)
+        if isOwned then
+            diagnostics.ownedCount = diagnostics.ownedCount + 1
+            if Rarity.tierOf(id) >= 10 then diagnostics.ownedMythicPlus = diagnostics.ownedMythicPlus + 1 end
             if not (ownedOk and owned == true) then diagnostics.ownershipFallbacks = diagnostics.ownershipFallbacks + 1 end
             local def = Fighters.list[id]
             local success, ready, reason, cost = pcall(Gems.canUnlock, view.abilities, available, id, "awaken", def, view.passives)
@@ -2007,9 +2111,9 @@ local function awakenTick()
     local chosen = candidates[1]
     if not chosen then
         if needsGems then Bot.AwakenStatus = "waiting for gems / " .. tostring(gems)
-        elseif diagnostics.ownedMythicPlus == 0 then Bot.AwakenStatus = "no owned Mythic+ in profile"
+        elseif diagnostics.ownedCount == 0 then Bot.AwakenStatus = "no owned fighters in profile"
         elseif diagnostics.errors > 0 then Bot.AwakenStatus = "eligibility error; see awakening logs"
-        else Bot.AwakenStatus = tostring(diagnostics.ownedMythicPlus) .. " owned / " .. tostring(diagnostics.unlocked)
+        else Bot.AwakenStatus = tostring(diagnostics.ownedCount) .. " owned / " .. tostring(diagnostics.unlocked)
             .. " unlocked / " .. tostring(diagnostics.noAwakening) .. " without Awakening" end
         return
     end
@@ -2179,14 +2283,27 @@ label.Parent = gui
 gui.Parent = playerGui
 function Bot.Stop()
     if not alive then return end
-    local ok, err = pcall(function() logger:finish("unload"); logger:flush(true) end)
-    if not ok then logger:fail(err) end
     alive = false; Bot.Enabled = false; dealGeneration = dealGeneration + 1
-    if Input.sample == sampleWrapper then Input.sample = originalSample end
-    if Online.bind == bindWrapper then Online.bind = originalBind end
-    for _, conn in ipairs(connections) do conn:Disconnect() end
-    if (queued or queueRequested) and Bot.AutoJoin then pcall(Online.queue, false, "classic") end
-    gui:Destroy()
+    local cancelQueue = (queued or queueRequested) and Bot.AutoJoin
+    queued, queueRequested = false, false; resetCombat()
+    Bot.StopErrors = {}
+    local function cleanup(name, action)
+        local ok, err = pcall(action)
+        if not ok then Bot.StopErrors[#Bot.StopErrors + 1] = name .. ": " .. tostring(err) end
+    end
+    cleanup("log finish", function() logger:finish("unload") end)
+    cleanup("log flush", function() logger:flush(true) end)
+    cleanup("input restore", function() if Input.sample == sampleWrapper then Input.sample = originalSample end end)
+    cleanup("bind restore", function() if Online.bind == bindWrapper then Online.bind = originalBind end end)
+    cleanup("event detach", function()
+        for event, wrapper in pairs(ownedOnlineSlots) do
+            local slot = onlineSlots[event]
+            if slot and slot.callback == wrapper then slot.callback = nil end
+        end
+    end)
+    for _, conn in ipairs(connections) do cleanup("disconnect", function() conn:Disconnect() end) end
+    if cancelQueue then cleanup("queue cancel", function() Online.queue(false, "classic") end) end
+    cleanup("UI destroy", function() gui:Destroy() end)
     status("Unloaded")
 end
 local function combatInput(input)
@@ -2206,7 +2323,7 @@ local function combatInput(input)
     return false
 end
 connections[#connections + 1] = UIS.InputBegan:Connect(function(input, processed)
-    if UIS:GetFocusedTextBox() then return end
+    if not alive or UIS:GetFocusedTextBox() then return end
     if input.KeyCode == Enum.KeyCode.F6 then
         Bot.Enabled = not Bot.Enabled
         dealGeneration = dealGeneration + 1
@@ -2272,7 +2389,7 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.18 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.19 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
@@ -2280,4 +2397,4 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.18] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.19] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
