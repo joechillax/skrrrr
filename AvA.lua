@@ -125,7 +125,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.19-ultimate-all-awaken",
+    Version = "4.20-pressure-spacing",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -193,6 +193,7 @@ local dashOpener, nextCloseDash = nil, 0
 local recoveryGuardUntil = 0
 local pendingDash, nextOffensiveDash = nil, 0
 local pendingAttack, defenseKind = nil, nil
+local neutralSince = nil
 local opponentCPU = nil
 local matchController = liveModules.MatchController
 local skipState, lastControllerScan = nil, -100
@@ -214,6 +215,7 @@ local function resetCombat()
     recoveryGuardUntil = 0
     pendingDash, nextOffensiveDash = nil, 0
     pendingAttack, defenseKind = nil, nil
+    neutralSince = nil
     Bot.Snapshot = nil
 end
 local function validSession(v)
@@ -436,6 +438,7 @@ function logger:index()
             file = self.path, active = self.active, matchId = self.id, summary = self.stats,
             capped = self.full == true, bytes = self.bytes, slots = Bot.LogSlots,
             awakening = {status = Bot.AwakenStatus, diagnostics = Bot.AwakenDiagnostics, error = Bot.AwakenError},
+            popup = Bot.LastPopup,
             recovery = {status = Bot.RecoveryStatus, count = Bot.RecoveryCount, state = Bot.SessionState},
             slot = self.slot, sequence = self.sequence})
         writefile(self.folder .. "/latest.json", encoded)
@@ -581,7 +584,7 @@ function logger:sample(out)
         local success, ready, reason = pcall(sim.canUseMove, sim, me, key)
         if success then queries[key] = {ready = ready == true, reason = type(reason) == "string" and reason or nil} end
     end
-    self:line("sample", {phase = sim.phase, frame = sim.frame, simTime = sim.t, delay = current.nc.delay,
+    self:line("sample", {phase = sim.phase, frame = sim.frame, simTime = sim.t, delay = current.nc.delay, halfW = sim.halfW,
         me = actorLog(me), foe = actorLog(foe), input = out, queries = queries,
         decision = Bot.Snapshot, status = Bot.Status, enabled = Bot.Enabled, inputMode = Bot.InputMode,
         network = {lp = current.nc.lp == true, acked = current.nc.acked, fillTo = current.nc.fillTo,
@@ -875,8 +878,20 @@ local function groundFollowup(sim, me, foe, info, key, lead, distance)
         and downLeft > impact then return true, "owned down combo" end
     return false, "ground window closed"
 end
+local function minorZoneHit(hit, tick, arg)
+    if type(hit) ~= "table" or hit.noStun ~= true or hit.grab or hit.unblockable
+        or (tonumber(hit.stun) or 0) > 0 or (tonumber(hit.dmg) or 0) > 2 then return false end
+    if type(tick) == "number" and (tick <= 0 or (tonumber(hit.dmg) or 0) / tick > 4) then return false end
+    if type(arg) == "table" and (arg.autoFire ~= nil or arg.pinFire ~= nil or arg.pull or arg.sink) then return false end
+    if type(hit.kb) == "table" and (math.abs(tonumber(hit.kb[1]) or 0) > 0 or math.abs(tonumber(hit.kb[2]) or 0) > 0) then return false end
+    for _, name in ipairs({"root", "stun", "freeze", "seal", "noBlock", "sleep"}) do
+        if hit.status and hit.status[name] then return false end
+    end
+    return true
+end
 local function threat(sim, me)
     local soon, projectile, unblockable, blockDir, source = math.huge, false, false, nil, nil
+    local minorZone
     local function consider(eta, ranged, cannotBlock, direction, kind)
         if eta < soon or (cannotBlock == true and not unblockable and eta <= soon + 1 / 60) then
             soon, projectile, unblockable, blockDir, source = math.max(0, eta), ranged == true,
@@ -946,8 +961,10 @@ local function threat(sim, me)
                                 local wait = math.max(0, eta) + (tonumber(z.delay) or (fx[1] == "sprout" and 0.3 or 0))
                                 if (at == "self" or at == "target" or at == "targetBody")
                                     and math.abs(me.x + (me.vx or 0) * wait - center) <= (z.r or 0.9) + 1.2 then
-                                    consider(wait, false, z.hit.grab or z.hit.unblockable or false,
-                                        center >= me.x and 1 or -1, "delayed effect")
+                                    if not minorZoneHit(z.hit, z.tick, z) then
+                                        consider(wait, false, z.hit.grab or z.hit.unblockable or false,
+                                            center >= me.x and 1 or -1, "delayed effect")
+                                    end
                                 end
                             end
                         end
@@ -986,9 +1003,13 @@ local function threat(sim, me)
     end
     for _, z in pairs(sim.zones or {}) do
         local owner = sim.fighters[z.owner]
+        local lastHit = z.hits and z.hits[me.idx]
+        local repeatable = type(z.tick) == "number"
         if owner and owner.team ~= me.team and not z.dead and type(z.hit) == "table"
-            and not (z.once and z.hits and z.hits[me.idx]) then
+            and not (lastHit ~= nil and (z.once or not repeatable)) then
             local wait = math.max(0, (tonumber(z.delay) or 0) - (tonumber(z.t) or 0))
+            if type(lastHit) == "number" and repeatable then wait = math.max(wait, lastHit + z.tick - (sim.t or 0)) end
+            local aliveAtImpact = type(z.life) ~= "number" or (tonumber(z.t) or 0) + wait < z.life or z.armed == false
             local x, y = me.x + (me.vx or 0) * wait, me.y + (me.vy or 0) * wait
             local a, b = z.p0, z.p1
             local zx, zy = tonumber(z.x) or 0, tonumber(z.y) or 0
@@ -999,12 +1020,16 @@ local function threat(sim, me)
                 zx, zy = a.X + vx * t, a.Y + vy * t
             end
             local r = (tonumber(z.cr) or tonumber(z.r) or 0.9) + 1.2
-            if (x - zx) ^ 2 + (y - zy) ^ 2 <= r ^ 2 then
-                consider(wait, false, z.hit.unblockable or z.hit.grab or false, zx >= me.x and 1 or -1, "zone")
+            if aliveAtImpact and (x - zx) ^ 2 + (y - zy) ^ 2 <= r ^ 2 then
+                if minorZoneHit(z.hit, z.tick, z.arg or z) then
+                    minorZone = {kind = z.kind, eta = wait, damage = z.hit.dmg, tick = z.tick}
+                else
+                    consider(wait, false, z.hit.unblockable or z.hit.grab or false, zx >= me.x and 1 or -1, "zone")
+                end
             end
         end
     end
-    return soon, projectile, unblockable, blockDir, source
+    return soon, projectile, unblockable, blockDir, source, minorZone
 end
 local function closeDashReach(me, foe, dir, lead, sim)
     if type(me.def) ~= "table" or type(foe.def) ~= "table"
@@ -1066,10 +1091,13 @@ local function decide(manual)
         memory.defenseMargin = math.min(0.12, (memory.defenseMargin or 0) + 0.015)
     end
     previousSelf, previousHp = me, me.hp
-    local eta, isProjectile, unblockable, blockDir, threatSource = threat(sim, me)
+    local eta, isProjectile, unblockable, blockDir, threatSource, minorZone = threat(sim, me)
     blockDir = blockDir or dir
     local lead = math.min(0.35, math.max(0, tonumber(current.nc.delay) or 6) / 60 + 1 / 60)
     local combatClock = type(sim.t) == "number" and sim.t or now
+    if trapped or (me.state ~= "neutral" and me.state ~= "block") then neutralSince = nil
+    elseif not neutralSince or neutralSince > combatClock then neutralSince = combatClock end
+    local neutralIdle = neutralSince and combatClock - neutralSince or 0
     if pendingAttack and (pendingAttack.me ~= me or trapped or combatClock < pendingAttack.at
         or me.moveSeq ~= pendingAttack.seq or combatClock > pendingAttack.untilT) then pendingAttack = nil end
     -- Arrival commitments prevent unrelated offense from replacing an earlier
@@ -1131,6 +1159,7 @@ local function decide(manual)
     Bot.Snapshot.dashInputPending = pendingDash ~= nil
     Bot.Snapshot.attackInputPending = attackPending
     Bot.Snapshot.threatSource = threatSource
+    Bot.Snapshot.minorZone = minorZone
     Bot.Snapshot.blockDirection = blockDir
     Bot.Snapshot.threatUnblockable = unblockable
     Bot.Snapshot.foeControl = controlMode(foe)
@@ -1200,6 +1229,8 @@ local function decide(manual)
     end
     local bestKey, bestScore, desired = nil, 0, 1.8
     local bestPriority, ultimateGoal = 0, nil
+    local hasRangedKit, rangedOpportunity = false, false
+    local spacingReason = "melee"
     local groundOptions = {}
     Bot.Snapshot.groundFollowups = {}
     Bot.Snapshot.skillReadiness = {}
@@ -1223,18 +1254,20 @@ local function decide(manual)
     local foeCounter = false
     if foe.move and foe.state == "move" then
         local k = foe.move.keys[foe.key or 1]
-        foeCounter = k and (k.counter ~= nil or k.reflect ~= nil) or false
+        foeCounter = k and (k.counter or k.reflect) and true or false
     end
     for _, key in ipairs({"x1", "x2", "x3", "ult", "form"}) do
         -- The kit's useful spacing does not disappear when its projectile goes
         -- on cooldown. Otherwise a ranged cast is followed by walking into J.
         local kitInfo = key ~= "ult" and key ~= "form" and moveInfo(sim, me, slots[key], key)
-        if kitInfo and kitInfo.ranged then desired = math.max(desired, math.min(8, kitInfo.hi * 0.62)) end
+        if kitInfo and kitInfo.ranged then
+            hasRangedKit = true; desired = math.max(desired, math.min(8, kitInfo.hi * 0.62)); spacingReason = "ranged recovery hold"
+        end
         local ready, readyReason, comboHold = canUse(sim, me, key)
         if key == "ult" and combatClock < nextUltimate then ready, readyReason = false, "awaiting ultimate result" end
         if key == "ult" then Bot.Snapshot.ultimate = {ready = ready, reason = readyReason or "checking opportunity"} end
         if key ~= reservedKey and ready then
-            Bot.Snapshot.skillReadiness[key] = readyReason
+            Bot.Snapshot.skillReadiness[key] = readyReason or "ready"
             local info = moveInfo(sim, me, slots[key], key)
             if info then
                 local f, cat, score = info.features, info.cat, 0
@@ -1307,6 +1340,10 @@ local function decide(manual)
                     end
                 end
                 local priority = score > 0 and 1 or 0
+                if score > 0 and ranged and key ~= "ult" and key ~= "form"
+                    and cat ~= "counter" and cat ~= "evade" and cat ~= "heal" and cat ~= "buff" and cat ~= "summon" then
+                    rangedOpportunity = true
+                end
                 if Bot.PrioritizeUltimate and score > 0 then
                     if key == "ult" then priority = 2
                     elseif score >= 9 or (f.heal and hp < 0.35) then priority = 3 end
@@ -1322,8 +1359,19 @@ local function decide(manual)
         and moveRemaining(foe) > lead + 0.15 and distance <= 6 and not foeCounter
         and not (foeKey and (foeKey.armor or foeKey.invuln))
     local chainPressure = me.state == "move" and me.move and me.move.basic == "light" and me.moveHit and foe.state == "stun"
-    if whiffOpening or chainPressure or (foe.state == "stun" and (foe.stunT or 0) > lead + 0.2) then desired = 1.8 end
-    if ultimateGoal and Bot.Movement ~= "manual" then desired = ultimateGoal end
+    if rangedOpportunity then spacingReason = "ranged opening"
+    elseif hasRangedKit and neutralIdle >= 0.75 and not attackPending and not defensePending and not danger then
+        desired = 1.8; spacingReason = "melee reengage"
+    end
+    if whiffOpening or chainPressure or (foe.state == "stun" and (foe.stunT or 0) > lead + 0.2) then
+        desired = 1.8; spacingReason = "confirmed pressure"
+    end
+    if ultimateGoal and Bot.Movement ~= "manual" then desired = ultimateGoal; spacingReason = "ultimate approach" end
+    local counterGap
+    if foeCounter then
+        counterGap = math.max(3.4, math.min(6, (tonumber(foe.move.range and foe.move.range[2]) or 4) + 0.6))
+        desired = counterGap; spacingReason = "counter wait"
+    end
     Bot.Snapshot.ultimateApproach = ultimateGoal
     Bot.Snapshot.whiffOpening = whiffOpening and true or false
     Bot.Snapshot.foeTeleportReady = foeTeleportETA < math.huge
@@ -1338,13 +1386,23 @@ local function decide(manual)
     if Bot.Movement == "manual" then
         for _, key in ipairs({"x", "down", "jump", "dash", "block", "light"}) do out[key] = manual and manual[key] or out[key] end
     else
-        if not targetHittable and not groundChoice then desired = math.max(desired, Bot.ProtectedSpacing) end
+        if not targetHittable and not groundChoice then desired = Bot.ProtectedSpacing; spacingReason = "protected target" end
+        local halfW = tonumber(sim.halfW)
+        local nearWall = halfW and math.abs(me.x) >= halfW - 2.5
+        local centerDir = me.x >= 0 and -1 or 1
+        local leaveCorner = nearWall and targetHittable and not danger and not foeCounter and not defensePending
+            and (me.state == "neutral" or me.state == "block")
+        if leaveCorner then desired = math.min(desired, 1.8); spacingReason = "leave corner" end
         local projectedGap = (dx + ((foe.vx or 0) - (me.vx or 0)) * lead) * dir
         Bot.Snapshot.spacingProjectedGap = projectedGap
         Bot.Snapshot.spacingDesired = desired
-        if danger or foeCounter then out.x = -dir
+        Bot.Snapshot.spacingReason = spacingReason
+        Bot.Snapshot.counterGap = counterGap
+        Bot.Snapshot.neutralIdle = neutralIdle
+        if danger then out.x = -dir
         elseif distance > desired + 0.35 and projectedGap > desired + 0.15 then out.x = dir
-        elseif distance < desired - 0.45 then out.x = -dir end
+        elseif distance < desired - 0.45 and projectedGap < desired - 0.15 then out.x = -dir end
+        if leaveCorner and distance > 2.8 and not attackPending then out.x = centerDir end
         if dashOpener and not danger then out.x = dir end
         if me.state == "neutral" and me.grounded and foe.y - me.y > 3 and now >= nextJump then
             out.jump = true; nextJump = now + 0.65
@@ -2204,6 +2262,7 @@ local function popupsTick()
                     if reveal and obj.Name == "SkipTap" then rank = 10 end
                     if reveal and obj.Name == "Tap" then rank = 9 end
                     if reveal and obj.Name == "Continue" then rank = 3 end
+                    if reveal and obj.Name == "Done" then rank = 12 end
                     if reveal and obj.Name == "Veil" then rank = 8 end
                     if reveal and obj.Name == "OpenPackHit" then rank = 8 end
                     local enabled = type(obj.GetAttribute) ~= "function" or obj:GetAttribute("Enabled") ~= false
@@ -2220,7 +2279,12 @@ local function popupsTick()
     end
     if selected then
         popupAttempts[selected] = os.clock()
-        if fireButton(selected, false) then
+        local screen = selected
+        while screen.Parent ~= playerGui and screen.Parent do screen = screen.Parent end
+        local activated = fireButton(selected, false)
+        Bot.LastPopup = {screen = screen.Name, button = selected.Name, activated = activated, at = os.clock()}
+        logger:line("popup_dismiss", Bot.LastPopup)
+        if activated then
             status("Dismissing popup / " .. selected.Name)
             return true
         end
@@ -2389,7 +2453,7 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.19 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.20 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
@@ -2397,4 +2461,4 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.19] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.20] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
