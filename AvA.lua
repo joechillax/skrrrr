@@ -126,7 +126,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.26-pvp-commitments",
+    Version = "4.27-pvp-contact",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -953,6 +953,16 @@ local function defenseKeyAt(info, me, afterInput)
         afterInput = afterInput - duration
     end
 end
+local function guardCounterCovers(counters, distance, hit)
+    if not counters or (hit and hit.noCounter) then return false end
+    for _, counter in ipairs(counters) do
+        if distance <= (tonumber(counter.counterNear) or math.huge)
+            and not (counter.counterBypass and hit and (hit.grab or hit.unblockable)) then
+            return true
+        end
+    end
+    return false
+end
 local function threat(sim, me)
     local soon, projectile, unblockable, blockDir, source = math.huge, false, false, nil, nil
     local minorZone, targetedUltimate
@@ -1323,7 +1333,7 @@ local function decide(manual)
     Bot.Snapshot.skillReadiness = {}
     local fullOpponent = foe.human == true and not (foe.botSeat or foe.dummy or foe.tutorBot)
     local foeRecovery = fullOpponent and foe.state == "move" and eta == math.huge and moveRemaining(foe) or nil
-    local foeTeleportETA, foeApproaches = math.huge, {}
+    local foeTeleportETA, foeApproaches, guardCounters = math.huge, {}, nil
     if fullOpponent and (foe.state == "neutral" or foe.state == "block") then
         for _, key in ipairs({"x1", "x2", "x3"}) do
             local id = sim:_pressMove(foe, key)
@@ -1335,6 +1345,12 @@ local function decide(manual)
             if info and info.armoredApproach and canUse(sim, foe, key) then
                 local tempo = info.def.fixedTime and 1 or tonumber(foe.def and foe.def.tempo) or 1
                 foeApproaches[#foeApproaches + 1] = {startup = info.startup * tempo, speed = info.approachSpeed}
+            end
+            local opening = info and info.def.keys and info.def.keys[1]
+            if distance <= 6 and foe.state == "block" and opening and opening.counter and (opening.onCounter or info.def.onCounter)
+                and canUse(sim, foe, key) then
+                guardCounters = guardCounters or {}
+                guardCounters[#guardCounters + 1] = opening
             end
         end
     end
@@ -1379,7 +1395,8 @@ local function decide(manual)
             if info then
                 local f, cat, score = info.features, info.cat, 0
                 local ranged = info.ranged
-                local startup = info.startup * (info.def.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1)
+                local tempo = info.def.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
+                local startup = info.startup * tempo
                 if info.approachTo and info.approachSpeed > 0 then
                     startup = math.max(startup, math.max(0, distance - info.approachTo) / info.approachSpeed)
                 end
@@ -1439,6 +1456,11 @@ local function decide(manual)
                 if cat ~= "counter" and cat ~= "evade" and key ~= "form" and not protectedCast
                     and distance < 4 and not stunOpening and startup > lead + 0.3 then score = 0 end
                 local offensive = cat ~= "counter" and cat ~= "evade" and cat ~= "heal" and key ~= "form" and key ~= "ult"
+                if score > 0 and offensive and not ranged and info.firstDirectHit
+                    and guardCounterCovers(guardCounters, predictedDistance, info.firstDirectHit) then
+                    score = 0
+                    Bot.Snapshot.openingBlocked[key] = "guarded melee counter ready"
+                end
                 local trap = info.targetTrap
                 if score > 0 and fullOpponent and offensive and trap and not groundOpening
                     and not (foe.state == "stun" and (foe.stunT or 0) >= horizon + trap.delay + 1 / 60)
@@ -1520,6 +1542,9 @@ local function decide(manual)
         desired = 1.8; spacingReason = "confirmed pressure"
     end
     if ultimateGoal and Bot.Movement ~= "manual" then desired = ultimateGoal; spacingReason = "ultimate approach" end
+    if guardCounters and not bestKey and not ultimateGoal then
+        desired = math.max(desired, 2.6); spacingReason = "guarded counter"
+    end
     local counterGap
     if foeCounter then
         counterGap = math.max(3.4, math.min(6, (tonumber(foe.move.range and foe.move.range[2]) or 4) + 0.6))
@@ -1609,10 +1634,13 @@ local function decide(manual)
             or (foe.stunT or 0) > math.max(lead, recoveryBuffer and recoveryLeft or 0) + startup * tempo + 1 / 60
         local freshChain = chainOpportunity and me.moveSeq ~= nil and me.moveSeq ~= lastLightSeq
         local neutralPress = not chainOpportunity and now >= nextLight
+        local counterThreat = not (basicInfo and basicInfo.shot)
+            and guardCounterCovers(guardCounters, math.abs(futureDx), basicInfo and basicInfo.firstDirectHit)
+        Bot.Snapshot.guardCounterReady = counterThreat or nil
         if not danger and not attackPending and not dashWaiting and not defensePending and targetHittable and distance < basicReach and math.abs(futureDx) < safeReach
             and math.abs(me.y - foe.y) < 3
             and guardReady(sim, me, foe, "punch", lead)
-            and not foeCounter and freeToPunch and stunFits
+            and not foeCounter and not counterThreat and freeToPunch and stunFits
             and (freshChain or neutralPress) then
             out.light = true; nextLight = now + math.max(0.09, lead + 0.03)
             lastLightSeq = me.moveSeq
@@ -2632,7 +2660,7 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.26 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.27 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
@@ -2640,4 +2668,4 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.26] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.27] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
