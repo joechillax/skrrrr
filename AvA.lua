@@ -126,7 +126,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.23-arena-ultimates",
+    Version = "4.24-runtime-ultimate-range",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -825,8 +825,9 @@ end
 local function arenaWideUltimate(sim, id, info)
     if Combat and Combat.ULT_ANYWHERE and Combat.ULT_ANYWHERE[id] then return true end
     local halfW = tonumber(sim.halfW)
-    return halfW and info.openingPulseRadius and info.openingPulseRadius >= 2 * halfW
-        and info.def.range and (tonumber(info.def.range[2]) or 0) >= 2 * halfW
+    -- The engine scales the cast range separately from the damage radius.
+    -- Check cast legality with _ultReach, even for a pulse that spans the arena.
+    return halfW and halfW > 0 and info.openingPulseRadius ~= nil and info.openingPulseRadius >= 2 * halfW or false
 end
 local function ultimateOpportunity(sim, me, foe, id, info, lead, eta, foeCounter, arenaWide)
     if not hittable(sim, foe) or foe.state == "held" then return false, "target protected" end
@@ -1469,7 +1470,8 @@ local function decide(manual)
     Bot.Snapshot.foeArmoredApproachReady = #foeApproaches > 0
     local closeDash, dashFollow = false, false
     local holdArenaRange = arenaUlt and not danger and not foeCounter and distance > 3
-        and (not bestKey or bestKey == "ult") and (me.state == "neutral" or me.state == "block")
+        and (bestKey == "ult" or (not bestKey and Bot.Snapshot.ultimate.reason == "awaiting ultimate result"))
+        and (me.state == "neutral" or me.state == "block")
     if holdArenaRange then
         local ok, reach = pcall(sim._ultReach, sim, me, slots.ult, foe)
         holdArenaRange = ok and reach == "in"
@@ -1489,7 +1491,7 @@ local function decide(manual)
         local centerDir = me.x >= 0 and -1 or 1
         local leaveCorner = nearWall and targetHittable and not danger and not foeCounter and not defensePending
             and (me.state == "neutral" or me.state == "block")
-        if leaveCorner then desired = math.min(desired, 1.8); spacingReason = "leave corner" end
+        if leaveCorner and not (arenaUlt and ultimateGoal) then desired = math.min(desired, 1.8); spacingReason = "leave corner" end
         local projectedGap = (dx + ((foe.vx or 0) - (me.vx or 0)) * lead) * dir
         Bot.Snapshot.spacingProjectedGap = projectedGap
         Bot.Snapshot.spacingDesired = desired
@@ -2562,7 +2564,7 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.23 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.24 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
@@ -2570,4 +2572,4 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.23] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.24] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
