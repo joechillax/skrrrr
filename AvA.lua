@@ -124,11 +124,13 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.17-ground-followups",
+    Version = "4.18-combat-update",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
     LobbyRecoveryDelay = 15,
+    AwayWarnings = 0,
+    AwayLimit = 3,
     InputCalls = 0,
     LiveInputFound = liveModules.PlayerInput ~= nil,
     LiveOnlineFound = liveModules.OnlineClient ~= nil,
@@ -344,7 +346,9 @@ local actorKeys = {"name", "idx", "state", "moveBase", "moveSeq", "key", "kt", "
     "airJumps", "airDashes", "guard", "guardMax", "guardLockT", "blockStunT",
     "dashInvT", "keyHold", "botSeat", "dummy", "tutorBot", "switchable", "form", "lifeLost",
     "downT", "kdGetup", "otgT0", "otgWin", "otgN", "otgOff", "otgFlBy", "otgFlCls",
-    "dcStr", "dcLoop", "dcCap", "dcBy", "dcHoldTo", "reviveInvT"}
+    "dcStr", "dcLoop", "dcCap", "dcBy", "dcHoldTo", "reviveInvT", "cl", "clHitSeq", "clHitT",
+    "clSkSeq", "clSkT", "clKdLockT", "clNoStunT", "clRag", "clTechT", "clEscCd",
+    "cdN", "cdP", "cdT", "cdKey", "combo", "l3Vic", "l3Seq", "hitCls"}
 local function controlMode(actor)
     if actor.botSeat or actor.dummy or actor.tutorBot then return "bot" end
     if actor.human then return "full" end
@@ -373,6 +377,7 @@ local function actorLog(actor)
     row.fighterId = actor.def and actor.def.name or nil
     row.movement = actor.mvt
     row.controlMode = controlMode(actor)
+    if type(actor.clC) == "table" then row.comboState = flat(actor.clC, {"by", "t0", "f0", "dmg", "hits", "hold", "sks", "chase", "vanish"}) end
     return row
 end
 function logger:fail(err)
@@ -549,13 +554,36 @@ function logger:sample(out)
     self:line("sample", {phase = sim.phase, frame = sim.frame, simTime = sim.t, delay = current.nc.delay,
         me = actorLog(me), foe = actorLog(foe), input = out, queries = queries,
         decision = Bot.Snapshot, status = Bot.Status, enabled = Bot.Enabled, inputMode = Bot.InputMode,
+        network = {lp = current.nc.lp == true, acked = current.nc.acked, fillTo = current.nc.fillTo,
+            ownKnown = current.nc.known and current.nc.known[current.side], stalls = current.stalls, desync = current.desync},
         manualGraceRemaining = math.max(0, Bot.ManualGrace - (os.clock() - lastManual))})
 end
 
+local function copyFields(value)
+    local result = {}; for k, v in pairs(value or {}) do result[k] = v end; return result
+end
+local function comboCutQuery(sim, me, key)
+    if type(sim._clSkillCut) ~= "function" then return false end
+    local foe = sim:other(me)
+    if not foe then return false end
+    local own, target = copyFields(me), copyFields(foe)
+    own.clC, target.clC = me.clC and copyFields(me.clC), foe.clC and copyFields(foe.clC)
+    local fighters = copyFields(sim.fighters); fighters[me.idx], fighters[foe.idx] = own, target
+    local query = setmetatable({fighters = fighters, other = function(_, actor)
+        return actor.idx == own.idx and target or own
+    end}, {__index = sim})
+    -- _clSkillCut consumes combo flags and can extend stun. Only run it on
+    -- isolated fighter/combo copies; native input performs any real cancel.
+    local ok, ready = pcall(sim._clSkillCut, query, own, key)
+    return ok and ready == true, target.stunT
+end
 local function canUse(sim, me, key)
     if me.locks and me.locks[key] then return false end
     local ok, result, reason = pcall(sim.canUseMove, sim, me, key)
-    if ok and not result and me.state == "move" and type(sim._skillCutOk) == "function" then
+    if ok and not result and me.state == "move" and me.cl ~= nil then
+        local ready, hold = comboCutQuery(sim, me, key)
+        if ready then return true, "combo-chain", hold end
+    elseif ok and not result and me.state == "move" and type(sim._skillCutOk) == "function" then
         local chainOk, chain = pcall(sim._skillCutOk, sim, me, key)
         if chainOk and chain == true then return true, "chain" end
     end
@@ -591,13 +619,15 @@ local function escapeKind(sim, me, key)
     if def and def.comboBreaker then return "breaker" end
     if not rising and (reason == "breaker" or reason == "transform") then return reason end
 end
-local function protectedTarget(sim, foe)
-    return foe.ko or (foe.hp and foe.hp <= 0) or foe.invuln or foe.invis or foe.clash or foe.state == "ko"
+local function protectedTarget(sim, foe, floorMelee)
+    local gettingUp = foe.state == "move" and (foe.moveBase == "GetUpKD" or foe.moveBase == "GetUp")
+    return foe.ko or (foe.hp and foe.hp <= 0) or (foe.invuln and not (floorMelee and gettingUp))
+        or foe.invis or foe.clash or foe.state == "ko"
         or (tonumber(foe.cbInvT) or 0) > (sim.t or 0)
         or (tonumber(foe.evInvT) or 0) > (sim.t or 0)
         or (tonumber(foe.reviveInvT) or 0) > (sim.t or 0)
         or ((foe.dashT or 0) > 0 and (foe.dashInvT or 0) > (sim.t or 0))
-        or (foe.state == "move" and (foe.moveBase == "GetUpKD" or foe.moveBase == "GetUp"))
+        or (gettingUp and not floorMelee)
 end
 local function hittable(sim, foe)
     return not (protectedTarget(sim, foe) or foe.state == "down"
@@ -662,13 +692,24 @@ local function moveInfo(sim, me, id, key)
                 cacheKey ~= "skill" and cacheKey or nil)}
         entry.projectileReach = projectileReach
         local startup, duration, activeSeen, targetTeleport, approachSpeed, armoredApproach = 0, 0, false, false, 0, false
-        local groundDamage, firstActiveDuration, approachTo, firstProjectileSpeed, firstHitDelay = false, 0, nil, 0, 0
+        local groundDamage, firstActiveDuration, approachTo, firstProjectileSpeed, firstHitDelay, firstDirectHit, hasShot = false, 0, nil, 0, 0, nil, false
         for _, k in ipairs(def.keys or {}) do
             local active = k.hit or k.grab
             if k.hit then groundDamage = true end
+            if k.hit and not k.hit.shot and not activeSeen then firstDirectHit = k.hit end
+            if k.hit and type(k.hit.shot) == "string" then
+                hasShot = true
+                local projectile = proj(k.hit.shot)
+                if not activeSeen and type(projectile) == "table" and not projectile.beam then firstProjectileSpeed = tonumber(projectile.speed) or 0 end
+            end
             for _, fx in pairs(k.fx or {}) do
                 if fx[1] == "proj" or fx[1] == "strike" or fx[1] == "whip" or fx[1] == "release" then active = true end
                 if fx[1] == "proj" or fx[1] == "strike" or fx[1] == "whip" then groundDamage = true end
+                if (fx[1] == "zone" or fx[1] == "sprout") and type(fx[2]) == "table" and fx[2].hit then
+                    active = true
+                    if def.otg == true or def.hitDown == true then groundDamage = true end
+                    if not activeSeen then firstHitDelay = math.max(firstHitDelay, tonumber(fx[2].delay) or (fx[1] == "sprout" and 0.3 or 0)) end
+                end
                 if not activeSeen and fx[1] == "proj" and type(fx[2]) == "string" then
                     local projectile = sim:_projDef(me, fx[2])
                     if type(projectile) == "table" and not projectile.beam then firstProjectileSpeed = tonumber(projectile.speed) or 0 end
@@ -695,29 +736,37 @@ local function moveInfo(sim, me, id, key)
         entry.approachSpeed, entry.armoredApproach = approachSpeed, armoredApproach and activeSeen
         entry.groundDamage, entry.firstActiveDuration, entry.approachTo = groundDamage, firstActiveDuration, approachTo
         entry.firstProjectileSpeed, entry.firstHitDelay = firstProjectileSpeed, firstHitDelay
+        entry.firstDirectHit = firstDirectHit
+        entry.shot, entry.projectileReach = hasShot, projectileReach
         cache[cacheKey] = entry
     end
     local range = def.range or {0, 4}
     local hi = math.max(range[2] or 4, 1.5)
-    local ranged = (entry.features.proj or 0) > 0 or entry.features.beam
+    local ranged = (entry.features.proj or 0) > 0 or entry.features.beam or entry.shot
     if ranged then
         hi = math.max(hi, math.min(30, entry.projectileReach or 0))
         if hi <= 4 then hi = Bot.RangedFallback end
     end
+    if entry.shot and type(me.def and me.def.shotFar) == "number" then hi = math.min(hi, me.def.shotFar) end
     return {def = def, features = entry.features, cat = entry.cat,
         lo = entry.approachTo and 0 or (range[1] or 0), hi = hi, startup = entry.startup, duration = entry.duration,
         protectedStartup = def.keys and def.keys[1] and def.keys[1].invuln == true,
         targetTeleport = entry.targetTeleport, approachSpeed = entry.approachSpeed,
         armoredApproach = entry.armoredApproach, ranged = ranged, groundDamage = entry.groundDamage,
         needsTarget = entry.needsTarget,
+        shot = entry.shot,
         firstActiveDuration = entry.firstActiveDuration, approachTo = entry.approachTo,
+        firstDirectHit = entry.firstDirectHit,
         firstProjectileSpeed = entry.firstProjectileSpeed, firstHitDelay = entry.firstHitDelay}
 end
 local function groundFollowup(sim, me, foe, info, key, lead, distance)
-    if key == "ult" or key == "form" or foe.state ~= "down" or protectedTarget(sim, foe)
-        or foe.kdGetup or not info.groundDamage or info.features.grab or info.def.basic then return false, "protected/unsupported" end
+    local gettingUp = foe.state == "move" and (foe.moveBase == "GetUpKD" or foe.moveBase == "GetUp")
+    local floorMelee = info.firstDirectHit and not info.def.ultimate
+        and checkMethod(sim, "_floorMelee", me, foe, info.firstDirectHit, "move")
+    if key == "ult" or key == "form" or info.def.ultimate or (foe.state ~= "down" and not gettingUp
+        and not (foe.state == "tumble" and info.def.hitDown == true)) or protectedTarget(sim, foe, floorMelee)
+        or not info.groundDamage or info.features.grab or info.def.basic then return false, "protected/unsupported" end
     if not me.grounded and not (info.def.otg == true and not info.ranged) then return false, "air geometry" end
-    if (tonumber(foe.kdT) or 0) > (sim.t or 0) then return false, "knockdown protection" end
     local tempo = info.def.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
     local startup = info.startup * tempo
     if info.approachTo and info.approachSpeed > 0 then
@@ -735,6 +784,19 @@ local function groundFollowup(sim, me, foe, info, key, lead, distance)
     end
     local arrival = lead + 1 / 60
     local downLeft = tonumber(foe.downT)
+    local activeOTG = query("_otgDown", 0, foe)
+    if floorMelee and not activeOTG then
+        local hold = gettingUp and moveRemaining(foe) or downLeft
+        if hold and hold > impact then return true, "native floor melee" end
+        return false, "floor melee too late"
+    end
+    if info.def.hitDown == true and not activeOTG and not gettingUp then
+        local hold = foe.state == "down" and downLeft or math.max(0, (foe.hdHoldTo or 0) - (sim.t or 0))
+        if info.def.otg == true then hold = math.max(hold or 0, GroundRules.OTG_SKILL_EXT or 0.8) end
+        if hold and hold > impact then return true, "native hitDown skill" end
+        return false, "hitDown hold too short"
+    end
+    if foe.kdGetup or (tonumber(foe.kdT) or 0) > (sim.t or 0) then return false, "knockdown protection" end
     if not downLeft or downLeft <= arrival then return false, "standing before input arrives" end
     if query("_otgDown", arrival, foe) then
         if not query("_otgOk", arrival, me, foe, "move", nil) then return false, "ground cap/window closed" end
@@ -884,7 +946,7 @@ local function threat(sim, me)
     end
     return soon, projectile, unblockable, blockDir, source
 end
-local function closeDashReach(me, foe, dir, lead)
+local function closeDashReach(me, foe, dir, lead, sim)
     if type(me.def) ~= "table" or type(foe.def) ~= "table"
         or type(me.def.scale) ~= "number" or type(foe.def.scale) ~= "number"
         or me.mvt == "blink" or me.def.dashSkill ~= nil
@@ -897,7 +959,7 @@ local function closeDashReach(me, foe, dir, lead)
     local cls = me.cls or {}
     local duration = mul * 0.225 * (cls.dashTime or 1)
     local speed = math.max(15.923076923076923 * mul * (cls.dashDist or 1) / (cls.dashTime or 1),
-        1.2 * (me.spd or 0))
+        1.2 * (me.spd or 0)) * (sim and type(sim._dashFinish) == "function" and 1.2 or 1)
     local closing = speed - (foe.vx or 0) * dir
     return closing > 0 and math.max(0, gap - reach) / closing <= math.min(0.16, duration * 0.7)
 end
@@ -955,7 +1017,14 @@ local function decide(manual)
     local attackPending = pendingAttack ~= nil
     local dashReady, dashAvailable, dashReserve, dashRechargeIn = dashBudget(me, combatClock)
     local offensiveDashReady = dashReady and dashAvailable > dashReserve and combatClock >= nextOffensiveDash
-    local guardSafe = type(me.guard) == "number" and me.guard >= Bot.MinGuardToBlock
+    local blockAllowed = not checkMethod(sim, "_statusHas", me, "noBlock")
+        and not (me.statusOn and me.status and me.status.noBlock)
+        and (me.clKdLockT or 0) <= combatClock
+    local guardRequired = Bot.MinGuardToBlock
+    if me.cls and type(me.cls.blockPunches) == "number" and type(me.guardMax) == "number" then
+        guardRequired = math.max(math.min(guardRequired, me.guardMax * 0.3), me.guardMax / (me.cls.blockPunches + 0.5) + 0.5)
+    end
+    local guardSafe = blockAllowed and type(me.guard) == "number" and me.guard >= guardRequired
         and (me.guardLockT == nil or me.guardLockT <= combatClock)
     if Bot.RecoveryGuard and trapped and me.grounded and guardSafe and distance <= 4.2 and not unblockable then
         recoveryGuardUntil = combatClock + lead + 0.18
@@ -1006,12 +1075,35 @@ local function decide(manual)
     Bot.Snapshot.threatUnblockable = unblockable
     Bot.Snapshot.foeControl = controlMode(foe)
     Bot.Snapshot.dashOpener = dashOpener and (dashOpener.followAt and "J queued" or (dashOpener.confirmed and "hit confirmed" or "Q queued")) or nil
+    Bot.Snapshot.blockAllowed, Bot.Snapshot.guardRequired = blockAllowed, guardRequired
+    Bot.Snapshot.comboStyle, Bot.Snapshot.comboDamageTier = me.cl, foe.cdN
+    Bot.Snapshot.networkLP = current.nc.lp == true
+    Bot.Snapshot.dashSpeedMultiplier = type(sim._dashFinish) == "function" and 1.2 or 1
     -- Dashes/jumps cannot get you out of ordinary hitstun. Use a legal escape
     -- according to the live readiness API; never force a cooldown or state change.
     if trapped then
+        if sim.clOn ~= nil and combatClock >= nextEscape then
+            if me.clRag ~= nil and (me.state == "tumble" or me.state == "down") and checkMethod(sim, "_clEscOk", me) then
+                out.dash = true; out.x = -dir; nextEscape = combatClock + math.max(0.15, lead + 0.04)
+                Bot.Snapshot.action = "native ragdoll escape"; status("Ragdoll escape / Q")
+                return out
+            elseif me.clTechT ~= nil and me.state == "tumble" and not me.grounded and combatClock >= me.clTechT then
+                out.jump = true; out.x = -dir; nextEscape = combatClock + math.max(0.15, lead + 0.04)
+                Bot.Snapshot.action = "native air tech"; status("Air recovery / jump")
+                return out
+            end
+        end
         local escapeKey, escapeScore = nil, 0
         local rising = me.state == "move" and (me.moveBase == "GetUp" or me.moveBase == "GetUpKD")
-        local needsEscape = not rising or (not me.invuln and (me.cbInvT or 0) <= combatClock and danger)
+        local incomingHit
+        if rising and foe.state == "move" and foe.hitCls == "move" and foe.move and not foe.move.ultimate then
+            for i = foe.key or 1, #(foe.move.keys or {}) do
+                if foe.move.keys[i].hit and not foe.move.keys[i].hit.shot then incomingHit = foe.move.keys[i].hit; break end
+            end
+        end
+        local getupMelee = incomingHit and checkMethod(sim, "_floorMelee", foe, me, incomingHit, "move")
+        Bot.Snapshot.getupMeleeThreat = getupMelee and true or false
+        local needsEscape = not rising or ((not me.invuln or getupMelee) and (me.cbInvT or 0) <= combatClock and danger)
         if needsEscape then
             for _, key in ipairs({"x1", "x2", "x3", "form", "ult"}) do
                 local kind = escapeKind(sim, me, key)
@@ -1049,6 +1141,7 @@ local function decide(manual)
     local bestKey, bestScore, desired = nil, 0, 1.8
     local groundOptions = {}
     Bot.Snapshot.groundFollowups = {}
+    Bot.Snapshot.skillReadiness = {}
     local fullOpponent = foe.human == true and not (foe.botSeat or foe.dummy or foe.tutorBot)
     local foeTeleportETA, foeApproaches = math.huge, {}
     if fullOpponent and (foe.state == "neutral" or foe.state == "block") then
@@ -1076,7 +1169,9 @@ local function decide(manual)
         -- on cooldown. Otherwise a ranged cast is followed by walking into J.
         local kitInfo = key ~= "ult" and key ~= "form" and moveInfo(sim, me, slots[key], key)
         if kitInfo and kitInfo.ranged then desired = math.max(desired, math.min(8, kitInfo.hi * 0.62)) end
-        if key ~= reservedKey and canUse(sim, me, key) then
+        local ready, readyReason, comboHold = canUse(sim, me, key)
+        if key ~= reservedKey and ready then
+            Bot.Snapshot.skillReadiness[key] = readyReason
             local info = moveInfo(sim, me, slots[key], key)
             if info then
                 local f, cat, score = info.features, info.cat, 0
@@ -1089,8 +1184,9 @@ local function decide(manual)
                 local groundOpening, groundReason = false, nil
                 if not targetHittable then groundOpening, groundReason = groundFollowup(sim, me, foe, info, key, lead, distance) end
                 groundOptions[key] = groundOpening
-                if foe.state == "down" then Bot.Snapshot.groundFollowups[key] = {eligible = groundOpening, reason = groundReason} end
-                local stunOpening = groundOpening or (foe.state == "stun" and (tonumber(foe.stunT) or 0) >= horizon + 1 / 60)
+                if not targetHittable then Bot.Snapshot.groundFollowups[key] = {eligible = groundOpening, reason = groundReason} end
+                local stunOpening = groundOpening or (foe.state == "stun" and (foe.clNoStunT or 0) <= combatClock
+                    and math.max(tonumber(foe.stunT) or 0, tonumber(comboHold) or 0) >= horizon + 1 / 60)
                 local predictedDistance = math.abs(dx + ((foe.vx or 0) - (me.vx or 0)) * horizon)
                 local inRange = predictedDistance >= info.lo and predictedDistance <= info.hi
                     and math.abs(foe.y - me.y) < (ranged and 4 or 3)
@@ -1196,7 +1292,8 @@ local function decide(manual)
         local tempo = basicDef and basicDef.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
         local basicHorizon = lead + startup * tempo
         local futureDx = dx + (foe.vx or 0) * basicHorizon - (me.vx or 0) * lead
-        local safeReach = math.max(0.5, math.min(basicReach - 0.1, Bot.MaxBasicRange))
+        local safeReach = math.max(0.5, math.min(basicReach - 0.1,
+            basicInfo and basicInfo.shot and basicInfo.hi - 0.1 or Bot.MaxBasicRange))
         local chainOpportunity = comboWindow or earlyChain
         local recoveryLeft = moveRemaining(me)
         local confirmedRecovery = me.state == "move" and me.grounded and not lightMove
@@ -1232,7 +1329,7 @@ local function decide(manual)
             and (me.dashT or 0) <= 0 and me.facing == dir
             and offensiveDashReady and now >= nextDodge and combatClock >= nextCloseDash
             and combatClock >= (me.dashAt or -10) + 0.2
-            and meleeChoice and closeDashReach(me, foe, dir, lead)
+            and meleeChoice and closeDashReach(me, foe, dir, lead, sim)
             and guardReady(sim, me, foe, "punch", lead) then
             out.dash = true; out.x = dir; closeDash = true
         end
@@ -1265,7 +1362,7 @@ local function decide(manual)
     local approachPressure = foe.human == true and targetHittable and foe.state == "neutral" and foe.grounded
         and foe.facing == -dir and closingSpeed > 5 and distance <= 6
         and distance - closingSpeed * (lead + 0.1) < 3
-    local fallbackGuardSafe = (me.guard == nil or guardSafe) and me.guardLockT == nil
+    local fallbackGuardSafe = blockAllowed and (me.guard == nil or guardSafe) and me.guardLockT == nil
     local predictBlock = Bot.PredictBlock and guardSafe and me.grounded
         and (me.state == "neutral" or (me.state == "block" and me.facing == blockDir))
         and not unblockable and ((eta >= 0 and eta < lead + 0.24 + (memory.defenseMargin or 0)) or approachPressure)
@@ -1629,6 +1726,11 @@ local function on(event, callback)
 end
 on("queue", function(value) queued = value == true; if not queued then queueRequested = false end end)
 on("lobby", function() lobbyUpdatedAt = os.clock() end)
+on("away", function(count, limit)
+    Bot.AwayWarnings = tonumber(count) or 1; Bot.AwayLimit = tonumber(limit) or 3
+    logger:line("away_warning", {count = Bot.AwayWarnings, limit = Bot.AwayLimit})
+    if logger.active and logger.stats then logger.stats.awayWarnings = Bot.AwayWarnings; logger.stats.awayLimit = Bot.AwayLimit end
+end)
 on("match", function(info)
     if retiredMatches[eventMatchId(info)] then return end
     if eventMatchId(info) ~= nil and eventMatchId(info) == matchId and busy then
@@ -1638,6 +1740,7 @@ on("match", function(info)
     if matchId ~= eventMatchId(info) then retireMatch(matchId, session, false); session = nil end
     matchEventAt = os.clock()
     Bot.RecoveryStatus = "watching"
+    Bot.AwayWarnings = 0
     busy = true; queued = false; ending = false
     queueRequested = false
     skipState = nil
@@ -2169,11 +2272,12 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.17 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.18 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
+            .. (Bot.AwayWarnings > 0 and ("\nAway: " .. Bot.AwayWarnings .. "/" .. Bot.AwayLimit .. " / keep Roblox focused") or "")
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.17] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.18] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
