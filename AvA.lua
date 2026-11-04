@@ -125,7 +125,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.21-ultimate-timing",
+    Version = "4.22-defense-timing",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -912,14 +912,14 @@ local function minorZoneHit(hit, tick, arg)
     end
     return true
 end
-local function invulnerableAt(info, me, afterInput)
+local function defenseKeyAt(info, me, afterInput)
+    if afterInput < 0 then return nil end
     local tempo = info.def.fixedTime and 1 or tonumber(me.def and me.def.tempo) or 1
     for _, key in ipairs(info.def.keys or {}) do
         local duration = ((tonumber(key.dur) or 0.05) + (tonumber(key.hold) or 0)) * tempo
-        if afterInput < duration then return afterInput >= 0 and key.invuln == true end
+        if afterInput < duration then return key end
         afterInput = afterInput - duration
     end
-    return false
 end
 local function threat(sim, me)
     local soon, projectile, unblockable, blockDir, source = math.huge, false, false, nil, nil
@@ -1331,9 +1331,21 @@ local function decide(manual)
                 elseif cat == "heal" then
                     if hp < Bot.HealBelow and eta > horizon + 0.12 then score = 5 + (1 - hp) * 5 end
                 elseif cat == "counter" then
-                    if danger and (not isProjectile or f.reflect) then score = 12 - eta * 3 end
+                    local frame = danger and defenseKeyAt(info, me, eta - lead)
+                    if frame and not (unblockable and frame.counterBypass) then
+                        if isProjectile then
+                            if frame.reflect or frame.blockProj or (frame.counterProj and info.def.onCounterProj) then
+                                score = 12 - eta * 3
+                            end
+                        elseif frame.counter and (frame.onCounter or info.def.onCounter)
+                            and not (targetedStrike and frame.counterMelee)
+                            and (not frame.counterNear or distance <= frame.counterNear) then
+                            score = 12 - eta * 3
+                        end
+                    end
                 elseif cat == "evade" then
-                    if imminent and invulnerableAt(info, me, eta - lead) then score = 9 end
+                    local frame = danger and defenseKeyAt(info, me, eta - lead)
+                    if frame and frame.invuln == true then score = 9 end
                 elseif key == "form" or cat == "buff" or cat == "summon" then
                     if not danger and (foe.hp or 0) > 10 and (key == "form" or not info.needsTarget
                         or targetHittable or groundOpening) then score = key == "form" and 6 or 2 end
@@ -2495,7 +2507,7 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.21 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.22 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
             .. "\nAwaken: " .. Bot.AwakenStatus
@@ -2503,4 +2515,4 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.21] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
+warn("[QuickMatchAuto v4.22] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload.")
