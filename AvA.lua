@@ -132,7 +132,7 @@ local Bot = {
     RewardStatus = "idle",
     Status = "Starting",
     LastError = nil,
-    Version = "4.30-rush-timing",
+    Version = "4.31-targeted-threats",
     AwakenDiagnostics = {},
     RecoveryStatus = "watching",
     RecoveryCount = 0,
@@ -1058,19 +1058,24 @@ local function threat(sim, me)
             local dist = math.abs(foe.x - me.x)
             local range = move.range or {0, 4}
             local closing = math.max(0, ((foe.vx or 0) - (me.vx or 0)) * (me.x >= foe.x and 1 or -1))
-            local targetWarp, remoteStrike, ultimatePulse, lunging = false, false, false, false
+            local targetWarp, remoteStrike, ultimatePulse, lunging, targetArea = false, false, false, false, false
             for i = foe.key or 1, #move.keys do
                 if contactLunge(move.keys[i]) then lunging = true end
                 for _, fx in ipairs(move.keys[i].fx or {}) do
                     if fx[1] == "teleport" and (fx[2] == "around" or fx[2] == "behind" or fx[2] == "through") then targetWarp = true end
                     if fx[1] == "strike" and type(fx[2]) == "table" and fx[2].ignoreDist then remoteStrike = true end
+                    local area = type(fx[2]) == "table" and fx[2]
+                    if i > (foe.key or 1) and (fx[1] == "sprout" or fx[1] == "zone") and area and area.hit
+                        and (area.at == "target" or area.at == "targetBody" or (fx[1] == "sprout" and not area.at)) then
+                        targetArea = true
+                    end
                     if move.ultimate and fx[1] == "pulse" and i > (foe.key or 1) and type(fx[2]) == "table"
                         and not fx[2].statusOnly and (tonumber(fx[2].dmg) or 0) > 0 then ultimatePulse = true end
                 end
             end
             local attackX, relocated = foe.x, false
             local nearby = targetWarp or (dist <= (range[2] or 4) + 1.4 + closing * 0.35 and math.abs(foe.y - me.y) < 4)
-            if nearby or remoteStrike or ultimatePulse or lunging then
+            if nearby or remoteStrike or ultimatePulse or lunging or targetArea then
                 for i = foe.key or 1, #move.keys do
                     local k = move.keys[i]
                     local active, ranged, flight = k.hit or k.grab or k.needsGrab, false, 0
@@ -1114,13 +1119,18 @@ local function threat(sim, me)
                                 and (me.x - attackX) ^ 2 + (me.y - foe.y) ^ 2 <= radius ^ 2 then
                                 consider(eta, false, hit.unblockable or hit.grab, attackX >= me.x and 1 or -1, "ultimate pulse")
                             end
-                        elseif nearby and (fx[1] == "sprout" or fx[1] == "zone") and type(fx[2]) == "table" then
+                        elseif (nearby or targetArea) and (fx[1] == "sprout" or fx[1] == "zone")
+                            and i > (foe.key or 1) and type(fx[2]) == "table" then
                             local z = fx[2]
                             if type(z.hit) == "table" then
                                 local at = z.at or (fx[1] == "sprout" and "target" or "self")
-                                local center = (at == "self" and foe.x or me.x) + (z.dx or 0) * (foe.facing or 1)
-                                local wait = math.max(0, eta) + (tonumber(z.delay) or (fx[1] == "sprout" and 0.3 or 0))
-                                if (at == "self" or at == "target" or at == "targetBody")
+                                local targeted = at == "target" or at == "targetBody"
+                                local spawnAt = math.max(0, eta)
+                                local targetX = me.x + (me.vx or 0) * spawnAt
+                                local center = (targeted and targetX or foe.x) + (z.dx or 0) * (foe.facing or 1)
+                                local wait = spawnAt + (tonumber(z.delay) or (fx[1] == "sprout" and 0.3 or 0))
+                                local withinReach = not targeted or not z.reach or math.abs(targetX - foe.x) <= z.reach
+                                if (at == "self" or targeted) and withinReach
                                     and math.abs(me.x + (me.vx or 0) * wait - center) <= (z.r or 0.9) + 1.2 then
                                     if not minorZoneHit(z.hit, z.tick, z) then
                                         consider(wait, false, z.hit.grab or z.hit.unblockable or false,
@@ -1617,6 +1627,10 @@ local function decide(manual)
                     Bot.Snapshot.openingBlocked[key] = "opponent recovers before attack"
                 end
                 if score > 0 and offensive and not info.protectedStartup and not stunOpening then
+                    if threatSource == "delayed effect" and eta <= commitment then
+                        score = 0
+                        Bot.Snapshot.openingBlocked[key] = "targeted effect interrupts commitment"
+                    end
                     local walkReach = 3 + walkSpeed * 1.1 * commitment + dashReach
                     if fullOpponent and foe.state == "neutral" and foe.dashFwd and (foe.dashT or 0) > 0 then
                         local dashTime = math.min(foe.dashT, impact)
@@ -2946,7 +2960,7 @@ task.spawn(function()
         end
         local okLog, logError = pcall(logger.flush, logger)
         if not okLog then logger:fail(logError) end
-        label.Text = "v4.30 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
+        label.Text = "v4.31 " .. (Bot.Enabled and "ON" or "PAUSED") .. " | " .. Bot.Status
             .. "\nF6 pause | F7 auto join: " .. (Bot.AutoJoin and "ON" or "OFF") .. " | F8 unload"
             .. "\nF9 mode: " .. (Bot.MatchMode == "ranked" and "Ranked" or "Quick Match")
             .. "\nLogs: " .. Bot.LogStatus .. " | Rewards: " .. Bot.RewardStatus
@@ -2955,4 +2969,4 @@ task.spawn(function()
         task.wait(0.5)
     end
 end)
-warn("[QuickMatchAuto v4.30] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload; F9 mode.")
+warn("[QuickMatchAuto v4.31] Full CONTROL. F6 autoplay, F7 automatic matchmaking, F8 unload; F9 mode.")
